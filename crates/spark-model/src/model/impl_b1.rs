@@ -1,5 +1,4 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-
 #![allow(unused_imports, dead_code)]
 
 use parking_lot::Mutex;
@@ -272,6 +271,7 @@ impl TransformerModel {
                 profile: false,
                 comm: ctx.comm,
                 graph_capture: ctx.graph_capture,
+                gdn_exact_replay: false,
             }
         };
 
@@ -453,6 +453,7 @@ impl TransformerModel {
             profile: false,
             comm: self.comm_ref(),
             graph_capture: false, // Eager mode — no CUDA graph
+            gdn_exact_replay: false,
         };
 
         // Eager layer loop: skip SSM layers, run attention layers only

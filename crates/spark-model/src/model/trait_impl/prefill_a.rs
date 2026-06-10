@@ -367,14 +367,26 @@ impl TransformerModel {
             profile: self.profile,
             comm: self.comm_ref(),
             graph_capture: false,
+            // Marconi warm hit: GDN layers replay from a restored SSM state
+            // and must use the bit-faithful WY4 recurrence (see layer.rs).
+            gdn_exact_replay: marconi_skip,
         };
 
         // ── 4. Forward through all layers ──
         // When Marconi skip is active, seq_len_start > 0 triggers paged attention
-        // in attention layers. SSM layers process only proc_count tokens using
-        // restored h_state + conv_state. kv_write_start=0 because ALL tokens in
-        // the batch are uncached (cached ones were skipped entirely).
-        let layer_kv_write_start = if marconi_skip { 0 } else { kv_write_start };
+        // in attention layers. SSM layers process only proc_count tokens
+        // using restored h_state + conv_state. On a Marconi intermediate hit
+        // the first (matched - snap_tok) processed tokens replay positions
+        // already in shared prefix-cache blocks — write-floor them so
+        // attention can't rewrite cached K/V with non-bit-exact recompute
+        // (see prefill_b/forward_layers.rs). Leaf hit → floor 0 (all new).
+        let layer_kv_write_start = if marconi_skip {
+            seq.cached_prefix_tokens
+                .saturating_sub(seq_len_start)
+                .min(proc_count)
+        } else {
+            kv_write_start
+        };
         let diag_prefill = self.profile && proc_count > 1; // Only with --profile
         for (i, layer) in self.layers.iter().enumerate() {
             layer
