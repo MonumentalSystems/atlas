@@ -369,46 +369,51 @@ impl TransformerModel {
                 stream,
             )?;
 
-            // LM head: padded_n sequential GEMVs (weights in L2 after first)
+            // LM head: ONE batched [padded_n, vocab] GEMM so the ~254 MB
+            // vocab weight is read ONCE per step instead of once per sequence
+            // (the per-row GEMV loop re-read it N times — a major C>=2 cost:
+            // ~N×254 MB/step). nvfp4/dense are batched here; FP8 single-scale
+            // keeps the per-row path (no batched single-scale FP8 GEMM handle
+            // on the model, and Holo's lm_head is NVFP4 anyway).
             let logits = self.buffers.logits();
             let v = self.config.vocab_size;
-            for i in 0..padded_n {
-                let normed_i = normed.offset(i * h * bf16);
-                let logits_i = logits.offset(i * v * bf16);
-                if let Some(ref fp8) = self.lm_head_fp8 {
+            if let Some(ref fp8) = self.lm_head_fp8 {
+                for i in 0..padded_n {
                     ops::dense_gemv_fp8w(
                         self.gpu.as_ref(),
                         self.dense_gemv_fp8w_kernel,
-                        normed_i,
+                        normed.offset(i * h * bf16),
                         fp8,
-                        logits_i,
-                        v as u32,
-                        h as u32,
-                        stream,
-                    )?;
-                } else if let Some(ref nvfp4) = self.lm_head_nvfp4 {
-                    ops::w4a16_gemv(
-                        self.gpu.as_ref(),
-                        self.w4a16_gemv_kernel,
-                        normed_i,
-                        nvfp4,
-                        logits_i,
-                        v as u32,
-                        h as u32,
-                        stream,
-                    )?;
-                } else {
-                    ops::dense_gemv(
-                        self.gpu.as_ref(),
-                        self.dense_gemv_kernel,
-                        normed_i,
-                        &self.lm_head_weight,
-                        logits_i,
+                        logits.offset(i * v * bf16),
                         v as u32,
                         h as u32,
                         stream,
                     )?;
                 }
+            } else if let Some(ref nvfp4) = self.lm_head_nvfp4 {
+                ops::w4a16_gemm(
+                    self.gpu.as_ref(),
+                    self.w4a16_gemm_kernel,
+                    normed,
+                    nvfp4,
+                    logits,
+                    padded_n as u32,
+                    v as u32,
+                    h as u32,
+                    stream,
+                )?;
+            } else {
+                ops::dense_gemm(
+                    self.gpu.as_ref(),
+                    self.dense_gemm_kernel,
+                    normed,
+                    &self.lm_head_weight,
+                    logits,
+                    padded_n as u32,
+                    v as u32,
+                    h as u32,
+                    stream,
+                )?;
             }
 
             if use_graphs {
