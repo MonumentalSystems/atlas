@@ -95,3 +95,30 @@ Revised next-lever ranking:
 2. **Attention FP8** for q/k/v/o decode projections if currently BF16 (attn proper
    3.4 ms/10L) — analogous to the SSM FP8 decode win.
 3. MoE w4a16 GEMV micro-optimization (hard, deep CUDA).
+
+## C>=2 profile + precise next levers (2026-06-19, ATLAS_MS_PROFILE)
+
+Multi-seq decode step breakdown (n=8, eager+synced; relative split is the signal):
+`total~87ms = ssm 56ms (30L, 64%) + attn 24ms (10L, 27%) + head 8ms (9%)`
+
+The C>=2 gap is NOT projections (batched), LM head (batched, L2-masked), or graphs
+(on). It's the parts that scale with N inside the layers:
+1. **Per-token MoE (xN)** — biggest single cost. 8 separate `ffn.forward()` per step
+   across 40 layers. Grouped GEMM (`forward_prefill`) is a measured LOSS for Holo's
+   256-expert/512-intermediate shape even under graphs. Needs a purpose-built batched
+   small-M MoE decode kernel (the deep, high-value nut).
+2. **Per-seq SSM conv/gdn recurrence (xN)** — N serial small kernels (poor GPU
+   occupancy). Fully batchable to one `batch=N` launch each:
+   - `gdn_decode`: already batch-capable; pass `h_state = states[0].h_state` (pool
+     base; slots are contiguous [0..n)) + contiguous q/k/v from a `[N, conv_dim]` conv
+     output.
+   - `gated_rms_norm`: use the existing `gated_rms_norm_prefill` (grid heads×N).
+   - `conv1d_update_l2norm`: ONLY missing piece — add an `input_stride` param to the
+     kernel (f32 + bf16) so it can read the qkv slice of the `[N, qkvz_size]`
+     deinterleaved buffer (stride=qkvz_size). Then batch=N, conv_state=pool base.
+   - BA+gates: keep per-seq (cheap, 64 outputs) writing into a contiguous `[N, 2*nv]`
+     gates buffer, or batch later.
+
+Both are kernel-adjacent efforts (revert-safe; verify vs needle/coherence). The SSM
+conv/gdn batching is the more tractable; the batched MoE decode kernel is the larger
+win but harder. C=1 (62/75) is per the user "fine"; focus is C>=2.
