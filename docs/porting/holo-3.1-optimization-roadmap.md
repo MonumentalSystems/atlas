@@ -151,3 +151,25 @@ Exhaustive feasibility done. The two C>=2 levers both require core-kernel change
 
 Both are dedicated kernel efforts, not quick edits. C=1 (62/75) is "fine" per user;
 C>=2 parity hinges on #2 primarily, #1 secondarily.
+
+## Empirical MoE-kernel result (2026-06-19, smem-A experiment)
+
+Attempted: cache the per-token activation A[K] in shared memory in
+`moe_expert_gate_up_shared` (every block re-reads the same A in the K-loop).
+Result: **no-op** (c1 61.4, c4 57.5, c8 79.4 — all within noise). Reverted.
+
+Conclusion (empirical, not just analysis): A is already L2-resident; the MoE
+expert GEMV is **weight-read bound** (each output's unique NVFP4 weight row +
+unpack), in an M=1 warp-per-output structure. It is already fully GPU-occupied
+at one token (~1152 blocks), so batching N tokens gives no occupancy win and the
+weight bytes are inherent (64 expert activations at N=8, same as vLLM). The ~2.3×
+gap vs bandwidth-optimal is the warp-per-output GEMV structure + per-output
+warp-reduction, NOT activation traffic or occupancy.
+
+So vLLM's ~2× C>=2 decode edge must come from a more efficient MoE expert kernel
+(tensor-core grouped-GEMM tiling that achieves higher effective weight-read
+throughput than warp-per-output GEMV). That is the single remaining C>=2 lever and
+it is a dedicated, research-grade CUDA kernel effort — not a tweak. Also note:
+steady-state decode (≈87ms/8-tok step ≈ 92 tok/s) is well above the bench's 78
+tok/s c8, so a few % of the c8 gap is prefill-admission ramp (pure-Rust lead #2),
+but the dominant gap is the MoE-bound steady decode step.
