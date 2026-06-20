@@ -173,3 +173,20 @@ it is a dedicated, research-grade CUDA kernel effort — not a tweak. Also note:
 steady-state decode (≈87ms/8-tok step ≈ 92 tok/s) is well above the bench's 78
 tok/s c8, so a few % of the c8 gap is prefill-admission ramp (pure-Rust lead #2),
 but the dominant gap is the MoE-bound steady decode step.
+
+## Definitive C>=2 conclusion (2026-06-19, by elimination)
+
+Three projection-batching experiments — LM-head GEMM, activation smem-cache, and
+o_proj GEMM — ALL measured as no-ops (c4/c8 within noise). Reason: projection
+weights (q/k/v/o/lm_head) are SHARED across the batch, so per-seq re-reads are
+L2-absorbed; batching them changes nothing at N<=8. The ONLY weights that scale
+HBM traffic with N are the MoE EXPERT weights (unique per token's top-k routing →
+~64 distinct reads at N=8, not cacheable). So:
+
+**The sole remaining C>=2 lever is the MoE expert GEMV kernel's effective HBM
+bandwidth (~2.3x off peak in the current warp-per-output M=1 structure).** Closing
+it = a better-tuned expert kernel (tensor-core grouped-GEMM tiling / higher
+memory-level parallelism), which is how vLLM gets its ~2x C>=2 edge. This is a
+dedicated CUDA kernel project; all lighter-weight approaches are empirically ruled
+out. (o_proj + LM-head batched GEMMs kept as correct architecture though
+perf-neutral on GB10's L2.)
