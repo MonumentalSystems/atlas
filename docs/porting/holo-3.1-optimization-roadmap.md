@@ -245,3 +245,41 @@ This is a pervasive decode-path kernel-fusion effort (multi-week), now definitiv
 root-caused. NOTE for future work: do NOT spend time on horizontal batching or
 per-kernel micro-opts of the decode GEMVs — empirically proven to be no-ops here. The
 win is fewer stages.
+
+## STRATEGIC SYNTHESIS: speculation is the right lever for chain-depth-bound decode (2026-06-20)
+
+Connecting the root cause (decode = dependency-chain-DEPTH bound) to the user's
+production setup (vLLM DFlash: γ=5 drafts, 2.5-3x acceptance):
+
+KEY INSIGHT: under chain-depth-bound decode, a VERIFY forward over K draft tokens
+costs ≈ ONE decode step in wall-clock (same ~hundreds of dependent stages; each
+stage just processes K tokens batched, and the step is latency-bound so the extra
+tokens-per-stage are nearly free) — yet it commits α·K accepted tokens. So
+speculative decode AMORTIZES the deep chain over multiple tokens. This is THE lever
+that beats the chain-depth wall WITHOUT the multi-week vertical-fusion rewrite, and
+it is precisely what makes vLLM fast (its 75/175 raw numbers are pre-DFlash; with
+DFlash it goes further). Atlas raw C=1=62 × 2.5x accept ≈ 155 tok/s — past the 75 bar.
+
+WHY THIS IS TRACTABLE FOR HOLO (unlike vertical fusion):
+- Atlas already has multi-token GDN verify kernels that populate SSM intermediates
+  correctly: `gdn_wy2/wy3/wy4` (K=2/3/4) and `gdn_wy17` (K=17) — and gdn_wy17 lives
+  in the qwen3.6-35b-a3b PTX set that Holo SYMLINKS to. So a γ≈4-16 verify path has
+  working kernels.
+- Atlas has `--self-speculative` (layer-skip drafting, no drafter checkpoint) and
+  `--ngram-speculative` as drafters that don't need the (crashing) DFlash drafter.
+- The DFlash scaffold caps drafts to 1 only because its GENERIC K=γ verify corrupts
+  SSM state; routing drafts through the WY-chunkwise verify (which doesn't) is the fix.
+
+RECOMMENDED PRIMARY NEXT EFFORT (re-prioritized above vertical fusion):
+1. Get a WORKING speculative decode on Holo — start with `--self-speculative`
+   (no drafter weights, lowest risk) routed through the WY (gdn_wy*) verify path;
+   measure acceptance + net tok/s with `scripts/bench_holo_atlas.py`. Even 1.5-2x
+   acceptance clears the 75 C=1 bar (62 → 93-124).
+2. Then the DFlash drafter (z-lab Qwen3.5-DFlash) for the full γ=5 / 2.5-3x: fix the
+   forward_block CUDA-700 crash (suspect freed NVFP4 lm_head/embed shared ptr) and
+   route γ drafts through gdn_wy verify instead of the generic K=γ path.
+Caveat: MTP K=2 was historically "net-negative on FP8" because γ=2 is tiny + drafter
+overhead; γ=5 with 2.5-3x accept is strongly net-positive (the user's measured result).
+
+Vertical fusion (previous section) remains the lever for RAW decode parity, but
+speculation is the faster path to the user's "blazingly fast / like 75 C=1" bar.
