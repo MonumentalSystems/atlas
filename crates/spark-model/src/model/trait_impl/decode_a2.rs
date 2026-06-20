@@ -213,10 +213,13 @@ impl TransformerModel {
         // valid across replays. This is the dominant lever for n>=2 decode
         // (eliminates ~1500 kernel launches/step). Opt-in until soaked; flip
         // the default once validated. Verify correctness with the needle test.
-        let use_graphs = std::env::var("ATLAS_DECODE_GRAPHS_MULTISEQ")
-            .ok()
-            .as_deref()
-            == Some("1");
+        let ms_profile = std::env::var("ATLAS_MS_PROFILE").ok().as_deref() == Some("1");
+        // ATLAS_MS_PROFILE forces eager (graphs off) so per-phase syncs are legal.
+        let use_graphs = !ms_profile
+            && std::env::var("ATLAS_DECODE_GRAPHS_MULTISEQ")
+                .ok()
+                .as_deref()
+                == Some("1");
 
         let ctx = ForwardContext {
             buffers: &self.buffers,
@@ -337,8 +340,16 @@ impl TransformerModel {
             dump_hidden("post_embed", stream)?;
 
             // Layer loop for padded_n sequences
+            let mut ssm_us: u128 = 0;
+            let mut attn_us: u128 = 0;
             for (layer_idx, layer) in self.layers.iter().enumerate() {
                 let mut layer_state_refs = extract_layer_refs(&mut all_layer_states, layer_idx);
+                let t0 = if ms_profile {
+                    self.gpu.synchronize(stream).ok();
+                    Some(std::time::Instant::now())
+                } else {
+                    None
+                };
                 layer.decode_multi_seq(
                     hidden,
                     residual,
@@ -350,10 +361,27 @@ impl TransformerModel {
                     &ctx,
                     stream,
                 )?;
+                if let Some(t0) = t0 {
+                    self.gpu.synchronize(stream).ok();
+                    let dt = t0.elapsed().as_micros();
+                    if self.config.layer_type(layer_idx) == LayerType::LinearAttention {
+                        ssm_us += dt;
+                    } else {
+                        attn_us += dt;
+                    }
+                }
                 if conc_hsd {
                     let _ = dump_hidden(&format!("after_L{:02}", layer_idx), stream);
                 }
             }
+            if ms_profile {
+                self.gpu.synchronize(stream).ok();
+            }
+            let lmhead_t0 = if ms_profile {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
 
             // Final norm [padded_n, H]
             let normed = self.buffers.norm_output();
@@ -414,6 +442,21 @@ impl TransformerModel {
                     h as u32,
                     stream,
                 )?;
+            }
+            if let Some(t0) = lmhead_t0 {
+                self.gpu.synchronize(stream).ok();
+                let head_us = t0.elapsed().as_micros();
+                let total = ssm_us + attn_us + head_us;
+                tracing::info!(
+                    "ATLAS_MS_PROFILE n={n} padded_n={padded_n}: total={}us  ssm={}us({}L)  attn={}us({}L)  head={}us  [per-tok {:.2}ms]",
+                    total,
+                    ssm_us,
+                    self.config.num_ssm_layers(),
+                    attn_us,
+                    self.layers.len() - self.config.num_ssm_layers(),
+                    head_us,
+                    total as f64 / 1000.0 / padded_n as f64,
+                );
             }
 
             if use_graphs {
