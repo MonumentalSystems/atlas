@@ -216,3 +216,32 @@ i.e. kernel FUSION and batching-across-N — not per-kernel throughput:
 - Fuse adjacent elementwise ops (norm+residual, etc.).
 This is pervasive decode-path kernel architecture work (how vLLM gets 2x), not a
 single kernel. It is the path to C>=2 (and further C=1) parity.
+
+## FINAL ROOT CAUSE: dependency-chain DEPTH, not kernel count (2026-06-20)
+
+I built and measured a strided batched-GDN kernel (collapse the per-seq GDN loop
+N→1 launch). Correct (needle c2/c4/c8 pass) but ANOTHER no-op (c4 55.7, c8 77.1).
+That is the 6th consecutive no-op (LM-head GEMM, o_proj GEMM, smem-A, K-loop unroll,
+grouped MoE, batched GDN). Combined with 15x-off-bandwidth, this is conclusive:
+
+**The decode step is bound by the DEPTH of its per-step kernel dependency chain, not
+by kernel count-per-stage or per-kernel throughput.** Each step is ~hundreds of
+SEQUENTIAL dependent kernel stages (per layer: rms_norm → QKVZ → BA/gates → conv1d →
+gdn → gated_norm → out_proj → moe_gate → topk → expert_gate_up → silu_down → wsum →
+residual, ×40 layers). Under CUDA graphs the GPU already pipelines independent kernels,
+so batching-across-N (which shrinks count WITHIN a stage) does NOT shorten the chain →
+no speedup. Every horizontal-batching/per-kernel optimization is therefore a no-op by
+construction. vLLM is ~2x faster because its decode path has FEWER, FUSED stages
+(shorter chain), not faster individual kernels.
+
+**The ONLY lever is VERTICAL KERNEL FUSION — reducing the number of sequential
+dependent stages per step:**
+- Fuse the SSM mixer: conv1d+gdn+gated_norm into one (or fewer) kernels.
+- Fuse the MoE chain: gate+topk+expert_gemv+silu+down+combine.
+- Fuse elementwise+norm boundaries (residual+rms_norm already partly fused).
+- Megakernel-style fusion of whole sub-blocks is how to approach vLLM's chain depth.
+
+This is a pervasive decode-path kernel-fusion effort (multi-week), now definitively
+root-caused. NOTE for future work: do NOT spend time on horizontal batching or
+per-kernel micro-opts of the decode GEMVs — empirically proven to be no-ops here. The
+win is fewer stages.
