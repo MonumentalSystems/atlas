@@ -293,3 +293,28 @@ crash fixed + drafts routed through the existing `gdn_wy*` verify (NOT the gener
 path that corrupts SSM state), or (b) wiring the layer-skip self-spec drafter through
 the SSM `gdn_wy*` verify. Holo HAS the verify kernels (gdn_wy2/3/4/17). This is the
 recommended primary next effort for the speed bar (see strategic synthesis above).
+
+## DFlash crash PINPOINTED (2026-06-20) — NVFP4 lm_head read as BF16
+
+Root cause of the DFlash `forward_block` CUDA-700 (and the ~13 tok/s "ran but useless"):
+- `factory/build.rs:384`: `target_lm_head_for_dflash = lm_head.weight` → the drafter's
+  `lm_head_shared` is a raw `DevicePtr`.
+- `dflash_head/forward_block.rs:334`: the drafter computes its logits with a **BF16
+  `dense_gemm`** on `lm_head_shared`.
+- But Holo's lm_head is **NVFP4** (`lm_head_nvfp4`, no BF16 tensor) — packed at ~0.5
+  bytes/elem (254 MB) vs the 1 GB a BF16 `[vocab=248320, h=2048]` would be.
+- So `dense_gemm` reads NVFP4-packed bytes as BF16: every drafter logit is garbage →
+  near-zero acceptance (→ slower than no-spec) AND it indexes ~4× past the 254 MB
+  buffer → latent OOB → the intermittent CUDA-700. ONE mismatch explains BOTH symptoms.
+
+FIX (targeted, the unblocking first step for DFlash on Holo):
+1. Pass the NVFP4 lm_head (`QuantizedWeight`: packed + scale + scale2), not a raw BF16
+   ptr, into `BlockDiffusionDraftHead` (build.rs + from_weights + the struct field).
+2. In `forward_block`, dispatch the final logits GEMM via `w4a16_gemm` when the head is
+   NVFP4 (mirror the model's lm_head dispatch), else keep `dense_gemm`.
+3. (embed_tokens_shared is BF16 on Holo — no change.)
+After this, the drafter produces CORRECT logits → real acceptance, and the crash is
+gone. THEN raise `ATLAS_DFLASH_DRAFT_CAP` and route γ drafts through the existing
+`gdn_wy*` verify (not the generic K=γ path) for the full γ=5 / 2.5-3x speedup.
+This is the concrete, no-longer-mysterious path to the user's "75 C=1" bar via their
+production DFlash approach.
