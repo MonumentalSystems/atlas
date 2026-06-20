@@ -264,19 +264,38 @@ impl Qwen3SsmLayer {
 
         // ── 2. Batched QKVZ projection: ONE [N,h]→[N,qkvz] GEMM (weights ×1) ──
         // FP8 (w8a16) when the decode overlay is installed, else BF16 dense.
+        // Prefer the pipelined (cp.async) w8a16 kernel — bit-identical, ~4.6×
+        // faster than the base w8a16_gemm, which nsys showed as 44.6% of the
+        // C>1 decode step. `.0 == 0` → fall back to the base kernel.
+        let w8a16_pipe = self.w8a16_gemm_pipelined_k.0 != 0;
         if let Some(ref fp8) = self.qkvz_fp8w {
-            ops::w8a16_gemm(
-                ctx.gpu,
-                self.w8a16_gemm_k,
-                normed_base,
-                fp8.weight,
-                fp8.row_scale,
-                deinterleaved,
-                n as u32,
-                qkvz_size as u32,
-                h as u32,
-                stream,
-            )?;
+            if w8a16_pipe {
+                ops::w8a16_gemm_pipelined(
+                    ctx.gpu,
+                    self.w8a16_gemm_pipelined_k,
+                    normed_base,
+                    fp8.weight,
+                    fp8.row_scale,
+                    deinterleaved,
+                    n as u32,
+                    qkvz_size as u32,
+                    h as u32,
+                    stream,
+                )?;
+            } else {
+                ops::w8a16_gemm(
+                    ctx.gpu,
+                    self.w8a16_gemm_k,
+                    normed_base,
+                    fp8.weight,
+                    fp8.row_scale,
+                    deinterleaved,
+                    n as u32,
+                    qkvz_size as u32,
+                    h as u32,
+                    stream,
+                )?;
+            }
         } else {
             ops::dense_gemm(
                 ctx.gpu,
@@ -382,18 +401,33 @@ impl Qwen3SsmLayer {
         // ── 4. Batched out_proj: ONE [N,value_dim]→[N,h] GEMM (weights ×1) ──
         // FP8 (w8a16) when the decode overlay is installed, else BF16 dense.
         if let Some(ref fp8) = self.out_proj_fp8w {
-            ops::w8a16_gemm(
-                ctx.gpu,
-                self.w8a16_gemm_k,
-                normed_out_base,
-                fp8.weight,
-                fp8.row_scale,
-                ssm_out_base,
-                n as u32,
-                h as u32,
-                value_dim as u32,
-                stream,
-            )?;
+            if w8a16_pipe {
+                ops::w8a16_gemm_pipelined(
+                    ctx.gpu,
+                    self.w8a16_gemm_pipelined_k,
+                    normed_out_base,
+                    fp8.weight,
+                    fp8.row_scale,
+                    ssm_out_base,
+                    n as u32,
+                    h as u32,
+                    value_dim as u32,
+                    stream,
+                )?;
+            } else {
+                ops::w8a16_gemm(
+                    ctx.gpu,
+                    self.w8a16_gemm_k,
+                    normed_out_base,
+                    fp8.weight,
+                    fp8.row_scale,
+                    ssm_out_base,
+                    n as u32,
+                    h as u32,
+                    value_dim as u32,
+                    stream,
+                )?;
+            }
         } else if let Some(ref out_proj_dense) = self.out_proj_dense {
             ops::dense_gemm(
                 ctx.gpu,
