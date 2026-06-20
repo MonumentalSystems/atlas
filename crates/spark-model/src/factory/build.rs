@@ -382,6 +382,9 @@ pub fn build_model(
     // so this clones the device pointer cheaply.
     let target_embed_for_dflash = embed.weight;
     let target_lm_head_for_dflash = lm_head.weight;
+    // NVFP4 lm_head (Copy) shared with the DFlash drafter so its final logits
+    // GEMM uses w4a16 instead of a BF16 dense_gemm on NVFP4-packed bytes.
+    let target_lm_head_nvfp4_for_dflash = lm_head_nvfp4;
     let target_hidden_for_dflash = config.hidden_size;
 
     let mut model = TransformerModel::new(
@@ -428,6 +431,7 @@ pub fn build_model(
                 weights,
                 target_embed_for_dflash,
                 target_lm_head_for_dflash,
+                target_lm_head_nvfp4_for_dflash,
                 target_hidden_for_dflash,
                 args.gamma,
                 args.window_size,
