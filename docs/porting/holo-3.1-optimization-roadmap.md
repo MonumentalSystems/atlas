@@ -190,3 +190,29 @@ memory-level parallelism), which is how vLLM gets its ~2x C>=2 edge. This is a
 dedicated CUDA kernel project; all lighter-weight approaches are empirically ruled
 out. (o_proj + LM-head batched GEMMs kept as correct architecture though
 perf-neutral on GB10's L2.)
+
+## DECISIVE: decode is latency/serialization-bound, not bandwidth-bound (2026-06-19)
+
+Measured c8 steady-state (long output, prefill amortized): 86.6 tok/s, ~92ms/8-tok
+step. Per-step weight traffic ~1.7 GB → ~18 GB/s EFFECTIVE vs ~273 GB/s peak =
+**15x off bandwidth**. The GPU is idle ~93% of the step. vLLM at this workload is
+~7.4x off (also latency-bound, ~2x better).
+
+This OVERTURNS the earlier "MoE GEMV bandwidth" conclusion. The decode step is a
+long SERIAL CHAIN of tiny kernels (per layer: rms_norm → QKVZ → BA/gates → conv1d →
+gdn → gated_norm → out_proj → moe_gate → topk → expert_gate_up → silu_down →
+wsum → residual, ×40 layers; with MoE per-token ×N and SSM recurrence per-seq ×N).
+Each kernel is small (underfills the GPU) and dependent on the previous → the GPU
+waits. That is why EVERY per-kernel efficiency tweak measured as a no-op
+(smem-A, K-loop unroll, LM-head/o_proj batched GEMM): you cannot speed up a kernel
+that is mostly idle-waiting in a dependency chain.
+
+**The real lever is reducing the per-step kernel COUNT / serial-chain length** —
+i.e. kernel FUSION and batching-across-N — not per-kernel throughput:
+- Batch the SSM recurrence across N (conv/gdn one batch=N launch each via stride
+  params) → collapses 8×30 per-seq kernels → 30. Most tractable.
+- Fuse the MoE decode chain (gate+topk+experts+down+combine) into fewer kernels;
+  the per-token loop (×N × 40 layers) is the longest serial sub-chain.
+- Fuse adjacent elementwise ops (norm+residual, etc.).
+This is pervasive decode-path kernel architecture work (how vLLM gets 2x), not a
+single kernel. It is the path to C>=2 (and further C=1) parity.
