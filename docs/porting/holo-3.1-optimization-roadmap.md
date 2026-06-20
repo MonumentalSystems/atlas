@@ -122,3 +122,32 @@ The C>=2 gap is NOT projections (batched), LM head (batched, L2-masked), or grap
 Both are kernel-adjacent efforts (revert-safe; verify vs needle/coherence). The SSM
 conv/gdn batching is the more tractable; the batched MoE decode kernel is the larger
 win but harder. C=1 (62/75) is per the user "fine"; focus is C>=2.
+
+## C>=2 kernel-level scope (final, 2026-06-19)
+
+Exhaustive feasibility done. The two C>=2 levers both require core-kernel changes
+(revert-safe but high-care; verify vs needle/coherence + SSM checksum):
+
+1. **Batch SSM recurrence (gdn + gated-norm)** — partial SSM-mixer win.
+   - `gated_delta_rule_decode_f32` (kernels/gb10/holo-3.1-35b-a3b/nvfp4/gated_delta_rule.cu
+     + common) has NO stride params (unlike `gated_delta_rule_prefill` which has
+     qk_stride/v_stride/gb_stride). To batch decode across N reading the interleaved
+     `[N, conv_dim]` conv output, ADD qk_stride/v_stride/gb_stride to the decode kernel
+     (mirror the prefill kernel) + op wrapper + 3 callers (ssm_forward, this path, MTP
+     conv_gdn pass d_inner/v_dim/2*nv to preserve behavior).
+   - Then in `try_decode_multi_seq_ssm_batched`: per-seq ba_gates→gates[N,2*nv] +
+     per-seq conv→conv_out[N,conv_dim] (no conv kernel change needed; batch=1 writes
+     to per-i offset), then ONE batched gdn (h_state=states[0].h_state pool base,
+     strides=conv_dim) + ONE `gated_rms_norm_prefill` (exists) + batched out_proj (done).
+   - Buffers (provably fit, M>=N): conv_out=ssm_conv_out_f32, gdn_out=ssm_qkvz,
+     normed_out reuses ssm_conv_out_f32 (free after gdn), ssm_out=moe_output.
+   - RISK: stride bug in the recurrence kernel = silent SSM-state corruption. High care.
+
+2. **Batched small-M MoE decode kernel** — the BIGGER C>=2 cost (per-token MoE xN,
+   ~MoE is the largest linear-scaling term). `forward_prefill` grouped GEMM is a
+   measured loss (sort/permute overhead at tiny per-expert M). Needs a purpose-built
+   kernel that processes N tokens' top-k expert GEMVs in one launch without the sort
+   (e.g. token-major expert dispatch). The largest win, the hardest.
+
+Both are dedicated kernel efforts, not quick edits. C=1 (62/75) is "fine" per user;
+C>=2 parity hinges on #2 primarily, #1 secondarily.
