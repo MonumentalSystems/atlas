@@ -141,6 +141,22 @@ impl TransformerModel {
         _stream: u64,
     ) -> Result<DevicePtr> {
         let n = tokens.len();
+        if std::env::var("ATLAS_DECODE_BATCH_LOG").ok().as_deref() == Some("1") {
+            let slots: Vec<i64> = seqs
+                .iter()
+                .map(|s| {
+                    s.ssm_slot
+                        .as_ref()
+                        .and_then(|g| g.idx())
+                        .map(|x| x as i64)
+                        .unwrap_or(-1)
+                })
+                .collect();
+            let contiguous = slots.iter().enumerate().all(|(i, &s)| s == i as i64);
+            tracing::info!(
+                "ATLAS_DECODE_BATCH: n={n} slots={slots:?} contiguous_0..n={contiguous}"
+            );
+        }
         let stream = self.gpu.default_stream();
         let h = self.config.hidden_size;
         let bf16 = 2usize;
@@ -181,14 +197,26 @@ impl TransformerModel {
         // 1d. Upload metadata with fixed stride (active + padding)
         let metadata = self.upload_batch_metadata_fixed(seqs, padded_n, &mut kv_cache, stream)?;
 
-        // CUDA graphs DISABLED for multi-sequence decode: SSM state pointers
-        // (h_state, conv_state) are baked into per-seq kernel args of
-        // gdn_decode/conv1d_update at capture time. When batch composition
-        // changes (sequences finish, swap_remove reorders), the graph
-        // replays with stale pointers and corrupts SSM state across seqs.
-        // Attention metadata uses fixed device addresses and is safe.
-        // n==1 still uses self.decode()'s correct graph cache.
-        let use_graphs = false;
+        // CUDA graphs for multi-sequence decode (ATLAS_DECODE_GRAPHS_MULTISEQ=1).
+        //
+        // The historical concern was that SSM h_state/conv_state pointers get
+        // baked into per-seq kernel args at capture, going stale when batch
+        // composition changes. That does NOT happen here: the scheduler holds
+        // the invariant that active sequences occupy contiguous SSM pool slots
+        // [0..n) in batch order (compact_sequence migrates survivors), verified
+        // empirically (slots always == [0,1,..,n-1]). So position i's state is
+        // ALWAYS at pool_base + i*stride — a fixed address baked correctly at
+        // capture; replay reads whatever sequence currently occupies slot i.
+        // Pad positions use the fixed dummy slot. Attention metadata, KV block
+        // tables, embed, and all scratch buffers are at fixed device addresses
+        // refreshed every step BEFORE replay. So a graph keyed by padded_n is
+        // valid across replays. This is the dominant lever for n>=2 decode
+        // (eliminates ~1500 kernel launches/step). Opt-in until soaked; flip
+        // the default once validated. Verify correctness with the needle test.
+        let use_graphs = std::env::var("ATLAS_DECODE_GRAPHS_MULTISEQ")
+            .ok()
+            .as_deref()
+            == Some("1");
 
         let ctx = ForwardContext {
             buffers: &self.buffers,

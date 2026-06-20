@@ -51,52 +51,63 @@ impl Qwen3SsmLayer {
         // BF16 (2 bytes), so hardcode the per-seq stride.
         let residual_elem = 2usize;
 
-        // ── Phase A: per-sequence SSM mixer ──
+        // ── Phase A: SSM mixer ──
         // Pre-norm, SSM mixer (recurrent, per-seq state), post-attn-norm.
         // Lays out `norm_output[0..n]` as the contiguous [N, h] BF16 MoE
-        // input. Identical kernel sequence to `decode()`'s mixer; only the
-        // MoE is deferred to Phase B.
-        for i in 0..n {
-            let hidden_i = hidden.offset(i * h * residual_elem);
-            let residual_i = residual.offset(i * h * residual_elem);
-            let normed_i = ctx.buffers.norm_output().offset(i * h * bf16);
+        // input. The MoE is deferred to Phase B.
+        //
+        // Fast path (batched projections): when the layer uses the
+        // sequential-QKVZ dense/NVFP4 weights with the FP32 conv+GDN
+        // recurrent kernels (the GB10 Holo serving config), the big
+        // QKVZ and out_proj GEMMs are batched into a single [N, ...] GEMM
+        // each — reading the ~50 MB QKVZ / out_proj weights ONCE instead
+        // of N times. On bandwidth-bound LPDDR5X this is the dominant
+        // decode cost, so it is the lever that makes C=N decode scale.
+        // The recurrent inner (BA/gates, conv1d, GDN, gated-norm) stays a
+        // per-seq loop with byte-identical kernels to `decode()`/`ssm_forward`.
+        if !self.try_decode_multi_seq_ssm_batched(hidden, residual, n, states, ctx, stream)? {
+            for i in 0..n {
+                let hidden_i = hidden.offset(i * h * residual_elem);
+                let residual_i = residual.offset(i * h * residual_elem);
+                let normed_i = ctx.buffers.norm_output().offset(i * h * bf16);
 
-            let ssm_state = states[i]
-                .as_any_mut()
-                .downcast_mut::<SsmLayerState>()
-                .ok_or_else(|| anyhow::anyhow!("Expected SsmLayerState for seq {i}"))?;
+                let ssm_state = states[i]
+                    .as_any_mut()
+                    .downcast_mut::<SsmLayerState>()
+                    .ok_or_else(|| anyhow::anyhow!("Expected SsmLayerState for seq {i}"))?;
 
-            // normed_i = rms_norm(hidden_i); residual_i = hidden_i
-            ops::rms_norm_residual(
-                ctx.gpu,
-                self.rms_norm_residual_k,
-                hidden_i,
-                &self.input_norm,
-                normed_i,
-                residual_i,
-                1,
-                h as u32,
-                eps,
-                stream,
-            )?;
+                // normed_i = rms_norm(hidden_i); residual_i = hidden_i
+                ops::rms_norm_residual(
+                    ctx.gpu,
+                    self.rms_norm_residual_k,
+                    hidden_i,
+                    &self.input_norm,
+                    normed_i,
+                    residual_i,
+                    1,
+                    h as u32,
+                    eps,
+                    stream,
+                )?;
 
-            // SSM mixer: consumes normed_i, returns ssm_out (in moe_output[0]).
-            let ssm_out = self.ssm_forward(normed_i, ssm_state, ctx, stream, false)?;
+                // SSM mixer: consumes normed_i, returns ssm_out (in moe_output[0]).
+                let ssm_out = self.ssm_forward(normed_i, ssm_state, ctx, stream, false)?;
 
-            // hidden_i += ssm_out; normed_i = rms_norm(hidden_i); residual_i = hidden_i
-            ops::residual_add_rms_norm(
-                ctx.gpu,
-                self.residual_add_rms_norm_k,
-                hidden_i,
-                ssm_out,
-                &self.post_attn_norm,
-                normed_i,
-                residual_i,
-                1,
-                h as u32,
-                eps,
-                stream,
-            )?;
+                // hidden_i += ssm_out; normed_i = rms_norm(hidden_i); residual_i = hidden_i
+                ops::residual_add_rms_norm(
+                    ctx.gpu,
+                    self.residual_add_rms_norm_k,
+                    hidden_i,
+                    ssm_out,
+                    &self.post_attn_norm,
+                    normed_i,
+                    residual_i,
+                    1,
+                    h as u32,
+                    eps,
+                    stream,
+                )?;
+            }
         }
 
         // ── Phase B+C: MoE + residual, dispatched by batch size ──
@@ -140,23 +151,278 @@ impl Qwen3SsmLayer {
             _ => {
                 // Per-token MoE: each seq's forward() writes moe_output[0];
                 // consume it immediately with a per-seq residual add before
-                // the next iteration overwrites it.
-                for i in 0..n {
-                    let hidden_i = hidden.offset(i * h * residual_elem);
-                    let normed_i = normed_base.offset(i * h * bf16);
-                    let moe_out = self.ffn.forward(normed_i, ctx, stream)?;
+                // the next iteration overwrites it. NOTE: the batched
+                // grouped-GEMM (forward_prefill) was measured SLOWER here on
+                // Holo (c4 31 vs 56 tok/s) — the expert sort/permute fixed
+                // overhead per layer dominates at small N. The real fix for
+                // this launch overhead is CUDA graphs for n>=2, not MoE
+                // batching (graphs capture these per-token launches for free).
+                if std::env::var("ATLAS_MOE_GROUPED_DECODE").ok().as_deref() == Some("1") {
+                    // Grouped-GEMM MoE over all N tokens (each expert read once).
+                    // Only sensible under CUDA graphs, where the sort/permute
+                    // launch overhead that made this a loss is captured for free.
+                    self.ffn.forward_prefill(normed_base, n, ctx, stream)?;
+                    let moe_out = ctx.buffers.moe_output();
                     ops::residual_add(
                         ctx.gpu,
                         self.residual_add_k,
-                        hidden_i,
+                        hidden,
                         moe_out,
-                        h as u32,
+                        (n * h) as u32,
                         stream,
                     )?;
+                } else {
+                    for i in 0..n {
+                        let hidden_i = hidden.offset(i * h * residual_elem);
+                        let normed_i = normed_base.offset(i * h * bf16);
+                        let moe_out = self.ffn.forward(normed_i, ctx, stream)?;
+                        ops::residual_add(
+                            ctx.gpu,
+                            self.residual_add_k,
+                            hidden_i,
+                            moe_out,
+                            h as u32,
+                            stream,
+                        )?;
+                    }
                 }
             }
         }
 
         Ok(())
+    }
+
+    /// Batched-projection SSM mixer for N concurrent decode sequences.
+    ///
+    /// Returns `Ok(false)` (caller falls back to the per-seq loop) unless the
+    /// layer is in the GB10 Holo serving config: sequential-QKVZ dense/NVFP4
+    /// weights + FP32 conv/GDN recurrent kernels. When eligible, the big QKVZ
+    /// and out_proj projections run as a single `[N, ...]` GEMM each (weights
+    /// read ONCE, not N times — the dominant bandwidth cost on LPDDR5X), while
+    /// the recurrent inner (BA/gates → conv1d → GDN → gated-norm) stays a
+    /// per-seq loop using the SAME single-token kernels as `ssm_forward`, so
+    /// the recurrence is byte-identical to the proven path. The per-seq states
+    /// are read straight from each `SsmLayerState`, so no contiguous-slot
+    /// assumption is required.
+    #[allow(clippy::too_many_arguments)]
+    fn try_decode_multi_seq_ssm_batched<'a, 'b: 'a>(
+        &self,
+        hidden: DevicePtr,
+        residual: DevicePtr,
+        n: usize,
+        states: &'a mut [&'b mut (dyn LayerState + 'static)],
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<bool> {
+        let use_f32_conv = self.conv1d_l2norm_f32_k.0 != 0;
+        let use_f32_gdn = self.gdn_f32_k.0 != 0 && self.gated_rms_norm_f32_k.0 != 0;
+        // QKVZ via dense BF16 GEMM or block-scaled FP8 GEMM (w8a16). NVFP4 and
+        // interleaved-QKVZ layouts take the proven per-seq loop.
+        let qkvz_ok = self.qkvz_nvfp4.is_none() && self.w8a16_gemm_k.0 != 0;
+        let out_ok = self.out_proj_fp8w.is_some() || self.out_proj_dense.is_some();
+        if n < 2 || !self.sequential_qkvz || !use_f32_conv || !use_f32_gdn || !qkvz_ok || !out_ok {
+            return Ok(false);
+        }
+
+        let h = ctx.config.hidden_size;
+        let bf16 = 2usize;
+        let eps = ctx.config.rms_norm_eps as f32;
+        let nk = ctx.config.linear_num_key_heads;
+        let kd = ctx.config.linear_key_head_dim;
+        let nv = ctx.config.linear_num_value_heads;
+        let vd = ctx.config.linear_value_head_dim;
+        let vpg = nv / nk;
+        let key_dim = nk * kd;
+        let value_dim = nv * vd;
+        let conv_dim = (key_dim * 2 + value_dim) as u32;
+        let qk_channels = (key_dim * 2) as u32;
+        let d_conv = ctx.config.linear_conv_kernel_dim as u32;
+        let qkvz_size = ctx.config.ssm_qkvz_size();
+        let ba_size = ctx.config.ssm_ba_size() as u32;
+
+        let normed_base = ctx.buffers.norm_output();
+        let deinterleaved = ctx.buffers.ssm_deinterleaved();
+        // normed_out[0..n] (post gated-norm, [N, value_dim] BF16) parks in the
+        // QKVZ scratch — free here because QKVZ projects into `deinterleaved`
+        // and the FP32 conv path uses `ssm_conv_out_f32`, not `ssm_qkvz`.
+        let normed_out_base = ctx.buffers.ssm_qkvz();
+        let ssm_out_base = ctx.buffers.moe_output();
+
+        // ── 1. Batched input RMS norm: hidden[0..n] → normed[0..n], residual ──
+        ops::rms_norm_residual(
+            ctx.gpu,
+            self.rms_norm_residual_k,
+            hidden,
+            &self.input_norm,
+            normed_base,
+            residual,
+            n as u32,
+            h as u32,
+            eps,
+            stream,
+        )?;
+
+        // ── 2. Batched QKVZ projection: ONE [N,h]→[N,qkvz] GEMM (weights ×1) ──
+        // FP8 (w8a16) when the decode overlay is installed, else BF16 dense.
+        if let Some(ref fp8) = self.qkvz_fp8w {
+            ops::w8a16_gemm(
+                ctx.gpu,
+                self.w8a16_gemm_k,
+                normed_base,
+                fp8.weight,
+                fp8.row_scale,
+                deinterleaved,
+                n as u32,
+                qkvz_size as u32,
+                h as u32,
+                stream,
+            )?;
+        } else {
+            ops::dense_gemm(
+                ctx.gpu,
+                self.dense_gemm_k,
+                normed_base,
+                &self.ssm.in_proj_qkvz,
+                deinterleaved,
+                n as u32,
+                qkvz_size as u32,
+                h as u32,
+                stream,
+            )?;
+        }
+
+        // ── 3. Per-seq recurrent inner (byte-identical to ssm_forward) ──
+        for i in 0..n {
+            let normed_i = normed_base.offset(i * h * bf16);
+            let deint_i = deinterleaved.offset(i * qkvz_size * bf16);
+            let z_i = deint_i.offset((key_dim * 2 + value_dim) * bf16);
+            let normed_out_i = normed_out_base.offset(i * value_dim * bf16);
+
+            let ssm_state = states[i]
+                .as_any_mut()
+                .downcast_mut::<SsmLayerState>()
+                .ok_or_else(|| anyhow::anyhow!("Expected SsmLayerState for seq {i}"))?;
+
+            // BA projection + GDN gates (reuse the single-token gates scratch).
+            let gates = ctx.buffers.ssm_gates();
+            let beta_fp32 = gates.offset(nv * 4);
+            ops::dense_gemv_ba_gates(
+                ctx.gpu,
+                self.ba_gates_k,
+                normed_i,
+                &self.ssm.in_proj_ba,
+                self.ssm.a_log.weight,
+                self.ssm.dt_bias.weight,
+                gates,
+                beta_fp32,
+                ba_size,
+                h as u32,
+                vpg as u32,
+                stream,
+            )?;
+
+            // Conv1d update + SiLU + L2-norm (FP32 recurrent path).
+            let conv_out = ctx.buffers.ssm_conv_out_f32();
+            ops::conv1d_update_l2norm(
+                ctx.gpu,
+                self.conv1d_l2norm_f32_k,
+                ssm_state.conv_state,
+                deint_i,
+                &self.ssm.conv1d,
+                conv_out,
+                conv_dim,
+                d_conv,
+                1,
+                qk_channels,
+                kd as u32,
+                1e-6,
+                stream,
+            )?;
+
+            // GDN recurrence (FP32 output into the conv buffer's Z-region tail).
+            let gdn_out = conv_out.offset((key_dim * 2 + value_dim) * 4);
+            let q_conv = conv_out;
+            let k_conv = conv_out.offset(key_dim * 4);
+            let v_conv = conv_out.offset(key_dim * 2 * 4);
+            ops::gdn_decode(
+                ctx.gpu,
+                self.gdn_f32_k,
+                ssm_state.h_state,
+                q_conv,
+                k_conv,
+                v_conv,
+                gates,
+                beta_fp32,
+                gdn_out,
+                1,
+                nk as u32,
+                nv as u32,
+                kd as u32,
+                vd as u32,
+                stream,
+            )?;
+
+            // Gated RMS norm with Z gate → normed_out[i].
+            ops::gated_rms_norm(
+                ctx.gpu,
+                self.gated_rms_norm_f32_k,
+                gdn_out,
+                z_i,
+                &self.ssm.norm,
+                normed_out_i,
+                nv as u32,
+                vd as u32,
+                vd as u32,
+                eps,
+                vd as u32,
+                stream,
+            )?;
+        }
+
+        // ── 4. Batched out_proj: ONE [N,value_dim]→[N,h] GEMM (weights ×1) ──
+        // FP8 (w8a16) when the decode overlay is installed, else BF16 dense.
+        if let Some(ref fp8) = self.out_proj_fp8w {
+            ops::w8a16_gemm(
+                ctx.gpu,
+                self.w8a16_gemm_k,
+                normed_out_base,
+                fp8.weight,
+                fp8.row_scale,
+                ssm_out_base,
+                n as u32,
+                h as u32,
+                value_dim as u32,
+                stream,
+            )?;
+        } else if let Some(ref out_proj_dense) = self.out_proj_dense {
+            ops::dense_gemm(
+                ctx.gpu,
+                self.dense_gemm_k,
+                normed_out_base,
+                out_proj_dense,
+                ssm_out_base,
+                n as u32,
+                h as u32,
+                value_dim as u32,
+                stream,
+            )?;
+        }
+
+        // ── 5. Batched residual add + post-attn RMS norm → norm_output[0..n] ──
+        ops::residual_add_rms_norm(
+            ctx.gpu,
+            self.residual_add_rms_norm_k,
+            hidden,
+            ssm_out_base,
+            &self.post_attn_norm,
+            normed_base,
+            residual,
+            n as u32,
+            h as u32,
+            eps,
+            stream,
+        )?;
+
+        Ok(true)
     }
 }

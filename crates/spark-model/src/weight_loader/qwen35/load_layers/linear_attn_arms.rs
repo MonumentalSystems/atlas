@@ -37,52 +37,40 @@ use crate::weight_map::{
 /// Prefill pipeline: dequant BF16 (via `load_ssm_qwen35`'s `dense_auto`),
 /// truncate to single-scale FP8 (`bf16_to_fp8`) — identical to the
 /// `Fp8Dequanted` branch of `build_linear_attention_nvfp4`.
-#[allow(clippy::too_many_arguments)]
-pub(super) fn build_linear_attention_fp8(
+/// Load the SSM projection weights as block-scaled FP8 for the `w8a16_gemv`
+/// (decode) / `w8a16_gemm` (batched decode) path: QKV and Z concatenated into
+/// a single `[Nq+Nz, K]` FP8 buffer + matching `[(Nq+Nz)/BS, K/BS]` BF16 block
+/// scales, plus the out_proj FP8 weight. Shared by the native-FP8 build and by
+/// the decode-only FP8 overlay on the BF16 dense build (`ATLAS_HOLO_FP8_SSM_DECODE`).
+fn load_ssm_fp8_decode_weights(
     layer_idx: usize,
     store: &WeightStore,
-    lp: &str,
+    p: &str,
     gpu: &dyn GpuBackend,
-    _variant: Nvfp4Variant,
-    config: &ModelConfig,
     h: usize,
-    _stream: u64,
-    input_norm: DenseWeight,
-    post_attn_norm: DenseWeight,
-    ffn: FfnComponent,
-) -> Result<Box<dyn TransformerLayer>> {
-    let p = format!("{lp}.linear_attn");
-    tracing::info!(
-        "Layer {layer_idx}: loading SSM FP8 native (block-scaled decode + single-scale prefill)"
-    );
-
-    // ── 1. Load block-scaled FP8 from disk (aliases the WeightStore
-    //       device pointers — no extra GPU memory beyond the alloc'd
-    //       concat buffers below).
+) -> Result<(Fp8Weight, Fp8Weight)> {
     let qkv_fp8 = load_fp8_block_scaled_as_fp8weight(store, &format!("{p}.in_proj_qkv"), gpu)?;
     let z_fp8 = load_fp8_block_scaled_as_fp8weight(store, &format!("{p}.in_proj_z"), gpu)?;
     let out_fp8 = load_fp8_block_scaled_as_fp8weight(store, &format!("{p}.out_proj"), gpu)?;
 
-    // Sanity-check the inputs match the canonical block-scaled format.
     qkv_fp8.scale_format.expect(
         WeightQuantFormat::Fp8BlockScaled,
-        "build_linear_attention_fp8::qkv_fp8 from disk",
+        "load_ssm_fp8_decode_weights::qkv_fp8 from disk",
     );
     z_fp8.scale_format.expect(
         WeightQuantFormat::Fp8BlockScaled,
-        "build_linear_attention_fp8::z_fp8 from disk",
+        "load_ssm_fp8_decode_weights::z_fp8 from disk",
     );
     out_fp8.scale_format.expect(
         WeightQuantFormat::Fp8BlockScaled,
-        "build_linear_attention_fp8::out_fp8 from disk",
+        "load_ssm_fp8_decode_weights::out_fp8 from disk",
     );
 
     let qkv_rows = qkv_fp8.n as usize;
     let z_rows = z_fp8.n as usize;
     let qkvz_n = qkv_rows + z_rows;
 
-    // ── 2. Concat weight bytes along N: [Nq, K] || [Nz, K] → [Nq+Nz, K].
-    //       Each row is K bytes; total = (Nq + Nz) * K.
+    // Concat weight bytes along N: [Nq, K] || [Nz, K] → [Nq+Nz, K].
     let qkvz_weight_ptr = gpu.alloc(qkvz_n * h)?;
     gpu.copy_d2d(qkv_fp8.weight, qkvz_weight_ptr, qkv_rows * h)?;
     gpu.copy_d2d(
@@ -91,11 +79,7 @@ pub(super) fn build_linear_attention_fp8(
         z_rows * h,
     )?;
 
-    // ── 3. Concat block scales along the N-block axis (BS=128, FP32):
-    //       [Nq/BS, K/BS] || [Nz/BS, K/BS] → [(Nq+Nz)/BS, K/BS].
-    //       Each scale row is `(K/BS) * 4` bytes (FP32, widened at load);
-    //       number of rows is `Nq/BS` and `Nz/BS`. Both Nq and Nz must align
-    //       to BS for the on-disk Qwen FP8 format (verified at load).
+    // Concat block scales along the N-block axis (BS=128, FP32).
     const BS: usize = 128;
     ensure!(
         qkv_rows.is_multiple_of(BS),
@@ -109,8 +93,7 @@ pub(super) fn build_linear_attention_fp8(
         h.is_multiple_of(BS),
         "SSM L{layer_idx}: hidden_size={h} not divisible by BS={BS}",
     );
-    let scale_cols = h / BS; // K/BS FP32 entries per scale row
-    // row_scale is FP32 (widened at load by load_fp8_block_scaled_as_fp8weight).
+    let scale_cols = h / BS;
     let scale_row_bytes = scale_cols * 4;
     let qkv_scale_rows = qkv_rows / BS;
     let z_scale_rows = z_rows / BS;
@@ -134,8 +117,32 @@ pub(super) fn build_linear_attention_fp8(
         k: h as u32,
         scale_format: WeightQuantFormat::Fp8BlockScaled,
     };
+    Ok((qkvz_fp8, out_fp8))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn build_linear_attention_fp8(
+    layer_idx: usize,
+    store: &WeightStore,
+    lp: &str,
+    gpu: &dyn GpuBackend,
+    _variant: Nvfp4Variant,
+    config: &ModelConfig,
+    h: usize,
+    _stream: u64,
+    input_norm: DenseWeight,
+    post_attn_norm: DenseWeight,
+    ffn: FfnComponent,
+) -> Result<Box<dyn TransformerLayer>> {
+    let p = format!("{lp}.linear_attn");
     tracing::info!(
-        "Layer {layer_idx}: SSM QKVZ FP8 [{qkvz_n},{h}] block-scaled, out_proj FP8 [{},{}] block-scaled",
+        "Layer {layer_idx}: loading SSM FP8 native (block-scaled decode + single-scale prefill)"
+    );
+
+    let (qkvz_fp8, out_fp8) = load_ssm_fp8_decode_weights(layer_idx, store, &p, gpu, h)?;
+    tracing::info!(
+        "Layer {layer_idx}: SSM QKVZ FP8 [{},{h}] block-scaled, out_proj FP8 [{},{}] block-scaled",
+        qkvz_fp8.n,
         out_fp8.n,
         out_fp8.k
     );
@@ -221,6 +228,13 @@ pub(super) fn build_linear_attention_dense_bf16(
         h,
         gpu,
     )?;
+    // `gpu_concat_rows` allocates an independent combined buffer (alloc +
+    // copy_d2d), so the per-projection BF16 expansions of in_proj_qkv /
+    // in_proj_z are dead after this point. They are freshly-allocated
+    // FP8→BF16 dequant outputs (not WeightStore aliases), ~50 MB/layer ×
+    // ~30 GDN layers ≈ 1.5 GB. Free them here — identical numerics.
+    let _ = gpu.free(ssm35.in_proj_qkv.weight);
+    let _ = gpu.free(ssm35.in_proj_z.weight);
 
     let nv = config.linear_num_value_heads;
     let nk = config.linear_num_key_heads;
@@ -259,6 +273,18 @@ pub(super) fn build_linear_attention_dense_bf16(
         gpu,
     )?;
     layer.out_proj_dense = Some(ssm35.out_proj);
+    // Decode-only FP8 SSM overlay (ATLAS_HOLO_FP8_SSM_DECODE=1): install the
+    // on-disk block-scaled FP8 QKVZ/out_proj so DECODE runs through
+    // w8a16_gemv / w8a16_gemm (half the BF16 weight bandwidth — SSM weights
+    // are the bulk of the per-step fixed decode cost), while PREFILL keeps the
+    // stable BF16 dense path (sidesteps the native-FP8 FLA-prefill crash at
+    // layer 36). Costs ~25 MB/GDN layer extra (BF16 kept for prefill).
+    if std::env::var("ATLAS_HOLO_FP8_SSM_DECODE").ok().as_deref() == Some("1") {
+        let p = format!("{lp}.linear_attn");
+        let (qkvz_fp8, out_fp8) = load_ssm_fp8_decode_weights(layer_idx, store, &p, gpu, h)?;
+        layer.set_fp8_decode_weights(Some(qkvz_fp8), Some(out_fp8));
+        tracing::info!("Layer {layer_idx}: SSM FP8 decode overlay installed (BF16 prefill kept)");
+    }
     Ok(Box::new(layer))
 }
 

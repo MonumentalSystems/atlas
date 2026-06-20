@@ -276,3 +276,21 @@ ATLAS_TARGET_HW=gb10 ATLAS_TARGET_MODEL=holo-3.1-35b-a3b ATLAS_TARGET_QUANT=nvfp
 
 Stable low-memory endpoint was restored and health-checked after the failed
 native FP8 SSM experiment.
+
+## Atlas Baseline Captured (2026-06-19, scripts/bench_holo_atlas.py)
+
+Measured on the stable 64K/C12 server (PID 843054, :8890) vs vLLM results.csv:
+
+| metric | Atlas | vLLM | gap |
+| --- | ---: | ---: | ---: |
+| tg128 c1 (tok/s) | 47.6 | 75.4 | 1.6x |
+| tg128 c2 agg | 49.1 | 118.2 | 2.4x |
+| tg128 c4 agg | 48.3 | ~145 | 3.0x |
+| pp2048 c1 (tok/s) | 460 | 4540 | 9.9x |
+| pp2048 c4 agg | 460 | 6700 | ~15x |
+
+Key findings:
+- **Decode does not batch**: c4 aggregate (48) ~= c1 (48). vLLM scales c1->c4 75->145.
+- **Prefill is the largest single gap (~10x per request)** and also serializes across
+  concurrency (ttft_max constant, wall scales linearly with conc).
+- Both prefill and decode are dominated by the GDN/SSM linear-attn path.
