@@ -283,3 +283,13 @@ overhead; γ=5 with 2.5-3x accept is strongly net-positive (the user's measured 
 
 Vertical fusion (previous section) remains the lever for RAW decode parity, but
 speculation is the faster path to the user's "blazingly fast / like 75 C=1" bar.
+
+## Self-speculative runtime test (2026-06-20) — needs wiring, not a flag
+- `--force-speculative` → "No MTP weights found" build failure (Holo ships no MTP head).
+- `--self-speculative` (layer-skip drafter) does not bring the server up on Holo.
+Conclusion: enabling speculation on Holo requires real work, not a config toggle —
+either (a) the DFlash drafter (z-lab Qwen3.5-DFlash) with its forward_block CUDA-700
+crash fixed + drafts routed through the existing `gdn_wy*` verify (NOT the generic K=γ
+path that corrupts SSM state), or (b) wiring the layer-skip self-spec drafter through
+the SSM `gdn_wy*` verify. Holo HAS the verify kernels (gdn_wy2/3/4/17). This is the
+recommended primary next effort for the speed bar (see strategic synthesis above).
