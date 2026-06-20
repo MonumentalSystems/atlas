@@ -318,3 +318,29 @@ gone. THEN raise `ATLAS_DFLASH_DRAFT_CAP` and route γ drafts through the existi
 `gdn_wy*` verify (not the generic K=γ path) for the full γ=5 / 2.5-3x speedup.
 This is the concrete, no-longer-mysterious path to the user's "75 C=1" bar via their
 production DFlash approach.
+
+## DATA-DRIVEN WIN + updated profile (2026-06-20, nsys)
+
+Got a clean eager (graphs-off) nsys kernel breakdown of C=4 decode — the real hot
+kernels, finally. Original: **w8a16_gemm 44.6%** (the FP8 SSM projection GEMM from
+the FP8-SSM-decode overlay), running ~5× off peak. Routed the batched-decode SSM
+projections to the bit-identical **w8a16_gemm_pipelined** (was only wired in prefill).
+**RESULT: c4 60→68 (+13%), c8 78→90 (+16%)** — first profiling-driven C>1 win. Committed.
+
+Post-fix profile (C=4 eager, % of GPU time):
+- 31.1% w8a16_gemm_pipelined (SSM proj; M=4 caps it at ~1.8× vs base — a better
+  small-M FP8 GEMM, or skipping FP8 for C>1, is the next SSM lever).
+- 16.0% w4a16_gemm = lm_head (M=4, N=248320; ~32 GB/s, ~8.5× off — needs a better
+  huge-N/small-M w4a16 kernel; per-row gemv is WORSE (N× weight reads), so keep the
+  batched GEMM and optimize the kernel).
+- 12.4% dense_gemv_bf16 = attention q/k/v **per-seq** (~160/step). Batchable to one
+  M=N dense_gemm (or FP8+pipelined like SSM), but needs a scatter into the strided
+  qkv_buf (same pattern as o_proj, whose isolated effect was L2-masked) — uncertain.
+- 12.0%+7.7% moe_expert gate_up/silu_down (per-token; deep).
+- 6.3% gated_delta_rule_decode_f32.
+
+These remaining levers lack a ready fast-variant swap (unlike w8a16); each is a real
+kernel-optimization task (small-M FP8/NVFP4 GEMMs, attention FP8+batch, MoE). Use the
+eager-nsys harness (`/tmp/nsys_eager.sh`) to re-profile after each.
+
+Current (graphs on): c1 61, c4 68 (47%), c8 90 (52% of vLLM).
