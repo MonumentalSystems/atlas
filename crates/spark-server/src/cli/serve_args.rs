@@ -460,6 +460,19 @@ pub struct ServeArgs {
     #[arg(long, default_value_t = false)]
     pub no_fast_load: bool,
 
+    /// Ask the fast loader to prefetch each buffered shard before per-tensor
+    /// reads. Useful on NFS-backed model stores with many small tensors per
+    /// shard, where normal kernel readahead may not keep up. Also enabled by
+    /// `ATLAS_FAST_LOAD_PREFETCH_SHARDS=1`.
+    #[arg(long, default_value_t = false)]
+    pub fast_load_prefetch_shards: bool,
+
+    /// Cap decoded vision input area before patching. 0 preserves the
+    /// model/default image preprocessor cap. Also settable with
+    /// `ATLAS_VISION_MAX_PIXELS`.
+    #[arg(long, default_value_t = 0)]
+    pub vision_max_pixels: usize,
+
     /// Address to bind the HTTP listener to. Defaults to `127.0.0.1` so a
     /// fresh install is reachable only from the local machine; pass
     /// `0.0.0.0` to expose on all interfaces (the server logs a warning

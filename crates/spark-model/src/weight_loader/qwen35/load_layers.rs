@@ -15,7 +15,7 @@ use crate::layer::TransformerLayer;
 use crate::layers::{FfnComponent, MoeLayer, Qwen3AttentionLayer};
 use crate::tp_shard::{TpShardKind, load_qkvo_tp, shard_fp8_block_scaled};
 use crate::weight_map::{
-    AttentionWeights, DenseWeight, Nvfp4Variant, QuantizedWeight, dense, detect_nvfp4_variant,
+    AttentionWeights, DenseWeight, Nvfp4Variant, QuantizedWeight, dense_auto, detect_nvfp4_variant,
     load_fp8_block_scaled_as_fp8weight, load_kv_scales, load_moe_qwen35,
     load_moe_qwen35_fp8_experts, quantize_to_nvfp4,
 };
@@ -74,12 +74,17 @@ pub(super) fn load_layers(
     // Resolve runtime quantization format from the detected on-disk
     // variant. This determines which kernels are used for
     // decode/prefill/verify.
+    let modelopt_mixed_precision = is_holo_modelopt_mixed_precision(config);
     let quant_format = if variant == Nvfp4Variant::Fp8Dequanted {
         QuantFormat::Fp8
     } else {
         QuantFormat::Nvfp4
     };
     let native_fp8 = quant_format == QuantFormat::Fp8;
+    let low_memory_modelopt_moe = modelopt_mixed_precision
+        && std::env::var("ATLAS_HOLO_LOW_MEMORY_MOE").ok().as_deref() == Some("1");
+    let native_modelopt_ssm = modelopt_mixed_precision
+        && std::env::var("ATLAS_HOLO_NATIVE_FP8_SSM").ok().as_deref() == Some("1");
     tracing::info!(
         "Weight format: {:?}, NVFP4 variant: {:?}, quant_format: {:?}",
         weight_format,
@@ -111,11 +116,22 @@ pub(super) fn load_layers(
         }
         skip
     };
+    if low_memory_modelopt_moe {
+        tracing::info!(
+            "ATLAS_HOLO_LOW_MEMORY_MOE=1: skipping Holo ModelOpt MoE transpose/predequant prefill copies"
+        );
+    }
+    if native_modelopt_ssm {
+        tracing::info!(
+            "ATLAS_HOLO_NATIVE_FP8_SSM=1: routing Holo ModelOpt SSM projections through native FP8"
+        );
+    }
 
     for (i, lt) in layer_types.iter().enumerate() {
         let lp = config.layer_prefix(i);
-        let input_norm = dense(store, &format!("{lp}.input_layernorm.weight"))?;
-        let post_attn_norm = dense(store, &format!("{lp}.post_attention_layernorm.weight"))?;
+        let input_norm = dense_auto(store, &format!("{lp}.input_layernorm.weight"), gpu)?;
+        let post_attn_norm =
+            dense_auto(store, &format!("{lp}.post_attention_layernorm.weight"), gpu)?;
 
         // When native_fp8, skip NVFP4 routed experts — FP8 fused batch1/2/3
         // kernels handle all MoE dispatch including MTP verify.
@@ -200,10 +216,10 @@ pub(super) fn load_layers(
         // With native FP8, the FP8 fused MoE kernel handles both prefill and decode.
         // Skip transposition and predequant (saves ~30 GB + CPU time for 122B EP=2).
         // ATLAS_FORCE_NVFP4_MOE=1 inverts: do the prep so NVFP4 path is usable.
-        if (!native_fp8 || force_nvfp4_moe) && !skip_moe_transpose {
+        if (!native_fp8 || force_nvfp4_moe) && !skip_moe_transpose && !low_memory_modelopt_moe {
             moe_layer.transpose_for_prefill(gpu, config)?;
         }
-        if !native_fp8 || force_nvfp4_moe {
+        if (!native_fp8 || force_nvfp4_moe) && !low_memory_modelopt_moe {
             moe_layer.predequant_for_prefill(gpu, config, stream)?;
         }
 
@@ -380,24 +396,37 @@ pub(super) fn load_layers(
         let ffn = FfnComponent::Moe(moe_layer);
 
         match lt {
-            LayerType::FullAttention if native_fp8 && dequant_attn_to_bf16 && !force_nvfp4_all => {
+            LayerType::FullAttention
+                if (native_fp8 && dequant_attn_to_bf16 && !force_nvfp4_all)
+                    || modelopt_mixed_precision =>
+            {
                 // ── BF16-dequant attention (diagnostic, TP=1) ──
                 // Dequant FP8 Q/K/V/O → BF16 on GPU, store as dense weights,
                 // and leave q/k/v/o quant-weights None so both prefill and
                 // decode fall through to the dense GEMM/GEMV paths.
-                use crate::weight_map::dequant_fp8_blockscaled_to_bf16;
                 if config.tp_world_size.max(1) != 1 {
                     anyhow::bail!(
-                        "ATLAS_FP8_DEQUANT_ATTN_TO_BF16 supports TP=1 only (got tp={})",
+                        "BF16-dequant attention supports TP=1 only (got tp={})",
                         config.tp_world_size,
                     );
                 }
                 let p = format!("{lp}.self_attn");
                 tracing::info!("Layer {i}: dequanting attention Q/K/V/O FP8→BF16 (dense)");
-                let q_bf16 = dequant_fp8_blockscaled_to_bf16(store, &format!("{p}.q_proj"), gpu)?;
-                let k_bf16 = dequant_fp8_blockscaled_to_bf16(store, &format!("{p}.k_proj"), gpu)?;
-                let v_bf16 = dequant_fp8_blockscaled_to_bf16(store, &format!("{p}.v_proj"), gpu)?;
-                let o_bf16 = dequant_fp8_blockscaled_to_bf16(store, &format!("{p}.o_proj"), gpu)?;
+                let load_fp8_dense = |name: &str| -> Result<DenseWeight> {
+                    if modelopt_mixed_precision {
+                        dense_auto(store, &format!("{p}.{name}.weight"), gpu)
+                    } else {
+                        crate::weight_map::dequant_fp8_blockscaled_to_bf16(
+                            store,
+                            &format!("{p}.{name}"),
+                            gpu,
+                        )
+                    }
+                };
+                let q_bf16 = load_fp8_dense("q_proj")?;
+                let k_bf16 = load_fp8_dense("k_proj")?;
+                let v_bf16 = load_fp8_dense("v_proj")?;
+                let o_bf16 = load_fp8_dense("o_proj")?;
 
                 let (k_scale, v_scale) = load_kv_scales(store, &p, gpu);
                 let dummy_qw = QuantizedWeight::null();
@@ -406,8 +435,8 @@ pub(super) fn load_layers(
                     k_proj: k_bf16,
                     v_proj: v_bf16,
                     o_proj: dummy_qw,
-                    q_norm: dense(store, &format!("{p}.q_norm.weight"))?,
-                    k_norm: dense(store, &format!("{p}.k_norm.weight"))?,
+                    q_norm: dense_auto(store, &format!("{p}.q_norm.weight"), gpu)?,
+                    k_norm: dense_auto(store, &format!("{p}.k_norm.weight"), gpu)?,
                     q_norm_full: None,
                     k_norm_full: None,
                     k_scale,
@@ -481,8 +510,8 @@ pub(super) fn load_layers(
                     k_proj: dummy,
                     v_proj: dummy,
                     o_proj: dummy_qw,
-                    q_norm: dense(store, &format!("{p}.q_norm.weight"))?,
-                    k_norm: dense(store, &format!("{p}.k_norm.weight"))?,
+                    q_norm: dense_auto(store, &format!("{p}.q_norm.weight"), gpu)?,
+                    k_norm: dense_auto(store, &format!("{p}.k_norm.weight"), gpu)?,
                     q_norm_full: None,
                     k_norm_full: None,
                     k_scale,
@@ -573,6 +602,33 @@ pub(super) fn load_layers(
             // existing NVFP4-quantized decode path.
             LayerType::LinearAttention => {
                 let layer = match variant {
+                    _ if native_modelopt_ssm => linear_attn_arms::build_linear_attention_fp8(
+                        i,
+                        store,
+                        &lp,
+                        gpu,
+                        variant,
+                        config,
+                        h,
+                        stream,
+                        input_norm,
+                        post_attn_norm,
+                        ffn,
+                    )?,
+                    _ if modelopt_mixed_precision => {
+                        linear_attn_arms::build_linear_attention_dense_bf16(
+                            i,
+                            store,
+                            &lp,
+                            gpu,
+                            variant,
+                            config,
+                            h,
+                            input_norm,
+                            post_attn_norm,
+                            ffn,
+                        )?
+                    }
                     // force_nvfp4_all routes the FP8 SSM through the NVFP4 builder
                     // (Fp8Dequanted requant) instead of the native-FP8 build.
                     Nvfp4Variant::Fp8Dequanted if !force_nvfp4_all => {
@@ -659,4 +715,11 @@ fn layer_dequant_selected(layer: usize) -> bool {
         None => true,
         Some(ranges) => ranges.iter().any(|&(a, b)| layer >= a && layer <= b),
     }
+}
+
+fn is_holo_modelopt_mixed_precision(config: &ModelConfig) -> bool {
+    config.model_type == "holo3_1_moe"
+        && config.quantization_config.as_ref().is_some_and(|qc| {
+            qc.quant_method == "modelopt" && qc.quant_algo.eq_ignore_ascii_case("MIXED_PRECISION")
+        })
 }

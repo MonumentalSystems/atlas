@@ -95,7 +95,7 @@ pub fn build_model(
     config.kv_layer_dims = loader.kv_layer_dims(&config);
 
     let mut layers = loader.load_layers(store, &config, gpu.as_ref(), &attn_layer_dtypes)?;
-    let embed = loader.load_embedding(store, &config)?;
+    let embed = loader.load_embedding(store, &config, gpu.as_ref())?;
     let final_norm = loader.load_final_norm(store, &config, gpu.as_ref())?;
     let lm_head = loader.load_lm_head(store, &config)?;
     let mtp_weights = loader.load_mtp_weights_multi(store, &config, gpu.as_ref())?;

@@ -599,12 +599,17 @@ pub(crate) async fn serve(mut args: cli::ServeArgs) -> Result<()> {
     serve_phases::log_response_store_audit(&response_store, &rate_limiter);
     let dump_writer = serve_phases::open_dump_writer(&args);
     let auth = build_auth_config(&args)?;
+    let vision_max_pixels = resolve_vision_max_pixels(&args)?;
+    if let Some(max_pixels) = vision_max_pixels {
+        tracing::info!("Vision max_pixels cap enabled: {}", max_pixels);
+    }
     let state = Arc::new(AppState {
         tokenizer,
         model_name,
         max_seq_len: args.max_seq_len,
         request_tx,
         vision_config: config.vision.clone(),
+        vision_max_pixels,
         default_temperature,
         default_top_k,
         default_top_p,
@@ -688,6 +693,23 @@ fn build_auth_config(args: &cli::ServeArgs) -> Result<Option<Arc<crate::auth::Au
         if cfg.token_count() == 1 { "" } else { "s" },
     );
     Ok(Some(Arc::new(cfg)))
+}
+
+fn resolve_vision_max_pixels(args: &cli::ServeArgs) -> Result<Option<usize>> {
+    if args.vision_max_pixels > 0 {
+        return Ok(Some(args.vision_max_pixels));
+    }
+    let Some(raw) = std::env::var("ATLAS_VISION_MAX_PIXELS").ok() else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed == "0" {
+        return Ok(None);
+    }
+    let parsed = trimmed.parse::<usize>().with_context(|| {
+        format!("ATLAS_VISION_MAX_PIXELS must be a positive integer, got {raw:?}")
+    })?;
+    Ok((parsed > 0).then_some(parsed))
 }
 
 /// QV1 (2026-05-26): canonicalize the model's declared quantization to

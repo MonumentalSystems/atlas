@@ -50,9 +50,9 @@ pub(crate) fn load_ssm_qwen35(
     Ok(SsmWeightsQwen35 {
         in_proj_qkv: load_proj(&format!("{p}.in_proj_qkv.weight"))?,
         in_proj_z: load_proj(&format!("{p}.in_proj_z.weight"))?,
-        in_proj_a: dense(store, &format!("{p}.in_proj_a.weight"))?,
-        in_proj_b: dense(store, &format!("{p}.in_proj_b.weight"))?,
-        conv1d: dense(store, &format!("{p}.conv1d.weight"))?,
+        in_proj_a: dense_auto(store, &format!("{p}.in_proj_a.weight"), gpu)?,
+        in_proj_b: dense_auto(store, &format!("{p}.in_proj_b.weight"), gpu)?,
+        conv1d: dense_auto(store, &format!("{p}.conv1d.weight"), gpu)?,
         // A_log and dt_bias MUST be FP32 — BF16 precision causes exponential
         // error amplification in the GDR decay gate at 8k+ tokens.
         a_log: dense_keep_f32(store, &format!("{p}.A_log"), gpu)?,
@@ -83,8 +83,8 @@ pub(crate) fn load_moe_qwen35(
 ) -> Result<MoeWeights> {
     let p = format!("{layer_prefix}.mlp");
 
-    let gate = dense(store, &format!("{p}.gate.weight"))?;
-    let shared_expert_gate = dense(store, &format!("{p}.shared_expert_gate.weight"))?;
+    let gate = dense_auto(store, &format!("{p}.gate.weight"), gpu)?;
+    let shared_expert_gate = dense_auto(store, &format!("{p}.shared_expert_gate.weight"), gpu)?;
 
     let inter = config.moe_intermediate_size;
     let h = config.hidden_size;
