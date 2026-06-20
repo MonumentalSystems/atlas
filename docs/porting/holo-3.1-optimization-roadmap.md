@@ -80,6 +80,18 @@ Combined config now (graphs + FP8 SSM decode): c1 61 (81%), c2 43, c4 60 (41%), 
 
 By function: **MoE ≈ 7 ms (43%)**, SSM mixer ≈ 5 ms (qkvz FP8 GEMV 3.4 ms — bandwidth-optimal at ~112µs/layer), attention proper ≈ 3.4 ms, lm_head 1.1 ms. To hit 75 tok/s (13.3 ms) need to cut ~3 ms — MoE is the only target big enough.
 
-**MoE bottleneck = decode under-occupancy.** `moe_expert_gate_up_shared` (NVFP4 routed+shared) launches grid `[div_ceil(n,8), top_k+1, 2]` = **~18 blocks at n=1** → severe GPU under-utilization. Moves ~480 MB/step but takes 4.6 ms vs ~1.8 ms bandwidth-optimal (2.6×). Same kernel dominates C>1 (per-token). **Next lever: a decode-specialized MoE expert kernel that tiles over the output/intermediate dim (many blocks) instead of over n/8** — `crates/spark-model/src/layers/ops/moe_expert.rs:230` + `kernels/.../moe_*`. This is the single highest-value remaining change for both C=1 and C>1; it's a CUDA kernel rewrite (numerics must match — validate vs needle/coherence).
+**MoE is ~3.5× off bandwidth — NOT an occupancy problem** (corrected: an earlier
+"~18 blocks" note was a misread). `moe_expert_gate_up_shared`'s grid
+`[div_ceil(n,8), top_k+1, 2]` uses `n = inter = 512` (OUTPUT dim, one token at
+decode) → grid `[64, 9, 2]` = **1152 blocks, well-occupied** (`moe_expert.rs:230`;
+`forward.rs:351` passes `inter, h`). MoE moves ~540 MB/step (8 routed + shared,
+gate/up/down NVFP4) but takes ~7 ms vs ~2 ms bandwidth-optimal. Gap = **w4a16 GEMV
+micro-efficiency at M=1** (B_packed coalescing, warp-reduction GEMV in
+`moe_shared_expert_fused.cu`), not tiling — deep kernel micro-opt, uncertain payoff.
 
-Secondary: attention proper 3.4 ms/10L — check if q/k/v/o projections are FP8 (like SSM) or could be.
+Revised next-lever ranking:
+1. **Port PR #177** (block-scaled FP8 prefill default + agentic fixes): accuracy +
+   path to full native FP8 SSM → drop BF16 → ~3.5 GB leaner. Moderate, validated.
+2. **Attention FP8** for q/k/v/o decode projections if currently BF16 (attn proper
+   3.4 ms/10L) — analogous to the SSM FP8 decode win.
+3. MoE w4a16 GEMV micro-optimization (hard, deep CUDA).
