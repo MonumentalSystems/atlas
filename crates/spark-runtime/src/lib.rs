@@ -5,6 +5,8 @@
 
 pub mod buffers;
 #[cfg(feature = "cuda")]
+pub mod cublaslt;
+#[cfg(feature = "cuda")]
 pub mod cuda_backend;
 #[cfg(unix)]
 pub mod fast_weights;

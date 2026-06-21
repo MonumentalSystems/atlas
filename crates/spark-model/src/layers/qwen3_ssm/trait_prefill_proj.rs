@@ -45,7 +45,31 @@ impl Qwen3SsmLayer {
             Some("1")
         );
         let force_w8a8 = ops::fp8_blockscaled_prefill_enabled();
-        if force_bf16 {
+        // High-efficiency cuBLASLt BF16 GEMM path (ATLAS_CUBLAS_GEMM=1). The
+        // hand-written blockscaled mma.sync GEMM hits only ~30% of the cuBLAS
+        // ceiling on GB10 (32 vs 85 TFLOPS bf16 on this shape). Dequant the FP8
+        // weight to BF16 once (cached), then route the projection through
+        // cuBLASLt. W16A16 here is strictly more accurate than the W8A8 path.
+        if ops::cublas_fp8_enabled()
+            && let Some(ref fp8w) = self.qkvz_fp8w
+        {
+            ops::cublas_fp8_rowwise_proj(
+                ctx.gpu,
+                normed,
+                ctx.buffers.fp8_act(),
+                ctx.buffers.fp8_act_scale(),
+                fp8w,
+                proj_dst,
+                k,
+                qkvz_size as u32,
+                h as u32,
+                stream,
+            )?;
+        } else if ops::cublas_gemm_enabled()
+            && let Some(ref fp8w) = self.qkvz_fp8w
+        {
+            ops::cublas_bf16_proj(ctx.gpu, normed, fp8w, proj_dst, k, qkvz_size as u32, h as u32, stream)?;
+        } else if force_bf16 {
             ops::dense_gemm(
                 ctx.gpu,
                 self.dense_gemm_k,
@@ -72,10 +96,11 @@ impl Qwen3SsmLayer {
             );
             let m = k as usize;
             let k_dim = h;
-            let a_fp8_bytes = m * k_dim;
-            let a_scale_bytes = m * (k_dim / 128) * 4;
-            let a_fp8_buf = ctx.gpu.alloc(a_fp8_bytes)?;
-            let a_scale_buf = ctx.gpu.alloc(a_scale_bytes)?;
+            // Persistent arena scratch (no per-projection alloc/sync/free): the
+            // quant→GEMM chain is same-stream ordered.
+            let a_fp8_buf = ctx.buffers.fp8_act();
+            let a_scale_buf = ctx.buffers.fp8_act_scale();
+            debug_assert!(m * k_dim <= ctx.buffers.fp8_act_bytes());
             // Per-token block FP8 quant of the activation, then block-scaled
             // FP8×FP8 GEMM folding both per-128 scales in an FP32 epilogue.
             ops::per_token_group_quant_fp8(
@@ -101,9 +126,6 @@ impl Qwen3SsmLayer {
                 h as u32,
                 stream,
             )?;
-            ctx.gpu.synchronize(stream)?;
-            ctx.gpu.free(a_fp8_buf)?;
-            ctx.gpu.free(a_scale_buf)?;
         } else if let Some(ref fp8w) = self.qkvz_fp8w
             && self.w8a16_gemm_pipelined_k.0 != 0
         {

@@ -18,6 +18,12 @@ pub fn start_chunked_prefill(
     prefill_event: u64,
     grammar_engine: &mut Option<GrammarEngine>,
     spontaneous_think_budget: u32,
+    // Co-dispatch: when true, do all per-request setup (grammar/sink/seq
+    // alloc/EP broadcast) but SKIP the inline chunk-0 prefill + first-token
+    // sampling, returning `InProgress { chunk_offset: 0 }` so >=2 concurrent
+    // streams batch into one `run_batched_prefill_step` forward. Vision is
+    // excluded upstream (PrefillInProgress carries no pixel state).
+    defer: bool,
 ) -> Result<StartPrefillResult> {
     // Merge user-supplied stop tokens with model EOS tokens.
     let stop_tokens = req.take_stop_tokens();
@@ -118,6 +124,68 @@ pub fn start_chunked_prefill(
         }
     };
     seq.session_hash = req_session_hash;
+
+    // Deferred co-dispatch: setup + EP broadcast, then return InProgress at
+    // chunk 0 WITHOUT prefilling — the batched step packs >=2 streams into one
+    // forward. Vision is excluded upstream, so no chunk-0 embedding injection.
+    if defer {
+        debug_assert!(image_pixels.is_empty(), "vision must be excluded from co-dispatch");
+        if let Err(e) = (|| -> Result<()> {
+            // EP: broadcast chunk 0 to worker (no-op on single-GPU; the batched
+            // step does NOT re-broadcast, so this stays the only broadcast site).
+            model.ep_broadcast_cmd_for_seq(seq.slot_idx as u32, 0xFFFFFFF0)?;
+            model.ep_broadcast_cmd(chunk_len as u32)?;
+            model.ep_broadcast_cmd(0)?; // chunk_start
+            model.ep_broadcast_cmd(prompt_tokens.len() as u32)?; // full prompt length
+            model.ep_broadcast_tokens(&prompt_tokens)?;
+            Ok(())
+        })() {
+            let msg = format!("deferred prefill EP broadcast failed: {e:#}");
+            send_error_to_sink(&mut sink, &msg);
+            if let Err(fe) = model.free_sequence(&mut seq) {
+                tracing::error!("prefill_a_step: free_sequence (deferred broadcast error): {fe:#}");
+            }
+            return Err(e);
+        }
+        return Ok(StartPrefillResult::InProgress(PrefillInProgress {
+            prompt_tokens,
+            session_hash: req_session_hash,
+            seq,
+            chunk_offset: 0,
+            max_tokens,
+            min_tokens: req_min_tokens,
+            eos_tokens: eos_tokens.to_vec(),
+            sink,
+            cancel_flag,
+            request_start,
+            temperature,
+            top_k,
+            top_p,
+            top_n_sigma,
+            min_p,
+            repetition_penalty,
+            repetition_penalty_window: 256,
+            presence_penalty,
+            frequency_penalty,
+            lz_penalty: req_lz_penalty,
+            dry_multiplier,
+            dry_base,
+            dry_allowed_length,
+            dry_sequence_breakers: Vec::new(),
+            logit_bias,
+            enable_thinking: req_enable_thinking,
+            thinking_budget: req_thinking_budget,
+            repetition_detection: req_repetition_detection,
+            spontaneous_think_budget,
+            require_tool_call: req_require_tool_call,
+            suppress_tool_call: req_suppress_tool_call,
+            disable_mtp: req_disable_mtp,
+            grammar_state,
+            seed: req_seed,
+            top_logprobs: req_top_logprobs,
+            timeout_at: req_timeout_at,
+        }));
+    }
 
     // Guard: free SSM slot on any error after allocation.
     let prefill_result = (|| -> Result<DevicePtr> {
@@ -290,6 +358,7 @@ pub fn start_chunked_prefill(
                 tool_call_opened: false,
                 inside_tool_body: false,
                 tool_call_completed: false,
+                post_completion_tool_opens: 0,
                 tool_body_streak_tokens: 0,
                 inside_parameter_body: false,
                 param_body_chars_emitted: 0,
@@ -377,6 +446,7 @@ pub fn start_chunked_prefill(
                 tool_call_opened: false,
                 inside_tool_body: false,
                 tool_call_completed: false,
+                post_completion_tool_opens: 0,
                 tool_body_streak_tokens: 0,
                 inside_parameter_body: false,
                 param_body_chars_emitted: 0,

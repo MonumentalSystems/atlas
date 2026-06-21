@@ -60,6 +60,22 @@ pub(super) fn install_high_speed_swap(
     }
 }
 
+/// Co-dispatch admission window: `Some(duration)` when `ATLAS_PREFILL_CODISPATCH=1`,
+/// else `None`. The window length is `ATLAS_PREFILL_CODISPATCH_WINDOW_MS` (default 5).
+fn codispatch_window() -> Option<std::time::Duration> {
+    let on = std::env::var("ATLAS_PREFILL_CODISPATCH")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if !on {
+        return None;
+    }
+    let ms = std::env::var("ATLAS_PREFILL_CODISPATCH_WINDOW_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(5);
+    Some(std::time::Duration::from_millis(ms))
+}
+
 /// Drain pending request queue and policy-select prefills to start.
 pub(super) fn drain_pending_requests(
     pending: &Arc<(Mutex<PendingQueue>, Condvar)>,
@@ -77,6 +93,23 @@ pub(super) fn drain_pending_requests(
         }
         if g.closed && g.requests.is_empty() {
             return Vec::new();
+        }
+        // Co-dispatch micro-batch window (ATLAS_PREFILL_CODISPATCH=1): when idle
+        // and only one prefill request has arrived, wait a few ms for a 2nd
+        // concurrent request so they batch into one forward via
+        // run_batched_prefill_step. Bounded by a deadline, so a lone request's
+        // TTFT only grows by the (small) window. Off by default.
+        if g.requests.len() < 2
+            && let Some(window) = codispatch_window()
+        {
+            let deadline = std::time::Instant::now() + window;
+            while g.requests.len() < 2 && !g.closed {
+                let now = std::time::Instant::now();
+                if now >= deadline {
+                    break;
+                }
+                cv.wait_for(&mut g, deadline - now);
+            }
         }
     }
 

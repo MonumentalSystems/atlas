@@ -17,7 +17,7 @@
 //!
 //! Constraints encoded:
 //!   - N ≥ 2 streams
-//!   - All streams share `chunk_len`, `seq_len_start` (q_offset), and
+//!   - All streams share `chunk_len`, nonzero `seq_len_start` (q_offset), and
 //!     `is_last_chunk` flag
 //!   - Total stacked tokens fits in buffer arena
 //!   - No MLA / HDIM=512 / HSS-engaged layer in the model
@@ -35,6 +35,20 @@ use super::super::super::types::TransformerModel;
 use super::proc_range::ProcRange;
 use super::stage_batched::PerStreamStageInfo;
 use super::upload_meta::MetaLayout;
+
+/// Whether chunk-0 streams may use the batched (paged) prefill path. Enabled by
+/// `ATLAS_Q12_BATCHED_FIRST_CHUNK=1` or `ATLAS_PREFILL_CODISPATCH=1` (the latter
+/// is the single end-to-end flag for cross-request co-dispatch of fresh prompts,
+/// whose every stream starts at chunk_start==0).
+fn first_chunk_batched_enabled() -> bool {
+    ["ATLAS_Q12_BATCHED_FIRST_CHUNK", "ATLAS_PREFILL_CODISPATCH"]
+        .iter()
+        .any(|k| {
+            std::env::var(k)
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false)
+        })
+}
 use crate::layer::{
     BatchedAttnMetadata, ForwardContext, GdnPrefillBuffers, LayerState, TransformerLayer,
 };
@@ -56,6 +70,7 @@ impl TransformerModel {
             self.buffers.scratch_bytes(),
             self.config.num_experts_per_tok,
             self.config.mrope_interleaved,
+            first_chunk_batched_enabled(),
         )
     }
 }
@@ -73,6 +88,7 @@ pub(in crate::model) fn check_kernel_batched_eligible<I>(
     scratch_cap: usize,
     top_k: usize,
     mrope: bool,
+    allow_chunk_zero: bool,
 ) -> bool
 where
     I: IntoIterator<Item = (usize, usize, bool)>,
@@ -109,6 +125,14 @@ where
         }
         total += chunk_len;
     }
+    let Some((chunk_len, chunk_start, _)) = first else {
+        return false;
+    };
+    // Batched attention is paged-only today; chunk 0 uses the non-paged
+    // cache-skip path and must stay on the single-stream dispatcher.
+    if chunk_start == 0 && !allow_chunk_zero {
+        return false;
+    }
     // Total stacked tokens fit in the token arena (hidden_states buffer).
     if total > arena_cap {
         return false;
@@ -117,7 +141,6 @@ where
     // pre-flight — runs before any stream mutation, so a false routes to the
     // per-stream path from a clean state (a mid-dispatch overrun would leave
     // streams dirty and the fallback would re-run setup → corruption).
-    let chunk_len = first.map(|(cl, _, _)| cl).unwrap_or(0);
     spark_runtime::buffers::q12_batched_scratch_bytes(n, chunk_len, top_k, mrope) <= scratch_cap
 }
 
@@ -150,8 +173,11 @@ impl TransformerModel {
         let mut kv_cache = self.kv_cache.lock();
 
         // Zero shared buffers once (instead of N times in per-stream).
-        if self.comm.is_some() || streams[0].chunk_start == 0 {
+        if self.comm.is_some() {
             self.buffers.zero_all(self.gpu.as_ref(), stream)?;
+        } else if streams[0].chunk_start == 0 {
+            self.buffers
+                .zero_prefill_essentials(self.gpu.as_ref(), stream)?;
         }
 
         let hidden_base = self.buffers.hidden_states();
@@ -175,6 +201,7 @@ impl TransformerModel {
             num_blocks: usize,
         }
         let mut per_stream: Vec<PerStreamMeta> = Vec::with_capacity(n);
+        let force_paged_first_chunk = streams[0].chunk_start == 0 && first_chunk_batched_enabled();
 
         // Tracks MRoPE / paged-flag agreement across streams.
         let mut use_mrope: Option<bool> = None;
@@ -282,7 +309,7 @@ impl TransformerModel {
                 meta_base,
                 stream,
             )?;
-            if layout.needs_paged {
+            if layout.needs_paged || force_paged_first_chunk {
                 self.prefill_b_upload_paged(
                     seq,
                     total,
@@ -314,7 +341,7 @@ impl TransformerModel {
             }
 
             let kv_write_start_eff = if marconi_skip { 0 } else { kv_write_start };
-            let (block_table_dev, seq_len_dev) = if layout.needs_paged {
+            let (block_table_dev, seq_len_dev) = if layout.needs_paged || force_paged_first_chunk {
                 let page_meta = seq.chunked_prefill_meta.as_ref().unwrap();
                 (page_meta.block_table, page_meta.seq_len)
             } else {

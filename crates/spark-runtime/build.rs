@@ -37,6 +37,10 @@ fn main() {
     // The actual CUDA driver is a stub at compile time; at runtime
     // it resolves to the NVIDIA driver installed on the system.
     println!("cargo:rustc-link-lib=dylib=cuda");
+    // cuBLASLt for the high-efficiency GEMM path (ATLAS_CUBLAS_GEMM=1). The
+    // hand-written mma.sync projection/MoE GEMMs hit only ~30% of the cuBLAS
+    // ceiling on GB10; cuBLASLt is a measured 2.7-4.8x lever on those shapes.
+    println!("cargo:rustc-link-lib=dylib=cublasLt");
 
     if let Ok(cuda_path) = std::env::var("CUDA_HOME") {
         println!("cargo:rustc-link-search=native={cuda_path}/lib64");

@@ -68,6 +68,12 @@ pub struct BufferSizes {
     /// GDN FLA chunked-prefill scratch (single buffer, sub-divided W|U|S|uc).
     /// 0 unless the model is a 128-dim-linear-head GDN model (ATLAS_GDN_FLA path).
     pub gdn_fla_scratch: usize,
+    /// FP8 block-scaled activation scratch for prefill projections (qkv / o /
+    /// ssm-qkvz). Persistent so the W8A8+FP32-epilogue path stops doing a
+    /// per-projection cuMemAlloc + cuStreamSynchronize + cuMemFree. 1 byte/elem.
+    pub fp8_act: usize,
+    /// Per-128-block FP32 scales paired with `fp8_act` (one f32 per 128 elems).
+    pub fp8_act_scale: usize,
 }
 
 impl BufferSizes {
@@ -194,12 +200,20 @@ impl BufferSizes {
         // The residual stream is always BF16.
         let residual_elem = bf16;
 
+        // FP8 block-scaled activation scratch for prefill projections. The
+        // widest contract dim across call sites is hidden (qkv / ssm-qkvz) or
+        // q_heads*head_dim (o_proj). 1 byte/elem fp8 + one f32 per 128-block.
+        let max_proj_k = h.max(q_heads * hd);
+        let fp8_act = m * max_proj_k;
+        let fp8_act_scale = m * max_proj_k.div_ceil(128) * 4;
+
         // GDN FLA chunked-prefill scratch — ONE buffer holding W|U|S|uc back-to-back,
         // sized for the chunked-prefill arena (nt = ceil(max_batch_tokens / CHUNK)).
         // Only the 128-dim-linear-head GDN path uses it (the FLA kernels are compiled
         // for K_DIM=V_DIM=128); 0 otherwise so BufferArena allocs NULL and the
         // ATLAS_GDN_FLA dispatch stays disabled. Layout per region:
-        //   W  [nt*nv][CHUNK][kd] bf16 ; U,uc [nt*nv][CHUNK][vd] bf16 ; S [nt*nv][kd][vd] f32.
+        //   W  [nt*nv][CHUNK][kd] bf16 ; U,uc [nt*nv][CHUNK][vd] bf16 ;
+        //   S  [nt*nv][kd][vd] bf16 ; gc [nt*nv][CHUNK] f32.
         const FLA_CHUNK: usize = 64;
         let gdn_fla_scratch = if config.linear_num_value_heads > 0
             && config.linear_key_head_dim == 128
@@ -211,9 +225,10 @@ impl BufferSizes {
             let vd = config.linear_value_head_dim;
             let w = nt * nv * FLA_CHUNK * kd * bf16;
             let u = nt * nv * FLA_CHUNK * vd * bf16;
-            let s = nt * nv * kd * vd * 4;
+            let s = nt * nv * kd * vd * bf16;
             let uc = nt * nv * FLA_CHUNK * vd * bf16;
-            w + u + s + uc
+            let gc = nt * nv * FLA_CHUNK * 4;
+            w + u + s + uc + gc
         } else {
             0
         };
@@ -301,6 +316,8 @@ impl BufferSizes {
             expert_down_out,
             splitk_workspace,
             gdn_fla_scratch,
+            fp8_act,
+            fp8_act_scale,
         }
     }
 
@@ -327,5 +344,7 @@ impl BufferSizes {
             + self.expert_down_out
             + self.splitk_workspace
             + self.gdn_fla_scratch
+            + self.fp8_act
+            + self.fp8_act_scale
     }
 }

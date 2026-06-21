@@ -29,6 +29,20 @@ pub(super) fn start_new_requests(
     active: &mut Vec<ActiveSeq>,
     prefilling: &mut Vec<PrefillInProgress>,
 ) {
+    // Co-dispatch (ATLAS_PREFILL_CODISPATCH=1): when >=2 non-vision requests are
+    // co-admitted this tick with no active decode to starve, DEFER their chunk-0
+    // prefill so they batch into one forward via run_batched_prefill_step (which
+    // sees prefilling.len() >= 2 → can_batch_prefill_only). Vision excluded: a
+    // shared prepare_vision_embed buffer would cross-contaminate stacked streams.
+    let want_codispatch = std::env::var("ATLAS_PREFILL_CODISPATCH")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+        && chunked
+        && new_reqs.len() >= 2
+        && active.is_empty()
+        && prefilling.is_empty()
+        && !model.is_ep()
+        && !new_reqs.iter().any(|r| r.has_image_pixels());
     for req in new_reqs {
         if chunked {
             // When no active sequences are decoding, process as much of the
@@ -52,6 +66,7 @@ pub(super) fn start_new_requests(
                 prefill_event,
                 grammar_engine,
                 spontaneous_think_budget,
+                want_codispatch,
             ) {
                 Ok(StartPrefillResult::Active(a)) => {
                     tracing::info!(

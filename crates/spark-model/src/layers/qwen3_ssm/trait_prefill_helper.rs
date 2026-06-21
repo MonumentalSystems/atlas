@@ -53,10 +53,10 @@ impl Qwen3SsmLayer {
             );
             let m = k as usize;
             let k_dim = h;
-            let a_fp8_bytes = m * k_dim;
-            let a_scale_bytes = m * (k_dim / 128) * 4;
-            let a_fp8_buf = ctx.gpu.alloc(a_fp8_bytes)?;
-            let a_scale_buf = ctx.gpu.alloc(a_scale_bytes)?;
+            // Persistent arena scratch (no per-projection alloc/sync/free).
+            let a_fp8_buf = ctx.buffers.fp8_act();
+            let a_scale_buf = ctx.buffers.fp8_act_scale();
+            debug_assert!(m * k_dim <= ctx.buffers.fp8_act_bytes());
             ops::per_token_group_quant_fp8(
                 ctx.gpu,
                 self.per_token_group_quant_fp8_k,
@@ -80,10 +80,37 @@ impl Qwen3SsmLayer {
                 h as u32,
                 stream,
             )?;
-            ctx.gpu.synchronize(stream)?;
-            ctx.gpu.free(a_fp8_buf)?;
-            ctx.gpu.free(a_scale_buf)?;
             Ok(())
+        } else if let Some(ref fp8w) = self.out_proj_fp8w
+            && self.w8a16_gemm_pipelined_k.0 != 0
+        {
+            ops::w8a16_gemm_pipelined(
+                ctx.gpu,
+                self.w8a16_gemm_pipelined_k,
+                normed_out_buf,
+                fp8w.weight,
+                fp8w.row_scale,
+                out_proj_buf,
+                k,
+                h as u32,
+                value_dim as u32,
+                stream,
+            )
+        } else if let Some(ref fp8w) = self.out_proj_fp8w
+            && self.w8a16_gemm_k.0 != 0
+        {
+            ops::w8a16_gemm(
+                ctx.gpu,
+                self.w8a16_gemm_k,
+                normed_out_buf,
+                fp8w.weight,
+                fp8w.row_scale,
+                out_proj_buf,
+                k,
+                h as u32,
+                value_dim as u32,
+                stream,
+            )
         } else if let Some(fp8) = self.out_proj_fp8 {
             if k > 128 {
                 ops::fp8_gemm_n128_m128(

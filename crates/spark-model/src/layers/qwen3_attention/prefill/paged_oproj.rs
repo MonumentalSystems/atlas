@@ -26,7 +26,12 @@ impl Qwen3AttentionLayer {
     ) -> Result<DevicePtr> {
         let o_out = ctx.buffers.norm_output();
         let force_w8a8 = ops::fp8_blockscaled_prefill_enabled();
-        if force_w8a8
+        if ops::cublas_gemm_enabled()
+            && let Some(fp8w) = self.o_weight.as_ref().and_then(|w| w.as_fp8())
+        {
+            // cuBLASLt BF16 (3x the hand-written mma.sync GEMM on GB10).
+            ops::cublas_bf16_proj(ctx.gpu, attn_out, fp8w, o_out, n, h, nq * hd, stream)?;
+        } else if force_w8a8
             && let Some(fp8w) = self.o_weight.as_ref().and_then(|w| w.as_fp8())
             && self.per_token_group_quant_fp8_k.0 != 0
             && self.fp8_gemm_t_blockscaled_k.0 != 0
@@ -38,10 +43,12 @@ impl Qwen3AttentionLayer {
             let m = n as usize;
             let k_dim = (nq * hd) as usize; // inner contract dim — input width of o_proj
             let n_out = h as usize; // output width of o_proj
-            let a_fp8_bytes = m * k_dim;
-            let a_scale_bytes = m * (k_dim / 128) * 4;
-            let a_fp8_buf = ctx.gpu.alloc(a_fp8_bytes)?;
-            let a_scale_buf = ctx.gpu.alloc(a_scale_bytes)?;
+            // Persistent arena scratch (no per-projection alloc/sync/free): the
+            // quant→GEMM→next-layer chain is same-stream ordered, so the buffer
+            // is safely reused without a host sync.
+            let a_fp8_buf = ctx.buffers.fp8_act();
+            let a_scale_buf = ctx.buffers.fp8_act_scale();
+            debug_assert!(m * k_dim <= ctx.buffers.fp8_act_bytes());
             ops::per_token_group_quant_fp8(
                 ctx.gpu,
                 self.per_token_group_quant_fp8_k,
@@ -65,9 +72,6 @@ impl Qwen3AttentionLayer {
                 k_dim as u32,
                 stream,
             )?;
-            ctx.gpu.synchronize(stream)?;
-            ctx.gpu.free(a_fp8_buf)?;
-            ctx.gpu.free(a_scale_buf)?;
         } else if let Some(ref fp8t) = self.o_fp8w_t
             && self.w8a16_gemm_t_pipelined_k.0 != 0
         {
