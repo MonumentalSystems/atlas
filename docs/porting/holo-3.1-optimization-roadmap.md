@@ -19,9 +19,13 @@ Two shipped wins; both verified live on `holo_serve.sh`:
    zero-speedup: the prefill chunk landed at 257 blocks, missing the 256-block
    checkpoint boundary, so no Marconi intermediate checkpoint was ever saved.
    `holo_serve.sh` now auto-aligns the chunk. NOTE: under full-MoE the warm hit
-   is semantically correct but NOT bit-identical (grouped-GEMM expert tiling
-   depends on chunk offset; the post-checkpoint recompute window differs from
-   cold) — acceptable, same class as vLLM prefix-cache non-determinism.
+   is semantically correct but NOT bit-identical for UNCONSTRAINED prose
+   (grouped-GEMM expert tiling depends on chunk offset; the post-checkpoint
+   recompute window differs from cold). HOWEVER for the production agent workload
+   — TOOL CALLING under XGrammar-constrained decoding — cold and warm emit
+   BIT-IDENTICAL tool calls (name + args), VERIFIED (/tmp/toolcall_cache_validate.py).
+   The grammar constraint absorbs the minor logit drift, so the caveat is cosmetic
+   (prose only), not a production risk.
 
 **Verified production config** (full MoE + prefix cache, ~105/121 GB w/ ~26 GB
 co-tenants): pp2048 c1–c4 **3.8–4.0K** (85%), tg128 c1 **73** (96%), c2 80, c4 114.
