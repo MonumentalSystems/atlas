@@ -19,7 +19,6 @@ ATTN_Q_T="${ATLAS_ATTN_PREFILL_Q_T:-1}"
 ATTN_T_PIPE="${ATLAS_ATTN_PREFILL_T_PIPE:-1}"
 EXACT_MOE_TILES="${ATLAS_MOE_PREFILL_EXACT_TILES:-1}"
 GDN_FUSED_NORM="${ATLAS_GDN_FUSED_NORM:-1}"
-LM_HEAD_DTYPE="${ATLAS_HOLO_LM_HEAD_DTYPE:-bf16}"
 # Native CUTLASS NVFP4 dense prefill projections (qkvz/Q/K/V/O + SSM out) — the
 # default prefill path (+~24% prefill, op-level cos 0.99 vs bf16, server-validated
 # coherent). REQUIRES the binary to be built with CUTLASS_HOME set; otherwise the
@@ -44,7 +43,7 @@ setsid -f env RUST_BACKTRACE=1 RUST_LOG=info \
   "$BIN" serve \
     --model-from-path /tank/holo-bf16kv-test --model-name holo3.1-atlas-poc \
     --port 8890 --bind 127.0.0.1 --max-seq-len "$MAX_SEQ_LEN" --max-num-seqs "$MAX_SEQS" --max-batch-size "$MAX_BATCH" \
-    --max-prefill-tokens "$MAX_PREFILL" --kv-cache-dtype bf16 --lm-head-dtype "$LM_HEAD_DTYPE" \
+    --max-prefill-tokens "$MAX_PREFILL" --kv-cache-dtype bf16 \
     --gpu-memory-utilization "$GPU_UTIL" --oom-guard-mb 256 --ssm-cache-slots 0 --ssm-checkpoint-interval 0 \
     --enable-prefix-caching false --tool-call-parser qwen3_coder \
     --default-chat-template-kwargs '{"enable_thinking":true}' \

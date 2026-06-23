@@ -43,7 +43,7 @@ impl Qwen3SsmLayer {
         // WY32 persistent: processes 32 tokens per WY iteration with H in
         // shared memory (~84KB). ~30× faster than per-token for 14k+ sequences.
         // Falls through to WY4 or sub-chunked persistent for shorter sequences.
-        tracing::info!(
+        tracing::debug!(
             "GDN prefill: total={total} wy32_k={} wy4_k={} persistent_k={} split4_k={}",
             self.gdn_prefill_wy32_k.0 != 0,
             self.gdn_prefill_persistent_wy4_k.0 != 0,

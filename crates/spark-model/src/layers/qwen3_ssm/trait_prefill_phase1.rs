@@ -49,11 +49,18 @@ impl Qwen3SsmLayer {
         let d_conv = ctx.config.linear_conv_kernel_dim;
         let qkvz_size = ctx.config.ssm_qkvz_size();
 
-        // Diagnostic: always sync at entry to catch prior-layer errors
-        tracing::info!("ssm phase1 ENTRY: k={k} h={h} qkvz={qkvz_size}");
-        ctx.gpu.synchronize(stream).map_err(|e| {
-            anyhow::anyhow!("ssm phase1 ENTRY: stream broken BEFORE we start (M={k}): {e}")
-        })?;
+        // Diagnostic: sync at entry to catch prior-layer errors — ONLY for the
+        // long sequences (>4096) where the historical crash occurred. For
+        // normal-size requests this unconditional full-device drain serialized
+        // the per-request varlen Phase-1 loop (4 reqs × 30 SSM layers = 120
+        // stalls/forward), collapsing batched prefill 3-4×. Gate it like the
+        // sibling syncs below.
+        if k > 4096 {
+            tracing::info!("ssm phase1 ENTRY: k={k} h={h} qkvz={qkvz_size}");
+            ctx.gpu.synchronize(stream).map_err(|e| {
+                anyhow::anyhow!("ssm phase1 ENTRY: stream broken BEFORE we start (M={k}): {e}")
+            })?;
+        }
 
         // ── 1. RMS norm + residual for N tokens ──
         let normed = ctx.buffers.norm_output();
@@ -78,115 +85,29 @@ impl Qwen3SsmLayer {
             })?;
         }
 
-        // ── 2+3. QKVZ GEMM (+ deinterleave if needed) ──
+        // ── 2+3. QKVZ GEMM + deinterleave ──
+        // Route through the SHARED single-stream dispatch `prefill_qkvz_proj`,
+        // which tries CUTLASS-NVFP4 (from nvfp4_t or the fp8-packed weight)
+        // first and uses the tensor-core pipelined BF16 kernel for the dense
+        // fallback. The batched path previously inlined a chain that LACKED the
+        // CUTLASS-NVFP4 branches, so co-dispatched requests fell back to the
+        // scalar `dense_gemm` — nsys showed that scalar GEMM at ~60% of batched-
+        // prefill GPU time (19–31 ms/call) while single-stream requests, which
+        // already used this helper, ran NVFP4 and were ~5× faster.
         let deinterleaved = ctx.buffers.ssm_deinterleaved();
-        let proj_dst = if self.sequential_qkvz {
-            deinterleaved
-        } else {
-            ctx.buffers.ssm_qkvz()
-        };
-        if let Some(fp8) = self.qkvz_fp8 {
-            ops::fp8_gemm_n128(
-                ctx.gpu,
-                self.fp8_gemm_k,
-                normed,
-                fp8,
-                proj_dst,
-                k,
-                qkvz_size as u32,
-                h as u32,
-                stream,
-            )
-            .map_err(|e| {
-                anyhow::anyhow!("ssm phase1: QKVZ FP8 GEMM failed (M={k}, N={qkvz_size}): {e}")
-            })?;
-        } else if let Some(ref nvfp4_t) = self.qkvz_nvfp4_t {
-            if k > 128 {
-                ops::w4a16_gemm_n128_m128(
-                    ctx.gpu,
-                    self.w4a16_gemm_t_m128_k,
-                    normed,
-                    nvfp4_t,
-                    proj_dst,
-                    k,
-                    qkvz_size as u32,
-                    h as u32,
-                    stream,
-                )
-                .map_err(|e| {
-                    anyhow::anyhow!("ssm phase1: QKVZ m128 GEMM failed (M={k}, N={qkvz_size}): {e}")
-                })?;
-            } else {
-                ops::w4a16_gemm_n128(
-                    ctx.gpu,
-                    self.w4a16_gemm_t_k,
-                    normed,
-                    nvfp4_t,
-                    proj_dst,
-                    k,
-                    qkvz_size as u32,
-                    h as u32,
-                    stream,
-                )
-                .map_err(|e| {
-                    anyhow::anyhow!("ssm phase1: QKVZ GEMM failed (M={k}, N={qkvz_size}): {e}")
-                })?;
-            }
-        } else if let Some(ref nvfp4) = self.qkvz_nvfp4 {
-            ops::w4a16_gemm(
-                ctx.gpu,
-                self.w4a16_gemm_k,
-                normed,
-                nvfp4,
-                proj_dst,
-                k,
-                qkvz_size as u32,
-                h as u32,
-                stream,
-            )
-            .map_err(|e| {
-                anyhow::anyhow!("ssm phase1: QKVZ GEMM failed (M={k}, N={qkvz_size}): {e}")
-            })?;
-        } else {
-            ops::dense_gemm(
-                ctx.gpu,
-                self.dense_gemm_k,
-                normed,
-                &self.ssm.in_proj_qkvz,
-                proj_dst,
-                k,
-                qkvz_size as u32,
-                h as u32,
-                stream,
-            )?;
-        }
-        // Diagnostic sync: isolate QKVZ GEMM crash from later kernels.
-        // Only for long sequences (>4096) where the crash occurs.
-        if k > 4096 {
-            ctx.gpu.synchronize(stream).map_err(|e| {
-                anyhow::anyhow!("ssm phase1: SYNC after QKVZ GEMM (M={k} N={qkvz_size}): {e}")
-            })?;
-        }
-        if !self.sequential_qkvz {
-            ops::deinterleave_qkvz(
-                ctx.gpu,
-                self.deinterleave_k,
-                proj_dst,
-                deinterleaved,
-                k,
-                nk as u32,
-                kd as u32,
-                vpg as u32,
-                vd as u32,
-                stream,
-            )?;
-        }
-
-        if k > 4096 {
-            ctx.gpu
-                .synchronize(stream)
-                .map_err(|e| anyhow::anyhow!("ssm phase1: SYNC after deinterleave (M={k}): {e}"))?;
-        }
+        self.prefill_qkvz_proj(
+            normed,
+            deinterleaved,
+            k,
+            qkvz_size,
+            h,
+            nk,
+            kd,
+            vpg,
+            vd,
+            ctx,
+            stream,
+        )?;
         // ── 4+5. Fused BA GEMM + GDN gates (token-parallel) ──
         let ba_size = ctx.config.ssm_ba_size();
         let gates_buf = ctx.buffers.ssm_gates();

@@ -186,17 +186,32 @@ impl Qwen3AttentionLayer {
         } else if let Some(o_bf16) = self.o_dense_bf16.as_ref() {
             // BF16 dense fallback (Gemma-4 dense per Nvidia ModelOpt's
             // ignore list — all self_attn projections must stay BF16).
-            ops::dense_gemm(
-                ctx.gpu,
-                self.dense_gemm_k,
-                attn_out,
-                o_bf16,
-                o_out,
-                n,
-                h,
-                nq * hd,
-                stream,
-            )?;
+            // Tensor-core pipelined GEMM (~40× scalar on large-M prefill).
+            if self.dense_gemm_pipelined_k.0 != 0 {
+                ops::dense_gemm_bf16_pipelined(
+                    ctx.gpu,
+                    self.dense_gemm_pipelined_k,
+                    attn_out,
+                    o_bf16,
+                    o_out,
+                    n,
+                    h,
+                    nq * hd,
+                    stream,
+                )?;
+            } else {
+                ops::dense_gemm(
+                    ctx.gpu,
+                    self.dense_gemm_k,
+                    attn_out,
+                    o_bf16,
+                    o_out,
+                    n,
+                    h,
+                    nq * hd,
+                    stream,
+                )?;
+            }
         } else {
             ops::w4a16_gemm(
                 ctx.gpu,

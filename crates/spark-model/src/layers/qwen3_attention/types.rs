@@ -240,6 +240,11 @@ pub struct Qwen3AttentionLayer {
     /// v3 variant: K_STEP=64.
     pub(super) w4a16_gemm_t_m128_v3_k: KernelHandle,
     pub(super) dense_gemm_k: KernelHandle,
+    /// Tensor-core pipelined BF16 GEMM (mma.sync + cp.async, 128×128 tile) —
+    /// ~40× the scalar `dense_gemm_k` on large-M prefill projections, same math
+    /// (cosine 1.0). Used for the BF16-fallback Q/K/V/O projections (Holo's
+    /// native-FP8-dequant-to-BF16 attention path).
+    pub(super) dense_gemm_pipelined_k: KernelHandle,
     pub(super) prefill_attn_k: KernelHandle,
     /// HDIM=512 contiguous prefill for Gemma-4 full-attention layers
     pub(super) prefill_attn_512_k: KernelHandle,

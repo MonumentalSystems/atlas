@@ -380,6 +380,11 @@ impl Qwen3AttentionLayer {
                 "w4a16_gemm_t_m128_v3",
             ),
             dense_gemm_k: gpu.kernel("gemm", "dense_gemm_bf16")?,
+            dense_gemm_pipelined_k: super::super::try_kernel(
+                gpu,
+                "gemm",
+                "dense_gemm_bf16_pipelined",
+            ),
             prefill_attn_k: gpu.kernel("inferspark_prefill", "inferspark_prefill")?,
             prefill_attn_512_k: super::super::try_kernel(
                 gpu,
