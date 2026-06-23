@@ -81,6 +81,62 @@ impl Qwen3SsmLayer {
                 stream,
             );
         }
+        // FLA chunked GDN (recompute_wu → chunk_delta_h_ksplit → chunk_fwd_o) —
+        // the same baked-default path single-stream prefill uses
+        // (trait_prefill_recur.rs). Its grid [num_chunks, nv, batch] yields
+        // num_chunks×nv blocks vs wy32's flat ~nv(32), so it fills GB10's 48 SMs
+        // far better. The batched/co-dispatch per-request loop calls THIS fn, and
+        // nsys showed it GDN-bound at ~45% of batched-prefill GPU time on the
+        // occupancy-starved wy64 — routing per-request GDN through FLA is the
+        // batching lever. Skipped on exact-replay (FLA's 64-tok regrouping drifts
+        // vs a snapshot-anchored pass) and non-128-dim heads.
+        let fla_scratch = ctx.buffers.gdn_fla_scratch();
+        if !ctx.gdn_exact_replay
+            && kd == 128
+            && vd == 128
+            && fla_scratch.0 != 0
+            && self.gdn_prefill_fla_recompute_wu_k.0 != 0
+            && self.gdn_prefill_fla_chunk_delta_h_k.0 != 0
+            && self.gdn_prefill_fla_chunk_fwd_o_k.0 != 0
+        {
+            let num_chunks = total.div_ceil(64);
+            let nt = num_chunks as usize;
+            let w_out = fla_scratch;
+            let u_out = w_out.offset(nt * nv * 64 * kd * bf16);
+            let s_out = u_out.offset(nt * nv * 64 * vd * bf16);
+            let uc_out = s_out.offset(nt * nv * kd * vd * bf16);
+            let gc_out = uc_out.offset(nt * nv * 64 * vd * bf16);
+            return ops::gdn_prefill_fla(
+                ctx.gpu,
+                self.gdn_prefill_fla_recompute_wu_k,
+                self.gdn_prefill_fla_chunk_delta_h_k,
+                self.gdn_prefill_fla_chunk_fwd_o_k,
+                ssm_state.h_state,
+                q_ptr,
+                k_ptr,
+                v_ptr,
+                gate_ptr,
+                beta_ptr,
+                gdn_bufs.output,
+                w_out,
+                u_out,
+                s_out,
+                uc_out,
+                gc_out,
+                1,
+                total,
+                num_chunks,
+                nk as u32,
+                nv as u32,
+                kd as u32,
+                vd as u32,
+                conv_dim as u32,
+                conv_dim as u32,
+                gb_stride,
+                ctx.profile,
+                stream,
+            );
+        }
         if self.gdn_prefill_wy32_k.0 != 0 && total > 32 && !cfg!(atlas_scale) {
             // #110: dynamic smem must cover the FULL kernel layout (H + smem_k +
             // smem_q + smem_warp[4] + smem_kd[C*C] + smem_g[C] + smem_bt[C], C=32).
