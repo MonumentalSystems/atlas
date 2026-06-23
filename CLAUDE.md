@@ -56,8 +56,26 @@ working binary with a qwen3-next-target / no-CUTLASS build. Always use the block
 
 ## North star
 
-vLLM-parity: decode c4 ≥ 145 tok/s, prefill c4 ≥ 6700 tok/s.
-Current single-stream prefill ≈ 2900 tok/s (~43% of the c4 target) → need ~2.3×.
+vLLM-parity. **Real apples-to-apples baseline** (vLLM `pp2048` from
+`/home/ms/spark-vllm-docker/results.csv`, measured Jun 3; DO NOT re-run vLLM):
+
+| conc | vLLM prefill | vLLM decode (tg128) | Atlas OFF prefill (~2855-tok prompt) |
+|------|-------------|---------------------|--------------------------------------|
+| c1   | 4540        | 75                  | ~3700  (**~80% of vLLM**)            |
+| c2   | 6090        | 118                 | ~3800  (62%)                         |
+| c5   | 6830        | 151                 | c4 ~3760 (55%)                       |
+| c10  | 7180        | 196                 | —                                    |
+
+- **Single-stream prefill is already ~80% of vLLM** — 90% is ~1.13×, NOT 2.3×.
+  (Earlier "43%/2.3×" was a baseline ERROR: compared a 1403-tok single-stream run
+  to vLLM's c5 *aggregate*. Prefill tok/s rises with prompt length; measure at the
+  SAME length.)
+- **The real gap is concurrency scaling**: Atlas prefill is FLAT (c1≈c2≈c4≈3700-3800)
+  while vLLM scales 1.5× (4540→6830). vLLM overlaps/batches prefill; Atlas OFF
+  serializes. varlen ON currently makes it WORSE (1985-2033 at c2/c4) because the
+  batched path still uses the slow occupancy-limited `wy64` GDN (single-stream uses
+  FLA). Keep varlen OFF; the win is (a) single-stream 80→90% via modest kernel
+  tuning, and (b) make concurrent prefill actually scale (batched GDN→FLA + overlap).
 
 ## Prefill bottleneck map (single-stream FLA path, the goal path)
 
