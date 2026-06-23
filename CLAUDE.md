@@ -148,15 +148,20 @@ Run a single prefill, then aggregate `SSM prefill [<section>] N=…: …µs` ove
   So it IS true FP4×FP4 on the Blackwell FP4 tensor cores. (MoE uses `moe_w4a16` =
   4-bit weight × bf16 act — that one is hand-rolled, NOT the cutlass FP4 path, and
   may have more headroom.)
-- So 16 TFLOP/s is the achieved CUTLASS Sm120 FP4 GEMM rate on GB10 (sm_121). The
-  gap to vLLM is therefore one (or more) of: (a) cutlass Sm120 schedule not tuned
-  for sm_121 (consumer Blackwell — no tcgen05/TMA fast path → cutlass falls back);
-  (b) vLLM ships a better hand-tuned sm_121 FP4 kernel; (c) the 6700 baseline isn't
-  apples-to-apples with our 4-mixed-prompt test. Cause is UNCONFIRMED.
-- Honest status: the remaining 2.3× is deep FP4-kernel-tuning territory on consumer
-  Blackwell (or a baseline-validation question), not a quick fix. Decisive next
-  experiment: micro-bench the cutlass FP4 GEMM at the exact shapes vs a known-good
-  reference, and/or confirm the vLLM 6700 conditions.
+- So 16 TFLOP/s is the achieved CUTLASS Sm120 FP4 GEMM rate on GB10 (sm_121).
+- ROOT CAUSE (as far as static analysis can go): the cutlass GEMM is
+  `ArchTag=Sm120`, `OpClassBlockScaledTensorOp`, `ThreadBlockShape<128,128,128>`,
+  `ClusterShape<1,1,1>`, `KernelScheduleAuto` (`cutlass_nvfp4_gemm.cu:39-73`),
+  compiled `-arch=sm_121f`. At M=1403/N=12288 there are ~1056 tiles over 48 SMs
+  (~22 waves) → NOT occupancy/tile-limited. It's compute-bound at ~7% of GB10 FP4
+  peak → the limit is per-tile MMA/blockscale-dequant efficiency (or sm_121's real
+  FP4 MMA rate), which tile/schedule tuning won't move. This is the prefill
+  single-stream wall — closing it needs either a hand-tuned sm_121 FP4 GEMM (what
+  vLLM likely ships) or confirming GB10's FP4 ceiling is genuinely this low.
+- BLOCKED: confirming MMA-vs-overhead split needs GEMM-internal profiling (nsys
+  ncu), but nsys can't capture these workloads on this box (see tooling note).
+  This is the gating blocker — without a working profiler, GEMM optimization is
+  blind. Unblock profiling FIRST, then attack the cutlass FP4 GEMM.
 
 ## Varlen continuous-batching prefill (in progress)
 
