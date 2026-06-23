@@ -57,6 +57,26 @@ working binary with a qwen3-next-target / no-CUTLASS build. Always use the block
 ## North star
 
 vLLM-parity: decode c4 ≥ 145 tok/s, prefill c4 ≥ 6700 tok/s.
+Current single-stream prefill ≈ 2900 tok/s (~43% of the c4 target) → need ~2.3×.
+
+## Prefill bottleneck map (single-stream FLA path, the goal path)
+
+Measured with `ATLAS_PROFILE=1` (per-section sync+timestamp; nsys can't cleanly
+capture the OFF/single-stream forward on this box — it keeps only a ~2 ms tail).
+Run a single prefill, then aggregate `SSM prefill [<section>] N=…: …µs` over the
+30 SSM layers. Per-SSM-layer split:
+
+- **moe_ffn ≈ 28%**, **qkvz_gemm ≈ 27%** (CUTLASS-NVFP4 proj), **gdn_prefill ≈ 27%**
+  (FLA scan), out_proj ≈ 11%, norms/gates ≈ 2.5%.
+- **No single 2.3× lever** — it's a 3-way tie (MoE / QKVZ-proj / GDN). Closing the
+  vLLM gap needs all three. (The earlier "GDN = 53%" was the *batched* path's slow
+  `wy64` kernel, NOT the FLA single-stream path.)
+- Sub-levers: GDN-FLA spine `chunk_delta_h` is 52% of GDN and occupancy-limited
+  (`grid=[nv=32,batch]`, serial over chunks); QKVZ NVFP4 GEMM ≈16 TFLOP/s (low,
+  headroom); MoE `_m128` fused gate+up variant is unregistered (faster large-M tiling).
+- Batched/varlen GDN still uses `wy64` (occupancy-limited) while single-stream uses
+  FLA — same stale-kernel pattern as the (now fixed) dense_gemm bug; bringing the
+  batched path onto FLA would help varlen but not the OFF goal path.
 
 ## Varlen continuous-batching prefill (in progress)
 
