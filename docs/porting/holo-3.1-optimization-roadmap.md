@@ -79,6 +79,20 @@ NEXT fusion target + hazards (scoped, not yet built):
 - Validate ANY change vs needle + cold==warm tool calls + SSM state checksum
   (`ATLAS_SSM_SAVE_DUMP`); SSM-state corruption is silent.
 
+CONCRETE IMPLEMENTATION RECIPE for the race-free conv→gdn→norm fusion (the win):
+Holo GDN is `linear_num_key_heads=16, linear_num_value_heads=32` → head_repeat=2
+(each k-head shared by 2 v-heads; `kh = vh/2`). Restructure
+`gated_delta_rule_decode_f32_norm` from a per-v-head grid (`grid=[num_v_heads,B]`,
+128 thr) to a **per-k-head grid** (`grid=[num_k_heads,B]`, 256 thr = 2 v-heads ×
+128): each block (a) conv1d-updates its q/k channels ONCE (no cross-block share →
+no race) into smem, conv1d-updates BOTH v-heads' V channels, (b) L2-norms q/k, (c)
+runs the recurrence for both v-heads (each 128-thread half), (d) gated-norm →
+output. Inputs become the raw deinterleaved qkvz + conv_state + ba_gates output
+(gates/beta) + h_state; drops the separate conv1d_update_l2norm launch. Chain
+`ba_gates → conv → gdn → norm` (3 serial) becomes `ba_gates → [conv+gdn+norm]` (2)
+— extends the proven +18% gdn+norm fusion. Wire as a new op + gate behind an env
+flag; A/B vs current on tg128 c2/c4 + needle + cold==warm tool calls.
+
 ## Diagnosis
 
 - **C=4 aggregate ≈ C=1 (decode doesn't batch).** Three serializations:
