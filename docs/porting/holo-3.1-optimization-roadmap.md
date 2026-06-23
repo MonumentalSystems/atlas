@@ -30,9 +30,23 @@ SSM_CACHE_SLOTS=32 SSM_CHECKPOINT_INTERVAL=256 KV_EXTERNAL_RESERVE_GB=26
 GPU_UTIL=0.66 MAX_SEQS=16`. Co-tenant headroom is tight vs a 37 GB spike — drop
 to `gate_up` or shrink the 8 GB decode-rollback ring if needed.
 
-**Remaining frontier:** batch decode c2/c4 (65–80% of vLLM) — per the analysis
-below, only vertical kernel fusion (megakernel) remains; horizontal batching and
-per-kernel swaps are proven no-ops.
+**Remaining frontier:** batch decode c2/c4 (65–80% of vLLM on tg128) — per the
+analysis below, only vertical kernel fusion (megakernel) remains; horizontal
+batching and per-kernel swaps are proven no-ops. BUT the tg128 c2 micro-benchmark
+OVER-states the problem: on the realistic agent sweep (image + 5–11K prompts,
+thinking off) the production config improves prefill 1.7–2.2×, TTFT ~2×, AND
+aggregate decode at production concurrency:
+
+| C  | PREFILL off→full | maxTTFT off→full | aggDECODE off→full |
+|----|------------------|------------------|--------------------|
+| 1  | 1713 → 2897      | 4.3 → 2.5s       | 56 → 55            |
+| 4  | 1789 → 3068      | 17.8 → 10.4s     | 81 → 68            |
+| 8  | 1853 → 4062      | 33.1 → 15.1s     | 100 → 112          |
+| 16 | 1861 → 3817      | 69.7 → 34.0s     | 119 → 149          |
+
+Decode scales 55→149 across c1→c16 on the production config, so the per-seq
+small-batch decode-kernel project is lower urgency than the tg128 c2 view implies
+— a deliberate future investment, not a production blocker.
 
 ## Diagnosis
 
