@@ -503,23 +503,80 @@ impl Qwen3AttentionLayer {
                 .launch(stream)?;
         }
         if let Some(bmeta) = batched_meta {
-            // Q12 Path B: batched paged-prefill attention. The kernel reads
-            // Q/O at per-batch offsets internally via blockIdx.z and uses
-            // block_table_ptrs[b] for each stream's paged KV pages.
-            let args = super::paged_attn_batched::PagedAttnBatchedArgs {
-                q_contiguous,
-                attn_out,
-                seq_len_start,
-                nq,
-                nkv,
-                hd,
-                bs,
-                inv_sqrt_d,
-                kv_len,
-                batched_meta: bmeta,
-                stream,
-            };
-            self.prefill_attention_paged_attn_batched(kv_cache, ctx, &args)?;
+            // Cross-request prefill via FlashInfer ragged/varlen attention
+            // (ATLAS_FLASHINFER_PREFILL=1): the fresh contiguous, post-RoPE
+            // Q/K/V already match FlashInfer's [rows, heads, 256] layout, so ONE
+            // varlen launch runs all N co-dispatched requests' causal
+            // self-attention — replacing the slow paged batched kernel (the
+            // reason co-dispatch flatlined). Chunk-0 only (seq_len_start==0):
+            // later chunks need the cached prefix, which isn't in the fresh
+            // buffers. BF16 / no-WHT only; head_dim 256.
+            let use_flashinfer = seq_len_start == 0
+                && hd == 256
+                && !k_is_turbo
+                && !v_is_turbo
+                && spark_runtime::flashinfer::available()
+                && std::env::var("ATLAS_FLASHINFER_PREFILL").ok().as_deref() == Some("1");
+            if use_flashinfer {
+                let batch = bmeta.batch_size as usize;
+                let chunk = bmeta.chunk_len as usize;
+                let total = (batch * chunk) as u32;
+                {
+                    use std::sync::atomic::{AtomicBool, Ordering};
+                    static LOGGED: AtomicBool = AtomicBool::new(false);
+                    if !LOGGED.swap(true, Ordering::Relaxed) {
+                        tracing::warn!(
+                            "FLASHINFER_PREFILL geometry: batch={batch} chunk_len={chunk} \
+                             total(batch*chunk)={total} num_tokens={num_tokens} \
+                             nq={nq} nkv={nkv} hd={hd} inv_sqrt_d={inv_sqrt_d}"
+                        );
+                    }
+                }
+                // Uniform same-chunk-len co-dispatch -> arithmetic indptr.
+                let indptr: Vec<i32> = (0..=batch).map(|i| (i * chunk) as i32).collect();
+                let indptr_bytes: Vec<u8> = indptr.iter().flat_map(|x| x.to_le_bytes()).collect();
+                let indptr_d = ctx.gpu.alloc(indptr_bytes.len())?;
+                ctx.gpu.copy_h2d(&indptr_bytes, indptr_d)?;
+                let r = spark_runtime::flashinfer::ragged_prefill_bf16_hd256(
+                    q_contiguous.0,
+                    k_contiguous.0,
+                    v_contiguous.0,
+                    attn_out.0,
+                    &indptr,
+                    &indptr,
+                    indptr_d.0,
+                    indptr_d.0,
+                    batch as u32,
+                    total,
+                    total,
+                    nq,
+                    nkv,
+                    hd,
+                    inv_sqrt_d,
+                    true,
+                    stream,
+                );
+                ctx.gpu.free(indptr_d)?;
+                r?;
+            } else {
+                // Q12 Path B: batched paged-prefill attention. The kernel reads
+                // Q/O at per-batch offsets internally via blockIdx.z and uses
+                // block_table_ptrs[b] for each stream's paged KV pages.
+                let args = super::paged_attn_batched::PagedAttnBatchedArgs {
+                    q_contiguous,
+                    attn_out,
+                    seq_len_start,
+                    nq,
+                    nkv,
+                    hd,
+                    bs,
+                    inv_sqrt_d,
+                    kv_len,
+                    batched_meta: bmeta,
+                    stream,
+                };
+                self.prefill_attention_paged_attn_batched(kv_cache, ctx, &args)?;
+            }
         } else {
             // Single-stream path requires meta_for_single (validated above).
             let meta = meta_for_single

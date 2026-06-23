@@ -1387,7 +1387,45 @@ KEY DATA-CONTRACT NOTES for STAGE 2 (from the wrapper agent — must hold when f
 - total_kv_rows is unused by the wrapper (KV extent from kv_indptr); total_qo_rows -> PrefillPlan
   total_num_rows.
 
-STAGE 2 (next): wire ragged_prefill into the batched prefill attention path
+## 2026-06-23 - VARLEN concurrency engine: PLAN (the realistic prefill-scaling path)
+
+STAGE 2 reframed (user direction): the existing same-length co-dispatch is a DEAD END (unrealistic
++ chunks pathologically small -> pp c2/c4 collapsed to 515 tok/s when FlashInfer engaged at
+chunk_len=39). FlashInfer's value is VARLEN. Build a varlen batched-prefill forward (extend the
+existing prefill_b/ path, don't rebuild). FlashInfer indptr/scale were CORRECT (geometry log:
+batch=2 chunk_len=39 total=78=num_tokens sm_scale=0.0625) — the path around it was wrong.
+
+CRITICAL FINDING (Plan agent): the existing batched path does NOT amortize SSM/MoE projection
+GEMMs today — Phase1 QKVZ GEMM + Phase3 out_proj/MoE run PER-STREAM (one GEMM per request, weight
+read N times). Only the GDN recurrence kernel + attention are token-major. So the prefill-scaling
+win needs TWO threads: (A) varlen geometry (cu_seqlens instead of b*chunk_len), (B) HOIST the
+SSM/MoE projection GEMMs to ONE stacked GEMM over total_tokens (this is where amortization comes
+from). Attention is already token-major; only its FlashInfer indptr must become real cu_seqlens.
+MoE is token-major/stateless — just call once over total_tokens. GDN kernel already does one
+independent recurrence per (b,head) from h_state_ptrs[b] — varlen = swap b*seq_len -> cu_seqlens[b]
++ loop bound. conv1d/L2-norm already per-stream-slice (varlen-correct).
+
+BUILD PLAN (extend prefill_b/; cu_seqlens [N+1] i32 is the single source of truth threaded into
+GDN kernel + FlashInfer):
+- M0 (correctness, NO new kernel): scheduler varlen admit (ATLAS_PREFILL_VARLEN, drop equal-length
+  check, per-stream full chunk, cap by arena); add cu_seqlens+total_tokens to BatchedAttnMetadata
+  (layer.rs) built in stage_batched.rs (remove proc_count uniformity assert, loop 0..proc_count);
+  convert ~12 b*chunk_len sites (batch_kernel.rs/batched_layer.rs) -> cu_seqlens[b]; FlashInfer
+  indptr from cu_seqlens (paged.rs:536); SSM v1 = per-request LOOP (call single-stream
+  prefill_gdn_full_inner per request slice w/ own h_state). TEST: 2 reqs len 37+200, one forward,
+  golden-compare each req's logits vs single-stream (batch.rs N=1 path).
+- M1 (the win): hoist Phase1 (RMS+QKVZ+BA/gates) + Phase3 (out_proj+MoE) to ONE stacked GEMM over
+  total_tokens; per-request tail only for conv1d/L2/norm. TEST: golden + assert 1 GEMM/layer + bench.
+- M2: varlen GDN kernel (cu_seqlens param in gated_delta_rule_persistent.cu + .cu + wy64; bindings
+  ssm_gdn_batched.rs) replacing the M0 per-request loop. TEST: golden vs M0 loop.
+- M3: scale (N=4,8 mixed lengths spanning WY32/persistent/split4 thresholds) + arena-overflow
+  graceful fallback + compute-sanitizer.
+HIGHEST RISK: varlen GDN kernel (M2) — de-risked by the M0 per-request loop first.
+Key files: prefill_b/{batched_layer,stage_batched,batch_kernel}.rs, qwen3_ssm/trait_prefill_{phase1,
+phase3,gdn}.rs, qwen3_attention/prefill/paged.rs, kernels gated_delta_rule*.cu,
+spark-server scheduler/phase_continue_prefills/run_batched_prefill.rs. Full plan in this session.
+
+## (superseded by varlen plan above) STAGE 2: wire ragged_prefill into the batched prefill attention path
 (qwen3_attention/prefill/paged_attn_batched.rs — the slow paged path the dormant co-dispatch fell
 back to), build qo/kv_indptr from the co-dispatched requests' seq lens (prefill_b/ batched geometry +
 scheduler phase_continue_prefills/run_batched_prefill.rs), produce contiguous [rows,heads,256] Q/K/V
