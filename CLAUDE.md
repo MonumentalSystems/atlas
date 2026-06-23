@@ -76,6 +76,14 @@ vLLM-parity. **Real apples-to-apples baseline** (vLLM `pp2048` from
   batched path still uses the slow occupancy-limited `wy64` GDN (single-stream uses
   FLA). Keep varlen OFF; the win is (a) single-stream 80→90% via modest kernel
   tuning, and (b) make concurrent prefill actually scale (batched GDN→FLA + overlap).
+- Measured (Jun 23): varlen ON at c4 with EXACTLY-uniform prompts is still 2042
+  tok/s vs OFF 3756 — the batched forward is ~1.8× SLOWER than running the requests
+  serially. So it's NOT the `uniform`-check or wy64-vs-FLA alone: the co-dispatch
+  ARCHITECTURE is overhead-bound (per-token Z-copy D2D loops — ~350k calls/forward at
+  c4; per-request conv1d/GDN; single serial stream; alloc churn). Making batched
+  prefill beat serial is a real rework, not a config flip. OFF itself is flat (no
+  overlap — 4 requests run back-to-back). Tractable near-term: single-stream 80→90%
+  (the GEMMs); concurrency is higher-ceiling but needs the overhead rework first.
 
 ## Prefill bottleneck map (single-stream FLA path, the goal path)
 
