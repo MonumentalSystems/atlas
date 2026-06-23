@@ -77,10 +77,19 @@ vLLM-parity. **Real apples-to-apples baseline** (vLLM `pp2048` from
   per-token Z-copy ~350k/forward, per-request conv1d/GDN loops, single serial stream,
   alloc churn), and even then it may only MATCH serial unless cross-request kernel
   overlap is added. Highest-leverage but largest concurrency item.
-- TOOLING: nsys can't profile long traces here (128 decode steps overflow the buffer →
-  only the last ~2ms survives, consistently just predequant/quant kernels). Single
-  prefill forwards capture OK. Use ATLAS_PROFILE=1 (per-section) for prefill; decode
-  has no equivalent profiler — decode kernel-level analysis is currently blind.
+- TOOLING — SOLVED: nsys truncation (only last ~2ms survived) was the default
+  flush-on-exit overflowing on long traces. FIX: add **`--cuda-flush-interval=100`**
+  to the nsys cmd (see /tmp/holo_serve_nsys_flush.sh) → full capture, confirmed on a
+  batched c4 forward. For per-kernel metrics (achieved FLOP/s, tensor-core util, stall
+  reasons): `ncu` IS installed (`/usr/local/cuda/bin/ncu`); GPU counters are admin-
+  locked (`RmProfilingAdminOnly:1`) but we have passwordless sudo → `sudo ncu --set
+  full -k <kernel> --target-processes all <cmd>`.
+- BATCHED-PREFILL PROFILE (varlen c4, flush-interval): GPU = GDN `wy64` 45% +
+  MoE 23% + dequant/pack 13%; API = 237k cuStreamSynchronize + 151k cuMemAlloc +
+  151k HtoD + 85k DtoH (load + per-request churn). Batched path loses on BOTH fronts.
+  Batching lever: (1) GDN per-request `wy64` loop → batched FLA (grid
+  [num_chunks,nv,batch] fills GPU as batch grows — the M2 work), (2) collapse the
+  per-request sync/alloc/copy churn (one stream/one sync per layer, not per-request).
 
 - **Single-stream prefill is already ~80% of vLLM** — 90% is ~1.13×, NOT 2.3×.
   (Earlier "43%/2.3×" was a baseline ERROR: compared a 1403-tok single-stream run
