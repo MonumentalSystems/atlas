@@ -286,6 +286,11 @@ impl MoeLayer {
             bf16_shared_up: None,
             bf16_shared_down: None,
             fp8_shared_expert: None,
+            // FP4 gate_up tables (ATLAS_HOLO_MOE_GATEUP_FP4) — built post-
+            // construction by the loader when the flag is on; None => the FP8
+            // fused gate_up path runs unchanged.
+            fp4_gate_up: None,
+            moe_permute_tokens_k: super::super::try_kernel(gpu, "moe", "moe_permute_tokens"),
             // Phase 2.7 Tier C — set by loader after construction (qwen35.rs).
             is_dflash_capture_layer: false,
             correction_bias_dev: weights_correction_bias,

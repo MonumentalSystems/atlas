@@ -269,4 +269,155 @@ impl MoeLayer {
 
         Ok(())
     }
+
+    /// Build the per-expert NVFP4 gate_up tables for the FP4 prefill path
+    /// (`ATLAS_HOLO_MOE_GATEUP_FP4`). For each non-null expert, dequant the
+    /// stored NVFP4 `gate_proj`/`up_proj` (`[N=inter, K=h]`) to BF16, then
+    /// re-pack via `pack_bf16_weight_to_nvfp4_t` into the CUTLASS escape-hatch
+    /// layout (`[N,K/2]` packed + `[K/16,N]` E4M3 scale, scale2 = 1.0).
+    ///
+    /// Additive: only invoked when the env flag is on. Leaves all existing
+    /// weight tables untouched so the FP8 path stays bit-identical when off.
+    pub fn build_fp4_gate_up(
+        &mut self,
+        gpu: &dyn GpuBackend,
+        config: &atlas_core::config::ModelConfig,
+        stream: u64,
+    ) -> Result<()> {
+        let h = config.hidden_size; // K
+        let inter = config.moe_intermediate_size; // N (per gate/up proj)
+        let n = inter;
+        let k = h;
+        let packed_len = (k / 2) * n; // [K/2, N] bytes (== [N,K/2] elems packed)
+        let scale_len = (k / 16) * n; // [K/16, N] E4M3 bytes
+
+        let mut t = MoeFp4GateUp {
+            gate_packed_ptrs: Vec::new(),
+            gate_scale_ptrs: Vec::new(),
+            gate_scale2_vals: Vec::new(),
+            up_packed_ptrs: Vec::new(),
+            up_scale_ptrs: Vec::new(),
+            up_scale2_vals: Vec::new(),
+            _owned: Vec::new(),
+        };
+
+        // Pack one NVFP4 expert projection: dequant -> BF16 -> CUTLASS NVFP4.
+        // Returns (packed_ptr, scale_ptr); both are tracked in `_owned`.
+        let mut pack_one = |qw: &QuantizedWeight| -> Result<(u64, u64)> {
+            let bf16 = dequant_nvfp4_qw_to_bf16(gpu, qw, n, k)?;
+            let packed = gpu.alloc(packed_len)?;
+            let scale = gpu.alloc(scale_len)?;
+            spark_runtime::cutlass::pack_bf16_weight_to_nvfp4_t(
+                bf16.0,
+                packed.0,
+                scale.0,
+                n as u32,
+                k as u32,
+                stream,
+            )?;
+            gpu.synchronize(stream)?;
+            gpu.free(bf16)?; // BF16 staging buffer no longer needed
+            t._owned.push(packed);
+            t._owned.push(scale);
+            Ok((packed.0, scale.0))
+        };
+
+        for expert in &self.weights.experts {
+            if expert.gate_proj.is_null() {
+                // Remote/placeholder expert: zero pointers (escape-hatch skips
+                // experts with empty token ranges, so these are never read).
+                t.gate_packed_ptrs.push(0);
+                t.gate_scale_ptrs.push(0);
+                t.gate_scale2_vals.push(1.0);
+                t.up_packed_ptrs.push(0);
+                t.up_scale_ptrs.push(0);
+                t.up_scale2_vals.push(1.0);
+                continue;
+            }
+            let (gp, gs) = pack_one(&expert.gate_proj)?;
+            t.gate_packed_ptrs.push(gp);
+            t.gate_scale_ptrs.push(gs);
+            t.gate_scale2_vals.push(1.0);
+            let (up, us) = pack_one(&expert.up_proj)?;
+            t.up_packed_ptrs.push(up);
+            t.up_scale_ptrs.push(us);
+            t.up_scale2_vals.push(1.0);
+        }
+
+        tracing::info!(
+            "FP4 MoE gate_up: packed {} experts (N={n} K={k}) -> CUTLASS NVFP4 layout",
+            t.gate_packed_ptrs.len(),
+        );
+        self.fp4_gate_up = Some(t);
+        Ok(())
+    }
+}
+
+/// Host dequant of an NVFP4 `QuantizedWeight` (`[N,K/2]` packed + `[N,K/16]`
+/// E4M3 block scales + f32 `weight_scale_2`) to a fresh BF16 `[N,K]` GPU
+/// buffer. Mirrors `weight_map::dequant_nvfp4_to_bf16`'s modelopt math
+/// (`val = e2m1[nibble] * fp8_e4m3(group_scale) * weight_scale_2`) but reads
+/// from already-loaded device pointers rather than the weight store.
+fn dequant_nvfp4_qw_to_bf16(
+    gpu: &dyn GpuBackend,
+    qw: &QuantizedWeight,
+    n: usize,
+    k: usize,
+) -> Result<DevicePtr> {
+    let total = n * k;
+    let packed_bytes = total / 2;
+    let num_groups = total / 16;
+
+    let mut packed = vec![0u8; packed_bytes];
+    let mut scales = vec![0u8; num_groups];
+    gpu.copy_d2h(qw.weight, &mut packed)?;
+    gpu.copy_d2h(qw.weight_scale, &mut scales)?;
+    let global_scale = qw.weight_scale_2;
+
+    // E2M1 nibble -> float (sign|exp2|mant1).
+    const E2M1: [f32; 16] = [
+        0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+    ];
+
+    let mut bf16_out = vec![0u16; total];
+    for group in 0..num_groups {
+        let block_scale = e4m3_byte_to_f32(scales[group]);
+        let combined = block_scale * global_scale;
+        for elem in 0..16 {
+            let flat = group * 16 + elem;
+            let byte = packed[flat / 2];
+            let nibble = if flat % 2 == 0 { byte & 0x0F } else { (byte >> 4) & 0x0F };
+            bf16_out[flat] = f32_to_bf16_bits(E2M1[nibble as usize] * combined);
+        }
+    }
+
+    let buf = gpu.alloc(total * 2)?;
+    let bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(bf16_out.as_ptr() as *const u8, total * 2) };
+    gpu.copy_h2d(bytes, buf)?;
+    Ok(buf)
+}
+
+/// OCP FP8 E4M3 (1-4-3, bias 7) byte -> f32. NaN (0x7F/0xFF) -> 0.
+fn e4m3_byte_to_f32(byte: u8) -> f32 {
+    let sign = if byte & 0x80 != 0 { -1.0 } else { 1.0 };
+    let exp = ((byte >> 3) & 0x0F) as i32;
+    let mant = (byte & 0x07) as i32;
+    if exp == 0 {
+        sign * (mant as f32 / 8.0) * 2f32.powi(-6)
+    } else if exp == 0x0F && mant == 0x07 {
+        0.0
+    } else {
+        sign * (1.0 + mant as f32 / 8.0) * 2f32.powi(exp - 7)
+    }
+}
+
+/// f32 -> BF16 bits with round-to-nearest-even (matches weight_map::f32_to_bf16).
+fn f32_to_bf16_bits(f: f32) -> u16 {
+    let bits = f.to_bits();
+    if (bits & 0x7FFF_FFFF) > 0x7F80_0000 {
+        return ((bits >> 16) | 0x0040) as u16;
+    }
+    let rounding_bias = 0x7FFF + ((bits >> 16) & 1);
+    (bits.wrapping_add(rounding_bias) >> 16) as u16
 }

@@ -237,6 +237,15 @@ pub(super) fn load_layers(
         // capture-layer indices are already offset-adjusted in factory.rs
         // before being placed on `config.dflash_capture_layers`.
         moe_layer.is_dflash_capture_layer = config.dflash_capture_layers.contains(&i);
+        // FP4 MoE gate_up (ATLAS_HOLO_MOE_GATEUP_FP4): pack each expert's
+        // gate/up NVFP4 weight into the CUTLASS NVFP4 escape-hatch layout for
+        // the FP4 grouped gate_up prefill path. Built from the untransposed
+        // NVFP4 expert weights (present here before any transpose/free), so it
+        // is intended for ATLAS_HOLO_FAST_MOE_MODE=off (skip prefill copies).
+        // Default OFF => bit-identical to the FP8 fused path.
+        if holo_moe_gateup_fp4() {
+            moe_layer.build_fp4_gate_up(gpu, config, stream)?;
+        }
         // With native FP8, the FP8 fused MoE kernel handles both prefill and decode.
         // Skip transposition and predequant (saves ~30 GB + CPU time for 122B EP=2).
         // ATLAS_FORCE_NVFP4_MOE=1 inverts: do the prep so NVFP4 path is usable.
@@ -771,6 +780,19 @@ enum HoloFastMoeMode {
     GateUp,
     Full,
     Unified,
+}
+
+/// `ATLAS_HOLO_MOE_GATEUP_FP4=1` opts in to the FP4 (NVFP4 block-scaled)
+/// grouped gate_up prefill path. OnceLock-cached, default OFF => the existing
+/// FP8 fused gate_up kernel runs unchanged (bit-identical).
+fn holo_moe_gateup_fp4() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("ATLAS_HOLO_MOE_GATEUP_FP4")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    })
 }
 
 fn holo_fast_moe_mode() -> Option<HoloFastMoeMode> {

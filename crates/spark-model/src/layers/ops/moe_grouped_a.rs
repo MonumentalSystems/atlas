@@ -297,6 +297,71 @@ pub fn moe_w4a16_fused_gate_up_k64_n128(
         .launch(stream)
 }
 
+/// Gather token rows into expert-sorted order: `permuted[i] = hidden[sorted_token_ids[i]]`.
+/// `permuted` is `[total_expanded, hidden]`. One block per output row, threads
+/// stride over `hidden`. Used by the FP4 grouped gate_up path (the CUTLASS
+/// escape-hatch needs contiguous per-expert rows; the FP8 fused kernel gathers
+/// internally so it doesn't need this).
+#[allow(clippy::too_many_arguments)]
+pub fn moe_permute_tokens(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    hidden_states: DevicePtr,
+    permuted: DevicePtr,
+    sorted_token_ids: DevicePtr,
+    hidden: u32,
+    total_expanded: u32,
+    stream: u64,
+) -> Result<()> {
+    let threads = hidden.min(256).max(1);
+    KernelLaunch::new(gpu, kernel)
+        .grid([total_expanded, 1, 1])
+        .block([threads, 1, 1])
+        .arg_ptr(hidden_states)
+        .arg_ptr(permuted)
+        .arg_ptr(sorted_token_ids)
+        .arg_u32(hidden)
+        .arg_u32(total_expanded)
+        .launch(stream)
+}
+
+/// FP4 grouped fused gate+up GEMM (`ATLAS_HOLO_MOE_GATEUP_FP4`).
+///
+/// Dispatches the proven Sm120 NVFP4 block-scaled collective once per active
+/// expert over its token slice (escape-hatch), writing `c_gate`/`c_up`
+/// `[M_total, N]` to match the FP8 fused kernel's output layout. `a` is the
+/// sorted/expert-contiguous `expert_input` (`[M_total, K]`); `expert_offsets`
+/// is the HOST copy of the device offsets. Per-expert weight tables come from
+/// the load-time [`moe::MoeFp4GateUp`] (CUTLASS `[N,K/2]` packed + `[K/16,N]`
+/// scale, scale2 = 1.0).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn moe_nvfp4_fused_gate_up_grouped(
+    fp4: &moe::MoeFp4GateUp,
+    a: DevicePtr,
+    c_gate: DevicePtr,
+    c_up: DevicePtr,
+    expert_offsets_host: &[i32],
+    n: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
+    spark_runtime::cutlass::nvfp4_grouped_gate_up(
+        a.0,
+        &fp4.gate_packed_ptrs,
+        &fp4.gate_scale_ptrs,
+        &fp4.gate_scale2_vals,
+        &fp4.up_packed_ptrs,
+        &fp4.up_scale_ptrs,
+        &fp4.up_scale2_vals,
+        c_gate.0,
+        c_up.0,
+        expert_offsets_host,
+        n,
+        k,
+        stream,
+    )
+}
+
 /// K64 fused gate+up GEMM — M=128 variant (Block D #3 — Avarok pattern).
 ///
 /// Doubles M_TILE from 64 → 128. Caller must compute `max_m_tiles_m128`

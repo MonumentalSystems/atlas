@@ -29,6 +29,28 @@ pub(crate) struct ExpertPtrTable {
     pub(crate) scale2_vals: DevicePtr,
 }
 
+/// Host-side per-expert NVFP4 weight tables for the FP4 gate_up prefill path
+/// (`ATLAS_HOLO_MOE_GATEUP_FP4`). Mirrors the CUTLASS escape-hatch
+/// `spark_runtime::cutlass::nvfp4_grouped_gate_up` contract: HOST arrays of
+/// per-expert device pointers in the `pack_bf16_weight_to_nvfp4_t` layout
+/// (`[N,K/2]` packed + `[K/16,N]` scale) plus host scale2 vals. Built at load
+/// time when the flag is on; `None` (and thus the field absent) keeps the
+/// existing FP8 fused gate_up path bit-identical.
+pub(crate) struct MoeFp4GateUp {
+    /// `[num_experts]` device pointers to each gate expert's packed `[N,K/2]`.
+    pub(crate) gate_packed_ptrs: Vec<u64>,
+    /// `[num_experts]` device pointers to each gate expert's scale `[K/16,N]`.
+    pub(crate) gate_scale_ptrs: Vec<u64>,
+    /// `[num_experts]` gate scale2 (always 1.0 — folded into the pack).
+    pub(crate) gate_scale2_vals: Vec<f32>,
+    pub(crate) up_packed_ptrs: Vec<u64>,
+    pub(crate) up_scale_ptrs: Vec<u64>,
+    pub(crate) up_scale2_vals: Vec<f32>,
+    /// Owning device allocations (packed + scale, gate then up) so they are
+    /// freed with the layer. Pointers above alias into these.
+    pub(crate) _owned: Vec<DevicePtr>,
+}
+
 /// Device-side pointer table for FP8 expert dispatch (one projection).
 ///
 /// FP8 experts use 2 pointer arrays (weight + block_scale) instead of
@@ -280,6 +302,16 @@ pub struct MoeLayer {
     bf16_shared_down: Option<DevicePtr>,
     // FP8 shared expert weights (None when shared expert is NVFP4)
     fp8_shared_expert: Option<Fp8ExpertWeight>,
+    /// FP4 gate_up prefill tables (`ATLAS_HOLO_MOE_GATEUP_FP4`). `None` =>
+    /// the existing FP8 fused gate_up path runs unchanged (default).
+    /// Populated at load by `build_fp4_gate_up` when the flag is on.
+    pub(crate) fp4_gate_up: Option<MoeFp4GateUp>,
+    /// `moe_permute_tokens` gather kernel — only needed by the FP4 escape-hatch
+    /// (which consumes expert-sorted contiguous rows, unlike the FP8 fused
+    /// kernel that gathers via `sorted_token_ids` internally). `try_kernel`
+    /// (handle may be 0 on images lacking it); never dispatched unless the FP4
+    /// path is active.
+    pub(crate) moe_permute_tokens_k: KernelHandle,
     // Phase 2.7 Tier C — Frankenstein dispatch flag.
     // True when this layer's index is in `config.dflash_capture_layers`.
     // When the env var `ATLAS_FRANKENSTEIN_DECODE_VIA_PREFILL=1` is set,
