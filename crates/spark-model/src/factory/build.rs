@@ -359,20 +359,45 @@ pub fn build_model(
     if max_concurrent < max_batch_size {
         // Suggest a max_seq_len that lets the requested batch size fit.
         let suggested_max_seq_len = (num_kv_blocks / max_batch_size.max(1)) * kv_block_size;
-        anyhow::bail!(
-            "KV cache can hold at most {} concurrent sequence(s) at --max-seq-len={}, \
-             but --max-batch-size={} was requested. \
-             KV pool has {} block(s) of {} tokens each; each sequence needs {} block(s). \
-             Try --max-seq-len {} (keeps max_batch_size={}) or reduce --max-batch-size.",
-            max_concurrent,
-            max_seq_len,
-            max_batch_size,
-            num_kv_blocks,
-            kv_block_size,
-            blocks_per_seq,
-            suggested_max_seq_len.max(kv_block_size),
-            max_batch_size,
-        );
+        // The check is WORST-CASE: it assumes every concurrent sequence reaches
+        // --max-seq-len. With paged KV (blocks allocated on demand) that almost
+        // never holds for real agent traffic (mixed/shorter sequences), so a high
+        // --max-seq-len (e.g. 64K for long agent contexts) needlessly caps
+        // --max-batch-size. ATLAS_KV_OVERCOMMIT=1 downgrades the hard error to a
+        // warning: the scheduler admits up to max_batch_size and the pool fills on
+        // demand (a genuinely over-long burst gets back-pressured by the block
+        // allocator, not a boot-time refusal).
+        let overcommit =
+            matches!(std::env::var("ATLAS_KV_OVERCOMMIT").as_deref(), Ok("1") | Ok("true"));
+        if overcommit {
+            tracing::warn!(
+                "KV OVERCOMMIT: pool fits {} seq(s) at full --max-seq-len={} but \
+                 --max-batch-size={} requested ({} block(s)/seq, {} block(s) total). \
+                 Paged KV allocates on demand; long-context bursts are back-pressured \
+                 at the block allocator, not refused at boot.",
+                max_concurrent,
+                max_seq_len,
+                max_batch_size,
+                blocks_per_seq,
+                num_kv_blocks,
+            );
+        } else {
+            anyhow::bail!(
+                "KV cache can hold at most {} concurrent sequence(s) at --max-seq-len={}, \
+                 but --max-batch-size={} was requested. \
+                 KV pool has {} block(s) of {} tokens each; each sequence needs {} block(s). \
+                 Try --max-seq-len {} (keeps max_batch_size={}), reduce --max-batch-size, \
+                 or set ATLAS_KV_OVERCOMMIT=1 to allow on-demand paged allocation.",
+                max_concurrent,
+                max_seq_len,
+                max_batch_size,
+                num_kv_blocks,
+                kv_block_size,
+                blocks_per_seq,
+                suggested_max_seq_len.max(kv_block_size),
+                max_batch_size,
+            );
+        }
     }
     let kv_cache = PagedKvCache::new(kv_config, num_kv_blocks, gpu.as_ref())?;
 
