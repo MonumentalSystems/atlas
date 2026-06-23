@@ -46,6 +46,8 @@ pub struct VisionEncoder {
     pub merger: MergerLayer,           // final merger (after block 27)
     // kernel handles
     k_gemm: KernelHandle,  // vision_gemm_bias: C[M,N] = A[M,K]@B[N,K]^T + bias
+    k_gemm_pipelined: KernelHandle, // dense_gemm_bf16_pipelined (tensor-core, ~40×; no bias)
+    k_add_bias: KernelHandle,       // vision_add_bias: C += bias[n] (fuses bias for the TC path)
     k_norm: KernelHandle,  // vision_layer_norm (biased, in-place)
     k_add: KernelHandle,   // vision_add_inplace
     k_gelu: KernelHandle,  // vision_gelu (in-place)

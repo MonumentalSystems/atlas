@@ -80,6 +80,11 @@ impl VisionEncoder {
             deepstack_indexes,
             merger,
             k_gemm: gpu.kernel("vision_encoder", "vision_gemm_bias")?,
+            // Tensor-core pipelined matmul (~40× the scalar vision_gemm_bias on
+            // the ViT's large-M GEMMs) + a row-broadcast bias add. Both gated to
+            // 0 → fall back to vision_gemm_bias. The ViT GEMMs dominate image prefill.
+            k_gemm_pipelined: crate::layers::try_kernel(gpu, "gemm", "dense_gemm_bf16_pipelined"),
+            k_add_bias: crate::layers::try_kernel(gpu, "vision_encoder", "vision_add_bias"),
             k_norm: gpu.kernel("vision_encoder", "vision_layer_norm")?,
             k_add: gpu.kernel("vision_encoder", "vision_add_inplace")?,
             k_gelu: gpu.kernel("vision_encoder", "vision_gelu")?,
