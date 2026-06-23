@@ -52,6 +52,33 @@ Decode scales 55→149 across c1→c16 on the production config, so the per-seq
 small-batch decode-kernel project is lower urgency than the tg128 c2 view implies
 — a deliberate future investment, not a production blocker.
 
+### Batch-decode lever VALIDATED 2026-06-23: vertical fusion (not floored)
+
+The decode GPU is ~93% idle = bound by the DEPTH of the per-step dependent-kernel
+critical path, not bandwidth/occupancy. Proof: A/B of the existing
+`ATLAS_GDN_FUSED_NORM` (fuses gdn-recurrence + gated_rms_norm, 2 critical-path
+kernels → 1) on isolated copies-off decode: `=1` → c1 66 / c2 76 / **c4 116** vs
+`=0` → c1 66 / c2 72 / **c4 95.6** = **+18% c4, +5% c2**, growing with concurrency.
+So fusing MORE of the per-seq SSM recurrent chain compounds the win. (The earlier
+"strided-batched-GDN no-op" batched ACROSS seqs — already graph-overlapped, so it
+couldn't shorten the per-seq critical path. Vertical ≠ horizontal.)
+
+NEXT fusion target + hazards (scoped, not yet built):
+- The per-seq SSM chain is `ba_gates → conv1d_l2norm → gdn → norm` (serial on one
+  stream; gdn+norm already fused). `ba_gates` and `conv` are INDEPENDENT (disjoint
+  outputs) — only conv→gdn and ba_gates→gdn are true deps.
+- **conv→gdn fusion is BLOCKED by a race:** the per-(v_head,batch) gdn block would
+  conv its q/k channels, but q/k are shared across `head_repeat` v-heads
+  (`causal_conv1d.cu:435` shift+append+writeback per channel) → concurrent v-head
+  blocks race on the shared q/k conv_state, and cross-block ordering isn't
+  guaranteed in one launch. Workable only if q/k conv_state writeback is isolated
+  to one v-head per k-head (careful) or q/k stays a separate kernel.
+- **Cleaner lever: overlap `ba_gates ∥ conv`** (independent) via a side stream with
+  a join event before gdn → critical path 3→2 stages. Cost: multi-stream inside the
+  captured decode graph (fiddly but no kernel rewrite / no race).
+- Validate ANY change vs needle + cold==warm tool calls + SSM state checksum
+  (`ATLAS_SSM_SAVE_DUMP`); SSM-state corruption is silent.
+
 ## Diagnosis
 
 - **C=4 aggregate ≈ C=1 (decode doesn't batch).** Three serializations:
