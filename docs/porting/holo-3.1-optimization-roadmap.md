@@ -4,6 +4,36 @@ Date: 2026-06-19. Source: multi-agent investigation (workflow wf_681a86d7-f37) +
 captured baseline (`scripts/bench_holo_atlas.py`). Measuring stick: vLLM
 `results.csv` (tg128 c1=75.4, c2=118.2, c5=151.2, c10=196.0; pp2048 c1=4540).
 
+## UPDATE 2026-06-23 — verified production config (full MoE + prefix caching)
+
+Two shipped wins; both verified live on `holo_serve.sh`:
+
+1. **Prefill recovered: `FAST_MOE_MODE=full` → pp2048 3.9K tok/s (85% of vLLM),
+   TTFT 0.7s** (was 1844 / 1.5s with `FAST_MOE_MODE=off`). `off` had silently
+   HALVED prefill (skips the transposed `_t` experts → slow non-fused grouped
+   GEMM). The ~30 GB transpose copies are affordable again because KV was
+   right-sized 1.37M→~500K tokens. **The zero-copy fused-MoE kernel is therefore
+   DEFERRED** — not needed for current production prefill; only matters for the
+   64K×16 future where KV must be huge.
+2. **Prefix caching works: warm-hit TTFT 1.9×.** Root cause of the prior
+   zero-speedup: the prefill chunk landed at 257 blocks, missing the 256-block
+   checkpoint boundary, so no Marconi intermediate checkpoint was ever saved.
+   `holo_serve.sh` now auto-aligns the chunk. NOTE: under full-MoE the warm hit
+   is semantically correct but NOT bit-identical (grouped-GEMM expert tiling
+   depends on chunk offset; the post-checkpoint recompute window differs from
+   cold) — acceptable, same class as vLLM prefix-cache non-determinism.
+
+**Verified production config** (full MoE + prefix cache, ~105/121 GB w/ ~26 GB
+co-tenants): pp2048 c1–c4 **3.8–4.0K** (85%), tg128 c1 **73** (96%), c2 80, c4 114.
+Recipe: `ATLAS_HOLO_FAST_MOE_MODE=full FAST_MOE_LAYERS=0-39 PREFIX_CACHING=true
+SSM_CACHE_SLOTS=32 SSM_CHECKPOINT_INTERVAL=256 KV_EXTERNAL_RESERVE_GB=26
+GPU_UTIL=0.66 MAX_SEQS=16`. Co-tenant headroom is tight vs a 37 GB spike — drop
+to `gate_up` or shrink the 8 GB decode-rollback ring if needed.
+
+**Remaining frontier:** batch decode c2/c4 (65–80% of vLLM) — per the analysis
+below, only vertical kernel fusion (megakernel) remains; horizontal batching and
+per-kernel swaps are proven no-ops.
+
 ## Diagnosis
 
 - **C=4 aggregate ≈ C=1 (decode doesn't batch).** Three serializations:
