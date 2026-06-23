@@ -111,8 +111,15 @@ FlexGEMM (the 3D-viewport pipeline) + sparkview use ~36GB baseline. vLLM runs Ho
   even though Atlas uses ~42GB. vLLM's util is self-relative. To hit vLLM's 0.34, the
   KV-budget check should size against Atlas's own footprint / free memory, not total.
   Also the inference reserve is 10GB at max-batch=16 (5.6GB at 8) — a tunable chunk.
-- Working low-mem config: `ATLAS_HOLO_FAST_MOE_MODE=off ATLAS_KV_OVERCOMMIT=1
-  ATLAS_HOLO_GPU_UTIL=0.7 ATLAS_HOLO_MAX_SEQ_LEN=200000 ATLAS_HOLO_MAX_SEQS=16`.
+- **2nd issue FIXED: `ATLAS_KV_EXTERNAL_RESERVE_GB=<co-tenant GB>`** (factory/build.rs)
+  discounts external/co-tenant memory from the KV budget → util becomes self-relative
+  (vLLM-style). Co-tenant GB ≈ total − pre-load-free (preflight log; ~37 on this box).
+- **VERIFIED <67GB config** (fits alongside ComfyUI/voxel, beats vLLM's KV):
+  `ATLAS_HOLO_FAST_MOE_MODE=off ATLAS_KV_OVERCOMMIT=1 ATLAS_KV_EXTERNAL_RESERVE_GB=37
+  ATLAS_HOLO_GPU_UTIL=0.55 ATLAS_HOLO_MAX_SEQ_LEN=200000 ATLAS_HOLO_MAX_SEQS=16
+  ATLAS_HOLO_MAX_BATCH=16`. → 66.9GB budget, Atlas-own 30.9GB, 26GB KV = **1.37M
+  tokens** (vs vLLM ~300K), 200K ctx + 16 seqs, correct, serving. (inference reserve
+  is 10GB at max-batch=16 — lower max-batch to shrink it further if needed.)
 
 ## North star
 
