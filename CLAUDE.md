@@ -54,6 +54,22 @@ working binary with a qwen3-next-target / no-CUTLASS build. Always use the block
   `max_tokens=160` (realistic gen; 8 was too short).
 - **Do not re-run vLLM** (user directive). Baselines: `/home/ms/spark-vllm-docker/results.csv`.
 
+## REAL-workload perf (image + fact-extraction — the bench that matters)
+
+The synthetic pp2048 text bench HID the real bottleneck. On realistic traffic
+(image input + 4.5K→1K fact-extraction, /tmp/real_bench.py):
+- **The vision ViT dominated image requests** (~5s/image ViT-encode vs ~0.1s for the
+  290 LLM tokens). Root: `vision_gemm_bias` was a naive scalar GEMM. FIXED →
+  tensor-core (`dense_gemm_bf16_pipelined` + `vision_add_bias`), helper
+  `VisionEncoder::vit_gemm_bias` (all 27 blocks + merger + patch_embed). Verified
+  correct (Saturn → "a planet with rings, resembling Saturn").
+- **Image prefill c1: 5.0s → 0.69s (7.2×). Real mixed c4: ttft 9.96→3.52s, prefill
+  808→2284 tok/s (2.8×).** This was FAR more impactful than any LLM-prefill batching
+  lever — for image-heavy traffic the ViT is #1. Always bench real shapes.
+- Next real-workload levers: vision_attention_rope (the ViT attention, still custom);
+  decode of long (1K) fact-extraction outputs; vLLM real-shape baseline (only had
+  synthetic pp2048).
+
 ## North star
 
 vLLM-parity. **Real apples-to-apples baseline** (vLLM `pp2048` from
