@@ -234,16 +234,14 @@ impl TransformerModel {
         }
 
         // ── Phase 3: per-stream gated-RMS-norm + out-proj + MoE ──
-        for (b, seq) in seqs.iter_mut().enumerate() {
-            let off = meta.cu_seqlens_host[b] as usize;
-            let len = (meta.cu_seqlens_host[b + 1] - meta.cu_seqlens_host[b]) as usize;
-            let h_b = hidden_stacked.offset(off * h * dtype_bytes);
-            let r_b = residual_stacked.offset(off * h * dtype_bytes);
-            layer.prefill_phase3(h_b, r_b, len, gdn_bufs, off, ctx, stream)?;
-            // Suppress unused-binding warnings — seq could be queried for
-            // future per-stream metadata in phase3 but currently isn't.
-            let _ = seq;
-        }
+        // M1: Phase 3 (gated-RMS-norm, out_proj GEMM, post-norm, MoE, residuals)
+        // is fully token-parallel — no per-request state. Run it ONCE over all
+        // stacked tokens so out_proj + MoE read their weights once for the whole
+        // batch instead of once per request (the prefill-scaling win). The
+        // stacked hidden/residual/gdn buffers are packed contiguously, so
+        // token_offset=0 over total_tokens covers every request's slice.
+        let total = meta.total_tokens as usize;
+        layer.prefill_phase3(hidden_stacked, residual_stacked, total, gdn_bufs, 0, ctx, stream)?;
 
         // meta is consumed for chunk_len/batch_size above.
         let _ = meta;
