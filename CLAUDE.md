@@ -70,6 +70,37 @@ The synthetic pp2048 text bench HID the real bottleneck. On realistic traffic
   decode of long (1K) fact-extraction outputs; vLLM real-shape baseline (only had
   synthetic pp2048).
 
+## Memory (fit alongside co-tenants; the GB10 is SHARED)
+
+The GB10 (121.6GB unified) is shared — ComfyUI (sage-attn/fp8 image-gen) + o_voxel/
+FlexGEMM (the 3D-viewport pipeline) + sparkview use ~36GB baseline. vLLM runs Holo at
+`--gpu-memory-utilization 0.34` (~41GB) with 200K context + 16 seqs. Atlas was using
+~56GB — the excess blocked large-context/concurrency testing.
+
+- **ROOT CAUSE: MoE "Full prefill copies" (~30GB).** `transpose_for_prefill` +
+  `predequant_for_prefill` (helpers_a.rs) keep resident transposed/predequant expert
+  copies for fast prefill (`moe_w4a16_fused_gate_up_t_k64`). Gated by
+  `FAST_MOE_MODE=full` + `FAST_MOE_LAYERS=0-39`. (Attention already skips its prefill
+  transposes via the CUTLASS-NVFP4 work; MoE didn't.)
+- **FIX (works): `ATLAS_HOLO_FAST_MOE_MODE=off`** (any non-{gate_up,full,unified}
+  value → `holo_fast_moe_mode()` None → `skip_moe_prefill_copies=true`). Saves ~30GB;
+  prefill falls to the non-transposed `moe_w4a16_grouped_gemm_ptrtable` path
+  (`forward_prefill_routed.rs:168`). VERIFIED correct (image still right). Atlas
+  footprint ~42GB. NOTE the serve script's `${VAR:-full}` turns EMPTY into full —
+  pass the literal `off`, not "".
+- **TRADEOFF: prefill ~1.5× slower** (c1 1704 vs 2662 tok/s) — non-transposed MoE GEMM.
+  The real follow-up: make the non-transposed prefill fast (tune the kernel or
+  on-the-fly transpose) so memory-efficient ≠ slow.
+- **`ATLAS_KV_OVERCOMMIT=1`** → 200K max-seq-len + 16 seqs admits on-demand (276K-token
+  pool ≈ vLLM's 300K) instead of the worst-case refusal.
+- **2nd issue — budget formula counts co-tenant memory.** factory/build.rs checks
+  `total_consumed + reserve ≤ util×total_GPU`; with 36GB co-tenants it needs util≥0.65
+  even though Atlas uses ~42GB. vLLM's util is self-relative. To hit vLLM's 0.34, the
+  KV-budget check should size against Atlas's own footprint / free memory, not total.
+  Also the inference reserve is 10GB at max-batch=16 (5.6GB at 8) — a tunable chunk.
+- Working low-mem config: `ATLAS_HOLO_FAST_MOE_MODE=off ATLAS_KV_OVERCOMMIT=1
+  ATLAS_HOLO_GPU_UTIL=0.7 ATLAS_HOLO_MAX_SEQ_LEN=200000 ATLAS_HOLO_MAX_SEQS=16`.
+
 ## North star
 
 vLLM-parity. **Real apples-to-apples baseline** (vLLM `pp2048` from
