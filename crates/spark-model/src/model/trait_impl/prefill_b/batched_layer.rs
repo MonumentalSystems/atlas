@@ -139,7 +139,6 @@ impl TransformerModel {
         let n = seqs.len();
         debug_assert_eq!(n as u32, meta.batch_size);
         debug_assert_eq!(n, seqs_proc_start.len());
-        let chunk_len = meta.chunk_len as usize;
         let h = ctx.config.hidden_size;
         let dtype_bytes = 2usize;
 
@@ -148,8 +147,11 @@ impl TransformerModel {
         // The `_kv_write_start` arg is ignored by SSM layers (recurrent
         // state requires all tokens, no skip), so we pass 0.
         for (b, seq) in seqs.iter_mut().enumerate() {
-            let h_b = hidden_stacked.offset(b * chunk_len * h * dtype_bytes);
-            let r_b = residual_stacked.offset(b * chunk_len * h * dtype_bytes);
+            // VARLEN packed offsets from cu_seqlens (== b*chunk_len when uniform).
+            let off = meta.cu_seqlens_host[b] as usize;
+            let len = (meta.cu_seqlens_host[b + 1] - meta.cu_seqlens_host[b]) as usize;
+            let h_b = hidden_stacked.offset(off * h * dtype_bytes);
+            let r_b = residual_stacked.offset(off * h * dtype_bytes);
             // Split borrow so we can pass multiple &mut fields of the same seq.
             let (block_table, disk_block_ids, disk_last, layer_state) = {
                 let SequenceState {
@@ -169,7 +171,7 @@ impl TransformerModel {
             layer.prefill_phase1(
                 h_b,
                 r_b,
-                chunk_len,
+                len,
                 layer_state,
                 kv_cache,
                 seqs_proc_start[b],
@@ -178,7 +180,7 @@ impl TransformerModel {
                 disk_last,
                 0,
                 gdn_bufs,
-                b * chunk_len,
+                off,
                 ctx,
                 stream,
             )?;
@@ -188,23 +190,56 @@ impl TransformerModel {
         // Stage h_state_ptrs[N] device array at the dedicated scratch offset
         // (caller computes this offset to avoid colliding with the
         // BatchedAttnMetadata staging at scratch[0..]).
-        let h_state_ptrs_dev =
-            self.stage_h_state_ptrs(layer_idx, seqs, h_state_ptrs_scratch_offset, stream)?;
-
-        layer.prefill_gdn_full_batched(
-            h_state_ptrs_dev,
-            gdn_bufs,
-            meta.batch_size,
-            meta.chunk_len,
-            ctx,
-            stream,
-        )?;
+        // Uniform lengths → the fast batched GDN kernel (legacy). VARLEN
+        // (differing lengths) → a per-request loop over the single-stream GDN,
+        // each over its cu_seqlens slice with its own h_state. (M2 will replace
+        // this loop with a cu_seqlens-aware batched kernel.)
+        let cu = &meta.cu_seqlens_host;
+        let n_streams = seqs.len();
+        let uniform = (1..=n_streams).all(|b| (cu[b] - cu[b - 1]) == (cu[1] - cu[0]));
+        if uniform {
+            let h_state_ptrs_dev =
+                self.stage_h_state_ptrs(layer_idx, seqs, h_state_ptrs_scratch_offset, stream)?;
+            layer.prefill_gdn_full_batched(
+                h_state_ptrs_dev,
+                gdn_bufs,
+                meta.batch_size,
+                meta.chunk_len,
+                ctx,
+                stream,
+            )?;
+        } else {
+            let nk = ctx.config.linear_num_key_heads;
+            let kd = ctx.config.linear_key_head_dim;
+            let nv = ctx.config.linear_num_value_heads;
+            let vd = ctx.config.linear_value_head_dim;
+            let key_dim = nk * kd;
+            let value_dim = nv * vd;
+            let conv_dim = key_dim * 2 + value_dim;
+            let bf16 = 2usize;
+            let fp32 = 4usize;
+            for (b, seq) in seqs.iter_mut().enumerate() {
+                let off = cu[b] as usize;
+                let len = (cu[b + 1] - cu[b]) as usize;
+                let gb = GdnPrefillBuffers {
+                    qkv: gdn_bufs.qkv.offset(off * conv_dim * bf16),
+                    gate_beta: gdn_bufs.gate_beta.offset(off * (nv * 2) * fp32),
+                    output: gdn_bufs.output.offset(off * value_dim * bf16),
+                    z: gdn_bufs.z.offset(off * value_dim * bf16),
+                    total_len: len,
+                };
+                let st = seq.layer_states[layer_idx].as_mut();
+                layer.prefill_gdn_full(st, &gb, ctx, stream)?;
+            }
+        }
 
         // ── Phase 3: per-stream gated-RMS-norm + out-proj + MoE ──
         for (b, seq) in seqs.iter_mut().enumerate() {
-            let h_b = hidden_stacked.offset(b * chunk_len * h * dtype_bytes);
-            let r_b = residual_stacked.offset(b * chunk_len * h * dtype_bytes);
-            layer.prefill_phase3(h_b, r_b, chunk_len, gdn_bufs, b * chunk_len, ctx, stream)?;
+            let off = meta.cu_seqlens_host[b] as usize;
+            let len = (meta.cu_seqlens_host[b + 1] - meta.cu_seqlens_host[b]) as usize;
+            let h_b = hidden_stacked.offset(off * h * dtype_bytes);
+            let r_b = residual_stacked.offset(off * h * dtype_bytes);
+            layer.prefill_phase3(h_b, r_b, len, gdn_bufs, off, ctx, stream)?;
             // Suppress unused-binding warnings — seq could be queried for
             // future per-stream metadata in phase3 but currently isn't.
             let _ = seq;

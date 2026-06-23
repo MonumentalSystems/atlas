@@ -176,6 +176,22 @@ impl TransformerModel {
         let is_last_chunk = streams[0].is_last_chunk;
         let h = self.config.hidden_size;
         let dtype_bytes = 2usize;
+        let varlen = varlen_prefill_enabled();
+        // Packed per-stream token offsets (prefix-sum of per-stream chunk_len).
+        // For the legacy same-length path this is exactly `b*chunk_len`; for
+        // VARLEN it packs tightly so the stacked buffers have no padding. Used
+        // for embed / per-stream slice offsets / finalize.
+        let cu_off: Vec<usize> = {
+            let mut v = Vec::with_capacity(n + 1);
+            let mut acc = 0usize;
+            v.push(0);
+            for s in streams.iter() {
+                acc += s.chunk_len;
+                v.push(acc);
+            }
+            v
+        };
+        let total_tokens = cu_off[n];
 
         // EP active → NCCL needs the default stream.
         let stream = if self.comm.is_some() && self.config.ep_world_size > 1 {
@@ -235,12 +251,15 @@ impl TransformerModel {
         for (b, slice) in streams.iter_mut().enumerate() {
             let tokens = slice.prompt_tokens;
             let chunk_start = slice.chunk_start;
+            // Per-stream chunk_len (VARLEN: differs per stream; legacy: == chunk_len).
+            let cl = slice.chunk_len;
             let total = tokens.len();
             let seq = &mut *slice.seq;
 
-            // Embed at b*chunk_len*H offset into shared hidden buffer.
-            let hidden_b = hidden_base.offset(b * chunk_len * h * dtype_bytes);
-            self.prefill_b_embed_chunk_at(tokens, chunk_start, chunk_len, hidden_b, stream)?;
+            // Embed at the packed cu_off[b] offset into shared hidden buffer
+            // (== b*chunk_len for the uniform legacy path).
+            let hidden_b = hidden_base.offset(cu_off[b] * h * dtype_bytes);
+            self.prefill_b_embed_chunk_at(tokens, chunk_start, cl, hidden_b, stream)?;
 
             // Prefix-cache lookup, EP-sync, Marconi restore.
             let (kv_write_start, marconi_skip) = self.prefill_b_prefix_lookup(
@@ -254,7 +273,7 @@ impl TransformerModel {
 
             // Block allocation through end of chunk.
             let bs = kv_cache.block_size();
-            let end_pos = chunk_start + chunk_len;
+            let end_pos = chunk_start + cl;
             let blocks_needed = (end_pos - 1) / bs + 1;
             super::super::super::block_mgmt::ensure_blocks_through_prefill(
                 seq,
@@ -271,7 +290,7 @@ impl TransformerModel {
                     tokens,
                     seq,
                     chunk_start,
-                    chunk_len,
+                    cl,
                     is_last_chunk,
                     kv_write_start,
                     marconi_skip,
@@ -292,7 +311,9 @@ impl TransformerModel {
             // and effective_seq_len_start (q_offset) for the batched
             // attention kernel.
             if b > 0 {
-                if per_stream[0].proc_count != proc_count {
+                // VARLEN allows differing proc_count (cu_seqlens geometry); the
+                // legacy batched-attention/GDN kernels require uniform proc_count.
+                if !varlen && per_stream[0].proc_count != proc_count {
                     anyhow::bail!(
                         "kernel-batched: stream {b} proc_count={} differs from \
                          stream 0 proc_count={}. Caller should fall back.",
@@ -316,7 +337,7 @@ impl TransformerModel {
                 tokens,
                 seq,
                 chunk_start,
-                chunk_len,
+                cl,
                 proc_start,
                 proc_count,
                 effective_seq_len_start,
@@ -433,7 +454,8 @@ impl TransformerModel {
             gate_beta: self.gdn_buf_gate_beta,
             output: self.gdn_buf_out,
             z: self.gdn_buf_z,
-            total_len: proc_count * n,
+            // VARLEN: packed total (Σ per-stream). Legacy uniform: proc_count*n.
+            total_len: if varlen { total_tokens } else { proc_count * n },
         };
 
         // ForwardContext for batched layer calls. attn_metadata is
@@ -500,13 +522,14 @@ impl TransformerModel {
         for (b, slice) in streams.iter_mut().enumerate() {
             let tokens = slice.prompt_tokens;
             let chunk_start = slice.chunk_start;
+            let cl = slice.chunk_len;
             let seq = &mut *slice.seq;
             let m = &per_stream[b];
 
             // Phase 5: sequence-state update.
             seq.tokens
-                .extend_from_slice(&tokens[chunk_start..chunk_start + chunk_len]);
-            seq.seq_len = chunk_start + chunk_len;
+                .extend_from_slice(&tokens[chunk_start..chunk_start + cl]);
+            seq.seq_len = chunk_start + cl;
 
             let logits = if is_last_chunk {
                 self.prefill_b_finalize_last_at(
@@ -514,9 +537,9 @@ impl TransformerModel {
                     seq,
                     &mut kv_cache,
                     chunk_start,
-                    chunk_len,
+                    cl,
                     m.proc_count,
-                    b * chunk_len,
+                    cu_off[b],
                     stream,
                 )?
             } else {
@@ -525,7 +548,7 @@ impl TransformerModel {
                     seq,
                     &mut kv_cache,
                     chunk_start,
-                    chunk_len,
+                    cl,
                     stream,
                 )?;
                 DevicePtr::NULL
