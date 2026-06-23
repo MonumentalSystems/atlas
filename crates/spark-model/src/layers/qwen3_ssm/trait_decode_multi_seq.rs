@@ -376,18 +376,23 @@ impl Qwen3SsmLayer {
         // faster than the base w8a16_gemm, which nsys showed as 44.6% of the
         // C>1 decode step. `.0 == 0` → fall back to the base kernel.
         let w8a16_pipe = self.w8a16_gemm_pipelined_k.0 != 0;
-        // n<=4 weight-streaming block-scaled GEMV: avoids the pipelined kernel's
-        // M=4->128 MMA pad (32× compute over-provision, issue-bound). Weight
-        // streamed once into 4 FP32 accumulators; bit-identical per row to
-        // w8a16_gemv. Disable with ATLAS_SSM_GEMV_BATCH4=0.
-        let use_batch4 = self.w8a16_gemv_batch4_k.0 != 0
-            && n <= 4
+        // Weight-streaming block-scaled GEMV for batched decode: avoids the
+        // pipelined kernel's M->128 MMA pad (issue-bound). batch4 (M<=4) for the
+        // common path, batch16 (M<=16) for high-concurrency C=8/16. Bit-identical
+        // per row to w8a16_gemv. Disable with ATLAS_SSM_GEMV_BATCH4=0.
+        let gemv_batch_k = if n <= 4 {
+            self.w8a16_gemv_batch4_k
+        } else {
+            self.w8a16_gemv_batch16_k
+        };
+        let use_batch4 = gemv_batch_k.0 != 0
+            && n <= 16
             && std::env::var("ATLAS_SSM_GEMV_BATCH4").ok().as_deref() != Some("0");
         if let Some(ref fp8) = self.qkvz_fp8w {
             if use_batch4 {
                 ops::w8a16_gemv_batch4(
                     ctx.gpu,
-                    self.w8a16_gemv_batch4_k,
+                    gemv_batch_k,
                     normed_base,
                     fp8.weight,
                     fp8.row_scale,
@@ -759,7 +764,7 @@ impl Qwen3SsmLayer {
             if use_batch4 {
                 ops::w8a16_gemv_batch4(
                     ctx.gpu,
-                    self.w8a16_gemv_batch4_k,
+                    gemv_batch_k,
                     normed_out_base,
                     fp8.weight,
                     fp8.row_scale,

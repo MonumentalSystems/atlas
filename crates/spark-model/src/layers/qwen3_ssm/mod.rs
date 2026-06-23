@@ -152,6 +152,9 @@ pub struct Qwen3SsmLayer {
     // this streams the weight once with 4 FP32 accumulators. Bit-identical per
     // row to w8a16_gemv. KernelHandle(0) when not linked.
     w8a16_gemv_batch4_k: KernelHandle,
+    // M<=16 sibling of batch4 for high-concurrency decode (n=5..16): same
+    // weight-streaming GEMV, avoids the M-padded MMA at C=8/16.
+    w8a16_gemv_batch16_k: KernelHandle,
     w8a16_gemm_t_k: KernelHandle,
     // W8A8 + FP32 epilogue (vLLM-equivalent) prefill kernels.
     // `per_token_group_quant_fp8` produces FP8 activations + per-token-per-128

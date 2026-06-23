@@ -1316,6 +1316,45 @@ documented hard/dead-end territory. Consider decode largely tapped on accessible
 bigger remaining gaps vs vLLM (decode 112 vs 145; memory 62 vs 40GB w/ larger ctx) are structural
 (FlashInfer/CUTLASS-grade fused kernels; paged-KV memory efficiency).
 
+## 2026-06-23 - Concurrency scaling + w8a16_gemv_batch16 (high-C decode) + FlashInfer scout
+
+**Scaling (shipped lever-1 binary, 8K):** decode c1 72 / c4 110 / c8 120 / c16 145 (sub-linear).
+**Prefill FLAT ~3880 at ALL concurrency** (c1=c16) — ZERO cross-request prefill benefit vs vLLM
+scaling 4540->6700->7180 by packing requests into its 16K-token batch. Flat prefill is the biggest
+high-concurrency gap, hits the real 11.7K-prompt concurrent workload hardest.
+
+**SHIPPED: w8a16_gemv_batch16 — lever 1 extended to M<=16.** batch4 was gated n<=4 so it turned OFF
+at C=8/16 (fell back to M-padded pipelined). Refactored w8a16_gemv_batch4.cu into a
+`template<int MAX_M>` device helper + two extern-C globals: `w8a16_gemv_batch4` (M<=4) +
+`w8a16_gemv_batch16` (M<=16). Dispatch picks batch4 for n<=4, batch16 for n=5..16, pipelined n>16;
+same ATLAS_SSM_GEMV_BATCH4 gate (default on). Microtest extended: batch4@M=4 + batch16@M=8,16 all
+cos>=0.99999. Same-build A/B (MAX_SEQS=16, quality coherent math=482):
+  c4: 86.6->107.5 (+24%, batch4); c8: 120.3->136.3 (**+13%, batch16**); c16: 142.8->150.2 (**+5%**).
+c16 gains less (M=16 register pressure acc[16]+wf[16]; MoE/GDN per-token ×16 dominate). New highs:
+c8 136, c16 150. SHIPPED default.
+
+**FlashInfer scout — VERDICT: GO (proven feasible on GB10).** Background agent EMPIRICALLY proved
+FlashInfer's `BatchPrefillWithRaggedKVCacheDispatched` (flashinfer/attention/prefill.cuh) is a
+FlashAttention-2 SM80-class kernel (mma.sync/ldmatrix/cp.async), NOT FA3/Hopper. COMPILES to
+sm_121f SASS (520 HMMA + 160 LDSM + 96 LDGSTS, ZERO wgmma/TMA/tcgen05); isolated LDSM+HMMA probe
+RAN on live GB10 (launch_rc=0, finite — "ldmatrix broken" doesn't apply to the m8n8.x4 form used).
+head_dim=256 + GQA supported on SM80 path. Headers TORCH-FREE (torch coupling only in csrc/*.cu,
+bypassed like CUTLASS's Python). Corroborated by flashinfer #3170 (DGX Spark audit: consumer
+Blackwell = FA2 via SM89; only prebuilt trtllm-gen cubins missing, we compile from source).
+- INTEGRATION (mirror CUTLASS): new crates/spark-runtime/cuda/flashinfer_ragged_prefill.cu w/ two
+  extern-C wrappers `atlas_fi_prefill_plan(...)` + `atlas_fi_ragged_prefill_hd256(q,k,v,q_indptr,
+  kv_indptr,o,...,stream)`; build_flashinfer_object in build.rs gated on FLASHINFER_HOME; new
+  crates/spark-runtime/src/flashinfer.rs (mirror cutlass.rs); call from qwen3_attention/prefill.
+  BUILD WRINKLE: needs FlashInfer's pinned CCCL via -isystem ($FLASHINFER_HOME/3rdparty/cccl/
+  {libcudacxx/include,cub,thrust}) BEFORE CUDA-13 toolkit CCCL (CUDA 13 lacks cuda::fast_mod_div;
+  vendor the submodule).
+- EFFORT ~1 week: wrapper+build.rs+FFI ~1-2d; real work = PrefillPlan plumbing ~3-5d (two-call
+  plan/run, workspace sizing, plan-blob scheduler ptrs -> BatchPrefillRaggedParams, build
+  q_indptr/kv_indptr from Atlas batched layout, BF16 validate vs paged). Caveat: consumer Blackwell
+  halves FP32-accum MMA tput, but the prefill win is BATCHING (kill per-request paged-attn overhead
+  that flatlines us at 3880), not peak MMA. THE lever for cross-request prefill scaling. Full detail
+  + extern-C sigs: tasks/adfb2c4274c6365fc.output.
+
 NOTE (user, 2026-06-23): vLLM serves Holo in ~40GB CUDA mem with a much LARGER context window vs
 Atlas ~62GB — a real memory-efficiency gap (paged-KV / weight layout). Memory/context efficiency
 is a separate open track from the decode-speed work above.

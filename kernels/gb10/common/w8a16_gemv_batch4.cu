@@ -24,7 +24,6 @@
 #define N_PER_BLOCK 4
 #define WARP_SIZE 32
 #define FP8_BLOCK 128
-#define MAX_M 4
 
 // FP8 E4M3 -> f32 lookup table (256 entries). Identical table to w8a16_gemv.cu.
 __device__ __constant__ float E4M3_LUT_B4[256] = {
@@ -94,7 +93,13 @@ __device__ __constant__ float E4M3_LUT_B4[256] = {
     -384.0f, -416.0f, -448.0f, -0.0f,
 };
 
-extern "C" __global__ void w8a16_gemv_batch4(
+// Templated on the MAX rows (register array bound + unroll). The runtime `M`
+// (<= MAX_M) selects how many activation rows are actually computed, so one
+// instantiation serves all n in [1, MAX_M]. MAX_M=4 is the optimal common path
+// (n<=4); MAX_M=16 covers high-concurrency decode (n=5..16) without falling
+// back to the M-padded MMA.
+template <int MAX_M>
+__device__ __forceinline__ void w8a16_gemv_batchm_impl(
     const __nv_bfloat16* __restrict__ A,    // [M, K] BF16
     const unsigned char* __restrict__ B,     // [N, K] FP8 E4M3
     const float* __restrict__ block_scale,   // [N/128, K/128] FP32
@@ -185,4 +190,32 @@ extern "C" __global__ void w8a16_gemv_batch4(
             C[(unsigned long long)t * N + n] = __float2bfloat16(r);
         }
     }
+}
+
+// M<=4 (common-path batched decode). Optimal: no wasted unroll past 4 rows.
+extern "C" __global__ void w8a16_gemv_batch4(
+    const __nv_bfloat16* __restrict__ A,
+    const unsigned char* __restrict__ B,
+    const float* __restrict__ block_scale,
+    __nv_bfloat16* __restrict__ C,
+    unsigned int M,
+    unsigned int N,
+    unsigned int K
+) {
+    w8a16_gemv_batchm_impl<4>(A, B, block_scale, C, M, N, K);
+}
+
+// M<=16 (high-concurrency decode, n=5..16). Same weight-streaming pass; one
+// extra weight read serves up to 16 activation rows instead of the M-padded
+// MMA the pipelined kernel would use at these batch sizes.
+extern "C" __global__ void w8a16_gemv_batch16(
+    const __nv_bfloat16* __restrict__ A,
+    const unsigned char* __restrict__ B,
+    const float* __restrict__ block_scale,
+    __nv_bfloat16* __restrict__ C,
+    unsigned int M,
+    unsigned int N,
+    unsigned int K
+) {
+    w8a16_gemv_batchm_impl<16>(A, B, block_scale, C, M, N, K);
 }
