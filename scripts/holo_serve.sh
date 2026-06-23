@@ -25,6 +25,23 @@ GDN_FUSED_NORM="${ATLAS_GDN_FUSED_NORM:-1}"
 # nvfp4 GEMM bails at runtime. Override with ATLAS_CUTLASS_NVFP4_GEMM=0 to fall back.
 CUTLASS_NVFP4_GEMM="${ATLAS_CUTLASS_NVFP4_GEMM:-1}"
 CUTLASS_NVFP4_SSM_OUT="${ATLAS_CUTLASS_NVFP4_SSM_OUT:-1}"
+# Prefix caching (radix-tree KV reuse + Marconi SSM-snapshot restore for the
+# hybrid GDN layers). Off by default. To enable, also give SSM-snapshot slots +
+# a checkpoint interval so the recurrent state is restorable at prefix boundaries.
+PREFIX_CACHING="${ATLAS_HOLO_PREFIX_CACHING:-false}"
+SSM_CACHE_SLOTS="${ATLAS_HOLO_SSM_CACHE_SLOTS:-0}"
+SSM_CKPT_INTERVAL="${ATLAS_HOLO_SSM_CHECKPOINT_INTERVAL:-0}"
+# Prefix-cache chunk alignment: Marconi intermediate checkpoints only save when a
+# prefill chunk ends on a checkpoint-interval block boundary. The chunk caps to
+# max_batch_tokens = max_prefill_tokens + max_num_seqs (block-rounded), so to land
+# the chunk on `SSM_CKPT_INTERVAL * 16` tokens we must back off max_prefill by
+# max_num_seqs. Without this the chunk overshoots by one block (e.g. 4112=257 blk
+# vs 4096=256) and NO intermediate checkpoint is ever saved (warm hits recompute
+# the whole prefix → ~0 speedup). Verified: aligned → warm TTFT 1.9x. Only auto-set
+# when caching is on, checkpoints are enabled, and the caller didn't pin MAX_PREFILL.
+if [ "$PREFIX_CACHING" = "true" ] && [ "${SSM_CKPT_INTERVAL:-0}" -gt 0 ] && [ -z "${ATLAS_HOLO_MAX_PREFILL:-}" ]; then
+    MAX_PREFILL=$(( SSM_CKPT_INTERVAL * 16 - MAX_SEQS ))
+fi
 # cudart/cublasLt (+nccl) for the runtime dynamic links; keep any caller value.
 export LD_LIBRARY_PATH="/usr/local/cuda/lib64:/home/ms/nccl/build/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 # Self-clean: kill any prior server (setsid -f detaches, so a stale instance
@@ -33,6 +50,7 @@ for pid in $(pgrep -f "release/spark serve --model" 2>/dev/null); do kill -9 "$p
 sleep 2
 setsid -f env RUST_BACKTRACE=1 RUST_LOG=info \
   ATLAS_DECODE_GRAPHS_MULTISEQ=1 ATLAS_HOLO_FP8_SSM_DECODE=1 ATLAS_KV_OVERCOMMIT="${ATLAS_KV_OVERCOMMIT:-0}" \
+  ATLAS_KV_EXTERNAL_RESERVE_GB="${ATLAS_KV_EXTERNAL_RESERVE_GB:-0}" \
   ATLAS_TARGET_HW=gb10 ATLAS_TARGET_MODEL=holo-3.1-35b-a3b ATLAS_TARGET_QUANT=nvfp4 \
   ATLAS_FAST_LOAD_PREFETCH_SHARDS=1 ATLAS_HOLO_LOW_MEMORY_MOE="$LOW_MEMORY_MOE" \
   ATLAS_HOLO_FAST_MOE_MODE="$FAST_MOE_MODE" ATLAS_HOLO_FAST_MOE_LAYERS="$FAST_MOE_LAYERS" \
@@ -44,8 +62,8 @@ setsid -f env RUST_BACKTRACE=1 RUST_LOG=info \
     --model-from-path /tank/holo-bf16kv-test --model-name holo3.1-atlas-poc \
     --port 8890 --bind 127.0.0.1 --max-seq-len "$MAX_SEQ_LEN" --max-num-seqs "$MAX_SEQS" --max-batch-size "$MAX_BATCH" \
     --max-prefill-tokens "$MAX_PREFILL" --kv-cache-dtype bf16 \
-    --gpu-memory-utilization "$GPU_UTIL" --oom-guard-mb 256 --ssm-cache-slots 0 --ssm-checkpoint-interval 0 \
-    --enable-prefix-caching false --tool-call-parser qwen3_coder \
+    --gpu-memory-utilization "$GPU_UTIL" --oom-guard-mb 256 --ssm-cache-slots "$SSM_CACHE_SLOTS" --ssm-checkpoint-interval "$SSM_CKPT_INTERVAL" \
+    --enable-prefix-caching "$PREFIX_CACHING" --tool-call-parser qwen3_coder \
     --default-chat-template-kwargs '{"enable_thinking":true}' \
     --fast-load-prefetch-shards --vision-max-pixels 262144 \
     > "$LOG" 2>&1 </dev/null
