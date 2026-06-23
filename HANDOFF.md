@@ -1212,3 +1212,45 @@ copy is built would reclaim a few GB toward the <65GB target — a clean next op
   thinking on). Launching an analysis workflow (grounded in the documented dead-ends: grouped-MoE,
   token-major, atomic-c4, CUDA-graphs, SSM-batched-recurrent all measured losses) to map the C=4
   decode chain per-stage and synthesize a ranked, novel-lever plan.
+
+## 2026-06-23 - NVFP4 attention: WIRED + CORRECT but a LOSS (keep FP8 attn)
+
+Question: "can we use nvfp4 attention?" Answer: it's fully wired (prefill q_nvfp4_t path +
+decode w4a16_gemv at attention_forward_oproj.rs:76), gated by `ATLAS_HOLO_NATIVE_FP8_ATTN`
+(launcher default =1 -> FP8 attn; ModelOpt ships Holo attention in FP8). Tested
+`ATLAS_HOLO_NATIVE_FP8_ATTN=0` (NVFP4 attn) on gx10-9959, 8K/C4:
+- Quality COHERENT (math 482, JSON, vision) -> native NVFP4 attn is numerically correct AND
+  this validates the path-1 native-NVFP4 transpose (`cutlass_nvfp4_proj`) in production.
+- BUT a clear LOSS: decode c1/c2/c4 66.0/51.9/74.8 (vs FP8-attn 70.7/57.9/84.7 = **-6/-10/-12%**);
+  prefill c4 **1541 vs ~3880 = -60%** (systemic — NATIVE_FP8_ATTN=0 evidently disrupts more than
+  attention via the modelopt mixed-precision routing). Memory ~neutral (~62GB).
+- ROOT CAUSE (matches the decode workflow): the dense projections are ISSUE/OCCUPANCY-bound,
+  not bandwidth-bound, so 4-bit weights (fewer bytes) don't help; w4a16_gemv is just less
+  optimized than the FP8 w8a16 pipelined. Same lesson as ATLAS_HOLO_FP8_SSM_DECODE (fp8 81 > nvfp4 65).
+VERDICT: keep `ATLAS_HOLO_NATIVE_FP8_ATTN=1` (FP8 attention). NVFP4 attn works but is slower.
+
+## 2026-06-23 - DECODE CONCURRENCY workflow result (wuzqmr2sb) — the real plan
+
+11-agent grounded analysis. **KEY INSIGHT: decode is NOT bandwidth-walled.** n=4 step ~47ms vs a
+~11-13ms weight-bound floor (185 GB/s) => we're 3-4x above floor, dominated by **issue/occupancy
+inflation in the dense GEMMs + redundant reads**, not DRAM. Specifically: the SSM QKVZ+out_proj
+at n=4 already batch to ONE w8a16_gemm_pipelined launch (weights read once) BUT that kernel
+**pads M=4 -> 128-row MMA tile (32x compute over-provision)** and is occupancy/issue-bound by its
+own header.
+
+TOP PROTOTYPE (highest gain/effort, NOT a dead-end): **M=4 weight-streaming W8A16 block-scaled
+GEMV** (`kernels/gb10/common/w8a16_gemv_batch4.cu`, NEW) replacing the padded MMA for SSM
+QKVZ+out_proj at n<=4. Clones the already-shipped & winning `w8a16_gemv.cu` (M=1) +
+`dense_gemv_fp8w_batch2.cu` N-accumulator pattern: 4 FP32 accumulators, weight byte dequant'd
+ONCE and reused across all 4 rows, one DRAM pass, no 128-row pad, no tensor cores. Files:
+new .cu; `layers/ops/fp8_gemv_batch.rs` (w8a16_gemv_batch4 op — batch2 already declared, no
+kernel); `qwen3_ssm/trait_decode_multi_seq.rs` dispatch (n<=4 -> batch GEMV, keep pipelined for
+n>4); `qwen3_ssm/init.rs` kernel handle. Est **5-12% c4**, medium effort, low numeric risk
+(identical reduction order; cos>=0.9999 microtest + 8K/C4 A/B). Reusable for attention QKV/O.
+
+STACKING LEVERS (ranked, all non-dead-end): 2) same M=4 GEMV for attn QKV/O (5-12%); 3) batch
+the SHARED-expert GEMV to M=4 (read 4x today in the per-token MoE loop, ~279MB/step redundant,
+6-9%); 4) delete the redundant 3rd full FP32 H-state read in the GDN norm-clamp
+(gated_delta_rule.cu:179-219, accumulate sum-of-squares from registers, ~252MB/step, small/safe,
+4-8%); 5) async argmax D2H so host runs ahead (3-6%); 6) batched argmax+embed (2-4% cleanup).
+Full result: tasks/wuzqmr2sb.output. NEXT: implement the top prototype (w8a16_gemv_batch4).
