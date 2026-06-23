@@ -66,6 +66,7 @@ pub struct Qwen3SsmLayer {
     gdn_k: KernelHandle,
     gdn_f32_k: KernelHandle,
     gdn_f32_norm_k: KernelHandle,
+    gdn_f32_conv_norm_k: KernelHandle,
     gdn_f32_strided_k: KernelHandle,
     gdn_f32_strided_norm_k: KernelHandle,
     ba_gates_k: KernelHandle,

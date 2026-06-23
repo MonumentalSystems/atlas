@@ -78,6 +78,11 @@ impl Qwen3SsmLayer {
                 "gated_delta_rule",
                 "gated_delta_rule_decode_f32_norm",
             ),
+            gdn_f32_conv_norm_k: super::super::try_kernel(
+                gpu,
+                "gated_delta_rule",
+                "gated_delta_rule_decode_f32_conv_norm",
+            ),
             gdn_f32_strided_k: super::super::try_kernel(
                 gpu,
                 "gated_delta_rule",

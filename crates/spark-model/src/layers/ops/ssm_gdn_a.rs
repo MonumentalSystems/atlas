@@ -103,6 +103,63 @@ pub fn gdn_decode_f32_norm(
         .launch(stream)
 }
 
+/// FUSED conv1d_update_l2norm + recurrence + gated-RMS-norm decode.
+///
+/// Collapses the per-seq SSM decode chain `conv1d_l2norm -> gdn -> gated_norm`
+/// into one launch (shorter critical path on the chain-depth-bound decode).
+/// Race-free per-k-head grid: each block owns k-head `kh` and its `head_repeat`
+/// v-heads, conv-updating its own q/k AND v `conv_state` exclusively.
+/// Requires `head_repeat * v_dim == block`, `2*k_dim <= block`, `k_dim == v_dim`.
+#[allow(clippy::too_many_arguments)]
+pub fn gdn_decode_f32_conv_norm(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    h_state: DevicePtr,
+    conv_state: DevicePtr,
+    new_input: DevicePtr,
+    conv_weight: DevicePtr,
+    gate: DevicePtr,
+    beta: DevicePtr,
+    z_gate: DevicePtr,
+    norm_weight: DevicePtr,
+    output: DevicePtr,
+    batch_size: u32,
+    num_k_heads: u32,
+    num_v_heads: u32,
+    k_dim: u32,
+    v_dim: u32,
+    conv_dim: u32,
+    d_conv: u32,
+    l2_eps: f32,
+    eps: f32,
+    stream: u64,
+) -> Result<()> {
+    let head_repeat = num_v_heads / num_k_heads;
+    KernelLaunch::new(gpu, kernel)
+        .grid([num_k_heads, batch_size, 1])
+        .block([head_repeat * v_dim, 1, 1])
+        .arg_ptr(h_state)
+        .arg_ptr(conv_state)
+        .arg_ptr(new_input)
+        .arg_ptr(conv_weight)
+        .arg_ptr(DevicePtr::NULL) // conv_bias
+        .arg_ptr(gate)
+        .arg_ptr(beta)
+        .arg_ptr(z_gate)
+        .arg_ptr(norm_weight)
+        .arg_ptr(output)
+        .arg_u32(batch_size)
+        .arg_u32(num_k_heads)
+        .arg_u32(num_v_heads)
+        .arg_u32(k_dim)
+        .arg_u32(v_dim)
+        .arg_u32(conv_dim)
+        .arg_u32(d_conv)
+        .arg_f32(l2_eps)
+        .arg_f32(eps)
+        .launch(stream)
+}
+
 /// Strided FP32 GDN decode for concurrent sequence decode.
 ///
 /// Q/K/V are read from strided rows, typically the FP32 conv output laid out as

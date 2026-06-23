@@ -637,26 +637,37 @@ impl Qwen3SsmLayer {
                 }
 
                 let conv_out = ctx.buffers.ssm_conv_out_f32();
+                // Fused conv+gdn+norm decode kernel (one launch instead of
+                // conv1d_l2norm -> gdn -> norm). Race-free only for head_repeat=2
+                // (Holo: 16 k / 32 v) + 128-dim heads. Skips the standalone conv
+                // when active (the fused kernel does the conv internally).
+                let use_fused_conv = self.gdn_f32_conv_norm_k.0 != 0
+                    && nv == nk * 2
+                    && kd == 128
+                    && vd == 128
+                    && std::env::var("ATLAS_GDN_FUSED_CONV").ok().as_deref() == Some("1");
                 let sub_t0 = if detail_profile {
                     Some(std::time::Instant::now())
                 } else {
                     None
                 };
-                ops::conv1d_update_l2norm(
-                    ctx.gpu,
-                    self.conv1d_l2norm_f32_k,
-                    ssm_state.conv_state,
-                    deint_i,
-                    &self.ssm.conv1d,
-                    conv_out,
-                    conv_dim,
-                    d_conv,
-                    1,
-                    qk_channels,
-                    kd as u32,
-                    1e-6,
-                    stream,
-                )?;
+                if !use_fused_conv {
+                    ops::conv1d_update_l2norm(
+                        ctx.gpu,
+                        self.conv1d_l2norm_f32_k,
+                        ssm_state.conv_state,
+                        deint_i,
+                        &self.ssm.conv1d,
+                        conv_out,
+                        conv_dim,
+                        d_conv,
+                        1,
+                        qk_channels,
+                        kd as u32,
+                        1e-6,
+                        stream,
+                    )?;
+                }
                 if let Some(t0) = sub_t0 {
                     ctx.gpu.synchronize(stream).ok();
                     rec_conv_us += t0.elapsed().as_micros();
@@ -671,7 +682,35 @@ impl Qwen3SsmLayer {
                 } else {
                     None
                 };
-                if self.gdn_f32_norm_k.0 != 0
+                if use_fused_conv {
+                    ops::gdn_decode_f32_conv_norm(
+                        ctx.gpu,
+                        self.gdn_f32_conv_norm_k,
+                        ssm_state.h_state,
+                        ssm_state.conv_state,
+                        deint_i,
+                        self.ssm.conv1d.weight,
+                        gates,
+                        beta_fp32,
+                        z_i,
+                        self.ssm.norm.weight,
+                        normed_out_i,
+                        1,
+                        nk as u32,
+                        nv as u32,
+                        kd as u32,
+                        vd as u32,
+                        conv_dim,
+                        d_conv,
+                        1e-6,
+                        eps,
+                        stream,
+                    )?;
+                    if let Some(t0) = sub_t0 {
+                        ctx.gpu.synchronize(stream).ok();
+                        rec_gdn_us += t0.elapsed().as_micros();
+                    }
+                } else if self.gdn_f32_norm_k.0 != 0
                     && std::env::var("ATLAS_GDN_FUSED_NORM").ok().as_deref() == Some("1")
                 {
                     ops::gdn_decode_f32_norm(
