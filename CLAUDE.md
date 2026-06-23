@@ -89,8 +89,21 @@ FlexGEMM (the 3D-viewport pipeline) + sparkview use ~36GB baseline. vLLM runs Ho
   footprint ~42GB. NOTE the serve script's `${VAR:-full}` turns EMPTY into full —
   pass the literal `off`, not "".
 - **TRADEOFF: prefill ~1.5× slower** (c1 1704 vs 2662 tok/s) — non-transposed MoE GEMM.
-  The real follow-up: make the non-transposed prefill fast (tune the kernel or
-  on-the-fly transpose) so memory-efficient ≠ slow.
+  Recovering this is the open follow-up. ATTEMPTS so far (both negative):
+  - Coalescing the non-t kernel's B-load: NO change → it's NOT load-bound.
+  - A contained FP8-MMA swap (`moe_w4a16_grouped_gemm_ptrtable_fp8`, m16n8k32 e4m3
+    keeping the naive synchronous structure): SLOWER (1227 vs 1704) AND greedy output
+    diverged slightly — reverted. LESSON: the transposed kernel's speed is its
+    **cp.async pipelining + vectorized dequant + fusion**, NOT just the FP8 MMA. A
+    naive FP8 kernel loses to its own load/sync overhead.
+  - REAL FIX (substantial): port the FULL transposed `fused_gate_up_t_k64` structure
+    (double-buffered cp.async, vectorized dequant, fused gate+up, FP8 MMA) to the
+    `[N,K/2]` layout. The hard part is the load: transposed cp.async assumes
+    contiguous-N `[K/2,N]`; non-transposed is contiguous-K `[N,K/2]`, so the
+    cp.async + smem layout must be restructured (not just the address). Validate
+    token-for-token + logits vs the copies-ON path before shipping. Alternative:
+    accept the 1.5× (memory matters more) — on-the-fly transpose is WORSE (triples
+    weight traffic on a bandwidth-bound prefill).
 - **`ATLAS_KV_OVERCOMMIT=1`** → 200K max-seq-len + 16 seqs admits on-demand (276K-token
   pool ≈ vLLM's 300K) instead of the worst-case refusal.
 - **2nd issue — budget formula counts co-tenant memory.** factory/build.rs checks
