@@ -59,12 +59,19 @@ working binary with a qwen3-next-target / no-CUTLASS build. Always use the block
 vLLM-parity. **Real apples-to-apples baseline** (vLLM `pp2048` from
 `/home/ms/spark-vllm-docker/results.csv`, measured Jun 3; DO NOT re-run vLLM):
 
-| conc | vLLM prefill | vLLM decode (tg128) | Atlas OFF prefill (~2855-tok prompt) |
-|------|-------------|---------------------|--------------------------------------|
-| c1   | 4540        | 75                  | ~3700  (**~80% of vLLM**)            |
-| c2   | 6090        | 118                 | ~3800  (62%)                         |
-| c5   | 6830        | 151                 | c4 ~3760 (55%)                       |
-| c10  | 7180        | 196                 | —                                    |
+| conc | vLLM pp / tg | Atlas pp (OFF) | Atlas tg (decode) |
+|------|-------------|----------------|-------------------|
+| c1   | 4540 / 75   | ~3700 (**80%**)| **75 (100%)**     |
+| c2   | 6090 / 118  | ~3800 (62%)    | 84 (71%)          |
+| c4   | — / —       | ~3760          | 117               |
+| c5   | 6830 / 151  | (c4 ~3760, 55%)| (c8 = 153)        |
+| c10  | 7180 / 196  | —              | —                 |
+
+- **Single-stream: decode is AT PARITY (100%), prefill ~80%.** Blended c1 ≈ 90%.
+- The unified gap is **concurrency scaling**: both prefill AND decode scale to only
+  ~55–71% of vLLM's per-added-request efficiency. vLLM keeps per-req decode higher at
+  low concurrency (c2: 59/req vs our 42/req). This is a continuous-batching efficiency
+  gap (scheduler/overlap), and it's the highest-leverage target — it lifts both pp+tg.
 
 - **Single-stream prefill is already ~80% of vLLM** — 90% is ~1.13×, NOT 2.3×.
   (Earlier "43%/2.3×" was a baseline ERROR: compared a 1403-tok single-stream run
