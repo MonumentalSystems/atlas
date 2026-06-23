@@ -264,7 +264,27 @@ pub fn build_model(
     // unified-memory systems like GB10).
     let total_mem = gpu.total_memory()?;
     let actual_free = gpu.free_memory()?;
-    let used_so_far = total_mem.saturating_sub(actual_free);
+    let mut used_so_far = total_mem.saturating_sub(actual_free);
+    // GB10 is shared (ComfyUI/voxel/etc.). `used_so_far` counts those co-tenants
+    // against our --gpu-memory-utilization budget, so a low util needlessly
+    // starves the KV pool (vs vLLM, whose util is self-relative). Set
+    // ATLAS_KV_EXTERNAL_RESERVE_GB=<co-tenant GB> to DISCOUNT that external usage:
+    // the KV pool is then sized against Atlas's OWN footprint (weights + buffers),
+    // while the `.min(actual_free - reserve)` clamp still guarantees a physical fit.
+    if let Ok(v) = std::env::var("ATLAS_KV_EXTERNAL_RESERVE_GB")
+        && let Ok(gb) = v.parse::<f64>()
+        && gb > 0.0
+    {
+        let ext = (gb * 1024.0 * 1024.0 * 1024.0) as usize;
+        let discounted = used_so_far.saturating_sub(ext);
+        tracing::info!(
+            "ATLAS_KV_EXTERNAL_RESERVE_GB={gb}: discounting external/co-tenant memory \
+             from KV budget — used_so_far {:.1} GB → Atlas-own {:.1} GB",
+            used_so_far as f64 / (1024.0 * 1024.0 * 1024.0),
+            discounted as f64 / (1024.0 * 1024.0 * 1024.0),
+        );
+        used_so_far = discounted;
+    }
     let total_budget = (total_mem as f64 * gpu_memory_utilization) as usize;
     let kv_budget = total_budget
         .saturating_sub(used_so_far)
