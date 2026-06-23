@@ -518,34 +518,33 @@ impl Qwen3AttentionLayer {
                 && spark_runtime::flashinfer::available()
                 && std::env::var("ATLAS_FLASHINFER_PREFILL").ok().as_deref() == Some("1");
             if use_flashinfer {
+                // VARLEN: real per-request cu_seqlens from the staged metadata
+                // (host + device copies) — works for both uniform and varied
+                // request lengths. For chunk-0 self-attention qo_indptr==kv_indptr.
                 let batch = bmeta.batch_size as usize;
-                let chunk = bmeta.chunk_len as usize;
-                let total = (batch * chunk) as u32;
+                let total = bmeta.total_tokens;
+                let indptr_h = &bmeta.cu_seqlens_host;
+                let indptr_d = bmeta.cu_seqlens.0;
                 {
                     use std::sync::atomic::{AtomicBool, Ordering};
                     static LOGGED: AtomicBool = AtomicBool::new(false);
                     if !LOGGED.swap(true, Ordering::Relaxed) {
                         tracing::warn!(
-                            "FLASHINFER_PREFILL geometry: batch={batch} chunk_len={chunk} \
-                             total(batch*chunk)={total} num_tokens={num_tokens} \
-                             nq={nq} nkv={nkv} hd={hd} inv_sqrt_d={inv_sqrt_d}"
+                            "FLASHINFER_PREFILL(varlen) batch={batch} total={total} \
+                             num_tokens={num_tokens} cu_seqlens={indptr_h:?} \
+                             nq={nq} nkv={nkv} hd={hd} sm_scale={inv_sqrt_d}"
                         );
                     }
                 }
-                // Uniform same-chunk-len co-dispatch -> arithmetic indptr.
-                let indptr: Vec<i32> = (0..=batch).map(|i| (i * chunk) as i32).collect();
-                let indptr_bytes: Vec<u8> = indptr.iter().flat_map(|x| x.to_le_bytes()).collect();
-                let indptr_d = ctx.gpu.alloc(indptr_bytes.len())?;
-                ctx.gpu.copy_h2d(&indptr_bytes, indptr_d)?;
-                let r = spark_runtime::flashinfer::ragged_prefill_bf16_hd256(
+                spark_runtime::flashinfer::ragged_prefill_bf16_hd256(
                     q_contiguous.0,
                     k_contiguous.0,
                     v_contiguous.0,
                     attn_out.0,
-                    &indptr,
-                    &indptr,
-                    indptr_d.0,
-                    indptr_d.0,
+                    indptr_h,
+                    indptr_h,
+                    indptr_d,
+                    indptr_d,
                     batch as u32,
                     total,
                     total,
@@ -555,9 +554,7 @@ impl Qwen3AttentionLayer {
                     inv_sqrt_d,
                     true,
                     stream,
-                );
-                ctx.gpu.free(indptr_d)?;
-                r?;
+                )?;
             } else {
                 // Q12 Path B: batched paged-prefill attention. The kernel reads
                 // Q/O at per-batch offsets internally via blockIdx.z and uses
