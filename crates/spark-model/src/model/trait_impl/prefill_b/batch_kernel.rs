@@ -59,6 +59,7 @@ impl TransformerModel {
     /// streams. Cheap upfront check — caller (dispatch) falls back to
     /// per-stream when false.
     pub(in crate::model) fn kernel_batched_eligible(&self, streams: &[PrefillSlice<'_>]) -> bool {
+        let varlen = varlen_prefill_enabled();
         check_kernel_batched_eligible(
             streams
                 .iter()
@@ -70,9 +71,20 @@ impl TransformerModel {
             self.buffers.scratch_bytes(),
             self.config.num_experts_per_tok,
             self.config.mrope_interleaved,
-            first_chunk_batched_enabled(),
+            // VARLEN v1 batches chunk-0 (fresh K/V) through FlashInfer ragged.
+            first_chunk_batched_enabled() || varlen,
+            varlen,
         )
     }
+}
+
+/// VARLEN batched prefill enabled? (`ATLAS_PREFILL_VARLEN=1`). Co-admits
+/// varied-length concurrent prefills into one forward (cu_seqlens geometry,
+/// FlashInfer ragged attention). Requires a FLASHINFER_HOME build.
+pub(in crate::model) fn varlen_prefill_enabled() -> bool {
+    std::env::var("ATLAS_PREFILL_VARLEN")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
 }
 
 /// Pure-data predicate extracted from [`TransformerModel::kernel_batched_eligible`]
@@ -89,6 +101,7 @@ pub(in crate::model) fn check_kernel_batched_eligible<I>(
     top_k: usize,
     mrope: bool,
     allow_chunk_zero: bool,
+    varlen: bool,
 ) -> bool
 where
     I: IntoIterator<Item = (usize, usize, bool)>,
@@ -108,24 +121,25 @@ where
     }
     let mut first: Option<(usize, usize, bool)> = None;
     let mut total = 0usize;
+    let mut max_chunk_len = 0usize;
     for (chunk_len, chunk_start, is_last) in streams {
-        // `chunk_len`, `chunk_start`, and `is_last_chunk` must all
-        // match across streams. Different `chunk_start` produces
-        // different `effective_seq_len_start` post-Marconi (which the
-        // batched attention kernel cannot handle); mixing
-        // `is_last_chunk` can't dispatch one finalize_last and one
-        // save_checkpoint in a single batched call.
+        // `chunk_start` and `is_last_chunk` must match across streams (different
+        // `chunk_start` → different `effective_seq_len_start`; mixing `is_last`
+        // can't dispatch finalize_last + save_checkpoint together). `chunk_len`
+        // must ALSO match in the legacy path; the VARLEN path allows differing
+        // lengths (cu_seqlens geometry + FlashInfer ragged attention).
         match first {
             None => first = Some((chunk_len, chunk_start, is_last)),
             Some((cl, cs, il)) => {
-                if chunk_len != cl || chunk_start != cs || is_last != il {
+                if (!varlen && chunk_len != cl) || chunk_start != cs || is_last != il {
                     return false;
                 }
             }
         }
         total += chunk_len;
+        max_chunk_len = max_chunk_len.max(chunk_len);
     }
-    let Some((chunk_len, chunk_start, _)) = first else {
+    let Some((_chunk_len, chunk_start, _)) = first else {
         return false;
     };
     // Batched attention is paged-only today; chunk 0 uses the non-paged
@@ -141,7 +155,8 @@ where
     // pre-flight — runs before any stream mutation, so a false routes to the
     // per-stream path from a clean state (a mid-dispatch overrun would leave
     // streams dirty and the fallback would re-run setup → corruption).
-    spark_runtime::buffers::q12_batched_scratch_bytes(n, chunk_len, top_k, mrope) <= scratch_cap
+    // VARLEN: size the scratch pre-flight by the worst-case per-stream length.
+    spark_runtime::buffers::q12_batched_scratch_bytes(n, max_chunk_len, top_k, mrope) <= scratch_cap
 }
 
 impl TransformerModel {
