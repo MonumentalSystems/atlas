@@ -146,6 +146,12 @@ pub struct Qwen3SsmLayer {
     // KernelHandle(0) when not linked into the image. Gated ON only when
     // ATLAS_W8A16_PIPELINED=1 (default OFF — production dispatch unchanged).
     w8a16_gemm_pipelined_k: KernelHandle,
+    // M<=4 weight-streaming block-scaled FP8 GEMV. Replaces the M-padded
+    // w8a16_gemm_pipelined for n<=4 batched decode (qkvz + out_proj): pipelined
+    // pads M=4 to a 128-row MMA tile (32× compute over-provision, issue-bound);
+    // this streams the weight once with 4 FP32 accumulators. Bit-identical per
+    // row to w8a16_gemv. KernelHandle(0) when not linked.
+    w8a16_gemv_batch4_k: KernelHandle,
     w8a16_gemm_t_k: KernelHandle,
     // W8A8 + FP32 epilogue (vLLM-equivalent) prefill kernels.
     // `per_token_group_quant_fp8` produces FP8 activations + per-token-per-128

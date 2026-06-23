@@ -1254,3 +1254,34 @@ the SHARED-expert GEMV to M=4 (read 4x today in the per-token MoE loop, ~279MB/s
 (gated_delta_rule.cu:179-219, accumulate sum-of-squares from registers, ~252MB/step, small/safe,
 4-8%); 5) async argmax D2H so host runs ahead (3-6%); 6) batched argmax+embed (2-4% cleanup).
 Full result: tasks/wuzqmr2sb.output. NEXT: implement the top prototype (w8a16_gemv_batch4).
+
+## 2026-06-23 - w8a16_gemv_batch4 SHIPPED: +23% c4 / +31% c2 decode (the prototype WON big)
+
+Implemented the workflow's top prototype and it's the biggest decode win yet.
+- NEW kernel `kernels/gb10/common/w8a16_gemv_batch4.cu`: M<=4 weight-streaming block-scaled FP8
+  GEMV. Clones w8a16_gemv (M=1) block-scale path + the multi-accumulator pattern; weight byte
+  dequant'd (LUT*block_scale) ONCE, MAC'd into M FP32 accumulators. Replaces w8a16_gemm_pipelined
+  (which pads M=4 -> 128-row MMA tile, 32× compute over-provision, issue-bound) for n<=4.
+- Op `ops::w8a16_gemv_batch4` (fp8_gemv_batch.rs); kernel handle + dispatch in
+  qwen3_ssm/{init.rs,mod.rs,trait_decode_multi_seq.rs} for BOTH qkvz (:379) and out_proj (:738),
+  gated `ATLAS_SSM_GEMV_BATCH4` (default ON; =0 falls back to pipelined). Same `fp8.weight` +
+  `fp8.row_scale` (FP32 [N/128,K/128] block-scale — verified identical to what pipelined reads).
+- MICROTEST `examples/w8a16_gemv_batch4_microtest.rs`: batch4(M=4) vs 4× w8a16_gemv(M=1) =
+  **cos 1.000000000, max_abs 0.0 (bit-identical)** per row.
+- SERVER A/B on gx10-9959 (8K/C4, same build, quality coherent math=482):
+
+  | decode | batch4 OFF | batch4 ON | delta |
+  | c1 | 71.8 | 70.9 | flat |
+  | c2 | 58.4 | 76.3 | **+31%** |
+  | c4 | 86.2 | 106.1 | **+23%** |
+
+  Prefill flat (~3.88k). The c2<c1 inversion is GONE (now monotonic 71->76->106). c4 went from
+  59% -> 73% of vLLM's 145. Far beats the workflow's 5-12% static estimate (the M-pad was a
+  bigger fraction of the step than modeled). SHIPPED as default. Committed.
+- STACKING NEXT (same workflow, all still open): lever 2 (same GEMV for attn QKV/O, 10 layers),
+  lever 3 (batch shared-expert GEMV M=4), lever 4 (delete redundant 3rd GDN H-read), lever 5/6
+  (async argmax, batched argmax+embed). Each independent and additive.
+
+NOTE (user, 2026-06-23): vLLM serves Holo in ~40GB CUDA mem with a much LARGER context window vs
+Atlas ~62GB — a real memory-efficiency gap (paged-KV / weight layout). Memory/context efficiency
+is a separate open track from the decode-speed work above.

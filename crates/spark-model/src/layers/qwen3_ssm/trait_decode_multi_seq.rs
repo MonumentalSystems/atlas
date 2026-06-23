@@ -376,8 +376,28 @@ impl Qwen3SsmLayer {
         // faster than the base w8a16_gemm, which nsys showed as 44.6% of the
         // C>1 decode step. `.0 == 0` → fall back to the base kernel.
         let w8a16_pipe = self.w8a16_gemm_pipelined_k.0 != 0;
+        // n<=4 weight-streaming block-scaled GEMV: avoids the pipelined kernel's
+        // M=4->128 MMA pad (32× compute over-provision, issue-bound). Weight
+        // streamed once into 4 FP32 accumulators; bit-identical per row to
+        // w8a16_gemv. Disable with ATLAS_SSM_GEMV_BATCH4=0.
+        let use_batch4 = self.w8a16_gemv_batch4_k.0 != 0
+            && n <= 4
+            && std::env::var("ATLAS_SSM_GEMV_BATCH4").ok().as_deref() != Some("0");
         if let Some(ref fp8) = self.qkvz_fp8w {
-            if w8a16_pipe {
+            if use_batch4 {
+                ops::w8a16_gemv_batch4(
+                    ctx.gpu,
+                    self.w8a16_gemv_batch4_k,
+                    normed_base,
+                    fp8.weight,
+                    fp8.row_scale,
+                    deinterleaved,
+                    n as u32,
+                    qkvz_size as u32,
+                    h as u32,
+                    stream,
+                )?;
+            } else if w8a16_pipe {
                 ops::w8a16_gemm_pipelined(
                     ctx.gpu,
                     self.w8a16_gemm_pipelined_k,
@@ -736,7 +756,20 @@ impl Qwen3SsmLayer {
         // ── 4. Batched out_proj: ONE [N,value_dim]→[N,h] GEMM (weights ×1) ──
         // FP8 (w8a16) when the decode overlay is installed, else BF16 dense.
         if let Some(ref fp8) = self.out_proj_fp8w {
-            if w8a16_pipe {
+            if use_batch4 {
+                ops::w8a16_gemv_batch4(
+                    ctx.gpu,
+                    self.w8a16_gemv_batch4_k,
+                    normed_out_base,
+                    fp8.weight,
+                    fp8.row_scale,
+                    ssm_out_base,
+                    n as u32,
+                    h as u32,
+                    value_dim as u32,
+                    stream,
+                )?;
+            } else if w8a16_pipe {
                 ops::w8a16_gemm_pipelined(
                     ctx.gpu,
                     self.w8a16_gemm_pipelined_k,
