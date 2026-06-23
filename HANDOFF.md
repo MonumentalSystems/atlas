@@ -1187,7 +1187,28 @@ planted FACT lines verbatim; extraction `{"total_nodes":140,"down_count":47,"reg
 DECODE is the standing gap: all Atlas modes ~50 tok/s c1 here vs **vLLM 254** — the known
 decode-concurrency lever (SSM-side), untouched by this prefill work.
 
-MEMORY WATCH: NVFP4-default needed GPU_UTIL 0.85 (server ~61GB; OOM'd at 0.75 with the 26GB
+MEMORY WATCH: NVFP4-default needed GPU_UTIL 0.85 (server ~62GB; OOM'd at 0.75 with the 26GB
 co-tenant). NVFP4 keeps redundant weight copies (native path: checkpoint `[K/2,N]` + transposed
 `[N,K/2]`; fp8 path: fp8 original + packed nvfp4). Freeing the unused original once the CUTLASS
 copy is built would reclaim a few GB toward the <65GB target — a clean next optimization.
+
+## 2026-06-23 - pushed (aedd4a1), vision verified, memory-trim investigated, NVFP4 deployed
+
+- **Pushed** to origin: `0b32505..75f974d` (NVFP4 default) then `..aedd4a1` (predequant guard).
+- **Memory trim — investigated, mostly a no-op for Holo.** Gated attention
+  `predequant_for_prefill` under NVFP4 (commit aedd4a1) mirroring the transpose skip, BUT it
+  doesn't help Holo: Holo attn weights are FP8 (not NVFP4), so predequant was already a no-op
+  and `q_fp8` was never allocated. The SSM `qkvz_fp8`/`out_proj_fp8` CANNOT be freed — decode
+  reads them (`trait_decode_batched.rs:130,384`). The ~1GB of nvfp4 packs is intrinsic to the
+  prefill speedup. NET: no easy Holo memory win; ~62GB is mostly base weights + KV, within the
+  <65GB target on a dedicated box. (The transpose-skip DOES save Holo memory: fp8 transposed
+  copies, 10 attn layers.)
+- **Vision VERIFIED under NVFP4** (real /tank photos, attn q/k/v/o flow through NVFP4): wizards
+  scene described accurately (4 robed figures, hexagonal lantern, floating hex portrait frames,
+  golden fantasy); asset sheet OCR'd the title "WEST AFRICAN VILLAGE MARKET & GRANARY PROPS PACK"
+  verbatim + identified modular 3D game assets. Both coherent + correct.
+- **DECODE CONCURRENCY is now the active track** (item 1): Atlas ~50 tok/s c1 (long ctx) / ~85 c4
+  vs vLLM 145-255. This is the dominant latency lever for the real workload (11.7K in / 137 out,
+  thinking on). Launching an analysis workflow (grounded in the documented dead-ends: grouped-MoE,
+  token-major, atomic-c4, CUDA-graphs, SSM-batched-recurrent all measured losses) to map the C=4
+  decode chain per-stage and synthesize a ranked, novel-lever plan.
