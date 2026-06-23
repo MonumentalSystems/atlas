@@ -1425,6 +1425,37 @@ Key files: prefill_b/{batched_layer,stage_batched,batch_kernel}.rs, qwen3_ssm/tr
 phase3,gdn}.rs, qwen3_attention/prefill/paged.rs, kernels gated_delta_rule*.cu,
 spark-server scheduler/phase_continue_prefills/run_batched_prefill.rs. Full plan in this session.
 
+## 2026-06-23 - VARLEN engine M0 BUILT + ENGAGES (one buffer-bounds bug to squash)
+
+M0 is code-complete, compiles, and the varlen batched-prefill path ENGAGES end-to-end —
+PROVEN by the log on a 2-request different-length test (ATLAS_PREFILL_VARLEN=1
+ATLAS_FLASHINFER_PREFILL=1 ATLAS_PREFILL_CODISPATCH=1 ATLAS_Q12_BATCHED_FIRST_CHUNK=1):
+  Q12 kernel-batched dispatch attempt n=2 chunk_len=548
+  FLASHINFER_PREFILL(varlen) batch=2 total=1746 cu_seqlens=[0, 548, 1746] nq=16 nkv=2 hd=256
+=> the varlen FlashInfer attention ran with REAL different per-request lengths (548 + 1198). The
+same-length co-dispatch could never do this. Small different-length prompts (when scratch fits)
+also returned each request's OWN correct answer, no cross-contamination.
+
+BUT: it then crashes `CUDA_ERROR_ILLEGAL_ADDRESS (700)` -> bails to per-stream (so output stays
+correct via fallback, but the CUDA context corrupts -> 500 on the failing batch). Gated OFF by
+default (ATLAS_PREFILL_VARLEN), so production is unaffected.
+
+THE BUG (scoped): `total=1746` but `chunk_len=548`, and `n*chunk_len = 1096 < 1746`. Something
+downstream is STILL sized/indexed by the uniform `n*chunk_len` (or `chunk_len`) instead of the
+packed `total_tokens` — so it overflows when varlen packs more tokens than `n*chunk_len`. Prime
+suspects (audit for chunk_len/n*chunk_len that must become total_tokens):
+- batch_kernel.rs:232 `moe_scratch_bytes = chunk_len * top_k * 4 * 2 * n` (uniform sizing).
+- per_stream_meta_bytes / scratch_cursor sizing (chunk_len-based).
+- attention Q/K/V/out buffers (ssm_deinterleaved/ssm_qkvz/attn_output) + the V offset
+  `k_contiguous.offset(num_tokens*kv_dim*bf16)` — confirm num_tokens=total in the batched path.
+- the GDN per-request slice vs gdn_buf_* arena capacity.
+NEXT: run under compute-sanitizer (ATLAS_PREFILL_VARLEN=1, the 2-req different-length probe) to
+pinpoint the exact OOB kernel+buffer, fix its sizing to total_tokens, re-test. Then M1 (hoist
+SSM/MoE GEMMs = the prefill-scaling win), M2 (varlen GDN kernel replacing the per-request loop).
+Engine code committed: c77f63d (SSM), 6f2e5d0 (geometry+attn), 6701c83 (eligibility).
+Probes: /tmp/varlen_quality.py, /tmp/varlen_small.py. Debug launcher: /tmp/holo_serve_dbg.sh
+(RUST_LOG=info,atlas::q12=debug).
+
 ## (superseded by varlen plan above) STAGE 2: wire ragged_prefill into the batched prefill attention path
 (qwen3_attention/prefill/paged_attn_batched.rs — the slow paged path the dormant co-dispatch fell
 back to), build qo/kv_indptr from the co-dispatched requests' seq lens (prefill_b/ batched geometry +

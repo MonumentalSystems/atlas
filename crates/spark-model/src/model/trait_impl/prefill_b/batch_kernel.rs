@@ -192,6 +192,10 @@ impl TransformerModel {
             v
         };
         let total_tokens = cu_off[n];
+        // Largest per-stream chunk (VARLEN). All per-stream scratch slots must be
+        // sized for this, not streams[0].chunk_len, or a longer stream's meta /
+        // MoE topk staging overruns its slot (CUDA 700).
+        let max_chunk_len = streams.iter().map(|s| s.chunk_len).max().unwrap_or(chunk_len);
 
         // EP active → NCCL needs the default stream.
         let stream = if self.comm.is_some() && self.config.ep_world_size > 1 {
@@ -242,10 +246,11 @@ impl TransformerModel {
         // slot table. Conservative estimate: 12 bytes per token + small
         // header. Reserved 4 KB per stream is plenty for chunk_len ≤ 256.
         // For larger chunk_len the scratch budget scales with arena_cap.
-        let per_stream_meta_bytes = ((chunk_len * 16) + 64).max(4096);
+        let per_stream_meta_bytes = ((max_chunk_len * 16) + 64).max(4096);
         // Cumulative scratch offset cursor — starts after MoE topk
-        // staging area (per single-stream upload_meta convention).
-        let moe_scratch_bytes = chunk_len * self.config.num_experts_per_tok * 4 * 2 * n;
+        // staging area (per single-stream upload_meta convention). Sized by the
+        // largest per-stream chunk so a long VARLEN stream's topk staging fits.
+        let moe_scratch_bytes = max_chunk_len * self.config.num_experts_per_tok * 4 * 2 * n;
         let mut scratch_cursor = (moe_scratch_bytes + 63) & !63;
 
         for (b, slice) in streams.iter_mut().enumerate() {
