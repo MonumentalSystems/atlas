@@ -102,13 +102,14 @@ impl Qwen3AttentionLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
-        let (fp8w_t, weight_opt, fp8, nvfp4_t, dense) = match proj {
+        let (fp8w_t, weight_opt, fp8, nvfp4_t, dense, label) = match proj {
             Proj::Q => (
                 self.q_fp8w_t.as_ref(),
                 self.q_weight.as_ref(),
                 self.q_fp8,
                 self.q_nvfp4_t.as_ref(),
                 &self.attn.q_proj,
+                "attn_q",
             ),
             Proj::K => (
                 self.k_fp8w_t.as_ref(),
@@ -116,6 +117,7 @@ impl Qwen3AttentionLayer {
                 self.k_fp8,
                 self.k_nvfp4_t.as_ref(),
                 &self.attn.k_proj,
+                "attn_k",
             ),
             Proj::V => (
                 self.v_fp8w_t.as_ref(),
@@ -123,6 +125,7 @@ impl Qwen3AttentionLayer {
                 self.v_fp8,
                 self.v_nvfp4_t.as_ref(),
                 &self.attn.v_proj,
+                "attn_v",
             ),
         };
 
@@ -130,17 +133,27 @@ impl Qwen3AttentionLayer {
         // W8A8 + FP32 epilogue: requires NON-transposed FP8 weights with
         // block scales (matches the kernel signature). The attn layer stores
         // those via set_fp8_weights — accessible via weight_opt.as_fp8().
-        if force_w8a8
+        if ops::cutlass_nvfp4_attn_qkv_enabled(label)
+            && let Some(nvfp4_t) = nvfp4_t
+        {
+            ops::log_cutlass_nvfp4_route(label, n, out_dim, h);
+            ops::cutlass_nvfp4_proj(ctx.gpu, normed, nvfp4_t, out, n, out_dim, h, stream)?;
+        } else if ops::cutlass_nvfp4_attn_qkv_enabled(label)
+            && let Some(fp8w) = weight_opt.and_then(|w| w.as_fp8())
+        {
+            ops::log_cutlass_nvfp4_route(label, n, out_dim, h);
+            ops::cutlass_nvfp4_proj_from_fp8(ctx.gpu, normed, fp8w, out, n, out_dim, h, stream)?;
+        } else if force_w8a8
             && let Some(fp8w) = weight_opt.and_then(|w| w.as_fp8())
             && self.per_token_group_quant_fp8_k.0 != 0
             && self.fp8_gemm_t_blockscaled_k.0 != 0
         {
             let m = n as usize;
             let k_dim = h as usize;
-            let a_fp8_bytes = m * k_dim;
-            let a_scale_bytes = m * (k_dim / 128) * 4;
-            let a_fp8_buf = ctx.gpu.alloc(a_fp8_bytes)?;
-            let a_scale_buf = ctx.gpu.alloc(a_scale_bytes)?;
+            // Persistent arena scratch (no per-projection alloc/sync/free).
+            let a_fp8_buf = ctx.buffers.fp8_act();
+            let a_scale_buf = ctx.buffers.fp8_act_scale();
+            debug_assert!(m * k_dim <= ctx.buffers.fp8_act_bytes());
             ops::per_token_group_quant_fp8(
                 ctx.gpu,
                 self.per_token_group_quant_fp8_k,
@@ -164,9 +177,6 @@ impl Qwen3AttentionLayer {
                 h,
                 stream,
             )?;
-            ctx.gpu.synchronize(stream)?;
-            ctx.gpu.free(a_fp8_buf)?;
-            ctx.gpu.free(a_scale_buf)?;
         } else if let Some(fp8t) = fp8w_t {
             ops::w8a16_gemm_t(
                 ctx.gpu,

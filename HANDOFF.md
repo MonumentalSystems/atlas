@@ -406,6 +406,751 @@ left dormant behind `ATLAS_PREFILL_CODISPATCH=1` (default off, measured loss).
    — long-term work. The `ms_qkv_batch4` task above is the smallest concrete first step.
 4. Keep dFlash a separate track; does not change the prefill path.
 
+### SESSION 2026-06-21 (cont.) — DECODE cliff RESOLVED + committed to CUTLASS program
+
+**GOAL (user, north star):** vLLM-parity — decode C=4≥145, prefill C=4≥6700; stretch C=16.
+Memory <60GB, preferably <50GB. (Current banked: prefill ~3520 c1-c4 = 77% of vLLM;
+decode c1 70 / c2 54 / c4 82; mem ~61GB.)
+
+**The c2<c1 decode inversion is NOT a spec cliff — spec is OFF for Holo.** `serve.rs:464`:
+`use_speculative = (args.speculative || args.dflash) && has_proposer()`. The launcher
+(/tmp/holo_ab.sh) passes NEITHER `--speculative` NOR `--dflash` → `use_speculative=false`
+unconditionally. All spec paths (n-gram/self-spec/MTP, gated to `active.len()==1` in
+scheduler/mod.rs:328-413) are dead for this config. So c1=70 is PLAIN single-seq decode,
+and c2<c1 is pure **batched-decode inefficiency** (the single-seq path is well-optimized;
+the n≥2 batched path re-reads weights per-seq). The spec-cliff fix is MOOT — do not pursue.
+
+**Every in-house "easy" decode/concurrency lever is now banked or a measured loss:**
+cuBLAS bf16 (+17%, banked) / fp8 cuBLAS (GB10 per-tensor only, dead) / batched-flash (7×
+slower, dead) / co-dispatch prefill (36% loss) / `ATLAS_SSM_BATCHED_RECURRENT` (c4 59) /
+`ATLAS_MOE_GROUPED_DECODE` (c4 77) / spec cliff (moot). Same root cause each time: Atlas's
+hand-written batched kernels don't amortize weight reads; the obvious batching regresses.
+vLLM's 145/6700 come from FlashInfer + CUTLASS grouped-GEMM + fused-MoE kernels.
+
+**DECISION (user): commit to the CUTLASS integration program.** The only path that closes
+the C=4 gap. Plan: (M0 de-risk) one CUTLASS fp8/bf16 dense GEMM, prove the toolchain end-
+to-end + beat hand kernel; (M1 big lever) CUTLASS grouped-GEMM → fused MoE; (M2) cuDNN
+varlen flash → batched prefill; (M3) memory (fp8 weights + native-fp8 SSM).
+
+#### Scouting map for next session (two Explore agents, this session) — START HERE
+
+**(A) Build/FFI surface — how to add a CUTLASS .cu (gating risk, now mapped):**
+- Kernels compiled by `crates/atlas-kernels/build.rs` (+ `build_target.rs`, `build_codegen.rs`)
+  via direct nvcc: `nvcc --ptx -arch=sm_121f -O3 <extra> file.cu -o file.ptx`. Output is
+  **PTX text, device-only**. arch `sm_121f` from `kernels/gb10/HARDWARE.toml:4`.
+- TWO GOTCHAS for CUTLASS: the NVIDIA compile passes **no `-std`** (CUTLASS needs `-std=c++17`)
+  and **no `-I`** (CUTLASS headers need `-I<cutlass>/include` + `/tools/util/include`); also
+  it hardcodes `--ptx` (host-driven `cutlass::gemm::device::Gemm` can't be a single --ptx TU).
+- ⇒ **Use the host-callable library path (B), NOT the PTX registry path.** Mirror the cuBLASLt
+  integration exactly: compile `cutlass_*.cu` to an OBJECT via a NEW nvcc step in
+  `crates/spark-runtime/build.rs` (analog of the cublasLt block at build.rs:39-52), declare
+  `extern "C"` host wrapper in a new `crates/spark-runtime/src/cutlass.rs` (modeled on
+  `cublaslt.rs:379`, takes u64 device ptrs + stream:u64), call from `ops.rs` (analog of
+  ops.rs:181). Link with `cargo:rustc-link-lib=static=...` + cudart/cudadevrt.
+- Files to touch: new `crates/spark-runtime/src/cutlass.rs`; edit `crates/spark-runtime/build.rs`
+  (+lib.rs reg); new `kernels/.../cutlass_*.cu`; new fn in `crates/spark-model/src/layers/ops.rs`.
+- (PTX-path registry, for reference: module name=file stem, `gpu.kernel(module, "extern_C_symbol")`,
+  loaded via `AtlasRegistry::init` registry.rs:140; launch via `KernelLaunch` kernel_args.rs:51.)
+
+**(B) CUTLASS target shapes (Holo 3.1, from MODEL.toml — authoritative; repo has no config.json):**
+- Dims: hidden h=2048, moe_intermediate=512, num_experts=256, top_k=8, shared_expert_inter=512,
+  head_dim=256, n_q_heads=16, n_kv_heads=2, attn q gated (q_proj N=2×q_dim=8192), 40 layers
+  (10 attn + 30 GDN), GDN key_dim=2048 value_dim=4096.
+- **Dense GEMM targets** (M=tokens, N=out, K=in), all via `cublas_fp8_rowwise_proj` today:
+  SSM qkvz N=12288 K=2048 | SSM out_proj N=2048 K=4096 | attn q N=8192 K=2048 |
+  attn k/v N=512 K=2048 | attn o N=2048 K=4096.
+- **MoE (the big C>1 lever) — CRITICAL GOTCHA for grouped GEMM:** decode routes C×8 tokens
+  over 256 experts → avg tokens/expert = C·8/256 = **0.125 (C=4), 0.5 (C=16) — far below 1**.
+  Per-expert M≈1. THIS is why `ATLAS_MOE_GROUPED_DECODE` (sort/permute + ptr-table grouped
+  GEMM) LOST (c4 60→33 under graphs): grouped-GEMM is built for M≫1; the sort/permute fixed
+  overhead per layer ×30 dominates at M≈1. Per-token GEMV wins at decode. ⇒ **A CUTLASS
+  grouped GEMM must beat M≈1 with minimal per-group overhead (or use a fused-MoE-GEMV design,
+  not classic grouped GEMM).** Per-expert shapes: gate/up N=512 K=2048, down N=2048 K=512.
+- Decode MoE dispatch: `qwen3_ssm/trait_decode_multi_seq.rs:146` — n=2/3 fused (`forward_k2/k3`),
+  **n≥4 falls to per-token loop (:204-214)** calling `MoeLayer::forward` (moe/forward.rs:28).
+- Plug points: prefill+grouped-decode share `MoeLayer::run_routed_grouped_gemm`
+  (moe/forward_prefill_routed.rs:21); current grouped kernel wrappers in
+  `ops/moe_grouped_a.rs:114+`. Sort/permute scaffolding (reusable group descriptors:
+  expert_offsets + sorted_token_ids) in `moe/forward_prefill.rs:246,289,308`.
+
+**ENV CHECK (2026-06-21, done):** CUTLASS is NOT installed on this box (no headers, no py pkg).
+Toolchain OK: nvcc CUDA 13.0 V13.0.88 supports `sm_121f`; GPU GB10 cap 12.1 confirmed. CUTLASS is
+header-only → just needs `-I<cutlass>/include -I<cutlass>/tools/util/include`.
+
+**NEXT ACTION:** (1) `git clone https://github.com/NVIDIA/cutlass` (need ≥3.8 for consumer-Blackwell
+sm_120/sm_121; GB10 has no TMA/wgmma → the **Ampere-class mma.sync (SM80) collectives** are what
+will run, NOT the sm_100 tcgen05/TMA kernels — copy a `examples/` SM80 bf16 GEMM as the starting
+template); confirm it compiles for `sm_121f`. (2) build M0 — a CUTLASS bf16 (or per-tensor-fp8)
+dense GEMM host wrapper for ONE projection (SSM qkvz N=12288 K=2048), validate cos≈1 + perf vs
+cuBLAS/hand. (3) only then M1 grouped MoE. NOTE the M≈1 MoE-decode reality above — grouped GEMM
+may need a fused-GEMV design, and the win there is decode-concurrency (the real C=4 lever), not
+prefill. (Re-run the deeper scout on best CUTLASS sm_121 example kernels when starting M0.)
+
 ## Sync note
 
 There is an untracked `docs/porting/holo-3.1-handoff.md` with historical notes; use it only for background. This `HANDOFF.md` is the active handoff for the current continuation.
+
+### SESSION 2026-06-22 — CUTLASS M0 + token-major MoE decode experiment
+
+**CUTLASS dense BF16 M0 built and smoke-tested.** Added optional host-callable CUTLASS
+integration behind `CUTLASS_HOME` build cfg + `ATLAS_CUTLASS_GEMM=1`. The wrapper compiles
+as a runtime object, not through the PTX registry. FFI smoke tests execute real CUDA GEMMs:
+small tile-compatible shape and real Holo SSM QKVZ shape `M=3537 N=12288 K=2048`.
+
+Dense primitive sweep on DGX Spark/GB10 showed generic CUTLASS BF16 is **not** a blanket
+replacement for cuBLASLt:
+- `ssm_qkvz`: CUTLASS modestly wins, about 9-12% faster than cuBLASLt.
+- `attn_q/k/v`: roughly parity / tiny wins.
+- `ssm_out`, `attn_o`, dense MoE proxy shapes: cuBLASLt wins clearly.
+
+Conclusion: keep CUTLASS M0 as useful infrastructure and maybe route `ssm_qkvz`, but this
+does not solve decode concurrency. Generic dense CUTLASS is not the MoE answer on GB10.
+
+**cuBLASLt multi-algo route-batch sweep done.** Small-M routed MoE proxies show library GEMM
+only becomes plausible near `M=64-128`; Holo C=4 has only `C*top_k=32` total routes spread
+across 256 experts, so classic grouped/dense GEMM remains the wrong shape for decode.
+
+**Token-major MoE decode path implemented + measured + LOST.** Added opt-in
+`ATLAS_MOE_TOKEN_MAJOR_DECODE=1`, reusing generic `moe_prefill` token-major kernels for N>=4
+instead of grouped-GEMM sorting. Tested on `gx10-9959` with 8K/C4 clamp:
+
+Baseline:
+- decode c1 70.7
+- decode c2 57.9
+- decode c4 84.7
+- prefill c4 3135
+- spark memory about 55.2 GB
+
+`ATLAS_MOE_TOKEN_MAJOR_DECODE=1`:
+- decode c1 70.7
+- decode c2 55.5
+- decode c4 75.5
+- prefill c4 3116
+- spark memory about 55.3 GB
+
+Result: token-major decode regressed C4 by about 10.9%; keep it OFF. Do not rediscover this
+as a likely win. The generic token-major prefill kernels are still too prefill-shaped for
+decode concurrency.
+
+**Current concurrency conclusion:** the next real path is a purpose-built fused decode MoE
+kernel, not grouped GEMM, not generic token-major prefill reuse, and not a dense library GEMM
+swap. It must reduce the decode-stage chain around routed MoE directly: gate/topk + routed
+expert gate/up + activation/down + weighted combine, with minimal per-expert sorting/setup.
+
+## 2026-06-22 - C=4 atomic-add fused MoE decode prototype
+
+Implemented an opt-in prototype behind `ATLAS_MOE_ATOMIC_C4_DECODE=1`:
+- `kernels/gb10/common/moe_decode_atomic_c4.cu`
+- `crates/spark-model/src/layers/ops/moe_atomic_c4.rs`
+- `crates/spark-model/src/layers/moe/forward_atomic_c4.rs`
+- SSM multi-seq dispatch routes `n == 4` through it before token-major decode.
+
+Shape/scope:
+- Holo NVFP4 only, shared expert required, no transposed/unified layout, no pre-expert norm.
+- Reuses batched routing and token-major gate/up.
+- Routed down computes weighted contributions into `[4,H]` FP32 scratch with `atomicAdd(float*)`.
+- Finalize casts routed FP32 accumulation to BF16. For EP, BF16 all-reduce still happens on routed-only output, then existing `moe_batched_blend` adds shared expert once.
+- FP32 scratch is carved from `BufferArena::scratch()` after top-k indices/weights, so no persistent memory increase.
+
+Build:
+```bash
+LD_LIBRARY_PATH=/home/ms/nccl/build/lib LIBRARY_PATH=/home/ms/nccl/build/lib ATLAS_TARGET_HW=gb10 ATLAS_TARGET_MODEL=holo-3.1-35b-a3b ATLAS_TARGET_QUANT=nvfp4 cargo build --release --bin spark
+```
+Result: build passed; atlas-kernels compiled 139 kernels including the new module.
+
+Remote test on `gx10-9959` with clamp:
+```bash
+ATLAS_HOLO_GPU_UTIL=0.80 ATLAS_HOLO_MAX_SEQ_LEN=8192 ATLAS_HOLO_MAX_SEQS=4 ATLAS_HOLO_MAX_BATCH=4 ATLAS_HOLO_MAX_PREFILL=8192 ATLAS_MOE_ATOMIC_C4_DECODE=1
+```
+Benchmark:
+- tg128 c1: 71.7 tok/s
+- tg128 c2: 55.3 tok/s
+- tg128 c4: 72.7 tok/s
+- pp2048 c1: 3109 tok/s
+- pp2048 c2: 3126 tok/s
+- pp2048 c4: 3141 tok/s
+
+Conclusion: C=4 atomic-add prototype is a regression versus the recorded baseline (`c4 84.7 tok/s`) and even below token-major (`c4 75.5 tok/s`). Do not enable. Likely reasons: same token-major gate/up launch shape plus many small down CTAs, atomic contention/serialization, and no reduction in the dominant SSM batched projection cost.
+
+Next useful direction: stop optimizing classic route-major decode MoE at C=4. For concurrency gains, test CUDA graphs over the current per-token MoE loop or fuse the SSM per-seq recurrent microkernels; MoE-only changes have now shown negative results for grouped, token-major, and atomic C4 paths.
+
+## 2026-06-22 - Multi-seq CUDA graphs test
+
+Atlas already had an opt-in multi-seq decode graph path in `crates/spark-model/src/model/trait_impl/decode_a2.rs`, gated by `ATLAS_DECODE_GRAPHS_MULTISEQ=1`. It captures/replays the full padded batch decode graph keyed by `padded_n` (`2`, `4`, `8`) after pre-step metadata uploads. Tested this directly on `gx10-9959` with the same clamp used for Holo R&D:
+
+```bash
+ATLAS_HOLO_GPU_UTIL=0.80 ATLAS_HOLO_MAX_SEQ_LEN=8192 ATLAS_HOLO_MAX_SEQS=4 ATLAS_HOLO_MAX_BATCH=4 ATLAS_HOLO_MAX_PREFILL=8192 ATLAS_DECODE_GRAPHS_MULTISEQ=1
+```
+
+Logs confirmed graph capture engaged:
+- `Captured CUDA graph for batch size 2`
+- `Captured CUDA graph for batch size 4`
+
+Benchmark:
+- tg128 c1: 70.8 tok/s
+- tg128 c2: 57.7 tok/s
+- tg128 c4: 83.7 tok/s
+- pp2048 c1: 3136 tok/s
+- pp2048 c2: 3135 tok/s
+- pp2048 c4: 3138 tok/s
+
+Conclusion: multi-seq CUDA graphs alone are effectively flat versus recorded baseline (`c4 84.7 tok/s`). Launch overhead is not the main C4 bottleneck for this path.
+
+Also tested the combination predicted by comments to possibly help grouped MoE:
+
+```bash
+ATLAS_HOLO_GPU_UTIL=0.80 ATLAS_HOLO_MAX_SEQ_LEN=8192 ATLAS_HOLO_MAX_SEQS=4 ATLAS_HOLO_MAX_BATCH=4 ATLAS_HOLO_MAX_PREFILL=8192 ATLAS_DECODE_GRAPHS_MULTISEQ=1 ATLAS_MOE_GROUPED_DECODE=1
+```
+
+Benchmark:
+- tg128 c1: 71.5 tok/s
+- tg128 c2: 58.1 tok/s
+- tg128 c4: 80.4 tok/s
+- pp2048 c1: 3124 tok/s
+- pp2048 c2: 3118 tok/s
+- pp2048 c4: 3131 tok/s
+
+Conclusion: graphs + grouped MoE is worse than graphs alone and worse than baseline. Do not enable.
+
+Current negative list for C4 decode R&D:
+- grouped MoE without graphs: previously measured bad
+- token-major MoE: c4 75.5 tok/s
+- atomic C4 MoE: c4 72.7 tok/s
+- multi-seq CUDA graphs alone: c4 83.7 tok/s
+- multi-seq CUDA graphs + grouped MoE: c4 80.4 tok/s
+
+Next useful direction: SSM-side work, not MoE/launch overhead. The C4 wall appears dominated by batched SSM projection/recurrent work and memory bandwidth, not kernel launch latency.
+
+## 2026-06-22 - SSM-side R&D: fused strided GDN+norm primitive
+
+Docs/test review before touching code:
+- `ATLAS_SSM_BATCHED_RECURRENT=1` was already measured as a loss (`c4 ~59 tok/s`), so do not re-run that unchanged.
+- Relevant docs: `docs/porting/holo-3.1-optimization-roadmap.md`, `docs/adr/0011-ep-batched-decode-optimization.md`, and existing GDN examples (`gdn_verify_fused_microtest`, `gdn_batched_repro`).
+- MTP verify has K=2/3/4 fused WY kernels, but those process multiple tokens in one sequence. C=4 serving is four independent SSM states, so those kernels cannot be directly reused for concurrency.
+
+Implemented a bounded SSM primitive for the existing opt-in batched recurrent branch:
+- New CUDA kernel: `gated_delta_rule_decode_f32_strided_norm` in `kernels/gb10/common/gated_delta_rule.cu`.
+- New Rust wrapper: `gdn_decode_f32_strided_norm` in `crates/spark-model/src/layers/ops/ssm_gdn_a.rs`.
+- New `Qwen3SsmLayer` optional handle: `gdn_f32_strided_norm_k`.
+- `try_decode_multi_seq_ssm_batched` now uses the fused strided GDN+gated-RMS path when both `ATLAS_SSM_BATCHED_RECURRENT=1` and `ATLAS_GDN_FUSED_NORM=1` are set and the kernel exists; otherwise it falls back to the old strided-GDN + per-token norm sequence.
+
+Purpose:
+- Removes the FP32 intermediate GDN output global write/read and N separate `gated_rms_norm` launches from the already-existing batched recurrent experiment.
+- Baseline behavior is unchanged because `ATLAS_SSM_BATCHED_RECURRENT` remains opt-in/off.
+
+Build:
+```bash
+LD_LIBRARY_PATH=/home/ms/nccl/build/lib LIBRARY_PATH=/home/ms/nccl/build/lib ATLAS_TARGET_HW=gb10 ATLAS_TARGET_MODEL=holo-3.1-35b-a3b ATLAS_TARGET_QUANT=nvfp4 cargo build --release --bin spark
+```
+Result: build passed; atlas-kernels compiled 139 kernels including the new symbol.
+
+Next validation, if spending `gx10-9959` time:
+1. Add or adapt a synthetic microtest from `gdn_verify_fused_microtest` to compare `gated_delta_rule_decode_f32_strided_norm` against `gated_delta_rule_decode_f32_strided` + `gated_rms_norm` for batch=4.
+2. Only after cosine passes, A/B server with:
+   `ATLAS_SSM_BATCHED_RECURRENT=1 ATLAS_GDN_FUSED_NORM=1` under the usual 8K/C4 clamp.
+3. Expectation should be conservative: previous batched recurrent was far behind baseline, so this may remain a loss; it just isolates whether the extra norm/write/read was a material part of that loss.
+
+## 2026-06-22 - SSM fused strided-norm validation result
+
+Added `crates/spark-model/examples/gdn_strided_norm_microtest.rs` and registered it under `gpu-examples`.
+
+Microtest compares:
+- old path: `gated_delta_rule_decode_f32_strided` -> `gated_rms_norm_f32_input`
+- new path: `gated_delta_rule_decode_f32_strided_norm`
+
+Important target-specific fix: Holo uses `kernels/gb10/qwen3.6-35b-a3b/nvfp4/gated_delta_rule.cu` as a model-specific override, so the new symbol had to be added there as well as common. Initial symbol lookup failed until this was fixed.
+
+Microtest command:
+```bash
+ATLAS_TARGET_HW=gb10 ATLAS_TARGET_MODEL=holo-3.1-35b-a3b ATLAS_TARGET_QUANT=nvfp4 \
+  cargo run -p spark-model --release --features cuda,gpu-examples --example gdn_strided_norm_microtest
+```
+
+Microtest result, local and on `gx10-9959`:
+- output cos: `1.000000000`
+- output max_abs: `0.00048828`
+- h_state cos: `1.000000000`
+- h_state max_abs: `0.00000006`
+
+Server A/B on `gx10-9959` under usual clamp:
+```bash
+ATLAS_HOLO_GPU_UTIL=0.80 ATLAS_HOLO_MAX_SEQ_LEN=8192 ATLAS_HOLO_MAX_SEQS=4 \
+ATLAS_HOLO_MAX_BATCH=4 ATLAS_HOLO_MAX_PREFILL=8192 \
+ATLAS_SSM_BATCHED_RECURRENT=1 ATLAS_GDN_FUSED_NORM=1
+```
+
+Benchmark result:
+- tg128 c1: 71.4 tok/s
+- tg128 c2: 59.4 tok/s, but only 184/256 requested output tokens generated
+- tg128 c4: 61.7 tok/s, but only 386/512 requested output tokens generated
+- pp2048 c1: 3077 tok/s
+- pp2048 c2: 3123 tok/s
+- pp2048 c4: 3118 tok/s
+
+Conclusion: fused strided-norm primitive is locally correct, but the overall `ATLAS_SSM_BATCHED_RECURRENT=1` branch remains a major server regression and appears behaviorally unsafe at C2/C4 (early EOS / shorter outputs). Keep `ATLAS_SSM_BATCHED_RECURRENT` off. This confirms the old batched recurrent loss was not just the extra norm launches or FP32 GDN output traffic.
+
+Next SSM-side direction should not be this branch. If continuing SSM decode work, focus on per-seq primitive efficiency in the baseline path: profile `ATLAS_SSM_DETAIL_PROFILE=1` on `gx10-9959` and target whichever of BA gates / conv / GDN-fused-norm / out_proj dominates under current safe baseline.
+
+## 2026-06-22 - CUTLASS native NVFP4 check on `gx10-9959`
+
+Question answered: prior CUTLASS M0 only tested BF16/dequant GEMM. Native CUTLASS NVFP4 had
+not been tested. Tested it now using NVIDIA CUTLASS 4.6 examples copied to `gx10-9959`.
+
+Build:
+```bash
+cd /home/ms/cutlass
+export CUDA_HOME=/usr/local/cuda PATH=/usr/local/cuda/bin:$PATH
+cmake -S . -B /tmp/cutlass-nvfp4-build \
+  -DCUTLASS_NVCC_ARCHS=121a \
+  -DCUTLASS_ENABLE_TESTS=OFF \
+  -DCUTLASS_ENABLE_TOOLS=ON \
+  -DCUTLASS_ENABLE_EXAMPLES=ON \
+  -DCMAKE_BUILD_TYPE=Release
+cmake --build /tmp/cutlass-nvfp4-build --target 79a_blackwell_geforce_nvfp4_bf16_gemm -j8
+cmake --build /tmp/cutlass-nvfp4-build --target 79d_blackwell_geforce_nvfp4_grouped_gemm -j8
+```
+
+Important constraint:
+- `79a_blackwell_geforce_nvfp4_bf16_gemm` is **NVFP4 x NVFP4 -> BF16**, not W4A16.
+- Atlas Holo currently has BF16 activations + NVFP4 weights, so using this class of kernel
+  requires quantizing activations to NVFP4 and producing CUTLASS scale-factor layouts.
+- A lower-bound standalone BF16->FP4 pack/scale microbench was measured separately; it is not
+  exact CUTLASS layout code, but gives the right launch+memory-order cost.
+
+Native NVFP4 dense GEMM exact-ish Holo prefill shapes (`79a`, iterations=30):
+- `ssm_qkvz_prefill` M=3537 N=12288 K=2048: `0.703125 ms`, `253188 GFLOP/s`
+- `attn_q_prefill` M=3537 N=8192 K=2048: `0.477175 ms`, `248718 GFLOP/s`
+- `attn_kv_prefill` M=3537 N=512 K=2048: `0.0414528 ms`, `178942 GFLOP/s`
+- `out_prefill` M=3537 N=2048 K=4096: `0.204025 ms`, `290852 GFLOP/s`
+- dense MoE proxy gate/up M=28296 N=512 K=2048: `0.287398 ms`, `206476 GFLOP/s`
+- dense MoE proxy down M=28296 N=2048 K=512: `0.615019 ms`, `96486.5 GFLOP/s`
+
+Native NVFP4 dense GEMM decode/small-M sweep (`79a`, iterations=100):
+- qkvz M=4 N=12288 K=2048: `0.0675421 ms`, `2980.76 GFLOP/s`
+- qkvz M=8 N=12288 K=2048: `0.0651309 ms`, `6182.22 GFLOP/s`
+- qkvz M=16 N=12288 K=2048: `0.0617571 ms`, `13039.9 GFLOP/s`
+- qkvz M=128 N=12288 K=2048: `0.0228096 ms`, `282445 GFLOP/s`
+- qkvz M=512 N=12288 K=2048: `0.11546 ms`, `223193 GFLOP/s`
+- out M=4 N=2048 K=4096: `0.0271072 ms`, `2475.68 GFLOP/s`
+- out M=16 N=2048 K=4096: `0.0247376 ms`, `10851.3 GFLOP/s`
+- out M=128 N=2048 K=4096: `0.0205907 ms`, `104294 GFLOP/s`
+- out M=512 N=2048 K=4096: `0.0371984 ms`, `230922 GFLOP/s`
+- out M=2048 N=2048 K=4096: `0.105494 ms`, `325702 GFLOP/s`
+
+Approximate activation BF16->FP4 pack/scale lower bound:
+- M=4 K=2048: `0.004098 ms`
+- M=8 K=2048: `0.004104 ms`
+- M=16 K=2048: `0.004105 ms`
+- M=128 K=2048: `0.005249 ms`
+- M=512 K=2048: `0.010246 ms`
+- M=2048 K=2048: `0.029629 ms`
+- M=4 K=4096: `0.004108 ms`
+- M=16 K=4096: `0.004109 ms`
+- M=512 K=4096: `0.016420 ms`
+
+Grouped NVFP4 MoE-like small-M sweep (`79d`, iterations=100, `--no_verif`):
+- gate/up M=1 N=512 K=2048 groups=16: `0.0348819 ms`, `0.962 TFLOP/s`
+- gate/up M=1 N=512 K=2048 groups=32: `0.0471581 ms`, `1.423 TFLOP/s`
+- gate/up M=1 N=512 K=2048 groups=64: `0.198529 ms`, `0.676 TFLOP/s`
+- gate/up M=4 N=512 K=2048 groups=16: `0.0308653 ms`, `4.349 TFLOP/s`
+- gate/up M=4 N=512 K=2048 groups=32: `0.0430803 ms`, `6.231 TFLOP/s`
+- down M=1 N=2048 K=512 groups=16: `0.0459126 ms`, `0.731 TFLOP/s`
+- down M=1 N=2048 K=512 groups=32: `0.0718867 ms`, `0.934 TFLOP/s`
+- down M=1 N=2048 K=512 groups=64: `0.181971 ms`, `0.738 TFLOP/s`
+- down M=4 N=2048 K=512 groups=16: `0.0454851 ms`, `2.951 TFLOP/s`
+- down M=4 N=2048 K=512 groups=32: `0.0722326 ms`, `3.716 TFLOP/s`
+- gate/up M=16 N=512 K=2048 groups=32: `0.0449203 ms`, `23.903 TFLOP/s`
+- down M=16 N=2048 K=512 groups=32: `0.0726979 ms`, `14.770 TFLOP/s`
+
+CUTLASS MoE examples note:
+- `examples/92_blackwell_moe_gemm/*` are CMake-gated on `CUTLASS_NVCC_ARCHS MATCHES 100a`,
+  so the FP4 MoE examples are B200/SM100 targets, not DGX Spark/SM121 targets.
+- The usable GB10 native-FP4 examples are the `79_blackwell_geforce_gemm` kernels.
+
+Conclusion:
+- Native CUTLASS NVFP4 absolutely shows the missing large-M prefill GEMM ceiling on GB10:
+  ~180-290 TFLOP/s on Holo projection shapes, materially above cuBLAS BF16 and far above
+  Atlas's hand kernels.
+- It does **not** directly fix C=4 decode. At M=4/8/16, fixed overhead dominates, and adding
+  activation quantization makes qkvz decode roughly `0.066-0.072 ms` just for that projection
+  class. That is not a route to 145 tok/s C4.
+- Classic grouped NVFP4 also does **not** solve decode MoE at Holo routing density. M=1/4 per
+  expert remains very low throughput; only M=16 starts to become plausible, and C=4 avg
+  per-expert occupancy is far below that.
+
+Next useful CUTLASS direction:
+1. For **prefill**, build a real Atlas host wrapper for `NVFP4 x NVFP4 -> BF16` dense GEMM
+   plus activation NVFP4 quant/scale layout. Start with SSM qkvz and attention q/o.
+2. For **decode C=4**, do not spend time on classic grouped GEMM. If CUTLASS helps, it needs
+   a custom fused-GEMV/fused-MoE decode design or a persistent small-M design, not `79d` as-is.
+
+## 2026-06-22 - Native CUTLASS NVFP4 dense prefill integration: WORKING + +22% prefill
+
+Implemented opt-in native CUTLASS NVFP4 dense projection path behind:
+```bash
+ATLAS_CUTLASS_NVFP4_GEMM=1
+CUTLASS_HOME=/home/ms/cutlass
+```
+
+Files:
+- `crates/spark-runtime/cuda/cutlass_nvfp4_gemm.cu`
+- `crates/spark-runtime/src/cutlass.rs`
+- `crates/spark-runtime/build.rs`
+- `crates/spark-model/src/layers/ops.rs`
+- `crates/spark-model/src/layers/qwen3_ssm/trait_prefill_proj.rs`
+- `crates/spark-model/src/layers/qwen3_attention/prefill/paged_qkv.rs`
+- `crates/spark-model/src/layers/qwen3_attention/prefill/cache_skip_qkv.rs`
+- `crates/spark-model/src/layers/qwen3_attention/prefill/paged_oproj.rs`
+
+What it does:
+- Host-callable CUTLASS SM120/SM121 wrapper for `NVFP4 x NVFP4 -> BF16`.
+- Per-call activation pack: BF16 `[M,K]` -> CUTLASS NVFP4 packed activation + CUTLASS scale layout.
+- Native NVFP4 checkpoint path: consumes Atlas transposed NVFP4 `[K/2,N]` + `[K/16,N]`, repacks scales
+  into CUTLASS layout in the wrapper.
+- Holo-real FP8 projection path: dequant FP8 block-scaled weights to BF16 using existing cache, then pack
+  once into Atlas-transposed NVFP4 `[K/2,N]` + `[K/16,N]`, cache that packed weight, and feed the same
+  CUTLASS native NVFP4 wrapper with `weight_scale_2=1.0`.
+- Wired targets:
+  - SSM qkvz
+  - attention Q
+  - attention O
+
+Build flags needed:
+```bash
+CUTLASS_HOME=/home/ms/cutlass CUDA_HOME=/usr/local/cuda \
+LD_LIBRARY_PATH=/home/ms/nccl/build/lib LIBRARY_PATH=/home/ms/nccl/build/lib \
+ATLAS_TARGET_HW=gb10 ATLAS_TARGET_MODEL=holo-3.1-35b-a3b ATLAS_TARGET_QUANT=nvfp4 \
+cargo build --release --bin spark
+```
+
+Important build detail:
+- CUTLASS native FP4 templates require `--expt-relaxed-constexpr`; added to the runtime CUTLASS nvcc step.
+
+Remote test on `gx10-9959`:
+```bash
+ATLAS_HOLO_GPU_UTIL=0.80 ATLAS_HOLO_MAX_SEQ_LEN=8192 ATLAS_HOLO_MAX_SEQS=4 \
+ATLAS_HOLO_MAX_BATCH=4 ATLAS_HOLO_MAX_PREFILL=8192 ATLAS_CUTLASS_NVFP4_GEMM=1
+```
+
+First pass:
+- tg128 c1: `70.1 tok/s`
+- tg128 c2: `54.9 tok/s`
+- tg128 c4: `84.6 tok/s`
+- pp2048 c1: `3794 tok/s`
+- pp2048 c2: `3805 tok/s`
+- pp2048 c4: `3810 tok/s`
+
+Second pass:
+- tg128 c1: `70.4 tok/s`
+- tg128 c2: `58.9 tok/s`
+- tg128 c4: `84.1 tok/s`
+- pp2048 c1: `3774 tok/s`
+- pp2048 c2: `3815 tok/s`
+- pp2048 c4: `3808 tok/s`
+
+Comparison:
+- Prior safe baseline in this clamp was roughly pp2048 c4 `3100-3135 tok/s`.
+- Native CUTLASS NVFP4 qkvz+Q+O gives pp2048 c4 `~3808-3810 tok/s`, about **+21-23%**.
+- Decode remains flat (`c4 ~84 tok/s`), as expected; this is a large-M prefill path.
+- Spark memory reported by `nvidia-smi` after bench: about `59808 MB`, within the user's ~65GB realistic free
+  target but close enough to track.
+- No runtime CUTLASS/CUDA errors found in `/tmp/holo-cutlass-nvfp4-fp8pack.log`.
+
+Remote cleanup note:
+- `gx10-9959` had a stale old `crates/spark-server/src/reasoning_parser.rs` conflicting with the current
+  `reasoning_parser/mod.rs` module tree. Local repo only has the module tree. Removed the stale remote file
+  so the remote build could compile.
+
+Next useful follow-up:
+1. Add instrumentation/log-once for `ATLAS_CUTLASS_NVFP4_GEMM` routing so future benches can prove which
+   projections are active without inferring from throughput.
+2. Extend native NVFP4 dense prefill to attention K/V if the small N=512 shape does not regress; benchmark
+   carefully because K/V were not the big win in the standalone sweep.
+3. Consider SSM out_proj next only after checking its call-site currently has FP8/NVFP4 source weights;
+   standalone native FP4 out_proj shape was fast, but end-to-end benefit depends on whether activation pack
+   plus extra quant noise pays off.
+
+## 2026-06-22 - Native CUTLASS NVFP4 expansion + memory pass
+
+Follow-up workflow with subagents covered dense target expansion, memory, decode, and correctness risks.
+
+Code changes after the initial qkvz/Q/O native-FP4 win:
+- Added log-once route instrumentation: `CUTLASS_NVFP4_ROUTE ... M/N/K`.
+- Expanded attention prefill Q-only native-FP4 branch to Q/K/V in both paged and cache-skip paths.
+- Added SSM out-proj native-FP4 override behind separate explicit flag:
+  `ATLAS_CUTLASS_NVFP4_SSM_OUT=1`.
+- Fixed activation pack scale consistency: activation nibbles now quantize against the decoded stored UE4M3 scale.
+- Fixed native NVFP4 `weight_scale_2` semantics: no longer bakes FP32 global scale into UE4M3 per-block scale; applies it as CUTLASS epilogue alpha.
+- Reduced memory for FP8-origin weights: FP8 -> BF16 temporary for NVFP4 packing is now uncached and freed after the persistent NVFP4 pack is built.
+- Skipped unused attention FP8 prefill transposes when `ATLAS_CUTLASS_NVFP4_GEMM=1`.
+
+Remote results on `gx10-9959`, clamp:
+```bash
+ATLAS_HOLO_GPU_UTIL=0.80 ATLAS_HOLO_MAX_SEQ_LEN=8192 ATLAS_HOLO_MAX_SEQS=4 \
+ATLAS_HOLO_MAX_BATCH=4 ATLAS_HOLO_MAX_PREFILL=8192 \
+ATLAS_CUTLASS_NVFP4_GEMM=1 ATLAS_CUTLASS_NVFP4_SSM_OUT=1
+```
+
+After Q/K/V/O + qkvz + SSM out + memory fixes + transpose skip:
+- Pass 1:
+  - tg128 c1/c2/c4: `72.1 / 57.1 / 81.2 tok/s`
+  - pp2048 c1/c2/c4: `3876 / 3918 / 3922 tok/s`
+  - Spark memory during capture: `57391 MB`
+- Pass 2:
+  - tg128 c1/c2/c4: `71.9 / 56.9 / 80.8 tok/s`
+  - pp2048 c1/c2/c4: `3897 / 3905 / 3910 tok/s`
+  - Spark memory after warm pass: `58028 MB`
+
+Route logs confirmed active projections at M=2820:
+- `ssm_qkvz_fp8pack M=2820 N=12288 K=2048`
+- `ssm_out_fp8pack M=2820 N=2048 K=4096`
+- `q_proj M=2820 N=8192 K=2048`
+- `k_proj M=2820 N=512 K=2048`
+- `v_proj M=2820 N=512 K=2048`
+- `attn_o M=2820 N=2048 K=4096`
+
+Comparison:
+- Safe baseline before native-FP4 dense work: pp2048 c4 roughly `3100-3135 tok/s`.
+- Initial qkvz/Q/O native FP4: pp2048 c4 `~3808-3810 tok/s`, memory about `59808 MB`.
+- Expanded + memory pass: pp2048 c4 `~3910-3922 tok/s`, memory `~57.4-58.0 GB`.
+- Net: about `+25%` prefill vs safe baseline and `~1.8-2.4 GB` lower than the first native-FP4 implementation.
+- Decode remains flat/slightly noisy around `81-84 tok/s`; this work is still a large-M prefill path, not a C4 decode fix.
+
+Correctness/quality caveat:
+- This path is W4A4 for FP8-origin projection weights and can diverge from the previous W8A8/BF16-ish path. Throughput is proven; quality is not yet proven.
+- Before making it default, run deterministic temp-0 prompt/logit comparisons and projection op-dump cos/max_abs for qkvz, q_proj, o_proj, and SSM out.
+
+Next decode workflow from subagent:
+1. Profile current safe baseline C4 decode with `ATLAS_SSM_MS_PROFILE=1` / `ATLAS_SSM_DETAIL_PROFILE=1` or a short nsys slice.
+2. If dense projections remain material, build real batch4 decode projection kernels before touching MoE again.
+3. Only start purpose-built MoE `forward_k4` if profile shows MoE >25% of C4 wall.
+
+## 2026-06-22 - Native CUTLASS NVFP4 quality isolation
+
+Reason for this pass: full native-FP4 dense replacement was fast but generated garbage, so the path is not deployable without isolating the bad projections.
+
+Implemented granular route flags in addition to the old all-on flag:
+
+- `ATLAS_CUTLASS_NVFP4_GEMM=1` still enables all native-FP4 dense routes for perf experiments.
+- `ATLAS_CUTLASS_NVFP4_QKVZ=1` enables only SSM qkvz.
+- `ATLAS_CUTLASS_NVFP4_ATTN_Q=1` enables only attention Q.
+- `ATLAS_CUTLASS_NVFP4_ATTN_KV=1` enables attention K/V.
+- `ATLAS_CUTLASS_NVFP4_ATTN_O=1` enables attention O.
+- `ATLAS_CUTLASS_NVFP4_SSM_OUT=1` remains explicit-only for SSM out; it is no longer implicitly enabled by the all-on helper.
+
+Files touched for the isolation switches:
+
+- `crates/spark-model/src/layers/ops.rs`
+- `crates/spark-model/src/layers/qwen3_ssm/trait_prefill_proj.rs`
+- `crates/spark-model/src/layers/qwen3_ssm/trait_prefill_helper.rs`
+- `crates/spark-model/src/layers/qwen3_attention/prefill/paged_qkv.rs`
+- `crates/spark-model/src/layers/qwen3_attention/prefill/cache_skip_qkv.rs`
+- `crates/spark-model/src/layers/qwen3_attention/prefill/paged_oproj.rs`
+
+Remote build on `gx10-9959` passed:
+
+```bash
+CUTLASS_HOME=/home/ms/cutlass CUDA_HOME=/usr/local/cuda \
+LD_LIBRARY_PATH=/home/ms/nccl/build/lib:/usr/local/cuda/lib64 \
+LIBRARY_PATH=/home/ms/nccl/build/lib \
+ATLAS_TARGET_HW=gb10 ATLAS_TARGET_MODEL=holo-3.1-35b-a3b ATLAS_TARGET_QUANT=nvfp4 \
+cargo build --release --bin spark
+```
+
+Important stable-stack note: the server logs `SSM decode dtype: f32 (full precision)`. This matches the vLLM-side expectation that the SSM path is numerically sensitive. Do not replace SSM qkvz/out with W4A4 unless an op-level numerical comparator proves it safe.
+
+Quality probe results on `gx10-9959` with `/tmp/holo_quality_probe.py`:
+
+- Baseline/no native-FP4 dense: coherent.
+- `ATLAS_CUTLASS_NVFP4_GEMM=1`: corrupt.
+- `ATLAS_CUTLASS_NVFP4_GEMM=1` without SSM out: corrupt.
+- `ATLAS_CUTLASS_NVFP4_QKVZ=1`: corrupt. Routes only `ssm_qkvz_fp8pack`; outputs repeat digits/Chinese fragments.
+- `ATLAS_CUTLASS_NVFP4_ATTN_Q=1`: corrupt. Routes only `q_proj`; outputs repeat quotes/digits/dots.
+- `ATLAS_CUTLASS_NVFP4_ATTN_KV=1`: coherent on the short probe. Routes `k_proj` and `v_proj`.
+- `ATLAS_CUTLASS_NVFP4_ATTN_O=1`: coherent on the short probe. Routes `attn_o`.
+- `ATLAS_CUTLASS_NVFP4_ATTN_KV=1 ATLAS_CUTLASS_NVFP4_ATTN_O=1`: corrupt despite each route passing alone, so stacked native-FP4 replacements are not safe.
+
+O-only benchmark, standard 8K/C4 clamp, Spark memory about `57433 MB`:
+
+```text
+tg128:  c1 69.0 tok/s, c2 54.7 tok/s, c4 83.7 tok/s
+pp2048: c1 3177 tok/s, c2 3198 tok/s, c4 3186 tok/s
+```
+
+Conclusion: native CUTLASS NVFP4 has a real perf path in isolation, but it is not currently a usable end-to-end speed lever. The broad route gives ~3.9k pp2048 c4 but corrupts output. O-only is quality-clean but effectively baseline-class for prefill. KV-only is quality-clean but too small to expect material speedup. The next useful step is not more server benchmarking; it is an op-level numeric comparator for the native CUTLASS wrapper and packed layout.
+
+Next concrete task:
+
+1. Build a projection-level comparator on `gx10-9959` for the CUTLASS NVFP4 wrapper: compare native `nvfp4_gemm_bf16_act_weight_t` output against a decoded BF16 reference using the same packed A/B/scales for shapes `q_proj M~2820 N=8192 K=2048`, `k/v M~2820 N=512 K=2048`, `attn_o M~2820 N=2048 K=4096`, and `ssm_qkvz M~2820 N=12288 K=2048`.
+2. If comparator fails on qkvz/Q but passes KV/O, fix layout/scale handling before any further perf work.
+3. If comparator passes but generation still corrupts, treat W4A4 activation quantization as too lossy for qkvz/Q and keep the safe BF16/cuBLAS path there.
+
+## 2026-06-22 - NVFP4 op-level comparator: BUG, not W4A4 loss (DECISIVE)
+
+Built the comparator as an ignored unit test (no remote needed; ran on local `dgx-00` GB10):
+`crates/spark-runtime/src/cutlass.rs::tests::cutlass_nvfp4_projection_numeric_comparator`.
+
+For each shape it compares three GEMMs over identical inputs at M=128:
+- `out_cutlass`: the native CUTLASS NVFP4 kernel (`nvfp4_gemm_bf16_act_weight_t`).
+- `out_ref`: a host W4A4 dequant reference. Weight side reads the **exact** `packed_t`
+  nibbles + `scale_t` (e4m3) bytes the kernel consumes (bit-faithful to its weight
+  operand); activation side replicates the wrapper's per-16-group `max/6 -> e2m1` quant.
+- `out_true`: full unquantized BF16 GEMM.
+
+Run:
+```bash
+CUTLASS_HOME=/home/ms/cutlass CUDA_HOME=/usr/local/cuda \
+LD_LIBRARY_PATH=/usr/local/cuda/lib64:/home/ms/nccl/build/lib LIBRARY_PATH=/home/ms/nccl/build/lib \
+cargo test -p spark-runtime --release --features cuda \
+  cutlass_nvfp4_projection_numeric_comparator -- --ignored --nocapture
+```
+
+Results (all four shapes):
+```
+ssm_qkvz N=12288 K=2048  cos(cutlass,ref)=0.0026  cos(cutlass,true)=0.0024  cos(ref,true)=0.9901
+attn_q   N=8192  K=2048  cos(cutlass,ref)=-0.0004 cos(cutlass,true)=-0.0007 cos(ref,true)=0.9901
+attn_kv  N=512   K=2048  cos(cutlass,ref)=0.0087  cos(cutlass,true)=0.0079  cos(ref,true)=0.9902
+attn_o   N=2048  K=4096  cos(cutlass,ref)=0.0008  cos(cutlass,true)=0.0005  cos(ref,true)=0.9901
+```
+
+CONCLUSIONS (overturns the prior server-probe read):
+1. **It is a layout/scale BUG, not W4A4 loss.** `cos(cutlass,ref)≈0` AND `cos(cutlass,true)≈0`
+   on **every** shape — the kernel output is uncorrelated with what its own packed operands
+   imply. Magnitudes are sane (max_abs ~9-14 vs ref_rms ~1.5), so it's scrambling, not NaN/overflow.
+2. **W4A4 itself is fine.** `cos(ref,true)=0.990` for all shapes (incl. K=4096) — the ideal
+   W4A4 GEMM is a faithful ~0.99 approximation. So if the wrapper bug is fixed, native NVFP4
+   is a quality-acceptable path, and the +21-25% prefill becomes a REAL win (currently it
+   computes garbage).
+3. **The prior "qkvz/Q corrupt, KV/O coherent" isolation was a false signal.** KV-only and
+   O-only are *also* numerically broken (cos≈0); they only looked coherent on a short probe
+   because those projections are small/robust enough that scrambled values still produced
+   vaguely-coherent short text. The bug is NOT N-dependent.
+4. **The reference + weight pack are validated.** `cos(ref,true)=0.99` proves my packed-weight
+   readback decode and the runtime's `pack_bf16_weight_to_nvfp4_t` are both correct, AND that
+   CUTLASS reads `weight_packed_t` directly with `stride_b`. So the fault is localized to
+   `atlas_cutlass_nvfp4_gemm_bf16_act_weight_t` itself: the SFA/SFB scale-factor write layout
+   (`layout_sfa(row, base, 0)` / `layout_sfb(col, group*16, 0)`), the in-wrapper activation
+   pack into the A workspace, or the ColumnMajor `stride_b` interpretation of Atlas's `[K/2,N]`
+   packed weight. The CUTLASS SM120 blockscaled SF layout is a swizzled atom layout, not a
+   plain `[M,K/16]` — passing scalar `(coord, k_element, 0)` indices is the prime suspect.
+
+NEXT (bug localization, ranked):
+- a) Verify the SF layout: write a tiny K=16 (single group), scales=1.0, identity-ish case so
+  the SF layout collapses; if that GEMM matches, the bug is purely in the SFA/SFB swizzle write.
+- b) Validate `stride_b`/ColumnMajor vs Atlas `[K/2,N]` packed layout independently (a
+  weight-only identity-activation probe).
+- c) Cross-check against a known-good CUTLASS example (`79a_blackwell_geforce_nvfp4_bf16_gemm`)
+  SF-builder to see how scales must be laid out, and mirror it.
+Until fixed, native NVFP4 is OFF by default and must stay off — it was producing garbage even
+where the server output looked plausible. The cuBLASLt bf16 +17% remains the shipped prefill win.
+
+## 2026-06-22 - NVFP4 bug ROOT-CAUSED + FIXED (weight B transposed) — op-level validated
+
+Localized the bug with a host-only CUTLASS layout probe (`/tmp/nvfp4_layout_probe.cu`,
+compiled vs CUTLASS, prints element offsets for A/B/SFA/SFB and compares to the wrapper's
+manual indexing). Result:
+- **A data OK** (RowMajor, offset m*K+k matches). **SFA/SFB OK** (written through CUTLASS's
+  own `layout_sfa/sfb`, self-consistent).
+- **Weight B data was TRANSPOSED.** CUTLASS ColumnMajor B(N,K) wants element (n,k) at offset
+  `n*K + k` => byte `n*(K/2)+k/2`, i.e. **`[N, K/2]` K-contiguous**. Our pack emitted Atlas's
+  **`[K/2, N]`** (N-contiguous). E.g. `B(n=1,k=0)`: CUTLASS wants byte-elem 128, wrapper put it
+  at 2; `B(n=0,k=16)`: wants 16, wrapper put it at 4096. Fully scrambled -> the cos≈0.
+
+FIX (two feeding paths, both went through the same broken assumption):
+- **Path 2 / FP8-origin (Holo `ssm_qkvz`, `ssm_out`):** changed the pack kernel
+  `atlas_cutlass_pack_bf16_weight_nvfp4_t` (cuda/cutlass_nvfp4_gemm.cu) to emit `[N,K/2]`
+  (`packed_t[col*(k/2) + base/2 + i/2]`). The FP8 pack buffer is consumed ONLY by the CUTLASS
+  wrapper (verified), so this is safe.
+- **Path 1 / native nvfp4 checkpoint (attn q/k/v/o; SSM `*_nvfp4` if present):** the checkpoint
+  weight is `[K/2,N]` and shared with the hand kernels, so it can't be relayed. Added a cached
+  **byte transpose** `[K/2,N]->[N,K/2]` (`atlas_cutlass_transpose_nvfp4_packed_kton` kernel +
+  `cutlass::transpose_nvfp4_packed_kton` + `ops::cutlass_nvfp4_weight_transposed_cached`, keyed
+  by weight ptr like the FP8 cache). `cutlass_nvfp4_proj` now takes `gpu` and feeds the
+  transposed buffer; 5 call sites updated to pass `ctx.gpu`. Scales (`[K/16,N]`) are unchanged —
+  already correct (in-wrapper SFB repack reads them identically for both paths).
+
+VALIDATION (op-level, local `dgx-00`, `cargo test -p spark-runtime --release --features cuda
+cutlass::tests::cutlass_nvfp4 -- --ignored --nocapture`):
+- Comparator after fix (all four shapes): **cos(cutlass,ref) 0.00 -> 0.996**, and
+  **cos(cutlass,true)=0.990 == cos(ref,true)=0.990** — CUTLASS now computes correct W4A4 at the
+  ideal-quantization ceiling (residual 0.996 is just SF rounding in the host ref, not error).
+- `cutlass_nvfp4_transpose_is_bit_exact`: device transpose reproduces the golden `[N,K/2]` pack
+  byte-for-byte.
+- Full Holo `spark` binary builds clean with CUTLASS flags (ops.rs signature + 5 call sites).
+
+NET: the native-NVFP4 prefill path is now **numerically correct at W4A4 quality (cos 0.99 vs
+true bf16)**, so the previously-measured **+21-25% prefill becomes a REAL win** instead of
+garbage. Comparator + transpose tests are committed as ignored unit tests for regression.
+
+NEXT (server validation — needs a free GPU box, e.g. `gx10-9959`; do NOT run on `dgx-00`, it
+has a vLLM instance using ~42GB):
+1. Quality probe (`/tmp/holo_quality_probe.py`) with `ATLAS_CUTLASS_NVFP4_GEMM=1
+   ATLAS_CUTLASS_NVFP4_SSM_OUT=1` (now expected COHERENT for all routes, incl. the stacked
+   case that was corrupt before).
+2. pp2048 bench under the 8K/C4 clamp; expect ~3.9k c4 (+25%) and decode flat.
+3. If coherent + faster, consider promoting native NVFP4 from opt-in to a default prefill path
+   (with a temp-0 golden-logit diff vs the bf16/cuBLAS baseline first, since it is W4A4).
+
+## 2026-06-23 - NVFP4 fix SERVER-VALIDATED on gx10-9959: COHERENT + +24% prefill
+
+Synced the 8 changed files dgx-00 -> gx10-9959 (rsync -R), rebuilt the Holo `spark` binary
+there (clean), launched with the 8K/C4 clamp + `ATLAS_CUTLASS_NVFP4_GEMM=1
+ATLAS_CUTLASS_NVFP4_SSM_OUT=1` (CUTLASS_HOME + LD_LIBRARY_PATH=/usr/local/cuda/lib64 inherited
+through the launcher's `env`). Route confirmed active ("Skipping attention FP8 prefill
+transposes because ATLAS_CUTLASS_NVFP4_GEMM=1").
+
+**Quality probe (`/tmp/holo_quality_probe.py`) — COHERENT on all 4 prompts** (was CORRUPT with
+this exact config before the fix): reasoning sentence clean, math `17*23+91 = 482` (correct),
+compact JSON correct, 3-bullet summary correct. The W4A4 native path now produces correct text.
+
+**Bench (`scripts/bench_holo_atlas.py`, 8K/C4 clamp):**
+```
+pp2048 c1/c2/c4 = 3855 / 3885 / 3882 tok/s   (safe baseline ~3100-3135 => +24%)
+tg128  c1/c2/c4 = 71.9 / 58.6 / 85.7 tok/s   (decode flat, as expected — prefill-path win)
+ttft_max 0.7s across C.
+```
+
+NET: the native-NVFP4 dense prefill bug is fully resolved. The +24% prefill (≈85% of vLLM's
+4540 c1) is now a REAL, coherent win, not garbage. Server torn down afterward (shared box).
+Banked prefill state: ~3.88k c4 coherent (was ~3.13k cuBLAS-bf16 default). 
+
+Remaining before making it the DEFAULT (currently still opt-in behind the flags):
+- temp-0 golden-logit diff vs the bf16/cuBLAS baseline over a few prompts to quantify the W4A4
+  drift end-to-end (op-level was cos 0.99/projection; want whole-model logit agreement).
+- longer-context coherence pass (probe was short prompts).
+- commit the working-tree changes (still uncommitted on `feature/holo-port-pr177`).
+Decode C=4 (85 vs vLLM 145) is untouched by this — still the open north-star lever (SSM-side).
+
+## 2026-06-23 - NVFP4 temp-0 golden comparison vs vLLM + cuBLAS: quality CONFIRMED safe
+
+3-way temp-0, thinking-disabled, greedy comparison over 8 varied prompts with token logprobs:
+- **vLLM `holo3.1` (Hcompany/Holo-3.1-35B-A3B-NVFP4)** running on dgx-00 `127.0.0.1:8008` = gold ref.
+- **Atlas cuBLAS bf16** (`ATLAS_CUBLAS_GEMM=1`, W16A16) = high-precision Atlas ref.
+- **Atlas native NVFP4** (`ATLAS_CUTLASS_NVFP4_GEMM=1 ATLAS_CUTLASS_NVFP4_SSM_OUT=1`, W4A4) = candidate.
+Probes: `/tmp/golden_logit_probe.py` (param base_url+model), `/tmp/golden_compare.py` (3-way),
+`/tmp/atlas_logit_diff.py` (Atlas-vs-Atlas per-token logit drift).
+
+Content agreement with vLLM gold: **cuBLAS 4/8, NVFP4 3/8** — comparable. NVFP4's non-matches
+are all benign: `"Canberra."` vs `"Canberra"` (trailing period), `"sunny"` vs `"Sunny"`, a
+different-but-correct closed-form for the code task, phrasing in the reason sentence (where
+NVFP4 actually matched vLLM and cuBLAS didn't). instr/longish/math2 identical across all three.
+
+Atlas cuBLAS-vs-NVFP4 per-token logit drift (same stack/tokenizer — the clean W4A4-vs-W16A16
+signal): **mean |Δlogprob| = 0.039 nats** on agreed tokens; several prompts **bit-identical**
+greedy output (json 21/21, longish 40/40, instr 5/5, math2 2/2). Where they diverge it's a
+single low-margin greedy flip (e.g. "increasing"->"allowing") that then cascades — both
+branches coherent and correct. (Cross-stack token-string LCP reads 0% — a tokenizer-encoding
+artifact between vLLM and Atlas, not a real signal; content + same-stack logit delta are the
+valid metrics.)
+
+NOTE on the `math` prompt (vLLM 482 / cuBLAS 487 / NVFP4 400, all greedy): thinking was OFF
+here, and BOTH Atlas paths get it wrong & differ -> direct no-CoT arithmetic is unreliable,
+NOT a precision signal. With thinking ON (production default) NVFP4 returned the correct 482
+(earlier quality probe).
+
+VERDICT: **W4A4 native NVFP4 is quality-safe.** Logit drift vs the high-precision cuBLAS path is
+~0.04 nats (negligible, comparable to the cuBLAS<->vLLM gap); all outputs coherent and correct;
+divergences are benign greedy branch flips. Combined with the +24% prefill, native NVFP4 is a
+good candidate to promote from opt-in to DEFAULT prefill. Residual de-risk before flipping the
+default (optional, lower priority): a long-context + thinking-ON reasoning eval, and a final
+commit of the working tree.

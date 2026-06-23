@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
 // Helper functions for the LinearAttention arms of `load_layers`. Two
-// flavours: the native-FP8 path (block-scaled, w8a16_gemv decode +
-// single-scale fp8_gemm_n128 prefill) and the standard NVFP4-quantized
-// path.
+// flavours: the native-FP8 path (block-scaled, w8a16 decode + prefill) and
+// the standard NVFP4-quantized path.
 
 use anyhow::{Result, ensure};
 use atlas_core::config::ModelConfig;
@@ -19,7 +18,7 @@ use crate::weight_map::{
 };
 
 /// Native FP8 SSM build: keeps decode in block-scaled FP8 via `w8a16_gemv`,
-/// and prefill in single-scale FP8 via `fp8_gemm_n128`. No NVFP4 detour.
+/// and prefill in block-scaled FP8 via `w8a16_gemm`. No NVFP4 detour.
 ///
 /// Disk format (Qwen3.5/3.6 FP8 release):
 ///   - `{p}.in_proj_qkv.weight`        : `[Nq, K]` FP8 E4M3
@@ -34,9 +33,6 @@ use crate::weight_map::{
 /// then `w8a16_gemv` consumes it directly. The scale concat copies
 /// **block rows**, not raw F32 — that was the bug in the prior cut.
 ///
-/// Prefill pipeline: dequant BF16 (via `load_ssm_qwen35`'s `dense_auto`),
-/// truncate to single-scale FP8 (`bf16_to_fp8`) — identical to the
-/// `Fp8Dequanted` branch of `build_linear_attention_nvfp4`.
 /// Load the SSM projection weights as block-scaled FP8 for the `w8a16_gemv`
 /// (decode) / `w8a16_gemm` (batched decode) path: QKV and Z concatenated into
 /// a single `[Nq+Nz, K]` FP8 buffer + matching `[(Nq+Nz)/BS, K/BS]` BF16 block
@@ -135,9 +131,7 @@ pub(super) fn build_linear_attention_fp8(
     ffn: FfnComponent,
 ) -> Result<Box<dyn TransformerLayer>> {
     let p = format!("{lp}.linear_attn");
-    tracing::info!(
-        "Layer {layer_idx}: loading SSM FP8 native (block-scaled decode + single-scale prefill)"
-    );
+    tracing::info!("Layer {layer_idx}: loading SSM FP8 native (block-scaled decode + prefill)");
 
     let (qkvz_fp8, out_fp8) = load_ssm_fp8_decode_weights(layer_idx, store, &p, gpu, h)?;
     tracing::info!(
@@ -192,7 +186,7 @@ pub(super) fn build_linear_attention_fp8(
         gpu,
     )?;
     layer.set_fp8_decode_weights(Some(qkvz_fp8), Some(out_fp8));
-    tracing::info!("Layer {layer_idx}: SSM native FP8 — w8a16_gemv decode + w8a16_gemm prefill");
+    tracing::info!("Layer {layer_idx}: SSM native FP8 — w8a16 decode + prefill");
     Ok(Box::new(layer))
 }
 

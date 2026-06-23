@@ -83,8 +83,20 @@ pub(super) fn load_layers(
     let native_fp8 = quant_format == QuantFormat::Fp8;
     let low_memory_modelopt_moe = modelopt_mixed_precision
         && std::env::var("ATLAS_HOLO_LOW_MEMORY_MOE").ok().as_deref() == Some("1");
+    let holo_fast_moe_mode = if low_memory_modelopt_moe {
+        holo_fast_moe_mode()
+    } else {
+        None
+    };
+    let holo_fast_moe_spec = if low_memory_modelopt_moe {
+        std::env::var("ATLAS_HOLO_FAST_MOE_LAYERS").ok()
+    } else {
+        None
+    };
     let native_modelopt_ssm = modelopt_mixed_precision
         && std::env::var("ATLAS_HOLO_NATIVE_FP8_SSM").ok().as_deref() == Some("1");
+    let native_modelopt_attn = modelopt_mixed_precision
+        && std::env::var("ATLAS_HOLO_NATIVE_FP8_ATTN").ok().as_deref() == Some("1");
     tracing::info!(
         "Weight format: {:?}, NVFP4 variant: {:?}, quant_format: {:?}",
         weight_format,
@@ -117,13 +129,25 @@ pub(super) fn load_layers(
         skip
     };
     if low_memory_modelopt_moe {
-        tracing::info!(
-            "ATLAS_HOLO_LOW_MEMORY_MOE=1: skipping Holo ModelOpt MoE transpose/predequant prefill copies"
-        );
+        if let (Some(mode), Some(spec)) = (holo_fast_moe_mode, holo_fast_moe_spec.as_deref()) {
+            tracing::info!(
+                "ATLAS_HOLO_LOW_MEMORY_MOE=1: enabling Holo ModelOpt MoE {:?} prefill copies for layers {spec}",
+                mode,
+            );
+        } else {
+            tracing::info!(
+                "ATLAS_HOLO_LOW_MEMORY_MOE=1: skipping Holo ModelOpt MoE transpose/predequant prefill copies"
+            );
+        }
     }
     if native_modelopt_ssm {
         tracing::info!(
             "ATLAS_HOLO_NATIVE_FP8_SSM=1: routing Holo ModelOpt SSM projections through native FP8"
+        );
+    }
+    if native_modelopt_attn {
+        tracing::info!(
+            "ATLAS_HOLO_NATIVE_FP8_ATTN=1: routing Holo ModelOpt attention projections through native FP8"
         );
     }
 
@@ -216,10 +240,33 @@ pub(super) fn load_layers(
         // With native FP8, the FP8 fused MoE kernel handles both prefill and decode.
         // Skip transposition and predequant (saves ~30 GB + CPU time for 122B EP=2).
         // ATLAS_FORCE_NVFP4_MOE=1 inverts: do the prep so NVFP4 path is usable.
-        if (!native_fp8 || force_nvfp4_moe) && !skip_moe_transpose && !low_memory_modelopt_moe {
-            moe_layer.transpose_for_prefill(gpu, config)?;
+        let fast_holo_moe_layer = low_memory_modelopt_moe
+            && holo_fast_moe_mode.is_some()
+            && holo_fast_moe_layer_selected(i);
+        let skip_moe_prefill_copies = low_memory_modelopt_moe && !fast_holo_moe_layer;
+        if fast_holo_moe_layer {
+            tracing::info!(
+                "Layer {i}: selected for Holo ModelOpt {:?} MoE prefill copies",
+                holo_fast_moe_mode.expect("checked is_some"),
+            );
         }
-        if (!native_fp8 || force_nvfp4_moe) && !low_memory_modelopt_moe {
+        if (!native_fp8 || force_nvfp4_moe)
+            && (!skip_moe_transpose || fast_holo_moe_layer)
+            && !skip_moe_prefill_copies
+        {
+            match holo_fast_moe_mode {
+                Some(HoloFastMoeMode::GateUp) if fast_holo_moe_layer => {
+                    moe_layer.transpose_gate_up_for_prefill(gpu, config)?;
+                }
+                Some(HoloFastMoeMode::Unified) if fast_holo_moe_layer => {
+                    moe_layer.transpose_for_prefill_unified(gpu, config)?;
+                }
+                _ => {
+                    moe_layer.transpose_for_prefill(gpu, config)?;
+                }
+            }
+        }
+        if (!native_fp8 || force_nvfp4_moe) && !skip_moe_prefill_copies {
             moe_layer.predequant_for_prefill(gpu, config, stream)?;
         }
 
@@ -398,7 +445,7 @@ pub(super) fn load_layers(
         match lt {
             LayerType::FullAttention
                 if (native_fp8 && dequant_attn_to_bf16 && !force_nvfp4_all)
-                    || modelopt_mixed_precision =>
+                    || (modelopt_mixed_precision && !native_modelopt_attn) =>
             {
                 // ── BF16-dequant attention (diagnostic, TP=1) ──
                 // Dequant FP8 Q/K/V/O → BF16 on GPU, store as dense weights,
@@ -463,7 +510,9 @@ pub(super) fn load_layers(
                 layers.push(Box::new(layer));
                 attn_idx += 1;
             }
-            LayerType::FullAttention if native_fp8 && !force_nvfp4_all => {
+            LayerType::FullAttention
+                if (native_fp8 || native_modelopt_attn) && !force_nvfp4_all =>
+            {
                 // ── Native FP8 path: FP8 for both decode AND prefill ──
                 // NO NVFP4 dequant — saves ~30 GB peak memory on 122B EP=2.
                 // Decode uses w8a16_gemv, prefill uses w8a16_gemm (both with
@@ -715,6 +764,76 @@ fn layer_dequant_selected(layer: usize) -> bool {
         None => true,
         Some(ranges) => ranges.iter().any(|&(a, b)| layer >= a && layer <= b),
     }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum HoloFastMoeMode {
+    GateUp,
+    Full,
+    Unified,
+}
+
+fn holo_fast_moe_mode() -> Option<HoloFastMoeMode> {
+    use std::sync::OnceLock;
+    static MODE: OnceLock<Option<HoloFastMoeMode>> = OnceLock::new();
+    *MODE.get_or_init(|| {
+        let Ok(mode) = std::env::var("ATLAS_HOLO_FAST_MOE_MODE") else {
+            return None;
+        };
+        match mode.trim() {
+            "gate_up" | "gate-up" => Some(HoloFastMoeMode::GateUp),
+            "full" => Some(HoloFastMoeMode::Full),
+            "unified" => {
+                let unified_layout = std::env::var("ATLAS_UNIFIED_MOE_LAYOUT")
+                    .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                    .unwrap_or(false);
+                if unified_layout {
+                    Some(HoloFastMoeMode::Unified)
+                } else {
+                    tracing::warn!(
+                        "Ignoring ATLAS_HOLO_FAST_MOE_MODE=unified; set ATLAS_UNIFIED_MOE_LAYOUT=1 so decode uses transposed experts"
+                    );
+                    None
+                }
+            }
+            other => {
+                tracing::warn!(
+                    "Ignoring ATLAS_HOLO_FAST_MOE_MODE={other:?}; expected gate_up, full, or unified"
+                );
+                None
+            }
+        }
+    })
+}
+
+fn holo_fast_moe_layer_selected(layer: usize) -> bool {
+    use std::sync::OnceLock;
+    static SPEC: OnceLock<Vec<(usize, usize)>> = OnceLock::new();
+    let ranges = SPEC.get_or_init(|| {
+        let Ok(spec) = std::env::var("ATLAS_HOLO_FAST_MOE_LAYERS") else {
+            return Vec::new();
+        };
+        parse_layer_ranges(&spec)
+    });
+    ranges.iter().any(|&(a, b)| layer >= a && layer <= b)
+}
+
+fn parse_layer_ranges(spec: &str) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    for part in spec.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        if let Some((a, b)) = part.split_once('-') {
+            if let (Ok(a), Ok(b)) = (a.trim().parse::<usize>(), b.trim().parse::<usize>()) {
+                ranges.push((a.min(b), a.max(b)));
+            }
+        } else if let Ok(a) = part.parse::<usize>() {
+            ranges.push((a, a));
+        }
+    }
+    ranges
 }
 
 fn is_holo_modelopt_mixed_precision(config: &ModelConfig) -> bool {

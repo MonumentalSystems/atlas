@@ -45,23 +45,40 @@ impl MoeLayer {
             };
         }
 
-        // 4. Upper-bound max_m_tiles — sized for the absolute worst case
-        // (one expert eats all tokens) so the kernel never silently truncates
-        // a heavily-loaded expert's rows. The previous `avg*2` heuristic was
-        // wrong: real learned MoE routers concentrate experts ~7× the average
-        // (observed on Qwen3.6-35B-A3B at chunk=4097: avg=129, max=929 for
-        // expert 227 → kernel covered 320 rows but needed 929 → 609 rows
-        // silently dropped → systematic ~-14% under-count in routed-MoE
-        // output). The Poisson(avg) assumption in the old comment doesn't
-        // hold for trained routers — they're sparse + concentrated.
-        //
-        // Cost: extra empty tiles for under-utilized experts; each early-
-        // exits on `m_idx >= M_expert` so overhead is low vs the correctness
-        // bug.
-        //
-        // Mirrors the FP8 path (see forward_prefill_fp8.rs).
         let avg_per_expert = (num_tokens * top_k as usize).div_ceil(ne);
-        let max_m_tiles = (num_tokens * top_k as usize).div_ceil(64).max(1) as u32;
+        // Default to the absolute worst case (one expert receives every routed
+        // token) to prevent silent truncation. An opt-in load-factor cap lets
+        // Holo experiments trade that safety margin for fewer empty expert
+        // tiles after validating the router histogram.
+        let worst_case_m_tiles = (num_tokens * top_k as usize).div_ceil(64).max(1) as u32;
+        let exact_tiles = std::env::var("ATLAS_MOE_PREFILL_EXACT_TILES")
+            .ok()
+            .as_deref()
+            == Some("1")
+            && !ctx.graph_capture;
+        let max_m_tiles = if exact_tiles {
+            let mut offsets = vec![0u8; (ne + 1) * 4];
+            ctx.gpu
+                .copy_d2h_on_stream(expert_offsets, &mut offsets, stream)?;
+            let mut prev = 0u32;
+            let mut max_rows = 0u32;
+            for raw in offsets.chunks_exact(4).skip(1) {
+                let cur = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
+                max_rows = max_rows.max(cur.saturating_sub(prev));
+                prev = cur;
+            }
+            max_rows.div_ceil(64).max(1).min(worst_case_m_tiles)
+        } else {
+            std::env::var("ATLAS_MOE_PREFILL_MAX_LOAD_FACTOR")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|&factor| factor > 0)
+                .map(|factor| {
+                    let capped_rows = avg_per_expert.saturating_mul(factor);
+                    worst_case_m_tiles.min(capped_rows.div_ceil(64).max(1) as u32)
+                })
+                .unwrap_or(worst_case_m_tiles)
+        };
         super::dump::dump_expert_load(
             ctx.gpu,
             stream,
@@ -78,15 +95,13 @@ impl MoeLayer {
         // 5. Grouped gate+up GEMM — cp.async pipelined FP8-MMA K64 (transposed).
         let expert_gate_out = ctx.buffers.expert_gate_out();
         let expert_up_out = ctx.buffers.expert_up_out();
-        // Zero expert buffers unconditionally before the grouped GEMMs.
-        // Even with worst-case `max_m_tiles` (above), some kernel paths only
-        // write rows where `m_idx < M_expert` per expert — rows past the
-        // expert's actual count keep stale data from the previous prefill
-        // (or uninit memory on first prefill), which then propagates
-        // through unpermute_reduce as spurious contributions. Previously
-        // guarded by `ctx.comm.is_some()` (EP only), now unconditional.
-        // Mirrors the FP8 path fix (commit 34626d3).
-        {
+        // EP remote experts return without writing, so the destination must be
+        // zeroed before dispatch. In non-EP, `moe_sort_by_expert` produces a
+        // dense token_to_perm over exactly [0, total_expanded), and grouped
+        // kernels write every row that can be referenced by unpermute_reduce.
+        // Skipping the memset removes ~138 MB/layer of scratch clears on Holo.
+        let force_zero = std::env::var("ATLAS_MOE_PREFILL_ZERO").ok().as_deref() == Some("1");
+        if ctx.comm.is_some() || force_zero {
             let gate_bytes = total_expanded as usize * inter as usize * 2;
             let up_bytes = gate_bytes;
             let down_bytes = total_expanded as usize * h as usize * 2;
@@ -199,22 +214,53 @@ impl MoeLayer {
                 stream,
             )?;
             if let Some(dp) = &self.down_ptrs_t {
-                ops::moe_w4a16_grouped_gemm_ptrtable_n128(
-                    ctx.gpu,
-                    self.moe_grouped_gemm_t_k64,
-                    expert_gate_out,
-                    dp.packed_ptrs,
-                    dp.scale_ptrs,
-                    dp.scale2_vals,
-                    expert_down_out,
-                    expert_offsets,
-                    DevicePtr(0),
-                    num_experts,
-                    h,
-                    inter,
-                    max_m_tiles,
-                    stream,
-                )?;
+                let fp8_down = std::env::var("ATLAS_MOE_PREFILL_FP8_DOWN").ok().as_deref()
+                    == Some("1")
+                    && self.moe_fp8_grouped_gemm_t.0 != 0
+                    && self.bf16_to_fp8_k.0 != 0;
+                if fp8_down {
+                    ops::bf16_to_fp8(
+                        ctx.gpu,
+                        self.bf16_to_fp8_k,
+                        expert_gate_out,
+                        expert_up_out,
+                        total_expanded * inter,
+                        stream,
+                    )?;
+                    ops::moe_fp8_grouped_gemm_ptrtable_n128(
+                        ctx.gpu,
+                        self.moe_fp8_grouped_gemm_t,
+                        expert_up_out,
+                        dp.packed_ptrs,
+                        dp.scale_ptrs,
+                        dp.scale2_vals,
+                        expert_down_out,
+                        expert_offsets,
+                        DevicePtr(0),
+                        num_experts,
+                        h,
+                        inter,
+                        max_m_tiles,
+                        stream,
+                    )?;
+                } else {
+                    ops::moe_w4a16_grouped_gemm_ptrtable_n128(
+                        ctx.gpu,
+                        self.moe_grouped_gemm_t_k64,
+                        expert_gate_out,
+                        dp.packed_ptrs,
+                        dp.scale_ptrs,
+                        dp.scale2_vals,
+                        expert_down_out,
+                        expert_offsets,
+                        DevicePtr(0),
+                        num_experts,
+                        h,
+                        inter,
+                        max_m_tiles,
+                        stream,
+                    )?;
+                }
             } else {
                 ops::moe_w4a16_grouped_gemm_ptrtable(
                     ctx.gpu,

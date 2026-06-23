@@ -70,6 +70,22 @@ impl MoeLayer {
             moe_weighted_sum_blend_batch3: gpu
                 .kernel("moe_fused_batch3", "moe_weighted_sum_blend_batch3")?,
             w4a16_gemv_batch3: gpu.kernel("w4a16_gemv", "w4a16_gemv_batch3")?,
+            moe_expert_gate_up_shared_token_major: gpu
+                .kernel("moe_prefill", "moe_expert_gate_up_shared_prefill")?,
+            moe_expert_silu_down_shared_token_major: gpu
+                .kernel("moe_prefill", "moe_expert_silu_down_shared_prefill")?,
+            moe_weighted_sum_blend_token_major: gpu
+                .kernel("moe_prefill", "moe_weighted_sum_blend_prefill")?,
+            moe_decode_atomic_c4_silu_down_accum_k: super::super::try_kernel(
+                gpu,
+                "moe_decode_atomic_c4",
+                "moe_decode_atomic_c4_silu_down_accum",
+            ),
+            moe_decode_atomic_c4_finalize_k: super::super::try_kernel(
+                gpu,
+                "moe_decode_atomic_c4",
+                "moe_decode_atomic_c4_finalize",
+            ),
             moe_sort_by_expert: gpu.kernel("moe", "moe_sort_by_expert")?,
             moe_sorted_gate_up: gpu.kernel("moe_sorted", "moe_sorted_gate_up")?,
             moe_sorted_silu_down: gpu.kernel("moe_sorted", "moe_sorted_silu_down")?,

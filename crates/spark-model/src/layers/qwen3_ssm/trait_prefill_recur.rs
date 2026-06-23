@@ -110,7 +110,8 @@ impl Qwen3SsmLayer {
             let w_out = fla_scratch;
             let u_out = w_out.offset(nt * nv * 64 * kd * 2);
             let s_out = u_out.offset(nt * nv * 64 * vd * 2);
-            let uc_out = s_out.offset(nt * nv * kd * vd * 4);
+            let uc_out = s_out.offset(nt * nv * kd * vd * 2);
+            let gc_out = uc_out.offset(nt * nv * 64 * vd * 2);
             ops::gdn_prefill_fla(
                 ctx.gpu,
                 self.gdn_prefill_fla_recompute_wu_k,
@@ -127,6 +128,7 @@ impl Qwen3SsmLayer {
                 u_out,
                 s_out,
                 uc_out,
+                gc_out,
                 1,
                 k,
                 num_chunks,
@@ -137,6 +139,7 @@ impl Qwen3SsmLayer {
                 conv_dim as u32,
                 conv_dim as u32,
                 gb_stride,
+                ctx.profile,
                 stream,
             )?;
         } else if self.gdn_prefill_persistent_wy4_k.0 != 0 {

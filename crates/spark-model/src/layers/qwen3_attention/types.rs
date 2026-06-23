@@ -155,6 +155,8 @@ pub struct Qwen3AttentionLayer {
     pub(super) rope_k: KernelHandle,
     /// MRoPE-interleaved kernel.
     pub(super) rope_mrope_interleaved_k: KernelHandle,
+    /// K-only MRoPE kernel used when Q RoPE is fused into Q deinterleave/norm.
+    pub(super) rope_mrope_interleaved_k_only_k: KernelHandle,
     /// YaRN RoPE kernel using pre-computed inv_freq table (Mistral, etc.)
     pub(super) rope_yarn_k: KernelHandle,
     /// Proportional RoPE kernel (Gemma-4 full-attention layers).
@@ -288,6 +290,7 @@ pub struct Qwen3AttentionLayer {
     // Batched prefill kernels
     pub(super) deinterleave_qg_split_k: KernelHandle,
     pub(super) deinterleave_qg_split_qnorm_k: KernelHandle,
+    pub(super) deinterleave_qg_split_qnorm_mrope_k: KernelHandle,
     pub(super) sigmoid_gate_mul_batched_k: KernelHandle,
     // Pre-dequanted FP8 weights for zero-overhead prefill GEMMs
     pub(super) q_fp8: Option<DevicePtr>,

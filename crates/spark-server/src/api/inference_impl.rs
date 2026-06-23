@@ -47,6 +47,14 @@ impl InferenceRequest {
         }
     }
 
+    /// Whether this request carries preprocessed image embeddings.
+    pub fn has_image_pixels(&self) -> bool {
+        match self {
+            InferenceRequest::Blocking { image_pixels, .. } => !image_pixels.is_empty(),
+            InferenceRequest::Streaming { image_pixels, .. } => !image_pixels.is_empty(),
+        }
+    }
+
     /// Preprocessed image data, consumed by the scheduler before prefill.
     pub fn take_image_pixels(&mut self) -> Vec<(Vec<f32>, usize, usize)> {
         match self {

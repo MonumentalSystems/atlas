@@ -26,7 +26,17 @@ impl Qwen3AttentionLayer {
     ) -> Result<DevicePtr> {
         let o_out = ctx.buffers.norm_output();
         let force_w8a8 = ops::fp8_blockscaled_prefill_enabled();
-        if ops::cublas_gemm_enabled()
+        if ops::cutlass_nvfp4_attn_o_enabled()
+            && let Some(ref nvfp4_t) = self.o_nvfp4_t
+        {
+            ops::log_cutlass_nvfp4_route("attn_o", n, h, nq * hd);
+            ops::cutlass_nvfp4_proj(ctx.gpu, attn_out, nvfp4_t, o_out, n, h, nq * hd, stream)?;
+        } else if ops::cutlass_nvfp4_attn_o_enabled()
+            && let Some(fp8w) = self.o_weight.as_ref().and_then(|w| w.as_fp8())
+        {
+            ops::log_cutlass_nvfp4_route("attn_o", n, h, nq * hd);
+            ops::cutlass_nvfp4_proj_from_fp8(ctx.gpu, attn_out, fp8w, o_out, n, h, nq * hd, stream)?;
+        } else if ops::cublas_gemm_enabled()
             && let Some(fp8w) = self.o_weight.as_ref().and_then(|w| w.as_fp8())
         {
             // cuBLASLt BF16 (3x the hand-written mma.sync GEMM on GB10).

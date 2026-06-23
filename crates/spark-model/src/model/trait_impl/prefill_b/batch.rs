@@ -205,11 +205,13 @@ impl TransformerModel {
             let seq = &mut *slice.seq;
 
             // EP=2 zeroes ALL buffers per chunk for NCCL defence-in-depth.
-            // EP=1 zeroes essentials only at chunk_start==0 (stale data).
+            // EP=1 zeroes only prefill essentials at chunk_start==0; layer
+            // forward overwrites the remaining scratch buffers before read.
             if self.comm.is_some() {
                 self.buffers.zero_all(self.gpu.as_ref(), stream)?;
             } else if chunk_start == 0 {
-                self.buffers.zero_all(self.gpu.as_ref(), stream)?;
+                self.buffers
+                    .zero_prefill_essentials(self.gpu.as_ref(), stream)?;
             }
 
             // Phase 1+1b: embed at the shared hidden-buffer offset 0.

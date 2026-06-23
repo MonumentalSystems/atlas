@@ -298,15 +298,30 @@ pub fn fp8_gemm_act_weight_t_rowwise(
         set(DESC_TRANSA, &ta as *const i32 as *const c_void, 4, "TRANSA")?;
         set(DESC_TRANSB, &tb as *const i32 as *const c_void, 4, "TRANSB")?;
         let mode = SCALE_MODE_OUTER_VEC_32F;
-        set(DESC_A_SCALE_MODE, &mode as *const i32 as *const c_void, 4, "A_SCALE_MODE")?;
-        set(DESC_B_SCALE_MODE, &mode as *const i32 as *const c_void, 4, "B_SCALE_MODE")?;
+        set(
+            DESC_A_SCALE_MODE,
+            &mode as *const i32 as *const c_void,
+            4,
+            "A_SCALE_MODE",
+        )?;
+        set(
+            DESC_B_SCALE_MODE,
+            &mode as *const i32 as *const c_void,
+            4,
+            "B_SCALE_MODE",
+        )?;
         set(
             DESC_A_SCALE_POINTER,
             &weight_scale as *const u64 as *const c_void,
             8,
             "A_SCALE_POINTER",
         )?;
-        set(DESC_B_SCALE_POINTER, &act_scale as *const u64 as *const c_void, 8, "B_SCALE_POINTER")?;
+        set(
+            DESC_B_SCALE_POINTER,
+            &act_scale as *const u64 as *const c_void,
+            8,
+            "B_SCALE_POINTER",
+        )?;
 
         let mut la: cublasLtMatrixLayout_t = std::ptr::null_mut();
         let mut lb: cublasLtMatrixLayout_t = std::ptr::null_mut();
@@ -339,8 +354,16 @@ pub fn fp8_gemm_act_weight_t_rowwise(
         let mut returned: i32 = 0;
         chk(
             cublasLtMatmulAlgoGetHeuristic(
-                ctx.handle, desc, la, lb, ld_, ld_, pref, 1,
-                result.as_mut_ptr() as *mut c_void, &mut returned,
+                ctx.handle,
+                desc,
+                la,
+                lb,
+                ld_,
+                ld_,
+                pref,
+                1,
+                result.as_mut_ptr() as *mut c_void,
+                &mut returned,
             ),
             "AlgoGetHeuristic",
         )?;
@@ -350,15 +373,21 @@ pub fn fp8_gemm_act_weight_t_rowwise(
         let alpha: f32 = 1.0;
         let beta: f32 = 0.0;
         let status = cublasLtMatmul(
-            ctx.handle, desc,
+            ctx.handle,
+            desc,
             &alpha as *const f32 as *const c_void,
-            weight_fp8 as *const c_void, la,
-            act_fp8 as *const c_void, lb,
+            weight_fp8 as *const c_void,
+            la,
+            act_fp8 as *const c_void,
+            lb,
             &beta as *const f32 as *const c_void,
-            out as *const c_void, ld_,
-            out as *mut c_void, ld_,
+            out as *const c_void,
+            ld_,
+            out as *mut c_void,
+            ld_,
             result.as_ptr() as *const c_void,
-            ctx.workspace as *mut c_void, ctx.ws_size,
+            ctx.workspace as *mut c_void,
+            ctx.ws_size,
             stream as *mut c_void,
         );
         cublasLtMatmulPreferenceDestroy(pref);
@@ -406,15 +435,30 @@ pub fn fp8_gemm_act_weight_t_blkscaled(
         // per-[token,128-of-K] VEC128 (DeepSeek block-fp8 scheme).
         let a_mode = SCALE_MODE_BLK128X128_32F;
         let b_mode = SCALE_MODE_VEC128_32F;
-        set(DESC_A_SCALE_MODE, &a_mode as *const i32 as *const c_void, 4, "A_SCALE_MODE")?;
-        set(DESC_B_SCALE_MODE, &b_mode as *const i32 as *const c_void, 4, "B_SCALE_MODE")?;
+        set(
+            DESC_A_SCALE_MODE,
+            &a_mode as *const i32 as *const c_void,
+            4,
+            "A_SCALE_MODE",
+        )?;
+        set(
+            DESC_B_SCALE_MODE,
+            &b_mode as *const i32 as *const c_void,
+            4,
+            "B_SCALE_MODE",
+        )?;
         set(
             DESC_A_SCALE_POINTER,
             &weight_block_scale as *const u64 as *const c_void,
             8,
             "A_SCALE_POINTER",
         )?;
-        set(DESC_B_SCALE_POINTER, &act_scale as *const u64 as *const c_void, 8, "B_SCALE_POINTER")?;
+        set(
+            DESC_B_SCALE_POINTER,
+            &act_scale as *const u64 as *const c_void,
+            8,
+            "B_SCALE_POINTER",
+        )?;
 
         let mut la: cublasLtMatrixLayout_t = std::ptr::null_mut();
         let mut lb: cublasLtMatrixLayout_t = std::ptr::null_mut();
@@ -447,8 +491,16 @@ pub fn fp8_gemm_act_weight_t_blkscaled(
         let mut returned: i32 = 0;
         chk(
             cublasLtMatmulAlgoGetHeuristic(
-                ctx.handle, desc, la, lb, ld_, ld_, pref, 1,
-                result.as_mut_ptr() as *mut c_void, &mut returned,
+                ctx.handle,
+                desc,
+                la,
+                lb,
+                ld_,
+                ld_,
+                pref,
+                1,
+                result.as_mut_ptr() as *mut c_void,
+                &mut returned,
             ),
             "AlgoGetHeuristic",
         )?;
@@ -458,15 +510,21 @@ pub fn fp8_gemm_act_weight_t_blkscaled(
         let alpha: f32 = 1.0;
         let beta: f32 = 0.0;
         let status = cublasLtMatmul(
-            ctx.handle, desc,
+            ctx.handle,
+            desc,
             &alpha as *const f32 as *const c_void,
-            weight_fp8 as *const c_void, la,
-            act_fp8 as *const c_void, lb,
+            weight_fp8 as *const c_void,
+            la,
+            act_fp8 as *const c_void,
+            lb,
             &beta as *const f32 as *const c_void,
-            out as *const c_void, ld_,
-            out as *mut c_void, ld_,
+            out as *const c_void,
+            ld_,
+            out as *mut c_void,
+            ld_,
             result.as_ptr() as *const c_void,
-            ctx.workspace as *mut c_void, ctx.ws_size,
+            ctx.workspace as *mut c_void,
+            ctx.ws_size,
             stream as *mut c_void,
         );
         cublasLtMatmulPreferenceDestroy(pref);

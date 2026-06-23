@@ -101,6 +101,13 @@ pub struct MoeLayer {
     moe_expert_silu_down_shared_batch3: KernelHandle,
     moe_weighted_sum_blend_batch3: KernelHandle,
     w4a16_gemv_batch3: KernelHandle,
+    // Generic token-major NVFP4 MoE kernels. Used as an opt-in decode
+    // concurrency experiment for N>=4 without grouped-GEMM sorting.
+    moe_expert_gate_up_shared_token_major: KernelHandle,
+    moe_expert_silu_down_shared_token_major: KernelHandle,
+    moe_weighted_sum_blend_token_major: KernelHandle,
+    moe_decode_atomic_c4_silu_down_accum_k: KernelHandle,
+    moe_decode_atomic_c4_finalize_k: KernelHandle,
     // Sorted/grouped prefill path
     moe_sort_by_expert: KernelHandle,
     moe_sorted_gate_up: KernelHandle,
@@ -287,6 +294,7 @@ pub struct MoeLayer {
 // ── Sub-files (split for ≤500 LoC) ────────────────────────────────────────
 mod dump;
 mod forward;
+mod forward_atomic_c4;
 mod forward_batched;
 mod forward_ep;
 mod forward_k2;
@@ -297,6 +305,7 @@ mod forward_prefill_bf16;
 mod forward_prefill_fp8;
 mod forward_prefill_phase;
 mod forward_prefill_routed;
+mod forward_token_major;
 mod helpers_a;
 mod helpers_b;
 mod helpers_c;

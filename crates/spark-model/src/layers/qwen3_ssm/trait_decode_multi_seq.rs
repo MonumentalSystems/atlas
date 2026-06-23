@@ -46,6 +46,14 @@ impl Qwen3SsmLayer {
         let bf16 = 2usize;
         let eps = ctx.config.rms_norm_eps as f32;
         let n = num_seqs;
+        let ssm_ms_profile = std::env::var("ATLAS_SSM_MS_PROFILE").ok().as_deref() == Some("1")
+            && !ctx.graph_capture;
+        let phase_a_t0 = if ssm_ms_profile {
+            ctx.gpu.synchronize(stream).ok();
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
 
         // Per-seq hidden/residual stride: the residual stream is always
         // BF16 (2 bytes), so hardcode the per-seq stride.
@@ -109,6 +117,17 @@ impl Qwen3SsmLayer {
                 )?;
             }
         }
+        let phase_a_us = if let Some(t0) = phase_a_t0 {
+            ctx.gpu.synchronize(stream).ok();
+            t0.elapsed().as_micros()
+        } else {
+            0
+        };
+        let phase_b_t0 = if ssm_ms_profile {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
 
         // ── Phase B+C: MoE + residual, dispatched by batch size ──
         // Measured on GB10 (qwen3.5-122b, 256-expert MoE, EP=2):
@@ -171,6 +190,58 @@ impl Qwen3SsmLayer {
                         (n * h) as u32,
                         stream,
                     )?;
+                } else if n == 4
+                    && std::env::var("ATLAS_MOE_ATOMIC_C4_DECODE")
+                        .ok()
+                        .as_deref()
+                        == Some("1")
+                {
+                    // Purpose-built C=4 routed MoE decode: batched routing,
+                    // token-major gate/up, FP32 atomicAdd routed down
+                    // accumulation, then BF16 finalize/blend.
+                    self.ffn.forward_atomic_c4_decode(normed_base, n, ctx, stream)?;
+                    let moe_out = ctx.buffers.moe_output();
+                    ops::residual_add(
+                        ctx.gpu,
+                        self.residual_add_k,
+                        hidden,
+                        moe_out,
+                        (n * h) as u32,
+                        stream,
+                    )?;
+                } else if std::env::var("ATLAS_MOE_TOKEN_MAJOR_DECODE")
+                    .ok()
+                    .as_deref()
+                    == Some("1")
+                {
+                    // Token-major N-token MoE decode: batched gate/top-k plus
+                    // generic fused routed/shared kernels, no grouped-GEMM sort.
+                    self.ffn
+                        .forward_token_major_decode(normed_base, n, ctx, stream)?;
+                    let moe_out = ctx.buffers.moe_output();
+                    ops::residual_add(
+                        ctx.gpu,
+                        self.residual_add_k,
+                        hidden,
+                        moe_out,
+                        (n * h) as u32,
+                        stream,
+                    )?;
+                } else if std::env::var("ATLAS_MOE_BATCHED_DECODE").ok().as_deref() == Some("1") {
+                    // Batched gate GEMM over all N tokens, but keep the proven
+                    // per-token expert kernels. This avoids the grouped path's
+                    // sort/GEMM overhead while testing whether reading router
+                    // weights once helps C=4 decode.
+                    self.ffn.forward_batched(normed_base, n, ctx, stream)?;
+                    let moe_out = ctx.buffers.moe_output();
+                    ops::residual_add(
+                        ctx.gpu,
+                        self.residual_add_k,
+                        hidden,
+                        moe_out,
+                        (n * h) as u32,
+                        stream,
+                    )?;
                 } else {
                     for i in 0..n {
                         let hidden_i = hidden.offset(i * h * residual_elem);
@@ -187,6 +258,14 @@ impl Qwen3SsmLayer {
                     }
                 }
             }
+        }
+        if let Some(t0) = phase_b_t0 {
+            ctx.gpu.synchronize(stream).ok();
+            tracing::info!(
+                "ATLAS_SSM_MS_PROFILE n={n}: mixer={}us moe_residual={}us",
+                phase_a_us,
+                t0.elapsed().as_micros(),
+            );
         }
 
         Ok(())
@@ -247,6 +326,34 @@ impl Qwen3SsmLayer {
         // and the FP32 conv path uses `ssm_conv_out_f32`, not `ssm_qkvz`.
         let normed_out_base = ctx.buffers.ssm_qkvz();
         let ssm_out_base = ctx.buffers.moe_output();
+        let detail_profile = std::env::var("ATLAS_SSM_DETAIL_PROFILE").ok().as_deref() == Some("1")
+            && !ctx.graph_capture;
+        let mut detail_parts: Vec<(&'static str, u128)> = Vec::new();
+        let mut detail_t0 = if detail_profile {
+            ctx.gpu.synchronize(stream).ok();
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+        let mut rec_ba_us = 0u128;
+        let mut rec_conv_us = 0u128;
+        let mut rec_gdn_us = 0u128;
+        let mut rec_norm_us = 0u128;
+        macro_rules! detail_step {
+            ($label:expr) => {
+                if let Some(t0) = detail_t0.take() {
+                    ctx.gpu.synchronize(stream).ok();
+                    detail_parts.push(($label, t0.elapsed().as_micros()));
+                    detail_t0 = Some(std::time::Instant::now());
+                }
+            };
+            ($label:expr, final) => {
+                if let Some(t0) = detail_t0.take() {
+                    ctx.gpu.synchronize(stream).ok();
+                    detail_parts.push(($label, t0.elapsed().as_micros()));
+                }
+            };
+        }
 
         // ── 1. Batched input RMS norm: hidden[0..n] → normed[0..n], residual ──
         ops::rms_norm_residual(
@@ -261,6 +368,7 @@ impl Qwen3SsmLayer {
             eps,
             stream,
         )?;
+        detail_step!("input_norm");
 
         // ── 2. Batched QKVZ projection: ONE [N,h]→[N,qkvz] GEMM (weights ×1) ──
         // FP8 (w8a16) when the decode overlay is installed, else BF16 dense.
@@ -309,94 +417,321 @@ impl Qwen3SsmLayer {
                 stream,
             )?;
         }
+        detail_step!("qkvz");
 
-        // ── 3. Per-seq recurrent inner (byte-identical to ssm_forward) ──
-        for i in 0..n {
-            let normed_i = normed_base.offset(i * h * bf16);
-            let deint_i = deinterleaved.offset(i * qkvz_size * bf16);
-            let z_i = deint_i.offset((key_dim * 2 + value_dim) * bf16);
-            let normed_out_i = normed_out_base.offset(i * value_dim * bf16);
+        // ── 3. Recurrent inner ──
+        // Default: per-seq, byte-identical to ssm_forward. Experimental path:
+        // use existing batch dimensions for BA/gates, conv, GDN, and gated norm
+        // when the SSM pool states are contiguous slots [0..n).
+        let batched_recurrent = if std::env::var("ATLAS_SSM_BATCHED_RECURRENT").ok().as_deref()
+            == Some("1")
+            && self.gdn_f32_strided_k.0 != 0
+            && n > 1
+        {
+            let mut h_base = DevicePtr::NULL;
+            let mut conv_base = DevicePtr::NULL;
+            let mut contiguous = true;
+            for i in 0..n {
+                let ssm_state = states[i]
+                    .as_any_mut()
+                    .downcast_mut::<SsmLayerState>()
+                    .ok_or_else(|| anyhow::anyhow!("Expected SsmLayerState for seq {i}"))?;
+                if i == 0 {
+                    h_base = ssm_state.h_state;
+                    conv_base = ssm_state.conv_state;
+                } else {
+                    contiguous &= ssm_state.h_state.0 == h_base.0 + (i * self.h_state_bytes) as u64;
+                    contiguous &=
+                        ssm_state.conv_state.0 == conv_base.0 + (i * self.conv_state_bytes) as u64;
+                }
+            }
+            if contiguous {
+                Some((h_base, conv_base))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
 
-            let ssm_state = states[i]
-                .as_any_mut()
-                .downcast_mut::<SsmLayerState>()
-                .ok_or_else(|| anyhow::anyhow!("Expected SsmLayerState for seq {i}"))?;
-
-            // BA projection + GDN gates (reuse the single-token gates scratch).
+        if let Some((h_state_base, conv_state_base)) = batched_recurrent {
             let gates = ctx.buffers.ssm_gates();
             let beta_fp32 = gates.offset(nv * 4);
-            ops::dense_gemv_ba_gates(
+            let gate_stride = (nv * 2) as u32;
+            ops::dense_gemm_ba_gates_prefill(
                 ctx.gpu,
-                self.ba_gates_k,
-                normed_i,
+                self.ba_gates_prefill_k,
+                normed_base,
                 &self.ssm.in_proj_ba,
                 self.ssm.a_log.weight,
                 self.ssm.dt_bias.weight,
                 gates,
-                beta_fp32,
+                n as u32,
                 ba_size,
                 h as u32,
+                h as u32,
+                gate_stride,
+                nv as u32,
                 vpg as u32,
                 stream,
             )?;
+            detail_step!("recurrent_batched_ba");
 
-            // Conv1d update + SiLU + L2-norm (FP32 recurrent path).
             let conv_out = ctx.buffers.ssm_conv_out_f32();
             ops::conv1d_update_l2norm(
                 ctx.gpu,
                 self.conv1d_l2norm_f32_k,
-                ssm_state.conv_state,
-                deint_i,
+                conv_state_base,
+                deinterleaved,
                 &self.ssm.conv1d,
                 conv_out,
                 conv_dim,
                 d_conv,
-                1,
+                n as u32,
                 qk_channels,
                 kd as u32,
                 1e-6,
                 stream,
             )?;
+            detail_step!("recurrent_batched_conv");
 
-            // GDN recurrence (FP32 output into the conv buffer's Z-region tail).
-            let gdn_out = conv_out.offset((key_dim * 2 + value_dim) * 4);
-            let q_conv = conv_out;
-            let k_conv = conv_out.offset(key_dim * 4);
-            let v_conv = conv_out.offset(key_dim * 2 * 4);
-            ops::gdn_decode(
-                ctx.gpu,
-                self.gdn_f32_k,
-                ssm_state.h_state,
-                q_conv,
-                k_conv,
-                v_conv,
-                gates,
-                beta_fp32,
-                gdn_out,
-                1,
-                nk as u32,
-                nv as u32,
-                kd as u32,
-                vd as u32,
-                stream,
-            )?;
+            if self.gdn_f32_strided_norm_k.0 != 0
+                && std::env::var("ATLAS_GDN_FUSED_NORM").ok().as_deref() == Some("1")
+            {
+                let z_base = deinterleaved.offset((key_dim * 2 + value_dim) * bf16);
+                ops::gdn_decode_f32_strided_norm(
+                    ctx.gpu,
+                    self.gdn_f32_strided_norm_k,
+                    h_state_base,
+                    conv_out,
+                    conv_out.offset(key_dim * 4),
+                    conv_out.offset(key_dim * 2 * 4),
+                    gates,
+                    beta_fp32,
+                    z_base,
+                    self.ssm.norm.weight,
+                    normed_out_base,
+                    n as u32,
+                    nk as u32,
+                    nv as u32,
+                    kd as u32,
+                    vd as u32,
+                    conv_dim,
+                    conv_dim,
+                    gate_stride,
+                    qkvz_size as u32,
+                    value_dim as u32,
+                    eps,
+                    stream,
+                )?;
+                detail_step!("recurrent_batched_gdn_norm");
+            } else {
+                let gdn_out = conv_out.offset(n * conv_dim as usize * 4);
+                ops::gdn_decode_f32_strided(
+                    ctx.gpu,
+                    self.gdn_f32_strided_k,
+                    h_state_base,
+                    conv_out,
+                    conv_out.offset(key_dim * 4),
+                    conv_out.offset(key_dim * 2 * 4),
+                    gates,
+                    beta_fp32,
+                    gdn_out,
+                    n as u32,
+                    nk as u32,
+                    nv as u32,
+                    kd as u32,
+                    vd as u32,
+                    conv_dim,
+                    conv_dim,
+                    gate_stride,
+                    value_dim as u32,
+                    stream,
+                )?;
+                detail_step!("recurrent_batched_gdn");
 
-            // Gated RMS norm with Z gate → normed_out[i].
-            ops::gated_rms_norm(
-                ctx.gpu,
-                self.gated_rms_norm_f32_k,
-                gdn_out,
-                z_i,
-                &self.ssm.norm,
-                normed_out_i,
-                nv as u32,
-                vd as u32,
-                vd as u32,
-                eps,
-                vd as u32,
-                stream,
-            )?;
+                for i in 0..n {
+                    let deint_i = deinterleaved.offset(i * qkvz_size * bf16);
+                    let z_i = deint_i.offset((key_dim * 2 + value_dim) * bf16);
+                    let gdn_out_i = gdn_out.offset(i * value_dim * 4);
+                    let normed_out_i = normed_out_base.offset(i * value_dim * bf16);
+                    ops::gated_rms_norm(
+                        ctx.gpu,
+                        self.gated_rms_norm_f32_k,
+                        gdn_out_i,
+                        z_i,
+                        &self.ssm.norm,
+                        normed_out_i,
+                        nv as u32,
+                        vd as u32,
+                        vd as u32,
+                        eps,
+                        vd as u32,
+                        stream,
+                    )?;
+                }
+                detail_step!("recurrent_batched_norm");
+            }
+        } else {
+            for i in 0..n {
+                let normed_i = normed_base.offset(i * h * bf16);
+                let deint_i = deinterleaved.offset(i * qkvz_size * bf16);
+                let z_i = deint_i.offset((key_dim * 2 + value_dim) * bf16);
+                let normed_out_i = normed_out_base.offset(i * value_dim * bf16);
+
+                let ssm_state = states[i]
+                    .as_any_mut()
+                    .downcast_mut::<SsmLayerState>()
+                    .ok_or_else(|| anyhow::anyhow!("Expected SsmLayerState for seq {i}"))?;
+
+                let gates = ctx.buffers.ssm_gates();
+                let beta_fp32 = gates.offset(nv * 4);
+                let sub_t0 = if detail_profile {
+                    ctx.gpu.synchronize(stream).ok();
+                    Some(std::time::Instant::now())
+                } else {
+                    None
+                };
+                ops::dense_gemv_ba_gates(
+                    ctx.gpu,
+                    self.ba_gates_k,
+                    normed_i,
+                    &self.ssm.in_proj_ba,
+                    self.ssm.a_log.weight,
+                    self.ssm.dt_bias.weight,
+                    gates,
+                    beta_fp32,
+                    ba_size,
+                    h as u32,
+                    vpg as u32,
+                    stream,
+                )?;
+                if let Some(t0) = sub_t0 {
+                    ctx.gpu.synchronize(stream).ok();
+                    rec_ba_us += t0.elapsed().as_micros();
+                }
+
+                let conv_out = ctx.buffers.ssm_conv_out_f32();
+                let sub_t0 = if detail_profile {
+                    Some(std::time::Instant::now())
+                } else {
+                    None
+                };
+                ops::conv1d_update_l2norm(
+                    ctx.gpu,
+                    self.conv1d_l2norm_f32_k,
+                    ssm_state.conv_state,
+                    deint_i,
+                    &self.ssm.conv1d,
+                    conv_out,
+                    conv_dim,
+                    d_conv,
+                    1,
+                    qk_channels,
+                    kd as u32,
+                    1e-6,
+                    stream,
+                )?;
+                if let Some(t0) = sub_t0 {
+                    ctx.gpu.synchronize(stream).ok();
+                    rec_conv_us += t0.elapsed().as_micros();
+                }
+
+                let gdn_out = conv_out.offset((key_dim * 2 + value_dim) * 4);
+                let q_conv = conv_out;
+                let k_conv = conv_out.offset(key_dim * 4);
+                let v_conv = conv_out.offset(key_dim * 2 * 4);
+                let sub_t0 = if detail_profile {
+                    Some(std::time::Instant::now())
+                } else {
+                    None
+                };
+                if self.gdn_f32_norm_k.0 != 0
+                    && std::env::var("ATLAS_GDN_FUSED_NORM").ok().as_deref() == Some("1")
+                {
+                    ops::gdn_decode_f32_norm(
+                        ctx.gpu,
+                        self.gdn_f32_norm_k,
+                        ssm_state.h_state,
+                        q_conv,
+                        k_conv,
+                        v_conv,
+                        gates,
+                        beta_fp32,
+                        z_i,
+                        self.ssm.norm.weight,
+                        normed_out_i,
+                        1,
+                        nk as u32,
+                        nv as u32,
+                        kd as u32,
+                        vd as u32,
+                        eps,
+                        stream,
+                    )?;
+                    if let Some(t0) = sub_t0 {
+                        ctx.gpu.synchronize(stream).ok();
+                        rec_gdn_us += t0.elapsed().as_micros();
+                    }
+                } else {
+                    ops::gdn_decode(
+                        ctx.gpu,
+                        self.gdn_f32_k,
+                        ssm_state.h_state,
+                        q_conv,
+                        k_conv,
+                        v_conv,
+                        gates,
+                        beta_fp32,
+                        gdn_out,
+                        1,
+                        nk as u32,
+                        nv as u32,
+                        kd as u32,
+                        vd as u32,
+                        stream,
+                    )?;
+                    if let Some(t0) = sub_t0 {
+                        ctx.gpu.synchronize(stream).ok();
+                        rec_gdn_us += t0.elapsed().as_micros();
+                    }
+
+                    let sub_t0 = if detail_profile {
+                        Some(std::time::Instant::now())
+                    } else {
+                        None
+                    };
+                    ops::gated_rms_norm(
+                        ctx.gpu,
+                        self.gated_rms_norm_f32_k,
+                        gdn_out,
+                        z_i,
+                        &self.ssm.norm,
+                        normed_out_i,
+                        nv as u32,
+                        vd as u32,
+                        vd as u32,
+                        eps,
+                        vd as u32,
+                        stream,
+                    )?;
+                    if let Some(t0) = sub_t0 {
+                        ctx.gpu.synchronize(stream).ok();
+                        rec_norm_us += t0.elapsed().as_micros();
+                    }
+                }
+            }
+            if detail_profile {
+                detail_parts.push(("recurrent_ba", rec_ba_us));
+                detail_parts.push(("recurrent_conv", rec_conv_us));
+                detail_parts.push(("recurrent_gdn", rec_gdn_us));
+                if rec_norm_us > 0 {
+                    detail_parts.push(("recurrent_norm", rec_norm_us));
+                }
+                detail_t0 = Some(std::time::Instant::now());
+            }
         }
+        detail_step!("recurrent_total_tail");
 
         // ── 4. Batched out_proj: ONE [N,value_dim]→[N,h] GEMM (weights ×1) ──
         // FP8 (w8a16) when the decode overlay is installed, else BF16 dense.
@@ -441,6 +776,7 @@ impl Qwen3SsmLayer {
                 stream,
             )?;
         }
+        detail_step!("out_proj");
 
         // ── 5. Batched residual add + post-attn RMS norm → norm_output[0..n] ──
         ops::residual_add_rms_norm(
@@ -456,6 +792,15 @@ impl Qwen3SsmLayer {
             eps,
             stream,
         )?;
+        detail_step!("post_norm", final);
+        if detail_profile {
+            let summary = detail_parts
+                .iter()
+                .map(|(label, us)| format!("{label}={us}us"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            tracing::info!("ATLAS_SSM_DETAIL n={n}: {summary}");
+        }
 
         Ok(true)
     }

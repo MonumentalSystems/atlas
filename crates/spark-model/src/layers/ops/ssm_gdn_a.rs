@@ -56,6 +56,158 @@ pub fn gdn_decode(
         .launch(stream)
 }
 
+/// FP32 GDN decode fused with gated RMS norm.
+///
+/// Produces the same BF16 post-gated-norm output that a separate
+/// `gdn_decode_f32` + `gated_rms_norm_f32_input` pair would produce, while
+/// avoiding the intermediate FP32 global write/read.
+#[allow(clippy::too_many_arguments)]
+pub fn gdn_decode_f32_norm(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    h_state: DevicePtr,
+    query: DevicePtr,
+    key: DevicePtr,
+    value: DevicePtr,
+    gate: DevicePtr,
+    beta: DevicePtr,
+    z_gate: DevicePtr,
+    norm_weight: DevicePtr,
+    output: DevicePtr,
+    batch_size: u32,
+    num_k_heads: u32,
+    num_v_heads: u32,
+    k_dim: u32,
+    v_dim: u32,
+    eps: f32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([num_v_heads, batch_size, 1])
+        .block([128, 1, 1])
+        .arg_ptr(h_state)
+        .arg_ptr(query)
+        .arg_ptr(key)
+        .arg_ptr(value)
+        .arg_ptr(gate)
+        .arg_ptr(beta)
+        .arg_ptr(z_gate)
+        .arg_ptr(norm_weight)
+        .arg_ptr(output)
+        .arg_u32(batch_size)
+        .arg_u32(num_k_heads)
+        .arg_u32(num_v_heads)
+        .arg_u32(k_dim)
+        .arg_u32(v_dim)
+        .arg_f32(eps)
+        .launch(stream)
+}
+
+/// Strided FP32 GDN decode for concurrent sequence decode.
+///
+/// Q/K/V are read from strided rows, typically the FP32 conv output laid out as
+/// `[batch, Q | K | V]`. Gate/beta and output are also strided by batch row.
+#[allow(clippy::too_many_arguments)]
+pub fn gdn_decode_f32_strided(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    h_state: DevicePtr,
+    query: DevicePtr,
+    key: DevicePtr,
+    value: DevicePtr,
+    gate: DevicePtr,
+    beta: DevicePtr,
+    output: DevicePtr,
+    batch_size: u32,
+    num_k_heads: u32,
+    num_v_heads: u32,
+    k_dim: u32,
+    v_dim: u32,
+    qk_stride: u32,
+    v_stride: u32,
+    gb_stride: u32,
+    out_stride: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([num_v_heads, batch_size, 1])
+        .block([128, 1, 1])
+        .arg_ptr(h_state)
+        .arg_ptr(query)
+        .arg_ptr(key)
+        .arg_ptr(value)
+        .arg_ptr(gate)
+        .arg_ptr(beta)
+        .arg_ptr(output)
+        .arg_u32(batch_size)
+        .arg_u32(num_k_heads)
+        .arg_u32(num_v_heads)
+        .arg_u32(k_dim)
+        .arg_u32(v_dim)
+        .arg_u32(qk_stride)
+        .arg_u32(v_stride)
+        .arg_u32(gb_stride)
+        .arg_u32(out_stride)
+        .launch(stream)
+}
+
+/// Strided FP32 GDN decode fused with gated RMS norm.
+///
+/// Same recurrent update as `gdn_decode_f32_strided`, but writes BF16
+/// post-gated-norm output directly and skips the intermediate FP32 output
+/// buffer plus per-token gated-rms-norm launches.
+#[allow(clippy::too_many_arguments)]
+pub fn gdn_decode_f32_strided_norm(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    h_state: DevicePtr,
+    query: DevicePtr,
+    key: DevicePtr,
+    value: DevicePtr,
+    gate: DevicePtr,
+    beta: DevicePtr,
+    z_gate: DevicePtr,
+    norm_weight: DevicePtr,
+    output: DevicePtr,
+    batch_size: u32,
+    num_k_heads: u32,
+    num_v_heads: u32,
+    k_dim: u32,
+    v_dim: u32,
+    qk_stride: u32,
+    v_stride: u32,
+    gb_stride: u32,
+    z_stride: u32,
+    out_stride: u32,
+    eps: f32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([num_v_heads, batch_size, 1])
+        .block([128, 1, 1])
+        .arg_ptr(h_state)
+        .arg_ptr(query)
+        .arg_ptr(key)
+        .arg_ptr(value)
+        .arg_ptr(gate)
+        .arg_ptr(beta)
+        .arg_ptr(z_gate)
+        .arg_ptr(norm_weight)
+        .arg_ptr(output)
+        .arg_u32(batch_size)
+        .arg_u32(num_k_heads)
+        .arg_u32(num_v_heads)
+        .arg_u32(k_dim)
+        .arg_u32(v_dim)
+        .arg_u32(qk_stride)
+        .arg_u32(v_stride)
+        .arg_u32(gb_stride)
+        .arg_u32(z_stride)
+        .arg_u32(out_stride)
+        .arg_f32(eps)
+        .launch(stream)
+}
+
 /// Gated delta rule prefill (multi-token, sequential SSM update within kernel).
 ///
 /// Processes `seq_len` tokens sequentially per (batch, head) pair.
@@ -320,9 +472,9 @@ pub fn gdn_prefill_persistent_smem(
 ///
 /// Three sequential launches on `stream` (CPU-serialized → no GPU sync needed):
 ///   1. recompute_wu  (grid [num_chunks, nv, batch], 128 thr): solve (I+L)U=βV,
-///      (I+L)W=β·exp(gc)·K → W_out, U_out (bf16).
-///   2. chunk_delta_h_ksplit (grid [nv, batch], 256 thr): serial state spine,
-///      2 threads/v-column for occupancy → S_out (per-chunk entry states f32),
+///      (I+L)W=β·exp(gc)·K → W_out, U_out (bf16), gc_out (f32).
+///   2. chunk_delta_h_ksplit (grid [nv, batch], 256 thr): serial f32 state spine,
+///      2 threads/v-column for occupancy → S_out (per-chunk entry states bf16),
 ///      uc_out (bf16); updates h_state in-place.
 ///   3. chunk_fwd_o   (grid [num_chunks, nv, batch], 128 thr): O = Q̃·S_c +
 ///      tril(decay·Q̃·Kᵀ)·uc → output (bf16, same layout as wy4).
@@ -347,6 +499,7 @@ pub fn gdn_prefill_fla(
     u_out: DevicePtr,
     s_out: DevicePtr,
     uc_out: DevicePtr,
+    gc_out: DevicePtr,
     batch_size: u32,
     seq_len: u32,
     num_chunks: u32,
@@ -357,14 +510,33 @@ pub fn gdn_prefill_fla(
     qk_stride: u32,
     v_stride: u32,
     gb_stride: u32,
+    profile: bool,
     stream: u64,
 ) -> Result<()> {
     const C: u32 = 64; // CHUNK (kernel constant)
     let (kd, vd) = (k_dim, v_dim);
     // smem byte sizes — identical formulas to the GATE-B example (validated).
     let smem_wu = C * kd * 2 + C * C * 4 + C * C * 4 + C * 4;
-    let smem_dh = 2 * (C * (2 * kd + vd) * 2) + 2 * C * 4;
-    let smem_fo = C * kd * 2 + C * kd * 2 + C * C * 4 + C * vd * 2 + kd * vd * 2 + C * 4;
+    let smem_dh = 2 * (C * (2 * kd + vd) * 2) + 2 * C * 4 + 2 * (C + 1) * 4;
+    let smem_fo = C * kd * 2 + C * kd * 2 + C * C * 4 + C * vd * 2 + kd * vd * 2 + 2 * C * 4;
+
+    let mut t0: Option<std::time::Instant> = if profile {
+        gpu.synchronize(stream)?;
+        Some(std::time::Instant::now())
+    } else {
+        None
+    };
+
+    macro_rules! prof {
+        ($label:expr, $t0:expr) => {
+            if let Some(t0) = $t0.take() {
+                gpu.synchronize(stream)?;
+                let elapsed = t0.elapsed().as_micros();
+                tracing::info!("  SSM prefill [{}] N={}: {}µs", $label, seq_len, elapsed);
+                *$t0 = Some(std::time::Instant::now());
+            }
+        };
+    }
 
     // Kernel 1: recompute_wu.
     KernelLaunch::new(gpu, k_recompute_wu)
@@ -377,6 +549,7 @@ pub fn gdn_prefill_fla(
         .arg_ptr(beta)
         .arg_ptr(w_out)
         .arg_ptr(u_out)
+        .arg_ptr(gc_out)
         .arg_u32(batch_size)
         .arg_u32(seq_len)
         .arg_u32(num_chunks)
@@ -388,6 +561,7 @@ pub fn gdn_prefill_fla(
         .arg_u32(v_stride)
         .arg_u32(gb_stride)
         .launch(stream)?;
+    prof!("gdn_fla_recompute_wu", &mut t0);
 
     // Kernel 2: chunk_delta_h_ksplit (256-thread block = 2 threads / v-column).
     KernelLaunch::new(gpu, k_chunk_delta_h)
@@ -399,6 +573,7 @@ pub fn gdn_prefill_fla(
         .arg_ptr(u_out)
         .arg_ptr(key)
         .arg_ptr(gate)
+        .arg_ptr(gc_out)
         .arg_ptr(s_out)
         .arg_ptr(uc_out)
         .arg_u32(batch_size)
@@ -411,6 +586,7 @@ pub fn gdn_prefill_fla(
         .arg_u32(qk_stride)
         .arg_u32(gb_stride)
         .launch(stream)?;
+    prof!("gdn_fla_chunk_delta_h", &mut t0);
 
     // Kernel 3: chunk_fwd_o.
     KernelLaunch::new(gpu, k_chunk_fwd_o)
@@ -420,6 +596,7 @@ pub fn gdn_prefill_fla(
         .arg_ptr(query)
         .arg_ptr(key)
         .arg_ptr(gate)
+        .arg_ptr(gc_out)
         .arg_ptr(s_out)
         .arg_ptr(uc_out)
         .arg_ptr(output)
@@ -432,7 +609,17 @@ pub fn gdn_prefill_fla(
         .arg_u32(vd)
         .arg_u32(qk_stride)
         .arg_u32(gb_stride)
-        .launch(stream)
+        .launch(stream)?;
+    if let Some(t0) = t0 {
+        gpu.synchronize(stream)?;
+        let elapsed = t0.elapsed().as_micros();
+        tracing::info!(
+            "  SSM prefill [gdn_fla_chunk_fwd_o] N={}: {}µs",
+            seq_len,
+            elapsed
+        );
+    }
+    Ok(())
 }
 
 /// Fused 2-token GDN decode (speculative verification).

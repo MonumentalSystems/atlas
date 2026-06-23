@@ -179,6 +179,43 @@ pub fn moe_w4a16_grouped_gemm_ptrtable_n128(
         .launch(stream)
 }
 
+/// FP8-A pointer-table grouped GEMM with transposed NVFP4 weights.
+///
+/// A must already be converted to FP8 E4M3. The launch shape mirrors
+/// `moe_w4a16_grouped_gemm_ptrtable_n128`.
+#[allow(clippy::too_many_arguments)]
+pub fn moe_fp8_grouped_gemm_ptrtable_n128(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    a_fp8: DevicePtr,
+    b_packed_ptrs: DevicePtr,
+    b_scale_ptrs: DevicePtr,
+    scale2_vals: DevicePtr,
+    c: DevicePtr,
+    expert_offsets: DevicePtr,
+    sorted_token_ids: DevicePtr,
+    num_experts: u32,
+    n_out: u32,
+    k: u32,
+    max_m_tiles: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(n_out, 128), max_m_tiles, num_experts])
+        .block([128, 1, 1])
+        .arg_ptr(a_fp8)
+        .arg_ptr(b_packed_ptrs)
+        .arg_ptr(b_scale_ptrs)
+        .arg_ptr(scale2_vals)
+        .arg_ptr(c)
+        .arg_ptr(expert_offsets)
+        .arg_ptr(sorted_token_ids)
+        .arg_u32(num_experts)
+        .arg_u32(n_out)
+        .arg_u32(k)
+        .launch(stream)
+}
+
 /// K64 down GEMM: K_STEP_T=64 eliminates pipeline stall (compute=128 cycles > load ~100 cycles).
 /// Use when K=inter (512 for 35B) — 8 K-steps vs 16 with K32.
 ///

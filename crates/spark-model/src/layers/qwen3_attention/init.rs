@@ -175,6 +175,11 @@ impl Qwen3AttentionLayer {
                 "rope_mrope_interleaved",
                 "rope_forward_mrope_interleaved",
             ),
+            rope_mrope_interleaved_k_only_k: super::super::try_kernel(
+                gpu,
+                "rope_mrope_interleaved",
+                "rope_forward_mrope_interleaved_k_only",
+            ),
             rope_yarn_k: super::super::try_kernel(gpu, "rope", "rope_forward_yarn"),
             rope_proportional_k: super::super::try_kernel(gpu, "rope", "rope_forward_proportional"),
             reshape_cache_k: gpu.kernel(reshape_mod, reshape_fn)?,
@@ -513,6 +518,11 @@ impl Qwen3AttentionLayer {
             deinterleave_qg_split_k: gpu.kernel("ssm_preprocess", "deinterleave_qg_split")?,
             deinterleave_qg_split_qnorm_k: gpu
                 .kernel("ssm_preprocess", "deinterleave_qg_split_qnorm")?,
+            deinterleave_qg_split_qnorm_mrope_k: super::super::try_kernel(
+                gpu,
+                "ssm_preprocess",
+                "deinterleave_qg_split_qnorm_mrope",
+            ),
             sigmoid_gate_mul_batched_k: gpu.kernel("residual_add", "sigmoid_gate_mul_batched")?,
             q_fp8: None,
             k_fp8: None,

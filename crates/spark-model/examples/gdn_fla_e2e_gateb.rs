@@ -156,7 +156,7 @@ fn main() -> Result<()> {
             .arg_u32(NV as u32)
             .launch(0)?;
         let hp = up_f32(g, &h0)?;
-        let scp = g.alloc(nt * NV * KD * VD * 4)?;
+        let scp = g.alloc(nt * NV * KD * VD * 2)?;
         let ucp = g.alloc(nt * NV * C * VD * 2)?;
         let smem2 = (2 * (C * (2 * KD + VD) * 2) + 2 * C * 4) as u32; // 2×{W,K,U} double-buffer + 2×gc
         KernelLaunch::new(g, k_dh)
@@ -250,7 +250,7 @@ fn main() -> Result<()> {
     let hp = up_f32(g, &h0)?;
     let wp = g.alloc(nt * NV * C * KD * 2)?;
     let up = g.alloc(nt * NV * C * VD * 2)?;
-    let scp = g.alloc(nt * NV * KD * VD * 4)?;
+    let scp = g.alloc(nt * NV * KD * VD * 2)?;
     let ucp = g.alloc(nt * NV * C * VD * 2)?;
     let op = g.alloc(t * NV * VD * 2)?;
     let s1 = (C * KD * 2 + C * C * 4 + C * C * 4 + C * 4) as u32;

@@ -129,7 +129,10 @@ pub fn start_chunked_prefill(
     // chunk 0 WITHOUT prefilling — the batched step packs >=2 streams into one
     // forward. Vision is excluded upstream, so no chunk-0 embedding injection.
     if defer {
-        debug_assert!(image_pixels.is_empty(), "vision must be excluded from co-dispatch");
+        debug_assert!(
+            image_pixels.is_empty(),
+            "vision must be excluded from co-dispatch"
+        );
         if let Err(e) = (|| -> Result<()> {
             // EP: broadcast chunk 0 to worker (no-op on single-GPU; the batched
             // step does NOT re-broadcast, so this stays the only broadcast site).

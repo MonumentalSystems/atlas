@@ -470,7 +470,13 @@ impl Qwen3AttentionLayer {
         // ── 8. Paged Flash Attention for chunk 1+ ── (extracted to paged_attn.rs)
         let attn_out = ctx.buffers.attn_output();
         let inv_sqrt_d = self.effective_attn_scale(hd);
-        let kv_len = (seq_len_start + num_tokens) as u32;
+        // In Q12 batched mode `num_tokens` is the stacked token count
+        // (`batch_size * chunk_len`), while paged-attention kernels consume
+        // per-stream q_len/kv_len. Single-stream mode keeps the historical
+        // `seq_len_start + num_tokens` calculation.
+        let kv_len = batched_meta
+            .map(|m| seq_len_start + m.chunk_len as usize)
+            .unwrap_or(seq_len_start + num_tokens) as u32;
 
         // TurboQuant WHT bookends (mirrors decode/attention_forward.rs).
         // write_kv_cache (section 7) WHT-rotated K/V in place before caching,

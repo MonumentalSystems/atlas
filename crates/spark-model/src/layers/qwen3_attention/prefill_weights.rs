@@ -135,6 +135,12 @@ impl Qwen3AttentionLayer {
         gpu: &dyn GpuBackend,
         stream: u64,
     ) -> anyhow::Result<()> {
+        if crate::layers::ops::cutlass_nvfp4_gemm_enabled() {
+            tracing::info!(
+                "Skipping attention FP8 prefill transposes because ATLAS_CUTLASS_NVFP4_GEMM=1"
+            );
+            return Ok(());
+        }
         if self.w8a16_gemm_t_k.0 == 0 {
             return Ok(()); // kernel not available
         }
