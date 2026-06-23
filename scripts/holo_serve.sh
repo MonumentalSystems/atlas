@@ -8,14 +8,19 @@ GPU_UTIL="${ATLAS_HOLO_GPU_UTIL:-0.70}"
 MAX_SEQ_LEN="${ATLAS_HOLO_MAX_SEQ_LEN:-32768}"
 MAX_SEQS="${ATLAS_HOLO_MAX_SEQS:-8}"
 MAX_BATCH="${ATLAS_HOLO_MAX_BATCH:-8}"
-# Prefill chunk (tokens/scheduler step). Default 1024 — soak-validated as the best
-# point on the 64K production target: small chunks interleave decode ~4× more often
-# (1 decode token/seq per step, and steps are ~0.5s vs ~2s at 4080), so under
-# long-prefill contention decode doesn't starve (soak: 0 timeouts + 21 tok/s vs
-# 16 tok/s @4080). ALSO a hard ceiling: the SSM out_proj CUTLASS NVFP4 GEMM
-# (M = chunk) FAILS (status -2) above ~4-8K M — chunk=16384 crashes any prompt
-# >~4K with HTTP 500. Keep <= 4096 until that kernel tiles M internally.
-MAX_PREFILL="${ATLAS_HOLO_MAX_PREFILL:-1024}"
+# Prefill chunk (tokens/scheduler step). Default 2048 — the soak-validated +
+# profile-derived sweet spot on the 64K target. Why 2048 specifically: the MoE
+# routes top_k=8 over 256 experts, so a C-token chunk gives C/32 tokens/expert;
+# the fused gate_up kernel tiles M in 64-blocks, so C=2048 → exactly 64 tok/expert
+# = one FULL tile (100% MoE GEMM efficiency, 96% SM). C=1024 → 32/expert → HALF-
+# empty tiles → ~50% MoE eff (~85% SM) AND 2× the kernel launches (1 CPU dispatch
+# core is the bottleneck during prefill — no CUDA graphs there). Soak 2048 vs 1024:
+# 24 vs 17 completions, big_ctx 53s vs 72s, needles 6/6 vs 4/4, tools 9/9 vs 3/4.
+# 1024 only wins raw agg tok/s on a 128K-streaming worker (more decode interleaving)
+# — not representative of agent traffic. HARD CEILING: the SSM out_proj CUTLASS
+# NVFP4 GEMM (M=chunk) FAILS (status -2) above ~4-8K M, so chunk=16384 crashes any
+# >~4K prompt with HTTP 500. Capped at 4096 below until that kernel tiles M.
+MAX_PREFILL="${ATLAS_HOLO_MAX_PREFILL:-2048}"
 # Bind address: 127.0.0.1 (loopback, default) or 0.0.0.0 to expose on the LAN
 # (so it can be driven without an ssh tunnel). LAN exposure on an untrusted
 # network should be paired with --require-auth/--auth-tokens-file.
