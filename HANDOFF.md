@@ -1282,6 +1282,40 @@ Implemented the workflow's top prototype and it's the biggest decode win yet.
   lever 3 (batch shared-expert GEMV M=4), lever 4 (delete redundant 3rd GDN H-read), lever 5/6
   (async argmax, batched argmax+embed). Each independent and additive.
 
+## 2026-06-23 - Levers 2/3/4 IMPLEMENTED + A/B'd: ALL MARGINAL (do not re-attempt)
+
+Ran a 3-worktree-agent workflow (wck4npdx6) to implement levers 2/3/4 in parallel (each gated +
+microtested). Integrated each onto f64505b (3-way apply; worktrees were based on an older commit
+so patches needed --3way + manual conflict/visibility fixes) and ran clean same-build server A/Bs
+on gx10-9959 (8K/C4). RESULT: all three are within-noise washes on top of lever 1. Reverted all;
+tree stays at f64505b (lever 1 only). **The static cost-model estimates were 5-10x optimistic for
+the smaller stages — only the SSM projection (lever 1) had a real large reclaimable share.**
+
+- **Lever 2 (attn Q/K/V/O M=4 GEMV, ATLAS_ATTN_GEMV_BATCH4):** quality coherent, bit-identical
+  (reuses lever-1 kernel). A/B: c4 111.9 ON vs 110.7 OFF (+1%), c2 83.9 vs 83.4 — NOISE. The
+  attention is only 10 layers with smaller weights, and the batched path needs an extra d2d
+  scatter into per-seq layout that offsets the weight-read saving. REVERTED.
+- **Lever 3 (shared-expert M=4, ATLAS_MOE_SHARED_BATCH4):** new kernel
+  moe_shared_expert_batch4_fp8.cu; microtest PASS (gate/up/down cos=1.0, down bit-exact); server
+  quality COHERENT (routed-only suppression correct, no double-count). A/B: c4 112.7 ON vs 112.1
+  OFF, c2 84.5 vs 85.4 — NOISE. The shared expert is a small weight fraction; reading it 1x vs 4x
+  saves ~nothing vs the routed experts + SSM. REVERTED (correct but neutral; not worth the MoE
+  complexity on the decode path that has many dead-ends).
+- **Lever 4 (GDN 3rd-read deletion, ATLAS_GDN_FUSED_NORM_READ):** the agent edited the COMMON
+  gated_delta_rule.cu's `decode`/`decode_f32`, but Holo's hot decode kernel is
+  `gated_delta_rule_decode_f32_norm` in the OVERRIDE (qwen3.6-35b-a3b/nvfp4/...). So it's a NO-OP
+  for Holo without porting to the override's f32_norm — a sub-1% bit-equivalent gain not worth it.
+  NOT APPLIED.
+
+NET decode state: **lever 1 (w8a16_gemv_batch4, +23% c4) is the banked decode win** (c4 ~106-112,
+c2 ~76-85, c1 ~71; = ~73-78% of vLLM c4). Levers 2/3/4 are documented-marginal — do not redo.
+Remaining workflow levers 5/6 (async argmax D2H, batched argmax+embed) are launch/latency micro-
+opts (est 2-6%) and untested; lower priority. The next REAL decode lever would need to attack the
+routed-MoE per-token weight streaming or the GDN recurrent occupancy directly — both are in the
+documented hard/dead-end territory. Consider decode largely tapped on accessible levers; the
+bigger remaining gaps vs vLLM (decode 112 vs 145; memory 62 vs 40GB w/ larger ctx) are structural
+(FlashInfer/CUTLASS-grade fused kernels; paged-KV memory efficiency).
+
 NOTE (user, 2026-06-23): vLLM serves Holo in ~40GB CUDA mem with a much LARGER context window vs
 Atlas ~62GB — a real memory-efficiency gap (paged-KV / weight layout). Memory/context efficiency
 is a separate open track from the decode-speed work above.
