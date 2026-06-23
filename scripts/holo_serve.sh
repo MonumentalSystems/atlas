@@ -25,6 +25,13 @@ MAX_PREFILL="${ATLAS_HOLO_MAX_PREFILL:-2048}"
 # (so it can be driven without an ssh tunnel). LAN exposure on an untrusted
 # network should be paired with --require-auth/--auth-tokens-file.
 BIND="${ATLAS_HOLO_BIND:-127.0.0.1}"
+# FP8 down-GEMM for MoE prefill: pre-quantizes the post-SiLU intermediate to FP8
+# and routes the down projection through the faster fp8 grouped GEMM. ~14% faster
+# down-GEMM (~1% total prefill), numerically VERIFIED clean — needle 3/3 @10/30/55K,
+# trick-reasoning + tool-call all correct. Safe because the down activation feeds
+# the residual (FP8-tolerant), unlike the gate_up INPUT activation which diverged
+# under FP8. Default on; set 0 to disable.
+FP8_DOWN="${ATLAS_MOE_PREFILL_FP8_DOWN:-1}"
 LOW_MEMORY_MOE="${ATLAS_HOLO_LOW_MEMORY_MOE:-1}"
 FAST_MOE_MODE="${ATLAS_HOLO_FAST_MOE_MODE:-full}"
 FAST_MOE_LAYERS="${ATLAS_HOLO_FAST_MOE_LAYERS:-0-39}"
@@ -81,6 +88,7 @@ setsid -f env RUST_BACKTRACE=1 RUST_LOG=info \
   ATLAS_HOLO_FAST_MOE_MODE="$FAST_MOE_MODE" ATLAS_HOLO_FAST_MOE_LAYERS="$FAST_MOE_LAYERS" \
   ATLAS_HYBRID_MOE_LAYOUT="$HYBRID_MOE_LAYOUT" ATLAS_UNIFIED_MOE_LAYOUT="$UNIFIED_MOE_LAYOUT" \
   ATLAS_MOE_PREFILL_EXACT_TILES="$EXACT_MOE_TILES" ATLAS_GDN_FUSED_NORM="$GDN_FUSED_NORM" \
+  ATLAS_MOE_PREFILL_FP8_DOWN="$FP8_DOWN" \
   ATLAS_HOLO_NATIVE_FP8_ATTN="$NATIVE_FP8_ATTN" ATLAS_ATTN_PREFILL_Q_T="$ATTN_Q_T" ATLAS_ATTN_PREFILL_T_PIPE="$ATTN_T_PIPE" \
   ATLAS_CUTLASS_NVFP4_GEMM="$CUTLASS_NVFP4_GEMM" ATLAS_CUTLASS_NVFP4_SSM_OUT="$CUTLASS_NVFP4_SSM_OUT" \
   "$BIN" serve \
