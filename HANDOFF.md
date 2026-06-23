@@ -1355,6 +1355,46 @@ Blackwell = FA2 via SM89; only prebuilt trtllm-gen cubins missing, we compile fr
   that flatlines us at 3880), not peak MMA. THE lever for cross-request prefill scaling. Full detail
   + extern-C sigs: tasks/adfb2c4274c6365fc.output.
 
+## 2026-06-23 - FlashInfer ragged prefill: STAGE 1 BUILT + VALIDATED (FFI works, cos 0.999998)
+
+Built the host-callable FlashInfer ragged/varlen prefill integration end-to-end and proved it
+correct in-tree. Inert without FLASHINFER_HOME (atlas_flashinfer cfg off -> bail path), so default
+builds are unchanged.
+- VENDORED: /home/ms/flashinfer (permanent). GOTCHA: its 3rdparty/cccl submodule was empty/too-old
+  (lacks cuda::fast_mod_div); copied a working CCCL (HEAD f150d51, has fast_modulo_division.h) to
+  /home/ms/flashinfer/3rdparty/cccl. build.rs needs that CCCL via -isystem BEFORE CUDA-13's CCCL.
+- crates/spark-runtime/cuda/flashinfer_ragged_prefill.cu (agent-written): two extern-C fns —
+  atlas_fi_ragged_prefill_bf16_hd256 (PrefillPlan -> BatchPrefillRaggedParams<bf16,bf16,bf16,int32>
+  -> BatchPrefillWithRaggedKVCacheDispatched<CTA_TILE_Q,256,256,kNone,false,MaskMode,
+  DefaultAttention<false,false,false,false>>). MaskMode is a COMPILE-TIME template (dispatches
+  causal/none); CTA_TILE_Q via DISPATCH_CTA_TILE_Q over plan_info. Compiles to sm_121f (FA2/SM80
+  HMMA+LDSM+LDGSTS).
+- build.rs: build_flashinfer_object gated on FLASHINFER_HOME (mirrors build_cutlass_object) ->
+  libatlas_flashinfer.a, cfg atlas_flashinfer.
+- crates/spark-runtime/src/flashinfer.rs: FFI + safe `ragged_prefill_bf16_hd256(...)`. WORKSPACES:
+  the FlashInfer float workspace is a BUDGET PrefillPlan splits within (NOT a computed size — the
+  wrapper's size-query returned 552GB nonsense). Use FIXED budgets: float 256MB, int 64MB, pinned
+  64MB (cuMemAlloc + cudaHostAlloc, lazy OnceLock). lib.rs registers the module.
+- VALIDATION (ignored test flashinfer::tests::flashinfer_ragged_prefill_matches_cpu_reference,
+  FLASHINFER_HOME build): 2 ragged requests (6+10 tok), GQA 4qo/2kv, hd=256, causal vs a CPU
+  reference -> **worst_cos=0.999998**. The FFI runs + is numerically correct.
+
+KEY DATA-CONTRACT NOTES for STAGE 2 (from the wrapper agent — must hold when feeding real data):
+- indptr DUALITY: pass qo/kv indptr BOTH host (PrefillPlan derefs on CPU) AND device (kernel reads).
+- STRIDES assume FULLY CONTIGUOUS [rows, heads, head_dim] BF16, no head/row padding. q_stride_n=
+  n_qo*256, q_stride_h=256; k/v_stride_n=n_kv*256.
+- sm_scale is RAW (1/sqrt(256)=0.0625); kernel applies log2e internally — do NOT pre-multiply.
+- total_kv_rows is unused by the wrapper (KV extent from kv_indptr); total_qo_rows -> PrefillPlan
+  total_num_rows.
+
+STAGE 2 (next): wire ragged_prefill into the batched prefill attention path
+(qwen3_attention/prefill/paged_attn_batched.rs — the slow paged path the dormant co-dispatch fell
+back to), build qo/kv_indptr from the co-dispatched requests' seq lens (prefill_b/ batched geometry +
+scheduler phase_continue_prefills/run_batched_prefill.rs), produce contiguous [rows,heads,256] Q/K/V
+(RoPE applied before), validate vs the single-request path, then re-enable co-dispatch + bench
+cross-request prefill scaling (target: prefill that scales with concurrency instead of flat 3880).
+Production build will add FLASHINFER_HOME=/home/ms/flashinfer to the recipe once Stage 2 lands.
+
 NOTE (user, 2026-06-23): vLLM serves Holo in ~40GB CUDA mem with a much LARGER context window vs
 Atlas ~62GB — a real memory-efficiency gap (paged-KV / weight layout). Memory/context efficiency
 is a separate open track from the decode-speed work above.
