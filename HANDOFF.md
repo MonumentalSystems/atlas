@@ -1456,6 +1456,31 @@ Engine code committed: c77f63d (SSM), 6f2e5d0 (geometry+attn), 6701c83 (eligibil
 Probes: /tmp/varlen_quality.py, /tmp/varlen_small.py. Debug launcher: /tmp/holo_serve_dbg.sh
 (RUST_LOG=info,atlas::q12=debug).
 
+## 2026-06-23 - VARLEN engine M1 (part 1 done): Phase 3 GEMMs hoisted
+
+M0 (working varlen engine) committed + verified. M1 hoists the per-stream projection GEMMs to
+one stacked GEMM over total_tokens (the prefill-scaling win — the plan found Phase1/Phase3 GEMMs
+run per-stream today).
+- DONE (e8aa47b): **Phase 3 hoisted.** prefill_phase3 (gated-norm, out_proj GEMM, post-norm, MoE,
+  residuals) is fully token-parallel — replaced the per-request loop in prefill_ssm_batched_layer
+  with ONE call over total_tokens. out_proj + MoE now read weights once for the whole batch.
+  Verified: varlen 2 diff-length reqs still correct (cu_seqlens=[0,1198,1746], succeeded, no crash).
+- TODO (M1 part 2): **hoist the Phase 1 QKVZ GEMM** (the BIGGEST, N=12288, ~15% of prefill). Needs
+  splitting prefill_phase1_inner (trait_prefill_phase1.rs) — steps 1-5 are token-parallel
+  (RMS+QKVZ GEMM+deinterleave+BA/gates GEMM), step 6 conv1d is PER-REQUEST (uses ssm_state.conv_state),
+  steps 7-8 (L2+copy) per-request. DESIGN (ready to execute):
+    fn prefill_phase1_proj(hidden, residual, num_tokens, ctx, stream): steps 1-5; writes
+      deinterleaved[0..num_tokens] + gates_buf[0..num_tokens] (shared buffers).
+    fn prefill_phase1_tail(state, num_tokens, src_offset, dst_offset, gdn_bufs, ctx, stream):
+      step6 conv reads deinterleaved.offset(src_offset*conv_dim*bf16) len num_tokens -> conv_out
+      (ssm_qkvz @0); step7 L2(conv_out); step8 copy conv_out -> gdn_bufs.qkv @dst_offset, copy
+      gates_buf.offset(src_offset*gate_stride*fp32) -> gdn_bufs.gate_beta @dst_offset.
+    prefill_phase1_inner = proj(num_tokens) + tail(num_tokens, src=0, dst=token_offset) [backcompat].
+    batched_layer Phase 1 (hoisted) = proj(hidden_stacked, total_tokens) ONCE, then per-request
+      tail(state_b, len_b, src=cu[b], dst=cu[b]).
+  conv1d MUST stay per-request (single state would convolve across request boundaries). Test: varlen
+  2 diff-length golden vs single-stream. Then M2 (varlen GDN kernel replacing the M0 per-request loop).
+
 ## (superseded by varlen plan above) STAGE 2: wire ragged_prefill into the batched prefill attention path
 (qwen3_attention/prefill/paged_attn_batched.rs — the slow paged path the dormant co-dispatch fell
 back to), build qo/kv_indptr from the co-dispatched requests' seq lens (prefill_b/ batched geometry +
