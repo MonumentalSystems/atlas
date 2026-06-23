@@ -8,7 +8,18 @@ GPU_UTIL="${ATLAS_HOLO_GPU_UTIL:-0.70}"
 MAX_SEQ_LEN="${ATLAS_HOLO_MAX_SEQ_LEN:-32768}"
 MAX_SEQS="${ATLAS_HOLO_MAX_SEQS:-8}"
 MAX_BATCH="${ATLAS_HOLO_MAX_BATCH:-8}"
-MAX_PREFILL="${ATLAS_HOLO_MAX_PREFILL:-16384}"
+# Prefill chunk (tokens/scheduler step). Default 1024 — soak-validated as the best
+# point on the 64K production target: small chunks interleave decode ~4× more often
+# (1 decode token/seq per step, and steps are ~0.5s vs ~2s at 4080), so under
+# long-prefill contention decode doesn't starve (soak: 0 timeouts + 21 tok/s vs
+# 16 tok/s @4080). ALSO a hard ceiling: the SSM out_proj CUTLASS NVFP4 GEMM
+# (M = chunk) FAILS (status -2) above ~4-8K M — chunk=16384 crashes any prompt
+# >~4K with HTTP 500. Keep <= 4096 until that kernel tiles M internally.
+MAX_PREFILL="${ATLAS_HOLO_MAX_PREFILL:-1024}"
+# Bind address: 127.0.0.1 (loopback, default) or 0.0.0.0 to expose on the LAN
+# (so it can be driven without an ssh tunnel). LAN exposure on an untrusted
+# network should be paired with --require-auth/--auth-tokens-file.
+BIND="${ATLAS_HOLO_BIND:-127.0.0.1}"
 LOW_MEMORY_MOE="${ATLAS_HOLO_LOW_MEMORY_MOE:-1}"
 FAST_MOE_MODE="${ATLAS_HOLO_FAST_MOE_MODE:-full}"
 FAST_MOE_LAYERS="${ATLAS_HOLO_FAST_MOE_LAYERS:-0-39}"
@@ -31,16 +42,25 @@ CUTLASS_NVFP4_SSM_OUT="${ATLAS_CUTLASS_NVFP4_SSM_OUT:-1}"
 PREFIX_CACHING="${ATLAS_HOLO_PREFIX_CACHING:-false}"
 SSM_CACHE_SLOTS="${ATLAS_HOLO_SSM_CACHE_SLOTS:-0}"
 SSM_CKPT_INTERVAL="${ATLAS_HOLO_SSM_CHECKPOINT_INTERVAL:-0}"
-# Prefix-cache chunk alignment: Marconi intermediate checkpoints only save when a
-# prefill chunk ends on a checkpoint-interval block boundary. The chunk caps to
-# max_batch_tokens = max_prefill_tokens + max_num_seqs (block-rounded), so to land
-# the chunk on `SSM_CKPT_INTERVAL * 16` tokens we must back off max_prefill by
-# max_num_seqs. Without this the chunk overshoots by one block (e.g. 4112=257 blk
-# vs 4096=256) and NO intermediate checkpoint is ever saved (warm hits recompute
-# the whole prefix → ~0 speedup). Verified: aligned → warm TTFT 1.9x. Only auto-set
-# when caching is on, checkpoints are enabled, and the caller didn't pin MAX_PREFILL.
-if [ "$PREFIX_CACHING" = "true" ] && [ "${SSM_CKPT_INTERVAL:-0}" -gt 0 ] && [ -z "${ATLAS_HOLO_MAX_PREFILL:-}" ]; then
-    MAX_PREFILL=$(( SSM_CKPT_INTERVAL * 16 - MAX_SEQS ))
+# Scheduler: fifo (default) or slai (SLO-aware: decode-first near TBT deadline +
+# shortest-prompt-first prefill ordering). slai prevents a giant prefill from
+# starving concurrent decodes / blocking small prompts (the soak failure mode).
+SCHED_POLICY="${ATLAS_HOLO_SCHED_POLICY:-slai}"
+# MAX_PREFILL safety + prefix-cache alignment:
+#  (1) CUTLASS cap — the SSM out_proj NVFP4 GEMM (M = chunk size) FAILS (status -2)
+#      above ~4-8K M, so a chunk > 4096 crashes any prompt that prefills in one big
+#      chunk (soak @16384: every >4K prompt returned HTTP 500). Hard-cap at 4096.
+#  (2) Checkpoint alignment — Marconi intermediate checkpoints save only when a
+#      chunk boundary lands on SSM_CKPT_INTERVAL*16 tokens, i.e. chunk must divide
+#      (SSM_CKPT_INTERVAL*16). The 1024 default divides 4096 (interval 256) ✓, so a
+#      checkpoint fires every 4 chunks; warm prefix hits skip in 4096-token steps.
+if [ "$MAX_PREFILL" -gt 4096 ]; then
+    echo "WARN: MAX_PREFILL=$MAX_PREFILL exceeds the SSM NVFP4 GEMM M-limit (~4-8K); capping to 4096 to avoid status-2 crash" >&2
+    MAX_PREFILL=4096
+fi
+if [ "$PREFIX_CACHING" = "true" ] && [ "${SSM_CKPT_INTERVAL:-0}" -gt 0 ] \
+   && [ $(( (SSM_CKPT_INTERVAL * 16) % MAX_PREFILL )) -ne 0 ]; then
+    echo "WARN: MAX_PREFILL=$MAX_PREFILL does not divide checkpoint interval $((SSM_CKPT_INTERVAL*16))t; prefix-cache checkpoints may not fire" >&2
 fi
 # cudart/cublasLt (+nccl) for the runtime dynamic links; keep any caller value.
 export LD_LIBRARY_PATH="/usr/local/cuda/lib64:/home/ms/nccl/build/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
@@ -60,10 +80,10 @@ setsid -f env RUST_BACKTRACE=1 RUST_LOG=info \
   ATLAS_CUTLASS_NVFP4_GEMM="$CUTLASS_NVFP4_GEMM" ATLAS_CUTLASS_NVFP4_SSM_OUT="$CUTLASS_NVFP4_SSM_OUT" \
   "$BIN" serve \
     --model-from-path /tank/holo-bf16kv-test --model-name holo3.1-atlas-poc \
-    --port 8890 --bind 127.0.0.1 --max-seq-len "$MAX_SEQ_LEN" --max-num-seqs "$MAX_SEQS" --max-batch-size "$MAX_BATCH" \
+    --port 8890 --bind "$BIND" --max-seq-len "$MAX_SEQ_LEN" --max-num-seqs "$MAX_SEQS" --max-batch-size "$MAX_BATCH" \
     --max-prefill-tokens "$MAX_PREFILL" --kv-cache-dtype bf16 \
     --gpu-memory-utilization "$GPU_UTIL" --oom-guard-mb 256 --ssm-cache-slots "$SSM_CACHE_SLOTS" --ssm-checkpoint-interval "$SSM_CKPT_INTERVAL" \
-    --enable-prefix-caching "$PREFIX_CACHING" --tool-call-parser qwen3_coder \
+    --enable-prefix-caching "$PREFIX_CACHING" --scheduling-policy "$SCHED_POLICY" --tool-call-parser qwen3_coder \
     --default-chat-template-kwargs '{"enable_thinking":true}' \
     --fast-load-prefetch-shards --vision-max-pixels 262144 \
     > "$LOG" 2>&1 </dev/null
