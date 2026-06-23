@@ -380,6 +380,94 @@ extern "C" int atlas_cutlass_transpose_nvfp4_packed_kton(
   return err == cudaSuccess ? 0 : -static_cast<int>(err);
 }
 
+// ───────────────────────────────────────────────────────────────────────────
+// GROUPED NVFP4 gate_up (Holo MoE Phase-1 ESCAPE-HATCH path).
+//
+// Proves the FP4 MATH integrates correctly in a grouped (per-expert) form by
+// dispatching the proven Sm120 NVFP4 collective once per expert over its token
+// slice. This is the documented fallback in the Phase-1 plan: it is bit-faithful
+// to nvfp4_gemm_bf16_act_weight_t (it IS that collective), at the cost of one
+// kernel launch per active expert (perf caveat — a hand-rolled grouped
+// block-scaled mma is the Phase-2 follow-up; the exact Sm120 instruction is
+//   mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X.m16n8k64
+//     .row.col.f32.e2m1.e2m1.f32.ue4m3
+// from $CUTLASS_HOME/include/cute/arch/mma_sm120.hpp:3216, SFA/SFB e4m3 scale
+// operands per cute/atom/mma_traits_sm120.hpp SFALayout/SFBLayout).
+//
+// Layout (matches the per-expert single-GEMM exactly):
+//   A          : bf16 [M_total, K] activations, row-major; expert e owns rows
+//                [expert_offsets[e], expert_offsets[e+1]).
+//   gate/up    : per-expert weight pointers; packed_t [N,K/2] + scale_t [K/16,N]
+//                (the pack_bf16_weight_to_nvfp4_t layout), scale2 = 1.0.
+//   C_gate/C_up: bf16 [M_total, N] each (gate and up written separately).
+// The CUTLASS collective requires M-tile alignment that it carves internally; we
+// pass the exact per-expert M (it handles M not a multiple of the CTA tile).
+extern "C" int atlas_cutlass_nvfp4_grouped_gate_up(
+    const void* A_bf16,                         // [M_total, K]
+    const unsigned long long* gate_packed_ptrs, // [num_experts] device ptrs -> [N,K/2]
+    const unsigned long long* gate_scale_ptrs,  // [num_experts] device ptrs -> [K/16,N]
+    const float* gate_scale2_vals,              // host or device? -> HOST array
+    const unsigned long long* up_packed_ptrs,
+    const unsigned long long* up_scale_ptrs,
+    const float* up_scale2_vals,
+    void* C_gate_bf16,                          // [M_total, N]
+    void* C_up_bf16,                            // [M_total, N]
+    const int* expert_offsets_host,             // [num_experts+1] HOST
+    int num_experts,
+    int n,
+    int k,
+    void* workspace,
+    size_t workspace_size,
+    cudaStream_t stream) {
+#if defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED) || defined(CUTLASS_ARCH_MMA_SM121_SUPPORTED)
+  if (n <= 0 || k <= 0 || (k % 16) != 0 || num_experts <= 0) {
+    return -1;
+  }
+  const __nv_bfloat16* A = static_cast<const __nv_bfloat16*>(A_bf16);
+  __nv_bfloat16* Cg = static_cast<__nv_bfloat16*>(C_gate_bf16);
+  __nv_bfloat16* Cu = static_cast<__nv_bfloat16*>(C_up_bf16);
+
+  for (int e = 0; e < num_experts; ++e) {
+    int m_start = expert_offsets_host[e];
+    int m_end = expert_offsets_host[e + 1];
+    int m_e = m_end - m_start;
+    if (m_e <= 0) {
+      continue;
+    }
+    const __nv_bfloat16* A_e = A + (size_t)m_start * k;
+    // gate
+    int rc = atlas_cutlass_nvfp4_gemm_bf16_act_weight_t(
+        A_e,
+        reinterpret_cast<const void*>(gate_packed_ptrs[e]),
+        reinterpret_cast<const void*>(gate_scale_ptrs[e]),
+        gate_scale2_vals[e],
+        Cg + (size_t)m_start * n,
+        m_e, n, k, workspace, workspace_size, stream);
+    if (rc != 0) {
+      return 100000 + rc;
+    }
+    // up
+    rc = atlas_cutlass_nvfp4_gemm_bf16_act_weight_t(
+        A_e,
+        reinterpret_cast<const void*>(up_packed_ptrs[e]),
+        reinterpret_cast<const void*>(up_scale_ptrs[e]),
+        up_scale2_vals[e],
+        Cu + (size_t)m_start * n,
+        m_e, n, k, workspace, workspace_size, stream);
+    if (rc != 0) {
+      return 200000 + rc;
+    }
+  }
+  return 0;
+#else
+  (void)A_bf16; (void)gate_packed_ptrs; (void)gate_scale_ptrs; (void)gate_scale2_vals;
+  (void)up_packed_ptrs; (void)up_scale_ptrs; (void)up_scale2_vals;
+  (void)C_gate_bf16; (void)C_up_bf16; (void)expert_offsets_host;
+  (void)num_experts; (void)n; (void)k; (void)workspace; (void)workspace_size; (void)stream;
+  return -120;
+#endif
+}
+
 extern "C" int atlas_cutlass_pack_bf16_weight_to_nvfp4_t(
     const void* weight_bf16,
     void* packed_t,

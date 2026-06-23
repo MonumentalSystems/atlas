@@ -42,6 +42,24 @@ unsafe extern "C" {
         k: i32,
         stream: *mut c_void,
     ) -> i32;
+    fn atlas_cutlass_nvfp4_grouped_gate_up(
+        a_bf16: *const c_void,
+        gate_packed_ptrs: *const u64,
+        gate_scale_ptrs: *const u64,
+        gate_scale2_vals: *const f32,
+        up_packed_ptrs: *const u64,
+        up_scale_ptrs: *const u64,
+        up_scale2_vals: *const f32,
+        c_gate_bf16: *mut c_void,
+        c_up_bf16: *mut c_void,
+        expert_offsets_host: *const i32,
+        num_experts: i32,
+        n: i32,
+        k: i32,
+        workspace: *mut c_void,
+        workspace_size: usize,
+        stream: *mut c_void,
+    ) -> i32;
     fn atlas_cutlass_transpose_nvfp4_packed_kton(
         src_packed_t: *const c_void,
         dst_packed: *mut c_void,
@@ -239,6 +257,81 @@ pub fn nvfp4_gemm_bf16_act_weight_t(
     #[cfg(not(atlas_cutlass))]
     {
         let _ = (act, weight_packed_t, weight_scale_t, weight_scale_2, out, m, n, k, stream);
+        bail!("CUTLASS support was not built; set CUTLASS_HOME when building")
+    }
+}
+
+/// Grouped (per-expert) NVFP4 fused gate_up GEMM — Holo MoE Phase-1
+/// escape-hatch path. Dispatches the proven Sm120 NVFP4 collective once per
+/// active expert over its token slice; bit-faithful to
+/// [`nvfp4_gemm_bf16_act_weight_t`] (it IS that collective), at one launch per
+/// expert. Used to validate that the FP4 math integrates correctly in grouped
+/// form before the hand-rolled block-scaled mma (Phase 2).
+///
+/// `a` is bf16 `[M_total, K]`; expert `e` owns rows
+/// `[expert_offsets[e], expert_offsets[e+1])`. `*_packed_ptrs`/`*_scale_ptrs`
+/// are device-pointer arrays (one per expert) in the
+/// [`pack_bf16_weight_to_nvfp4_t`] layout (`[N,K/2]` + `[K/16,N]`); the
+/// `*_scale2_vals` and `expert_offsets` slices are HOST arrays.
+#[allow(clippy::too_many_arguments)]
+pub fn nvfp4_grouped_gate_up(
+    a: u64,
+    gate_packed_ptrs: &[u64],
+    gate_scale_ptrs: &[u64],
+    gate_scale2_vals: &[f32],
+    up_packed_ptrs: &[u64],
+    up_scale_ptrs: &[u64],
+    up_scale2_vals: &[f32],
+    c_gate: u64,
+    c_up: u64,
+    expert_offsets: &[i32],
+    n: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
+    #[cfg(atlas_cutlass)]
+    {
+        let num_experts = gate_packed_ptrs.len();
+        if expert_offsets.len() != num_experts + 1 {
+            bail!(
+                "nvfp4_grouped_gate_up: expert_offsets len {} != num_experts+1 {}",
+                expert_offsets.len(),
+                num_experts + 1
+            );
+        }
+        let ctx = ctx()?;
+        let status = unsafe {
+            atlas_cutlass_nvfp4_grouped_gate_up(
+                a as *const c_void,
+                gate_packed_ptrs.as_ptr(),
+                gate_scale_ptrs.as_ptr(),
+                gate_scale2_vals.as_ptr(),
+                up_packed_ptrs.as_ptr(),
+                up_scale_ptrs.as_ptr(),
+                up_scale2_vals.as_ptr(),
+                c_gate as *mut c_void,
+                c_up as *mut c_void,
+                expert_offsets.as_ptr(),
+                num_experts as i32,
+                n as i32,
+                k as i32,
+                ctx.workspace as *mut c_void,
+                ctx.ws_size,
+                stream as *mut c_void,
+            )
+        };
+        if status != 0 {
+            bail!("CUTLASS nvfp4 grouped gate_up failed: status {status}");
+        }
+        Ok(())
+    }
+    #[cfg(not(atlas_cutlass))]
+    {
+        let _ = (
+            a, gate_packed_ptrs, gate_scale_ptrs, gate_scale2_vals,
+            up_packed_ptrs, up_scale_ptrs, up_scale2_vals, c_gate, c_up,
+            expert_offsets, n, k, stream,
+        );
         bail!("CUTLASS support was not built; set CUTLASS_HOME when building")
     }
 }
