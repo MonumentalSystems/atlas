@@ -68,10 +68,19 @@ vLLM-parity. **Real apples-to-apples baseline** (vLLM `pp2048` from
 | c10  | 7180 / 196  | —              | —                 |
 
 - **Single-stream: decode is AT PARITY (100%), prefill ~80%.** Blended c1 ≈ 90%.
-- The unified gap is **concurrency scaling**: both prefill AND decode scale to only
-  ~55–71% of vLLM's per-added-request efficiency. vLLM keeps per-req decode higher at
-  low concurrency (c2: 59/req vs our 42/req). This is a continuous-batching efficiency
-  gap (scheduler/overlap), and it's the highest-leverage target — it lifts both pp+tg.
+- Concurrency: per-req decode Atlas (75→42→30→19 at c1/c2/c4/c8) vs vLLM
+  (75→59→30→20 at c1/c2/c5/c10) CONVERGE by c4–c5 (~30/req). So decode concurrency is
+  fine at high conc (the c16 goal); the gap is only at c2.
+- **The real concurrency gap is PREFILL** (flat c1≈c4≈3700, ~55% of vLLM at c5).
+  vLLM batches prefill efficiently; Atlas OFF serializes and varlen ON is overhead-
+  bound (net loss). Closing it = the batched-prefill overhead rework (eliminate the
+  per-token Z-copy ~350k/forward, per-request conv1d/GDN loops, single serial stream,
+  alloc churn), and even then it may only MATCH serial unless cross-request kernel
+  overlap is added. Highest-leverage but largest concurrency item.
+- TOOLING: nsys can't profile long traces here (128 decode steps overflow the buffer →
+  only the last ~2ms survives, consistently just predequant/quant kernels). Single
+  prefill forwards capture OK. Use ATLAS_PROFILE=1 (per-section) for prefill; decode
+  has no equivalent profiler — decode kernel-level analysis is currently blind.
 
 - **Single-stream prefill is already ~80% of vLLM** — 90% is ~1.13×, NOT 2.3×.
   (Earlier "43%/2.3×" was a baseline ERROR: compared a 1403-tok single-stream run
