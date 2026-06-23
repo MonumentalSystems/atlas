@@ -149,6 +149,50 @@ pub trait TransformerLayer: Send + Sync {
         )
     }
 
+    /// M1 large-M batched Phase-1: token-parallel projections (RMS/QKVZ/BA-gates)
+    /// over ALL stacked tokens in one large-M GEMM each. SSM-only; the caller
+    /// runs `prefill_phase1_conv1d_one` per request then `prefill_phase1_l2_batched`.
+    fn prefill_phase1_proj_batched(
+        &self,
+        hidden_stacked: DevicePtr,
+        residual_stacked: DevicePtr,
+        total_tokens: usize,
+        gdn_bufs: &GdnPrefillBuffers,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        let _ = (hidden_stacked, residual_stacked, total_tokens, gdn_bufs, ctx, stream);
+        anyhow::bail!("prefill_phase1_proj_batched: only implemented for SSM layers")
+    }
+
+    /// M1: per-request conv1d tail (advances per-request conv_state), reading the
+    /// request's slice of the stacked QKVZ scratch and writing into gdn_bufs.qkv.
+    fn prefill_phase1_conv1d_one(
+        &self,
+        state: &mut dyn LayerState,
+        token_offset: usize,
+        len: usize,
+        gdn_bufs: &GdnPrefillBuffers,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        let _ = (state, token_offset, len, gdn_bufs, ctx, stream);
+        anyhow::bail!("prefill_phase1_conv1d_one: only implemented for SSM layers")
+    }
+
+    /// M1: batched L2 norm over the full stacked QKV buffer after all per-request
+    /// conv1d tails have written their slices.
+    fn prefill_phase1_l2_batched(
+        &self,
+        total_tokens: usize,
+        gdn_bufs: &GdnPrefillBuffers,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        let _ = (total_tokens, gdn_bufs, ctx, stream);
+        anyhow::bail!("prefill_phase1_l2_batched: only implemented for SSM layers")
+    }
+
     /// Two-phase SSM prefill — Phase 2: GDN recurrence on the full sequence.
     ///
     /// Runs the WY4-persistent GDN kernel over all `total_len` tokens in

@@ -139,52 +139,30 @@ impl TransformerModel {
         let n = seqs.len();
         debug_assert_eq!(n as u32, meta.batch_size);
         debug_assert_eq!(n, seqs_proc_start.len());
-        let h = ctx.config.hidden_size;
-        let dtype_bytes = 2usize;
 
-        // ── Phase 1: per-stream projections + conv1d + L2 norm ──
-        // Each stream's data lands in gdn_bufs at offset `b * chunk_len`.
-        // The `_kv_write_start` arg is ignored by SSM layers (recurrent
-        // state requires all tokens, no skip), so we pass 0.
+        // ── Phase 1 (M1 large-M hoist): the token-parallel projections
+        // (RMS, QKVZ, BA+gates) run ONCE over all stacked tokens — one large-M
+        // GEMM per layer instead of one small-M GEMM per request — then conv1d
+        // runs per request (it advances per-request conv_state), then one
+        // batched L2. Large M is where the GB10 tensor cores get efficient; the
+        // per-request QKVZ GEMM was ~27% of single-stream prefill at small M. ──
+        let total_tokens = meta.total_tokens as usize;
+        let _ = &kv_cache; // SSM Phase 1 no longer touches the KV cache.
+        layer.prefill_phase1_proj_batched(
+            hidden_stacked,
+            residual_stacked,
+            total_tokens,
+            gdn_bufs,
+            ctx,
+            stream,
+        )?;
         for (b, seq) in seqs.iter_mut().enumerate() {
-            // VARLEN packed offsets from cu_seqlens (== b*chunk_len when uniform).
             let off = meta.cu_seqlens_host[b] as usize;
             let len = (meta.cu_seqlens_host[b + 1] - meta.cu_seqlens_host[b]) as usize;
-            let h_b = hidden_stacked.offset(off * h * dtype_bytes);
-            let r_b = residual_stacked.offset(off * h * dtype_bytes);
-            // Split borrow so we can pass multiple &mut fields of the same seq.
-            let (block_table, disk_block_ids, disk_last, layer_state) = {
-                let SequenceState {
-                    block_table,
-                    disk_block_ids,
-                    disk_last_offloaded_per_layer,
-                    layer_states,
-                    ..
-                } = &mut **seq;
-                (
-                    block_table,
-                    disk_block_ids,
-                    disk_last_offloaded_per_layer,
-                    layer_states[layer_idx].as_mut(),
-                )
-            };
-            layer.prefill_phase1(
-                h_b,
-                r_b,
-                len,
-                layer_state,
-                kv_cache,
-                seqs_proc_start[b],
-                block_table,
-                disk_block_ids,
-                disk_last,
-                0,
-                gdn_bufs,
-                off,
-                ctx,
-                stream,
-            )?;
+            let layer_state = seq.layer_states[layer_idx].as_mut();
+            layer.prefill_phase1_conv1d_one(layer_state, off, len, gdn_bufs, ctx, stream)?;
         }
+        layer.prefill_phase1_l2_batched(total_tokens, gdn_bufs, ctx, stream)?;
 
         // ── Phase 2: ONE batched GDN kernel call ──
         // Stage h_state_ptrs[N] device array at the dedicated scratch offset

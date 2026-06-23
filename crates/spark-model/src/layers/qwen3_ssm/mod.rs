@@ -334,6 +334,47 @@ impl TransformerLayer for Qwen3SsmLayer {
         )
     }
 
+    fn prefill_phase1_proj_batched(
+        &self,
+        hidden_stacked: DevicePtr,
+        residual_stacked: DevicePtr,
+        total_tokens: usize,
+        gdn_bufs: &GdnPrefillBuffers,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        self.prefill_phase1_proj_batched_inner(
+            hidden_stacked,
+            residual_stacked,
+            total_tokens,
+            gdn_bufs,
+            ctx,
+            stream,
+        )
+    }
+
+    fn prefill_phase1_conv1d_one(
+        &self,
+        state: &mut dyn LayerState,
+        token_offset: usize,
+        len: usize,
+        gdn_bufs: &GdnPrefillBuffers,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        self.prefill_phase1_conv1d_one_inner(state, token_offset, len, gdn_bufs, ctx, stream)
+    }
+
+    fn prefill_phase1_l2_batched(
+        &self,
+        total_tokens: usize,
+        gdn_bufs: &GdnPrefillBuffers,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        self.prefill_phase1_l2_batched_inner(total_tokens, gdn_bufs, ctx, stream)
+    }
+
     fn prefill_gdn_full(
         &self,
         state: &mut dyn LayerState,
