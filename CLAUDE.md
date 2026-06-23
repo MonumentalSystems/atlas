@@ -85,18 +85,21 @@ vLLM-parity. **Real apples-to-apples baseline** (vLLM `pp2048` from
   overlap — 4 requests run back-to-back). Tractable near-term: single-stream 80→90%
   (the GEMMs); concurrency is higher-ceiling but needs the overhead rework first.
 
-## The concrete single-stream lever: MoE W4A16 → true FP4
+## The concrete single-stream lever: MoE FP8 → FP4 (precision, NOT tiling)
 
-- The MoE grouped GEMM (`moe_w4a16_grouped_gemm.cu`, `moe_w4a16_fused_gate_up`) uses
-  `__nv_bfloat16 smem_A` = 4-bit weight × BF16 activation → BF16 tensor cores, NOT
-  FP4. MoE is the single biggest single-stream section (~28%). The projections
-  already use true FP4×FP4 cutlass (Sm120); MoE does not → ~2× FP4 headroom on the
-  largest section — the highest-value single-stream lever.
-- Cost: no cutlass FP4 *grouped* GEMM exists yet (only dense `cutlass_nvfp4_gemm.cu`).
-  Building a grouped/batched FP4 blockscaled expert GEMM (+ accuracy validation —
-  FP4 MoE activations may drift; checkpoint ships NVFP4 weights so plausibly fine)
-  is the next real build. (Single-stream Z-staging is already in-place/strided at
-  `trait_prefill.rs:337`; the per-token Z-copy loop is batched-path-only.)
+- MoE is the biggest single-stream section (~28%). CORRECTION: it does NOT run BF16 —
+  the `moe_w4a16` grouped GEMM stages activations as bf16 in smem but converts them to
+  `e4m3` and runs `mma.sync.m16n8k32.f32.e4m3.e4m3` = **FP8×FP8 tensor cores** (4-bit
+  weight dequant→fp8, act bf16→fp8). So MoE is effectively W4A8-FP8-compute. The real
+  lever is **FP8 → FP4** (~2× FP4-vs-FP8 peak) — a PRECISION change, needs a new FP4
+  grouped expert kernel + accuracy validation (FP4 MoE acts may drift; vLLM ships NVFP4
+  so plausibly fine). No cutlass FP4 *grouped* GEMM exists yet (only dense).
+- TESTED + REJECTED (Jun 23): the `m128` fused-gate-up tile (M_TILE 64→128, same FP8
+  math) — ported into Holo, registered, ran correct (identical greedy outputs) but
+  NO speedup (3529-3567 vs 3700-3798 baseline; uneven token-per-expert distribution +
+  2× smem lowers occupancy). Reverted. Together with the M1 large-M-hoist null result,
+  this confirms **tiling/batching tweaks don't move these throughput-limited GEMMs** —
+  the gains require precision (FP8→FP4) or fundamentally better kernels.
 
 ## Prefill bottleneck map (single-stream FLA path, the goal path)
 
