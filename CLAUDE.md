@@ -78,6 +78,28 @@ Run a single prefill, then aggregate `SSM prefill [<section>] N=…: …µs` ove
   FLA — same stale-kernel pattern as the (now fixed) dense_gemm bug; bringing the
   batched path onto FLA would help varlen but not the OFF goal path.
 
+## The crux: GEMM throughput is ~16 TFLOP/s and we ALREADY use true FP4
+
+- M1 large-M hoist (commit a5bc5c9) gave NO clear c4 speedup → the GEMMs are
+  **throughput-limited, not M-limited**. The QKVZ GEMM at M=1403 is ~4.25 ms =
+  **~16 TFLOP/s**, compute-bound (memory ~0.3 ms).
+- We are NOT leaving the FP4 cores idle: the QKVZ/SSM/attention CUTLASS path is
+  `atlas_cutlass_nvfp4_gemm_bf16_act_weight_t` → `cutlass.rs:198`
+  `out = quant_nvfp4(act) @ weight_t`, kernel `ElementA=ElementB=nv_float4_t<e2m1>`,
+  `ArchTag=Sm120`. The `pack_bf16_act_nvfp4` kernel quantizes the activation to FP4.
+  So it IS true FP4×FP4 on the Blackwell FP4 tensor cores. (MoE uses `moe_w4a16` =
+  4-bit weight × bf16 act — that one is hand-rolled, NOT the cutlass FP4 path, and
+  may have more headroom.)
+- So 16 TFLOP/s is the achieved CUTLASS Sm120 FP4 GEMM rate on GB10 (sm_121). The
+  gap to vLLM is therefore one (or more) of: (a) cutlass Sm120 schedule not tuned
+  for sm_121 (consumer Blackwell — no tcgen05/TMA fast path → cutlass falls back);
+  (b) vLLM ships a better hand-tuned sm_121 FP4 kernel; (c) the 6700 baseline isn't
+  apples-to-apples with our 4-mixed-prompt test. Cause is UNCONFIRMED.
+- Honest status: the remaining 2.3× is deep FP4-kernel-tuning territory on consumer
+  Blackwell (or a baseline-validation question), not a quick fix. Decisive next
+  experiment: micro-bench the cutlass FP4 GEMM at the exact shapes vs a known-good
+  reference, and/or confirm the vLLM 6700 conditions.
+
 ## Varlen continuous-batching prefill (in progress)
 
 Goal: co-dispatch varied-length prefills into ONE forward so out_proj/MoE read
