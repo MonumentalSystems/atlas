@@ -30,21 +30,17 @@ impl VisionEncoder {
             .arg_u32(n_f32 as u32)
             .launch(stream)?;
         // patch_embed GEMM: buf_wide[p,1536] @ patch_embed_w[1152,1536]^T + b → buf_h1[p,1152]
-        KernelLaunch::new(gpu, self.k_gemm)
-            .grid([
-                div_ceil(self.hidden_size as u32, 32),
-                div_ceil(p as u32, 32),
-                1,
-            ])
-            .block([32, 32, 1])
-            .arg_ptr(self.buf_wide)
-            .arg_ptr(self.patch_embed_w)
-            .arg_ptr(self.patch_embed_b)
-            .arg_ptr(self.buf_h1)
-            .arg_u32(p as u32)
-            .arg_u32(self.hidden_size as u32)
-            .arg_u32(1536)
-            .launch(stream)?;
+        self.vit_gemm_bias(
+            gpu,
+            self.buf_wide,
+            self.patch_embed_w,
+            self.patch_embed_b,
+            self.buf_h1,
+            p as u32,
+            self.hidden_size as u32,
+            1536,
+            stream,
+        )?;
         // add the image-specific bilinear-interpolated pos_embed to buf_h1.
         // (Source was prepared by `resample_pos_embed()` in forward().)
         let n_pe = p * self.hidden_size;
