@@ -1154,3 +1154,40 @@ divergences are benign greedy branch flips. Combined with the +24% prefill, nati
 good candidate to promote from opt-in to DEFAULT prefill. Residual de-risk before flipping the
 default (optional, lower priority): a long-context + thinking-ON reasoning eval, and a final
 commit of the working tree.
+
+## 2026-06-23 - NVFP4 made DEFAULT + workload-matched benchmark (commit 75f974d)
+
+NVFP4 wired as the launcher default: `scripts/holo_serve.sh` now sets
+`ATLAS_CUTLASS_NVFP4_GEMM=1 ATLAS_CUTLASS_NVFP4_SSM_OUT=1` + `LD_LIBRARY_PATH`
+(overridable; binary must be built with CUTLASS_HOME). Whole session committed as 75f974d
+(96 files, NVFP4 fix + default + accumulated R&D checkpoint).
+
+Workload-matched bench (`/tmp/workload_bench.py`) mirroring real traffic: ~10.3K-token prompt /
+short out (thinking ON) + ~6.6K-token JSON fact-extraction. gx10-9959, GPU_UTIL=0.85,
+seq 16384, shared box (other tenant ~26GB). Median, c1:
+
+| mode (10.3K prompt, thinking on) | prefill tok/s | TTFT | extract prefill | decode c1 |
+| hand W8A8 (PRIOR prod default)   | 3018 | 3.42s | 3069 | 50.1 |
+| cuBLAS bf16 (`ATLAS_CUBLAS_GEMM`)| 3450 | 2.99s | 3506 | 50.5 |
+| **NVFP4 (NEW default)**          | **3600** | **2.87s** | **3673** | 49.0 |
+| vLLM holo3.1 (ref, LIVE traffic) | ~2400* | ~4.3s* | 2051* | **254.7** |
+
+\*vLLM under live traffic + partial TTFT capture on the long shape — indicative only.
+
+KEY NUANCE: the headline "+24%" was vs the **hand-W8A8** path (the actual prior launcher default —
+cuBLAS was never enabled in `holo_serve.sh`). So **NVFP4 vs prior production = +19% prefill /
+-16% TTFT at 10.3K** (and +24% at the shorter pp2048). **NVFP4 vs cuBLAS bf16 = only ~4-5%** (the
+GEMM share shrinks at long context as the hardware-limited GDN scan + flash grow). NVFP4's extra
+edge over cuBLAS is memory (4-bit weights vs cuBLAS's ~2GB bf16 dequant) + it's the native path.
+
+Quality at the real workload (NVFP4, thinking on, 10.3K ctx): **perfect** — retrieved all 3
+planted FACT lines verbatim; extraction `{"total_nodes":140,"down_count":47,"regions":["ap","eu",
+"us"],"max_mem_gb":63}` all fields correct (vLLM gave down_count 70, further from truth ~46).
+
+DECODE is the standing gap: all Atlas modes ~50 tok/s c1 here vs **vLLM 254** — the known
+decode-concurrency lever (SSM-side), untouched by this prefill work.
+
+MEMORY WATCH: NVFP4-default needed GPU_UTIL 0.85 (server ~61GB; OOM'd at 0.75 with the 26GB
+co-tenant). NVFP4 keeps redundant weight copies (native path: checkpoint `[K/2,N]` + transposed
+`[N,K/2]`; fp8 path: fp8 original + packed nvfp4). Freeing the unused original once the CUTLASS
+copy is built would reclaim a few GB toward the <65GB target — a clean next optimization.
