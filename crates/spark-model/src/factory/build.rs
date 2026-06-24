@@ -264,26 +264,72 @@ pub fn build_model(
     // unified-memory systems like GB10).
     let total_mem = gpu.total_memory()?;
     let actual_free = gpu.free_memory()?;
+    let gib = |b: usize| b as f64 / (1024.0 * 1024.0 * 1024.0);
     let mut used_so_far = total_mem.saturating_sub(actual_free);
-    // GB10 is shared (ComfyUI/voxel/etc.). `used_so_far` counts those co-tenants
-    // against our --gpu-memory-utilization budget, so a low util needlessly
-    // starves the KV pool (vs vLLM, whose util is self-relative). Set
-    // ATLAS_KV_EXTERNAL_RESERVE_GB=<co-tenant GB> to DISCOUNT that external usage:
-    // the KV pool is then sized against Atlas's OWN footprint (weights + buffers),
-    // while the `.min(actual_free - reserve)` clamp still guarantees a physical fit.
-    if let Ok(v) = std::env::var("ATLAS_KV_EXTERNAL_RESERVE_GB")
-        && let Ok(gb) = v.parse::<f64>()
-        && gb > 0.0
-    {
+    // GB10 is shared (ComfyUI/voxel/etc.). Raw `used_so_far` counts those
+    // co-tenants against our --gpu-memory-utilization budget, so a low util
+    // needlessly starves the KV pool (vs vLLM, whose util is self-relative).
+    //
+    // We want the KV pool sized against Atlas's OWN footprint (weights +
+    // buffers), excluding co-tenants. Two ways to find that footprint:
+    //
+    //   1. AUTO (default, preferred): free-at-context-init minus free-now =
+    //      exactly what THIS process allocated since startup. Co-tenants that
+    //      were already resident at init are in the baseline, so they cancel
+    //      out — and it self-corrects as co-tenants come and go (no stale
+    //      constant). Requires `set_baseline_free_bytes` to have run (it does
+    //      under the real server; absent under the mock backend → we skip it).
+    //
+    //   2. MANUAL override: ATLAS_KV_EXTERNAL_RESERVE_GB=<co-tenant GB> still
+    //      wins when explicitly set (>0), for operators who want to RESERVE
+    //      headroom for co-tenants that will arrive LATER (the auto measure
+    //      only sees current state).
+    //
+    // The `.min(actual_free - reserve)` clamp below still guarantees a physical
+    // fit regardless of which path set `used_so_far`.
+    let manual_reserve_gb = std::env::var("ATLAS_KV_EXTERNAL_RESERVE_GB")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|&gb| gb > 0.0);
+    if let Some(gb) = manual_reserve_gb {
         let ext = (gb * 1024.0 * 1024.0 * 1024.0) as usize;
         let discounted = used_so_far.saturating_sub(ext);
         tracing::info!(
-            "ATLAS_KV_EXTERNAL_RESERVE_GB={gb}: discounting external/co-tenant memory \
-             from KV budget — used_so_far {:.1} GB → Atlas-own {:.1} GB",
-            used_so_far as f64 / (1024.0 * 1024.0 * 1024.0),
-            discounted as f64 / (1024.0 * 1024.0 * 1024.0),
+            "ATLAS_KV_EXTERNAL_RESERVE_GB={gb} (manual override): discounting \
+             external/co-tenant memory from KV budget — used_so_far {:.1} GB → \
+             Atlas-own {:.1} GB",
+            gib(used_so_far),
+            gib(discounted),
         );
         used_so_far = discounted;
+    } else if let Some(baseline) = spark_runtime::gpu::baseline_free_bytes() {
+        // AUTO: bytes this process consumed since context init.
+        let atlas_own = baseline.saturating_sub(actual_free);
+        // Sanity-gate: baseline must be ≥ free-now, atlas_own positive and no
+        // larger than total used (co-tenants can't be negative). If a co-tenant
+        // *freed* memory during our load, baseline > free-now still holds and
+        // atlas_own just slightly overcounts (conservative — fine). If the
+        // numbers are implausible, fall back to raw used_so_far.
+        if atlas_own > 0 && atlas_own <= used_so_far {
+            tracing::info!(
+                "KV budget self-relative (auto): baseline-free {:.1} GB − free-now \
+                 {:.1} GB = Atlas-own {:.1} GB; co-tenants {:.1} GB excluded \
+                 (set ATLAS_KV_EXTERNAL_RESERVE_GB to override)",
+                gib(baseline),
+                gib(actual_free),
+                gib(atlas_own),
+                gib(used_so_far - atlas_own),
+            );
+            used_so_far = atlas_own;
+        } else {
+            tracing::warn!(
+                "KV budget auto-measure implausible (baseline {:.1} GB, free-now \
+                 {:.1} GB, used {:.1} GB) — using raw used_so_far",
+                gib(baseline),
+                gib(actual_free),
+                gib(used_so_far),
+            );
+        }
     }
     let total_budget = (total_mem as f64 * gpu_memory_utilization) as usize;
     let kv_budget = total_budget

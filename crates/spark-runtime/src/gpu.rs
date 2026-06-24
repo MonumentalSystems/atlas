@@ -8,6 +8,29 @@
 
 use anyhow::Result;
 use std::fmt;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+/// Free device memory (bytes) captured once at GPU-context init, BEFORE any
+/// model weights or buffers are allocated. Lets the KV-budget sizing measure
+/// *this process's own* footprint as `baseline_free - free_now`, which excludes
+/// co-tenant memory automatically (vs trusting a hardcoded
+/// `ATLAS_KV_EXTERNAL_RESERVE_GB` that goes stale as co-tenants come and go).
+/// 0 = unset (e.g. under the mock backend in tests) → callers fall back.
+static BASELINE_FREE_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+/// Record the free-memory baseline at GPU-context init. Call once, early,
+/// before weight loading. Idempotent-last-write; intended to be set exactly once.
+pub fn set_baseline_free_bytes(bytes: usize) {
+    BASELINE_FREE_BYTES.store(bytes, Ordering::Relaxed);
+}
+
+/// The free-memory baseline captured at context init, or `None` if never set.
+pub fn baseline_free_bytes() -> Option<usize> {
+    match BASELINE_FREE_BYTES.load(Ordering::Relaxed) {
+        0 => None,
+        v => Some(v),
+    }
+}
 
 /// Opaque device pointer wrapping a CUDA CUdeviceptr (u64).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
