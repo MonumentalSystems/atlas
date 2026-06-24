@@ -15,6 +15,7 @@ pub(super) fn start_new_requests(
     model: &dyn Model,
     new_reqs: Vec<InferenceRequest>,
     chunked: bool,
+    always_mixed: bool,
     max_prefill_tokens: usize,
     max_batch_tokens: usize,
     eos_tokens: &[u32],
@@ -43,8 +44,18 @@ pub(super) fn start_new_requests(
         && prefilling.is_empty()
         && !model.is_ep()
         && !new_reqs.iter().any(|r| r.has_image_pixels());
+    // Always-mixed chunk-0 fuse: when decodes are active and ATLAS_HOLO_ALWAYS_MIXED
+    // is on, DEFER a new request's chunk-0 (admit it to `prefilling` with
+    // chunk_offset=0, skip the inline blocking prefill) so it runs this SAME tick
+    // in continue_in_progress_prefills via the FUSED mixed path. Otherwise chunk-0
+    // ran here as a monolithic prefill that froze every active decode for the whole
+    // first chunk (the residual ~3.6s burst stall). Mutually exclusive with
+    // want_codispatch (which requires active.is_empty()). EP/vision excluded (per
+    // request, below) — same constraints as the fused mixed path.
+    let mixed_defer = always_mixed && chunked && !active.is_empty() && !model.is_ep();
     for req in new_reqs {
         if chunked {
+            let defer = want_codispatch || (mixed_defer && !req.has_image_pixels());
             // When no active sequences are decoding, process as much of the
             // prompt as buffers allow — avoids per-token paged decode fallback
             // in chunk 2+. Capped at max_batch_tokens (buffer capacity).
@@ -66,7 +77,7 @@ pub(super) fn start_new_requests(
                 prefill_event,
                 grammar_engine,
                 spontaneous_think_budget,
-                want_codispatch,
+                defer,
             ) {
                 Ok(StartPrefillResult::Active(a)) => {
                     tracing::info!(

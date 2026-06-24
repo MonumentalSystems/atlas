@@ -46,17 +46,12 @@ pub trait SchedulingPolicy: Send {
     /// prefill chunk into a decode step ("always-mixed" path).
     ///
     /// Returns a token budget in `[0, full_chunk]`:
-    /// - `full_chunk` when no decode is active (no TBT pressure) or the
-    ///   policy has no opinion (FIFO / default).
-    /// - A clamped, WY4-aligned slice (≥ `MIN_PREFILL_SLICE`) under
-    ///   moderate decode pressure so the fused step stays under the TBT
-    ///   target.
+    /// - `full_chunk` when no decode is active, or under moderate decode
+    ///   pressure — fuse the WHOLE chunk (measured: shrinking the slice does
+    ///   not lower decode TBT because the fused step's full-forward floor
+    ///   dominates; it only slows prefill).
     /// - `0` ONLY as a hard suppress when a decode has already blown its
     ///   TBT deadline — the caller must then run decode-only this tick.
-    ///
-    /// This is driven by MEASURED step cost (seeded from conservative
-    /// constants), NOT by `now − last_token_time` (which the fused step
-    /// self-resets every iteration — see spec blocker B2).
     fn prefill_slice_budget(&self, active_timings: &[ActiveSeqTiming], full_chunk: usize) -> usize {
         // Default (FIFO / unaware): inject the full chunk — same as today.
         let _ = active_timings;
@@ -66,11 +61,6 @@ pub trait SchedulingPolicy: Send {
     /// Policy name for logging.
     fn name(&self) -> &str;
 }
-
-/// Minimum prefill slice (tokens) injected into a fused mixed step.
-/// WY4-aligned; large enough to make forward progress on a long prompt,
-/// small enough to keep the fused step under the TBT target.
-pub const MIN_PREFILL_SLICE: usize = 32;
 
 /// FIFO scheduling: always prefill, take first N from queue.
 pub struct FifoPolicy;
@@ -97,40 +87,12 @@ impl SchedulingPolicy for FifoPolicy {
 /// - Selects the N shortest prompts from ALL pending (reduces median TTFT).
 pub struct SlaiPolicy {
     tbt_deadline: Duration,
-    /// Minimum fused prefill slice (tokens), WY4-aligned, read once from
-    /// `ATLAS_SLAI_MIN_PREFILL_SLICE` (default [`MIN_PREFILL_SLICE`]).
-    min_prefill_slice: usize,
-    /// Conservative seed for the decode-region step cost (ms) used to size
-    /// the prefill slice. TODO(holo-mixed Step 3): replace with an EWMA
-    /// updated from measured fused-step durations (a `record_step` hook
-    /// wired from the scheduler). Seeded high so the first slices are
-    /// conservative (small) until measurement lands.
-    t_dec_ms_seed: f64,
-    /// Conservative seed for marginal prefill cost (ms / token). TODO as
-    /// above — currently a constant. Tuned to GB10 Holo prefill (~0.6 ms
-    /// per WY4-aligned token at the resting chunk cap).
-    cost_per_tok_ms_seed: f64,
 }
 
 impl SlaiPolicy {
     pub fn new(tbt_deadline_ms: u64) -> Self {
-        // Read the minimum slice once; clamp ≥4 and WY4-align.
-        let min_prefill_slice = std::env::var("ATLAS_SLAI_MIN_PREFILL_SLICE")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .map(|v| {
-                let v = v.max(4);
-                (v / 4) * 4
-            })
-            .unwrap_or(MIN_PREFILL_SLICE);
         Self {
             tbt_deadline: Duration::from_millis(tbt_deadline_ms),
-            min_prefill_slice,
-            // Conservative constants (see field docs). Order of magnitude:
-            // a small decode batch costs a few ms/step; prefill marginal
-            // cost is sub-ms/token at the resting cap.
-            t_dec_ms_seed: 5.0,
-            cost_per_tok_ms_seed: 0.6,
         }
     }
 }
@@ -165,11 +127,8 @@ impl SchedulingPolicy for SlaiPolicy {
         }
 
         // Hard suppress: if ANY decode has already blown its TBT deadline,
-        // return 0 so the caller runs decode-only this tick. This is the
-        // ONLY case that returns 0 (spec B2 late-decode protection). Note
-        // `worst` is used ONLY as this hard guard, never to size the slice
-        // (the fused step self-resets last_token_time, so it cannot drive
-        // the budget — that is what makes B2's open-loop design fail).
+        // return 0 so the caller runs decode-only this tick — let the late
+        // decode catch up (a fused step would make it wait a whole forward).
         let now = Instant::now();
         let worst = active_timings
             .iter()
@@ -180,18 +139,16 @@ impl SchedulingPolicy for SlaiPolicy {
             return 0;
         }
 
-        // Cost-driven slice (spec B2 fix): size the prefill region from the
-        // measured (here: seeded) step cost so the fused step fits the TBT
-        // target. budget = (TBT_target − T_dec) / cost_per_tok.
-        let tbt_target_ms = self.tbt_deadline.as_secs_f64() * 1_000.0;
-        let headroom_ms = (tbt_target_ms - self.t_dec_ms_seed).max(0.0);
-        let raw = (headroom_ms / self.cost_per_tok_ms_seed).floor() as i64;
-        let raw = raw.clamp(0, full_chunk as i64) as usize;
-
-        // Clamp to [min_prefill_slice, full_chunk], WY4-align, floor at 4.
-        let budget = raw.clamp(self.min_prefill_slice.min(full_chunk), full_chunk);
-        let budget = (budget / 4) * 4;
-        budget.max(4).min(full_chunk)
+        // Otherwise fuse the FULL chunk. Measured (varied-load burst A/B,
+        // 2026-06-24): the fused step has a ~250ms full-forward floor that
+        // DOMINATES, so SHRINKING the prefill slice does NOT lower decode TBT
+        // — it only multiplies 250ms steps and slows prefill (slice=32 → 4.6×
+        // slower prefill for no TBT gain). A full-chunk slice keeps prefill at
+        // flag-off speed AND still halves the decode-freeze p99 (2529→1285ms)
+        // by riding decode on every chunk. So: fuse decode into the normal
+        // chunk, never shrink it. (The earlier cost-driven/EWMA shrink was the
+        // wrong lever for this model and was removed.)
+        full_chunk
     }
 
     fn name(&self) -> &str {

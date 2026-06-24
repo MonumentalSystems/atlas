@@ -276,6 +276,7 @@ pub fn run(
             &*model,
             new_reqs,
             chunked,
+            always_mixed,
             max_prefill_tokens,
             max_batch_tokens,
             &eos_tokens,
