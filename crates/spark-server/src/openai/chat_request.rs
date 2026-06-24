@@ -403,8 +403,13 @@ impl ChatCompletionRequest {
                 return (budget > 0, Some(budget));
             }
             if let Some(enabled) = kwargs.enable_thinking {
-                let budget = if enabled { DEFAULT_THINKING_BUDGET } else { 0 };
-                return (enabled, Some(budget));
+                // enable_thinking via chat_template_kwargs (incl. the server's
+                // --default-chat-template-kwargs '{"enable_thinking":true}'):
+                // defer the budget to the per-model max_thinking_budget (None)
+                // rather than the conservative 256-token DEFAULT — same rationale
+                // as the legacy/model-default branches below. Without this, that
+                // server default silently capped EVERY request's thinking at 256.
+                return (enabled, if enabled { None } else { Some(0) });
             }
         }
 
