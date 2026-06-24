@@ -302,7 +302,11 @@ pub fn moe_w4a16_fused_gate_up_k64_n128(
 /// stride over `hidden`. Used by the FP4 grouped gate_up path (the CUTLASS
 /// escape-hatch needs contiguous per-expert rows; the FP8 fused kernel gathers
 /// internally so it doesn't need this).
-#[allow(clippy::too_many_arguments)]
+///
+/// Retained for the legacy FP4 escape-hatch + potential reuse; the live FP4
+/// path now uses the fused kernel (in-kernel gather), so this is currently
+/// uncalled.
+#[allow(clippy::too_many_arguments, dead_code)]
 pub fn moe_permute_tokens(
     gpu: &dyn GpuBackend,
     kernel: KernelHandle,
@@ -334,7 +338,11 @@ pub fn moe_permute_tokens(
 /// is the HOST copy of the device offsets. Per-expert weight tables come from
 /// the load-time [`moe::MoeFp4GateUp`] (CUTLASS `[N,K/2]` packed + `[K/16,N]`
 /// scale, scale2 = 1.0).
-#[allow(clippy::too_many_arguments)]
+///
+/// Legacy escape-hatch: superseded by the fused FP4 kernel dispatch in
+/// `forward_prefill_routed`. Kept (and referencing the host `MoeFp4GateUp`
+/// pointer arrays) for A/B fallback; currently uncalled.
+#[allow(clippy::too_many_arguments, dead_code)]
 pub(crate) fn moe_nvfp4_fused_gate_up_grouped(
     fp4: &moe::MoeFp4GateUp,
     a: DevicePtr,

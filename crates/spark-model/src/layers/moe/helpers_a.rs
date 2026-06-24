@@ -291,15 +291,15 @@ impl MoeLayer {
         let packed_len = (k / 2) * n; // [K/2, N] bytes (== [N,K/2] elems packed)
         let scale_len = (k / 16) * n; // [K/16, N] E4M3 bytes
 
-        let mut t = MoeFp4GateUp {
-            gate_packed_ptrs: Vec::new(),
-            gate_scale_ptrs: Vec::new(),
-            gate_scale2_vals: Vec::new(),
-            up_packed_ptrs: Vec::new(),
-            up_scale_ptrs: Vec::new(),
-            up_scale2_vals: Vec::new(),
-            _owned: Vec::new(),
-        };
+        // gate_t / up_t are device ptr-tables for the FUSED kernel; filled
+        // after the per-expert pack loop from the collected host arrays.
+        let mut gate_packed_ptrs: Vec<u64> = Vec::new();
+        let mut gate_scale_ptrs: Vec<u64> = Vec::new();
+        let mut gate_scale2_vals: Vec<f32> = Vec::new();
+        let mut up_packed_ptrs: Vec<u64> = Vec::new();
+        let mut up_scale_ptrs: Vec<u64> = Vec::new();
+        let mut up_scale2_vals: Vec<f32> = Vec::new();
+        let mut owned: Vec<DevicePtr> = Vec::new();
 
         // Pack one NVFP4 expert projection: dequant -> BF16 -> CUTLASS NVFP4.
         // Returns (packed_ptr, scale_ptr); both are tracked in `_owned`.
@@ -317,35 +317,85 @@ impl MoeLayer {
             )?;
             gpu.synchronize(stream)?;
             gpu.free(bf16)?; // BF16 staging buffer no longer needed
-            t._owned.push(packed);
-            t._owned.push(scale);
+            owned.push(packed);
+            owned.push(scale);
             Ok((packed.0, scale.0))
         };
 
         for expert in &self.weights.experts {
             if expert.gate_proj.is_null() {
-                // Remote/placeholder expert: zero pointers (escape-hatch skips
-                // experts with empty token ranges, so these are never read).
-                t.gate_packed_ptrs.push(0);
-                t.gate_scale_ptrs.push(0);
-                t.gate_scale2_vals.push(1.0);
-                t.up_packed_ptrs.push(0);
-                t.up_scale_ptrs.push(0);
-                t.up_scale2_vals.push(1.0);
+                // Remote/placeholder expert: zero pointers (the fused kernel
+                // returns early for experts with an empty token range, so these
+                // are never dereferenced).
+                gate_packed_ptrs.push(0);
+                gate_scale_ptrs.push(0);
+                gate_scale2_vals.push(1.0);
+                up_packed_ptrs.push(0);
+                up_scale_ptrs.push(0);
+                up_scale2_vals.push(1.0);
                 continue;
             }
             let (gp, gs) = pack_one(&expert.gate_proj)?;
-            t.gate_packed_ptrs.push(gp);
-            t.gate_scale_ptrs.push(gs);
-            t.gate_scale2_vals.push(1.0);
+            gate_packed_ptrs.push(gp);
+            gate_scale_ptrs.push(gs);
+            gate_scale2_vals.push(1.0);
             let (up, us) = pack_one(&expert.up_proj)?;
-            t.up_packed_ptrs.push(up);
-            t.up_scale_ptrs.push(us);
-            t.up_scale2_vals.push(1.0);
+            up_packed_ptrs.push(up);
+            up_scale_ptrs.push(us);
+            up_scale2_vals.push(1.0);
         }
+        drop(pack_one);
+
+        // Upload the per-expert pointer arrays to device — the FUSED FP4 kernel
+        // reads its weight pointers from device memory (one u64 array per
+        // projection + an f32 scale2 array), exactly like the FP8 fused
+        // kernel's `gate_ptrs_t`/`up_ptrs_t`.
+        let upload_u64 = |gpu: &dyn GpuBackend,
+                          owned: &mut Vec<DevicePtr>,
+                          v: &[u64]|
+         -> Result<DevicePtr> {
+            let bytes: Vec<u8> = v.iter().flat_map(|p| p.to_le_bytes()).collect();
+            let d = gpu.alloc(bytes.len().max(8))?;
+            gpu.copy_h2d(&bytes, d)?;
+            owned.push(d);
+            Ok(d)
+        };
+        let upload_f32 = |gpu: &dyn GpuBackend,
+                          owned: &mut Vec<DevicePtr>,
+                          v: &[f32]|
+         -> Result<DevicePtr> {
+            let bytes: Vec<u8> = v.iter().flat_map(|p| p.to_le_bytes()).collect();
+            let d = gpu.alloc(bytes.len().max(4))?;
+            gpu.copy_h2d(&bytes, d)?;
+            owned.push(d);
+            Ok(d)
+        };
+        let gate_t = ExpertPtrTable {
+            packed_ptrs: upload_u64(gpu, &mut owned, &gate_packed_ptrs)?,
+            scale_ptrs: upload_u64(gpu, &mut owned, &gate_scale_ptrs)?,
+            scale2_vals: upload_f32(gpu, &mut owned, &gate_scale2_vals)?,
+        };
+        let up_t = ExpertPtrTable {
+            packed_ptrs: upload_u64(gpu, &mut owned, &up_packed_ptrs)?,
+            scale_ptrs: upload_u64(gpu, &mut owned, &up_scale_ptrs)?,
+            scale2_vals: upload_f32(gpu, &mut owned, &up_scale2_vals)?,
+        };
+        gpu.synchronize(stream)?;
+
+        let t = MoeFp4GateUp {
+            _owned: owned,
+            gate_packed_ptrs,
+            gate_scale_ptrs,
+            gate_scale2_vals,
+            up_packed_ptrs,
+            up_scale_ptrs,
+            up_scale2_vals,
+            gate_t,
+            up_t,
+        };
 
         tracing::info!(
-            "FP4 MoE gate_up: packed {} experts (N={n} K={k}) -> CUTLASS NVFP4 layout",
+            "FP4 MoE gate_up: packed {} experts (N={n} K={k}) -> fused-kernel NVFP4 device tables",
             t.gate_packed_ptrs.len(),
         );
         self.fp4_gate_up = Some(t);

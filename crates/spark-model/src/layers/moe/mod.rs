@@ -49,6 +49,14 @@ pub(crate) struct MoeFp4GateUp {
     /// Owning device allocations (packed + scale, gate then up) so they are
     /// freed with the layer. Pointers above alias into these.
     pub(crate) _owned: Vec<DevicePtr>,
+    /// Device-side ptr-tables for the FUSED FP4 kernel
+    /// (`moe_w4a16_fused_gate_up_t_k64_fp4`). The fused kernel — unlike the
+    /// CUTLASS escape-hatch collective — reads its per-expert weight pointers
+    /// from device memory (one `unsigned long long*` array per projection),
+    /// exactly like the FP8 fused kernel's `gate_ptrs_t`. These are the host
+    /// `*_packed_ptrs` / `*_scale_ptrs` / `*_scale2_vals` uploaded to device.
+    pub(crate) gate_t: ExpertPtrTable,
+    pub(crate) up_t: ExpertPtrTable,
 }
 
 /// Device-side pointer table for FP8 expert dispatch (one projection).
@@ -217,6 +225,13 @@ pub struct MoeLayer {
     /// `KernelHandle(0)` on models that don't ship the kernel; dispatch
     /// gates on `nvfp4_gate_up_m128` AND handle non-zero.
     moe_fused_gate_up_t_k64_m128: KernelHandle,
+    /// FUSED FP4 (block-scaled e2m1) variant of the K64 fused gate+up kernel
+    /// (`ATLAS_HOLO_MOE_GATEUP_FP4`). Same signature as `moe_fused_gate_up_t_k64`
+    /// but runs one `mma.sync.kind::mxf4nvf4.scale_vec::4X.m16n8k64` per k64
+    /// tile (vs 2× m16n8k32 e4m3). `try_kernel` — `KernelHandle(0)` on images
+    /// lacking it; the dispatch in `forward_prefill_routed` only fires when both
+    /// this handle and `fp4_gate_up` are set.
+    moe_fused_gate_up_t_k64_fp4: KernelHandle,
     moe_fp8_grouped_gemm_t: KernelHandle,
     w4a16_gemm_t: KernelHandle,
     bf16_to_fp8_k: KernelHandle,

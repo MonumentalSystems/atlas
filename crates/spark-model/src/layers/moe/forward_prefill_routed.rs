@@ -113,52 +113,37 @@ impl MoeLayer {
         }
         if max_m_tiles > 0 {
             if let Some(fp4) = self.fp4_gate_up.as_ref().filter(|_| {
-                self.moe_permute_tokens_k.0 != 0
+                self.moe_fused_gate_up_t_k64_fp4.0 != 0
             }) {
-                // ── FP4 gate_up escape-hatch (ATLAS_HOLO_MOE_GATEUP_FP4) ──
-                // The CUTLASS grouped collective consumes contiguous, expert-
-                // sorted A rows (unlike the FP8 fused kernel, which gathers via
-                // sorted_token_ids in-kernel). So: (1) gather expert_input into
-                // [total_expanded, h] sorted order, (2) copy expert_offsets D2H
-                // (the grouped wrapper takes host offsets), (3) run the per-
-                // expert NVFP4 collective. Outputs land in expert_gate_out /
-                // expert_up_out in the SAME sorted order the FP8 path produces,
-                // so silu+down+unpermute downstream are unchanged.
-                let te = total_expanded as usize;
-                let permuted = ctx.gpu.alloc(te * h as usize * 2)?;
-                ops::moe_permute_tokens(
+                // ── FUSED FP4 gate_up (ATLAS_HOLO_MOE_GATEUP_FP4) ──
+                // Single launch over the whole batch: grid z = num_experts,
+                // each block gathers its A rows in-kernel via sorted_token_ids
+                // (no permute), reads its weights from the device ptr-tables,
+                // and writes C_gate/C_up in the SAME sorted layout the FP8 fused
+                // kernel produces — so silu+down+unpermute downstream are
+                // unchanged. No gather, no D2H offset copy, no per-expert sync:
+                // identical orchestration to the FP8 fused path, just FP4 math
+                // (one m16n8k64 mxf4 MMA per k64 tile vs 2× m16n8k32 e4m3).
+                ops::moe_w4a16_fused_gate_up_k64_n128(
                     ctx.gpu,
-                    self.moe_permute_tokens_k,
+                    self.moe_fused_gate_up_t_k64_fp4,
                     expert_input,
-                    permuted,
-                    sorted_token_ids,
-                    h,
-                    total_expanded,
-                    stream,
-                )?;
-                // expert_offsets is [ne+1] i32 on device; the grouped wrapper
-                // needs it on the host. Sync so the gather + offsets are ready.
-                let mut off_bytes = vec![0u8; (ne + 1) * 4];
-                ctx.gpu
-                    .copy_d2h_on_stream(expert_offsets, &mut off_bytes, stream)?;
-                ctx.gpu.synchronize(stream)?;
-                let offsets_host: Vec<i32> = off_bytes
-                    .chunks_exact(4)
-                    .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                    .collect();
-                let res = ops::moe_nvfp4_fused_gate_up_grouped(
-                    fp4,
-                    permuted,
+                    fp4.gate_t.packed_ptrs,
+                    fp4.gate_t.scale_ptrs,
+                    fp4.gate_t.scale2_vals,
+                    fp4.up_t.packed_ptrs,
+                    fp4.up_t.scale_ptrs,
+                    fp4.up_t.scale2_vals,
                     expert_gate_out,
                     expert_up_out,
-                    &offsets_host,
+                    expert_offsets,
+                    sorted_token_ids,
+                    num_experts,
                     inter,
                     h,
+                    max_m_tiles,
                     stream,
-                );
-                ctx.gpu.synchronize(stream)?;
-                ctx.gpu.free(permuted)?;
-                res?;
+                )?;
             } else if let (Some(gp), Some(up)) = (&self.gate_ptrs_t, &self.up_ptrs_t) {
                 // Block D #3 dispatch: M=128 path needs the env var on AND
                 // the kernel actually loaded (try_kernel returns 0 on

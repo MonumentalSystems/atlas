@@ -103,6 +103,14 @@ impl MoeLayer {
                 "moe_w4a16",
                 "moe_w4a16_fused_gate_up_t_k64_m128",
             ),
+            // FUSED FP4 gate_up kernel (ATLAS_HOLO_MOE_GATEUP_FP4). try_kernel:
+            // KernelHandle(0) on images that didn't compile it; the FP4 dispatch
+            // checks this handle != 0 before firing.
+            moe_fused_gate_up_t_k64_fp4: super::super::try_kernel(
+                gpu,
+                "moe_w4a16",
+                "moe_w4a16_fused_gate_up_t_k64_fp4",
+            ),
             moe_fp8_grouped_gemm_t: gpu.kernel("moe_w4a16", "moe_fp8_grouped_gemm_ptrtable_t")?,
             // THE routed-expert FP8 prefill kernel: grid-compaction (persistent
             // 96-CTA grid over a compacted work-list). Handle may be 0 on older
