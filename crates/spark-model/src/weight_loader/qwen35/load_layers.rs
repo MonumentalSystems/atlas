@@ -246,6 +246,15 @@ pub(super) fn load_layers(
         if holo_moe_gateup_fp4() {
             moe_layer.build_fp4_gate_up(gpu, config, stream)?;
         }
+        // FP4 MoE down (ATLAS_HOLO_MOE_DOWN_FP4): pack each expert's down_proj
+        // NVFP4 weight into the FP4 down-kernel layout. Compounds with the FP4
+        // gate_up path to run the whole MoE FFN at FP4. Same constraint: built
+        // from untransposed NVFP4 down weights (present here before any
+        // transpose/free), so intended for ATLAS_HOLO_FAST_MOE_MODE=off.
+        // Default OFF => bit-identical to the FP8/w4a16 down path.
+        if holo_moe_down_fp4() {
+            moe_layer.build_fp4_down(gpu, config, stream)?;
+        }
         // With native FP8, the FP8 fused MoE kernel handles both prefill and decode.
         // Skip transposition and predequant (saves ~30 GB + CPU time for 122B EP=2).
         // ATLAS_FORCE_NVFP4_MOE=1 inverts: do the prep so NVFP4 path is usable.
@@ -790,6 +799,19 @@ fn holo_moe_gateup_fp4() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
         std::env::var("ATLAS_HOLO_MOE_GATEUP_FP4")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    })
+}
+
+/// `ATLAS_HOLO_MOE_DOWN_FP4=1` opts in to the FP4 (NVFP4 block-scaled) down
+/// prefill path. OnceLock-cached, default OFF => the existing FP8/w4a16 down
+/// path runs unchanged (bit-identical). Independent of the gate_up flag.
+fn holo_moe_down_fp4() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("ATLAS_HOLO_MOE_DOWN_FP4")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false)
     })

@@ -401,6 +401,107 @@ impl MoeLayer {
         self.fp4_gate_up = Some(t);
         Ok(())
     }
+
+    /// Build the per-expert NVFP4 down table for the FP4 down prefill path
+    /// (`ATLAS_HOLO_MOE_DOWN_FP4`). For each non-null expert, dequant the stored
+    /// NVFP4 `down_proj` (`[N=hidden, K=inter]`) to BF16, then re-pack via
+    /// `pack_bf16_weight_to_nvfp4_t` into the `[N,K/2]` packed + `[K/16,N]` E4M3
+    /// scale layout the FP4 down kernel reads (scale2 = 1.0 folded into the pack).
+    ///
+    /// Single projection (no gate/up fusion). Additive: only invoked when the
+    /// env flag is on; leaves all existing tables untouched so the FP8/w4a16
+    /// down path stays bit-identical when off. Must run before any down-proj
+    /// transpose/free (i.e. with ATLAS_HOLO_FAST_MOE_MODE=off).
+    pub fn build_fp4_down(
+        &mut self,
+        gpu: &dyn GpuBackend,
+        config: &atlas_core::config::ModelConfig,
+        stream: u64,
+    ) -> Result<()> {
+        let h = config.hidden_size; // N (down output = hidden)
+        let inter = config.moe_intermediate_size; // K (down input = inter)
+        let n = h;
+        let k = inter;
+        let packed_len = (k / 2) * n; // [K/2, N] bytes
+        let scale_len = (k / 16) * n; // [K/16, N] E4M3 bytes
+
+        let mut packed_ptrs: Vec<u64> = Vec::new();
+        let mut scale_ptrs: Vec<u64> = Vec::new();
+        let mut scale2_vals: Vec<f32> = Vec::new();
+        let mut owned: Vec<DevicePtr> = Vec::new();
+
+        let mut pack_one = |qw: &QuantizedWeight| -> Result<(u64, u64)> {
+            let bf16 = dequant_nvfp4_qw_to_bf16(gpu, qw, n, k)?;
+            let packed = gpu.alloc(packed_len)?;
+            let scale = gpu.alloc(scale_len)?;
+            spark_runtime::cutlass::pack_bf16_weight_to_nvfp4_t(
+                bf16.0,
+                packed.0,
+                scale.0,
+                n as u32,
+                k as u32,
+                stream,
+            )?;
+            gpu.synchronize(stream)?;
+            gpu.free(bf16)?;
+            owned.push(packed);
+            owned.push(scale);
+            Ok((packed.0, scale.0))
+        };
+
+        for expert in &self.weights.experts {
+            if expert.down_proj.weight.is_null() {
+                // Remote/placeholder expert: zero pointers (the kernel returns
+                // early for experts with an empty token range).
+                packed_ptrs.push(0);
+                scale_ptrs.push(0);
+                scale2_vals.push(1.0);
+                continue;
+            }
+            let (dp, ds) = pack_one(&expert.down_proj)?;
+            packed_ptrs.push(dp);
+            scale_ptrs.push(ds);
+            scale2_vals.push(1.0);
+        }
+        drop(pack_one);
+
+        let upload_u64 = |gpu: &dyn GpuBackend,
+                          owned: &mut Vec<DevicePtr>,
+                          v: &[u64]|
+         -> Result<DevicePtr> {
+            let bytes: Vec<u8> = v.iter().flat_map(|p| p.to_le_bytes()).collect();
+            let d = gpu.alloc(bytes.len().max(8))?;
+            gpu.copy_h2d(&bytes, d)?;
+            owned.push(d);
+            Ok(d)
+        };
+        let upload_f32 = |gpu: &dyn GpuBackend,
+                          owned: &mut Vec<DevicePtr>,
+                          v: &[f32]|
+         -> Result<DevicePtr> {
+            let bytes: Vec<u8> = v.iter().flat_map(|p| p.to_le_bytes()).collect();
+            let d = gpu.alloc(bytes.len().max(4))?;
+            gpu.copy_h2d(&bytes, d)?;
+            owned.push(d);
+            Ok(d)
+        };
+        let down_t = ExpertPtrTable {
+            packed_ptrs: upload_u64(gpu, &mut owned, &packed_ptrs)?,
+            scale_ptrs: upload_u64(gpu, &mut owned, &scale_ptrs)?,
+            scale2_vals: upload_f32(gpu, &mut owned, &scale2_vals)?,
+        };
+        gpu.synchronize(stream)?;
+
+        tracing::info!(
+            "FP4 MoE down: packed {} experts (N={n} K={k}) -> FP4 down device table",
+            packed_ptrs.len(),
+        );
+        self.fp4_down = Some(MoeFp4Down {
+            _owned: owned,
+            down_t,
+        });
+        Ok(())
+    }
 }
 
 /// Host dequant of an NVFP4 `QuantizedWeight` (`[N,K/2]` packed + `[N,K/16]`

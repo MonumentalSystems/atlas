@@ -298,6 +298,15 @@ impl MoeLayer {
             // construction by the loader when the flag is on; None => the FP8
             // fused gate_up path runs unchanged.
             fp4_gate_up: None,
+            // FP4 down path (ATLAS_HOLO_MOE_DOWN_FP4): table populated at load
+            // by build_fp4_down when the flag is on; None keeps the FP8/w4a16
+            // down path unchanged.
+            fp4_down: None,
+            moe_down_t_k64_fp4: super::super::try_kernel(
+                gpu,
+                "moe_w4a16",
+                "moe_w4a16_down_t_k64_fp4",
+            ),
             moe_permute_tokens_k: super::super::try_kernel(gpu, "moe", "moe_permute_tokens"),
             // Phase 2.7 Tier C — set by loader after construction (qwen35.rs).
             is_dflash_capture_layer: false,

@@ -638,6 +638,176 @@ fn run_shape(
     })
 }
 
+/// FP4 DOWN GEMM proof (`moe_w4a16_down_t_k64_fp4`). Single-output grouped
+/// kernel at the down shape: A = post-SiLU intermediate `[M, K=inter]`, weight
+/// = down_proj `[N=hidden, K=inter]`, output `[M, N]`. Validates the FP4 down
+/// kernel vs (a) the CUTLASS collective `nvfp4_gemm_bf16_act_weight_t` on the
+/// SAME packed weights (cos >= 0.999, identical FP4 math) and (b) the CPU bf16
+/// oracle (cos >= 0.98). Also times it vs the production FP8 down kernel
+/// (`moe_w4a16_grouped_gemm_ptrtable_t_k64`) on the REAL bf16 A/B.
+fn run_down_shape(
+    gpu: &dyn GpuBackend,
+    stream: u64,
+    m: usize,
+    n: usize, // hidden = 2048
+    k: usize, // inter = 512
+    seed: u64,
+) -> Result<(f64, f64, f64, f64, f64)> {
+    // (down_us, fp8_down_us, w4a16_down_us, cos_vs_collective, cos_vs_oracle)
+    let iters = 50usize;
+    let mut rng = Rng(seed);
+    let a_bf16: Vec<u16> = (0..m * k)
+        .map(|_| f32_to_bf16_bits(rng.uniform(-1.0, 1.0)))
+        .collect();
+    let b_bf16: Vec<u16> = (0..n * k)
+        .map(|_| f32_to_bf16_bits(rng.uniform(-0.5, 0.5)))
+        .collect();
+
+    let a_ptr = upload_bytes(gpu, &u16s_to_le(&a_bf16))?;
+    let b_bf16_ptr = upload_bytes(gpu, &u16s_to_le(&b_bf16))?;
+    let (mu, nu, ku) = (m as u32, n as u32, k as u32);
+
+    // FP4 N-major weight (pack_bf16_weight_to_nvfp4_t: packed [N,K/2], scale [K/16,N]).
+    let packed_len = (k / 2) * n;
+    let scale_len = (k / 16) * n;
+    let packed_ptr = gpu.alloc(packed_len)?;
+    let scale_ptr = gpu.alloc(scale_len)?;
+    spark_runtime::cutlass::pack_bf16_weight_to_nvfp4_t(
+        b_bf16_ptr.0, packed_ptr.0, scale_ptr.0, nu, ku, stream,
+    )?;
+    gpu.synchronize(stream)?;
+
+    // ── CUTLASS collective FP4 (reference for the same FP4 math) ──
+    let out_collective = gpu.alloc(m * n * 2)?;
+    let coll_launch = || {
+        spark_runtime::cutlass::nvfp4_gemm_bf16_act_weight_t(
+            a_ptr.0, packed_ptr.0, scale_ptr.0, 1.0, out_collective.0, mu, nu, ku, stream,
+        )
+    };
+    coll_launch()?;
+    gpu.synchronize(stream)?;
+    let c_collective = read_bf16(gpu, out_collective, m, n)?;
+
+    // ── FP4 down kernel (the one under test) ──
+    let down_handle = gpu.kernel("moe_w4a16", "moe_w4a16_down_t_k64_fp4")?;
+    let mk_ptr_tbl = |p: u64| -> Result<DevicePtr> {
+        let bytes = p.to_le_bytes();
+        let d = gpu.alloc(8)?;
+        gpu.copy_h2d(&bytes, d)?;
+        Ok(d)
+    };
+    let packed_tbl = mk_ptr_tbl(packed_ptr.0)?;
+    let scale_tbl = mk_ptr_tbl(scale_ptr.0)?;
+    let scale2_tbl = upload_bytes(gpu, &1.0f32.to_le_bytes())?;
+    let eoff_dev = {
+        let mut b = Vec::new();
+        b.extend_from_slice(&0i32.to_le_bytes());
+        b.extend_from_slice(&(m as i32).to_le_bytes());
+        upload_bytes(gpu, &b)?
+    };
+    let out_down = gpu.alloc(m * n * 2)?;
+    let max_m_tiles = div_ceil(mu, 64).max(1);
+    let down_launch = || -> Result<()> {
+        KernelLaunch::new(gpu, down_handle)
+            .grid([div_ceil(nu, 128), max_m_tiles, 1])
+            .block([128, 1, 1])
+            .arg_ptr(a_ptr)
+            .arg_ptr(packed_tbl)
+            .arg_ptr(scale_tbl)
+            .arg_ptr(scale2_tbl)
+            .arg_ptr(out_down)
+            .arg_ptr(eoff_dev)
+            .arg_u64(0) // sorted_token_ids = null (identity, as in production down)
+            .arg_u32(1) // num_experts
+            .arg_u32(nu)
+            .arg_u32(ku)
+            .launch(stream)?;
+        Ok(())
+    };
+    down_launch()?;
+    gpu.synchronize(stream)?;
+    let down_us = time_gemm(gpu, stream, iters, down_launch)?;
+    let c_down = read_bf16(gpu, out_down, m, n)?;
+
+    // ── production FP8 down kernel (moe_w4a16_grouped_gemm_ptrtable_t_k64) ──
+    // K-major [K/2,N] packed + [K/16,N] ue4m3 scales (its own layout).
+    let (b_pk, b_sk) = pack_weight_kmajor(&b_bf16, n, k);
+    let b_pk_ptr = upload_bytes(gpu, &b_pk)?;
+    let b_sk_ptr = upload_bytes(gpu, &b_sk)?;
+    let b_pk_tbl = mk_ptr_tbl(b_pk_ptr.0)?;
+    let b_sk_tbl = mk_ptr_tbl(b_sk_ptr.0)?;
+    let out_w4a16 = gpu.alloc(m * n * 2)?;
+    let w4a16_handle = gpu.kernel("moe_w4a16", "moe_w4a16_grouped_gemm_ptrtable_t_k64")?;
+    let w4a16_launch = || -> Result<()> {
+        KernelLaunch::new(gpu, w4a16_handle)
+            .grid([div_ceil(nu, 128), max_m_tiles, 1])
+            .block([128, 1, 1])
+            .arg_ptr(a_ptr)
+            .arg_ptr(b_pk_tbl)
+            .arg_ptr(b_sk_tbl)
+            .arg_ptr(scale2_tbl)
+            .arg_ptr(out_w4a16)
+            .arg_ptr(eoff_dev)
+            .arg_u64(0)
+            .arg_u32(1)
+            .arg_u32(nu)
+            .arg_u32(ku)
+            .launch(stream)?;
+        Ok(())
+    };
+    w4a16_launch()?;
+    gpu.synchronize(stream)?;
+    let w4a16_down_us = time_gemm(gpu, stream, iters, w4a16_launch)?;
+
+    // ── production FP8 down (fp8 A): bf16_to_fp8 then moe_fp8_grouped_gemm_ptrtable_t ──
+    // The currently-shipped down config (ATLAS_MOE_PREFILL_FP8_DOWN=1). Same
+    // K-major weights; A pre-converted to e4m3. Timed for the A/B baseline.
+    let a_fp8: Vec<u8> = a_bf16
+        .iter()
+        .map(|&b| f32_to_e4m3(bf16_bits_to_f32(b)))
+        .collect();
+    let a_fp8_ptr = upload_bytes(gpu, &a_fp8)?;
+    let out_fp8 = gpu.alloc(m * n * 2)?;
+    let fp8_handle = gpu.kernel("moe_w4a16", "moe_fp8_grouped_gemm_ptrtable_t")?;
+    let fp8_launch = || -> Result<()> {
+        KernelLaunch::new(gpu, fp8_handle)
+            .grid([div_ceil(nu, 128), max_m_tiles, 1])
+            .block([128, 1, 1])
+            .arg_ptr(a_fp8_ptr)
+            .arg_ptr(b_pk_tbl)
+            .arg_ptr(b_sk_tbl)
+            .arg_ptr(scale2_tbl)
+            .arg_ptr(out_fp8)
+            .arg_ptr(eoff_dev)
+            .arg_u64(0)
+            .arg_u32(1)
+            .arg_u32(nu)
+            .arg_u32(ku)
+            .launch(stream)?;
+        Ok(())
+    };
+    let fp8_down_us = if fp8_launch().is_ok() {
+        gpu.synchronize(stream)?;
+        time_gemm(gpu, stream, iters, fp8_launch).unwrap_or(0.0)
+    } else {
+        0.0
+    };
+
+    let c_ref = cpu_reference(&a_bf16, &b_bf16, m, n, k);
+    let cos_vs_collective = cosine_u16(&c_down, &c_collective);
+    let (cos_vs_oracle, _) = compare(&c_down, &c_ref);
+
+    for p in [
+        a_ptr, b_bf16_ptr, packed_ptr, scale_ptr, out_collective, packed_tbl, scale_tbl,
+        scale2_tbl, eoff_dev, out_down, b_pk_ptr, b_sk_ptr, b_pk_tbl, b_sk_tbl, out_w4a16,
+        a_fp8_ptr, out_fp8,
+    ] {
+        gpu.free(p).ok();
+    }
+
+    Ok((down_us, fp8_down_us, w4a16_down_us, cos_vs_collective, cos_vs_oracle))
+}
+
 fn main() -> Result<()> {
     // Holo 3.1 MoE gate_up: N = 2*moe_intermediate = 1024, K = hidden = 2048.
     let n = 1024usize;
@@ -797,6 +967,51 @@ fn main() -> Result<()> {
             "HEADLINE: at M=64  fp4_speedup_over_fp8={sp:.3}x  fp4_cos={:.4}",
             r.fp4_cos
         );
+    }
+
+    // ── FP4 DOWN kernel gate (moe_w4a16_down_t_k64_fp4) ──
+    // Down shape: N = hidden = 2048, K = inter = 512. Realistic M = tokens/expert.
+    println!();
+    println!("=== FP4 DOWN kernel (moe_w4a16_down_t_k64_fp4): N=2048 (hidden), K=512 (inter) ===");
+    println!(
+        "{:>6} {:>10} {:>12} {:>12} {:>20} {:>16} {:>12}",
+        "M", "down_us", "fp8down_us", "w4a16_us", "cos_vs_collective", "cos_vs_oracle", "fp4/fp8"
+    );
+    println!("{}", "-".repeat(94));
+    const DOWN_COLLECTIVE_GATE: f64 = 0.999;
+    let down_n = 2048usize;
+    let down_k = 512usize;
+    let mut down_pass = true;
+    let mut min_dn_coll = 1.0f64;
+    let mut min_dn_orc = 1.0f64;
+    for &m in &m_values {
+        let (down_us, fp8_us, w4a16_us, coll, orc) =
+            run_down_shape(gpu, stream, m, down_n, down_k, seed ^ (m as u64).wrapping_mul(0x7C15))?;
+        let sp = if down_us > 0.0 && fp8_us > 0.0 {
+            fp8_us / down_us
+        } else {
+            0.0
+        };
+        println!(
+            "{:>6} {:>10.2} {:>12.2} {:>12.2} {:>20.6} {:>16.6} {:>12.3}",
+            m, down_us, fp8_us, w4a16_us, coll, orc, sp
+        );
+        min_dn_coll = min_dn_coll.min(coll);
+        min_dn_orc = min_dn_orc.min(orc);
+        if coll < DOWN_COLLECTIVE_GATE || orc < COSINE_GATE {
+            down_pass = false;
+        }
+    }
+    println!("{}", "-".repeat(94));
+    if down_pass {
+        println!(
+            "DOWN RESULT: PASS (cos_vs_collective>={DOWN_COLLECTIVE_GATE} min {min_dn_coll:.6}; cos_vs_oracle>={COSINE_GATE} min {min_dn_orc:.6})"
+        );
+    } else {
+        eprintln!(
+            "DOWN RESULT: FAIL (collective min {min_dn_coll:.6} gate {DOWN_COLLECTIVE_GATE}; oracle min {min_dn_orc:.6} gate {COSINE_GATE})"
+        );
+        all_pass = false;
     }
 
     if all_pass {

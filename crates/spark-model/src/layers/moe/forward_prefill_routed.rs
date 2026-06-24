@@ -245,7 +245,34 @@ impl MoeLayer {
                 total_expanded * inter,
                 stream,
             )?;
-            if let Some(dp) = &self.down_ptrs_t {
+            // ── FP4 down (ATLAS_HOLO_MOE_DOWN_FP4) ── single block-scaled FP4
+            // MMA per k64 tile (mxf4nvf4.scale_vec::4X.m16n8k64), reading the
+            // post-SiLU intermediate (expert_gate_out) and the per-expert FP4
+            // down tables. Same sorted layout + null sorted_token_ids as the
+            // FP8/w4a16 down kernels, so unpermute downstream is unchanged.
+            // Compounds with the FP4 gate_up path to run the whole FFN at FP4.
+            if let Some(fp4d) = self
+                .fp4_down
+                .as_ref()
+                .filter(|_| self.moe_down_t_k64_fp4.0 != 0)
+            {
+                ops::moe_w4a16_grouped_gemm_ptrtable_n128(
+                    ctx.gpu,
+                    self.moe_down_t_k64_fp4,
+                    expert_gate_out,
+                    fp4d.down_t.packed_ptrs,
+                    fp4d.down_t.scale_ptrs,
+                    fp4d.down_t.scale2_vals,
+                    expert_down_out,
+                    expert_offsets,
+                    DevicePtr(0),
+                    num_experts,
+                    h,
+                    inter,
+                    max_m_tiles,
+                    stream,
+                )?;
+            } else if let Some(dp) = &self.down_ptrs_t {
                 let fp8_down = std::env::var("ATLAS_MOE_PREFILL_FP8_DOWN").ok().as_deref()
                     == Some("1")
                     && self.moe_fp8_grouped_gemm_t.0 != 0

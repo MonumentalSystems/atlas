@@ -59,6 +59,23 @@ pub(crate) struct MoeFp4GateUp {
     pub(crate) up_t: ExpertPtrTable,
 }
 
+/// Host-side per-expert NVFP4 weight table for the FP4 DOWN prefill path
+/// (`ATLAS_HOLO_MOE_DOWN_FP4`). Single projection (no gate/up fusion). Mirrors
+/// [`MoeFp4GateUp`] but for `down_proj` (`[N=hidden, K=inter]`): the down weight
+/// is dequanted to BF16 then re-packed via `pack_bf16_weight_to_nvfp4_t` into the
+/// `[N,K/2]` packed + `[K/16,N]` E4M3-scale layout the FP4 down kernel reads.
+/// Built at load when the flag is on; `None` (field absent) keeps the existing
+/// FP8/w4a16 down path bit-identical.
+pub(crate) struct MoeFp4Down {
+    /// Device-side ptr-table for the FP4 down kernel (`moe_w4a16_down_t_k64_fp4`):
+    /// one `unsigned long long*` array of per-expert packed pointers, one of
+    /// scale pointers, one f32 scale2 array — exactly like `down_ptrs_t`.
+    pub(crate) down_t: ExpertPtrTable,
+    /// Owning device allocations (per-expert packed + scale buffers + the three
+    /// uploaded ptr-table arrays) so they are freed with the layer.
+    pub(crate) _owned: Vec<DevicePtr>,
+}
+
 /// Device-side pointer table for FP8 expert dispatch (one projection).
 ///
 /// FP8 experts use 2 pointer arrays (weight + block_scale) instead of
@@ -321,6 +338,15 @@ pub struct MoeLayer {
     /// the existing FP8 fused gate_up path runs unchanged (default).
     /// Populated at load by `build_fp4_gate_up` when the flag is on.
     pub(crate) fp4_gate_up: Option<MoeFp4GateUp>,
+    /// FP4 down prefill table (`ATLAS_HOLO_MOE_DOWN_FP4`). `None` => the existing
+    /// FP8/w4a16 down path runs unchanged (default). Populated at load by
+    /// `build_fp4_down` when the flag is on. Compounds with `fp4_gate_up` to run
+    /// the whole MoE FFN at FP4.
+    pub(crate) fp4_down: Option<MoeFp4Down>,
+    /// FP4 down kernel handle (`moe_w4a16_down_t_k64_fp4`). `try_kernel` =>
+    /// `KernelHandle(0)` on images lacking it; the FP4-down dispatch checks this
+    /// handle != 0 AND `fp4_down` is set before firing.
+    pub(crate) moe_down_t_k64_fp4: KernelHandle,
     /// `moe_permute_tokens` gather kernel — only needed by the FP4 escape-hatch
     /// (which consumes expert-sorted contiguous rows, unlike the FP8 fused
     /// kernel that gathers via `sorted_token_ids` internally). `try_kernel`
