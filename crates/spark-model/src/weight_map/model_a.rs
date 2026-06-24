@@ -154,20 +154,24 @@ pub(crate) fn dense_f32_safe(
 ) -> Result<DenseWeight> {
     let w = store.get(name)?;
     if w.dtype == WeightDtype::FP32 {
-        tracing::info!(
-            "dense_f32_safe: converting {name} from FP32 to BF16 ({:?})",
-            w.shape
-        );
+        // On-device FP32→BF16 truncation — ONE async kernel on the load stream,
+        // no D2H/CPU/H2D round-trip. The old path did copy_d2h→CPU-truncate→
+        // copy_h2d per weight, each with 2 cuStreamSynchronize on the busy load
+        // stream → ~104s across 635 FP32 weights (the dominant cold-load cost).
+        // The kernel reads the high 2 bytes of each f32 → bit-identical to the
+        // prior CPU truncation. Ordered after the weight's upload (same stream),
+        // so no sync needed.
         let n = w.num_elements();
-        let mut f32_buf = vec![0u8; n * 4];
-        gpu.copy_d2h(w.ptr, &mut f32_buf)?;
-        // Truncate f32 → bf16: take upper 16 bits of each f32
-        let bf16_buf: Vec<u8> = f32_buf
-            .chunks_exact(4)
-            .flat_map(|c| [c[2], c[3]]) // upper 2 bytes = BF16
-            .collect();
-        let ptr = gpu.alloc(bf16_buf.len())?;
-        gpu.copy_h2d(&bf16_buf, ptr)?;
+        let ptr = gpu.alloc(n * 2)?;
+        let trunc = gpu.kernel("quantize_nvfp4", "f32_to_bf16_trunc")?;
+        let blocks = (n.div_ceil(256) as u32).max(1);
+        spark_runtime::kernel_args::KernelLaunch::new(gpu, trunc)
+            .grid([blocks, 1, 1])
+            .block([256, 1, 1])
+            .arg_ptr(w.ptr)
+            .arg_ptr(ptr)
+            .arg_u32(n as u32)
+            .launch(gpu.default_stream())?;
         Ok(DenseWeight { weight: ptr })
     } else {
         Ok(DenseWeight { weight: w.ptr })
