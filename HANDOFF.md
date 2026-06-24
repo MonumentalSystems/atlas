@@ -1,3 +1,190 @@
+# Holo 3.1 on Atlas — ACTIVE HANDOFF (2026-06-24)
+
+> This is the current handoff. The big historical experiment log (pre-2026-06-24,
+> lots of "don't re-try this" notes + the FlashInfer/CUTLASS integration history that
+> the §6 next-work builds on) is archived below the `═══ ARCHIVE ═══` line.
+
+Branch: `feature/holo-port-pr177` (push here). Model: `Hcompany/Holo-3.1-35B-A3B-NVFP4`
+(hybrid: 30 GDN/SSM + 10 full-attention + 256-expert MoE; hidden=2048, head_dim=256,
+16 q / 2 kv heads; GDN linear heads 16 key / 32 value, head_dim 128).
+
+## 0. TL;DR
+- **Deployed now:** Docker container `atlas-holo:cuda13.2-next` on `gx10-9959:8890`
+  (CUDA 13.2 + CUTLASS 4.4.2 + FlashInfer 0.6.13, util 0.55), coexisting with ComfyUI
+  (`pixal3d-comfy`, ~25-40GB). **Leave it up — user is testing it.**
+- **Shipped this session:** cold-load 145s→26s, self-relative KV budget, the **fused mixed
+  step** (decode-freeze 4.4s→1.3s, behind `ATLAS_HOLO_ALWAYS_MIXED`, default off), and the
+  **CUDA 13.2 container** (validated end-to-end). All committed + pushed.
+- **The remaining ~3x prefill gap vs vLLM is SOFTWARE (kernel wiring), not hardware.** The
+  CUDA 13.2 / CUTLASS 4.4.2 / FlashInfer 0.6.13 stack is proven to build + run correct; the
+  new kernels that hold the 3x exist but aren't wired into Atlas's hot paths. See §6.
+
+## 1. Machine topology (READ FIRST)
+Two machines, **separate filesystems**:
+- **dgx-00** — this dev shell. Edit code here (`/home/ms/atlas`). No GPU.
+- **gx10-9959** — the GB10 GPU host (sm_121, 48 SMs, 121.6GB unified). Build + serve here.
+
+Workflow: edit on dgx-00 → `rsync -az <file> gx10-9959:~/atlas/<same path>` → build on
+gx10-9959. Host `~/atlas` git HEAD is older (`0b32505`); session changes reached it via
+per-file rsync (working tree ≈ current). GPU is **SHARED** with ComfyUI prod — coexist,
+never OOM it. **DO NOT re-run vLLM** (baselines: `/home/ms/spark-vllm-docker/results.csv`).
+
+## 2. gx10-9959 ssh / ops runbook (hard-won)
+- **rsync one file:** `rsync -az crates/.../f.rs gx10-9959:~/atlas/crates/.../f.rs` (dir must
+  exist; `ssh gx10-9959 'mkdir -p ...'` first for new dirs).
+- **`setsid` launch → ssh exit 255 is HARMLESS** (server survives). Pattern: **launch in ONE
+  ssh, poll-readiness + work in a SEPARATE ssh.** Never combine launch+measure in one ssh.
+- **`pkill` may also exit 255** — verify in a fresh ssh.
+- **Kill servers:** `pkill -9 -f "release/spark serve --model"` (the `--model` avoids matching
+  your polling shells). Bare-metal server = 2 PIDs.
+- **Stale-"Listening" race:** grepping `/tmp/holo.log` can match a STALE "Listening" before
+  `holo_serve.sh` truncates → you hit a mid-restart server. **Poll readiness by
+  `python3 /tmp/correctness.py <url>` succeeding, not the log grep.**
+- **PATH:** non-interactive ssh lacks `nvcc`/`ncu`/`cargo` — `export PATH=/usr/local/cuda/bin:$PATH`
+  + `source ~/.cargo/env`, or full paths. Passwordless `sudo` works (for `ncu`).
+- **Docker** works without sudo (v29.2.1). `docker logs atlas-holo`; `docker ps --filter name=atlas-holo`.
+
+## 3. Build
+### 3a. Bare-metal (canonical) — every flag required
+```bash
+ssh gx10-9959 'cd ~/atlas && source ~/.cargo/env
+  export PATH=/usr/local/cuda/bin:$PATH CUTLASS_HOME=$HOME/cutlass FLASHINFER_HOME=$HOME/flashinfer
+  export RUSTFLAGS="-L/home/ms/nccl/build/lib -L/usr/local/cuda/lib64"
+  export ATLAS_TARGET_HW=gb10 ATLAS_TARGET_MODEL=holo-3.1-35b-a3b ATLAS_TARGET_QUANT=nvfp4
+  cargo build --release -p spark-server --bin spark --no-default-features --features cuda'
+```
+Success log: `compiled 141 kernels for target 0 (gb10, holo-3.1-35b-a3b, nvfp4)`. Omit any flag
+→ binary loads but fails at runtime. `#![deny(warnings)]` on (dead code fails). ~16s incremental.
+
+### 3b. Docker (the deployment path — NEW this session)
+Dockerfile: `docker/gb10/holo-3.1-35b-a3b/nvfp4/Dockerfile` (+ `.fast`).
+```bash
+# Baseline pins:
+ssh gx10-9959 'cd ~/atlas && docker build -f docker/gb10/holo-3.1-35b-a3b/nvfp4/Dockerfile -t atlas-holo:cuda13.2 .'
+# Version bump (the 3x prereq — A/B'able via build-args):
+ssh gx10-9959 'cd ~/atlas && docker build -f docker/gb10/holo-3.1-35b-a3b/nvfp4/Dockerfile \
+  --build-arg CUTLASS_REF=v4.4.2 --build-arg FLASHINFER_REF=v0.6.13 -t atlas-holo:cuda13.2-next .'
+```
+- CUDA 13.2 base on a 13.0 host driver WORKS (minor-version compat; PTX JIT-loads — validated;
+  vLLM does it too). `CUDARC_CUDA_VERSION=13000` baked in (cudarc panics on "13.2" otherwise).
+- BuildKit cache-mounts → ~2min rebuilds. `Dockerfile.fast` (COPY prebuilt binary) → seconds.
+- CUTLASS/FlashInfer cloned in-image at pinned refs (baseline = host `~/cutlass` cf064d2e /
+  `~/flashinfer` a671c02e). v4.4.2 + v0.6.13 compile with ZERO Atlas source changes.
+
+## 4. Serve / Deploy
+### 4a. Container (current)
+```bash
+docker run -d --name atlas-holo --gpus all --ipc=host -p 8890:8890 -v /tank:/tank:ro \
+  -e ATLAS_HOLO_FAST_MOE_MODE=off -e ATLAS_KV_OVERCOMMIT=1 \
+  atlas-holo:cuda13.2-next \
+  serve --model-from-path /tank/holo-bf16kv-test --model-name holo3.1-atlas-poc \
+    --port 8890 --bind 0.0.0.0 --kv-cache-dtype bf16 --gpu-memory-utilization 0.55 \
+    --max-seq-len 200000 --max-num-seqs 16 --max-batch-size 12 --scheduling-policy slai \
+    --tool-call-parser qwen3_coder --enable-prefix-caching true --ssm-cache-slots 32 \
+    --ssm-checkpoint-interval 256 --default-chat-template-kwargs '{"enable_thinking":true}' \
+    --vision-max-pixels 262144 --fast-load-prefetch-shards
+```
+- **MUST mount the WHOLE `/tank`** — weights in `/tank/holo-bf16kv-test` are **symlinks into
+  `/tank/hf/hub/...`**; mounting only the model dir → "No safetensor files found".
+- `--bind 0.0.0.0` (in-container loopback isn't host-reachable). util 0.55 — see §5.
+- Add `-e ATLAS_HOLO_ALWAYS_MIXED=1` to exercise the fused mixed step (§7).
+
+### 4b. Bare-metal
+`bash scripts/holo_serve.sh /tmp/holo.log` + env overrides (resting: util 0.40, FAST_MOE off,
+prefix on, ALWAYS_MIXED unset, KV_OVERCOMMIT=1, unset EXTERNAL_RESERVE/MAX_PREFILL). Most perf
+knobs are now code-defaults (cuBLAS GEMM, NVFP4 GEMM, co-dispatch, varlen, GDN-batched-FLA).
+
+## 5. Memory / auto-budget (gotcha)
+KV budget is **self-relative** (commit 212187e): `Atlas-own = baseline_free − free_now`. No
+`EXTERNAL_RESERVE` needed. **BUG:** overcounts when a co-tenant (ComfyUI) GROWS *during*
+Atlas's ~30s load → KV bails ("No memory left for KV cache"). Mitigation: **util headroom
+(0.55 not 0.40)** or retry when ComfyUI is steady. Proper fix (future): sample free-mem twice
+during load + take min, or NVML per-PID.
+
+## 6. THE NEXT WORK — the 3x is WIRING, not a pin bump
+vLLM gets 3x+ prefill on the SAME GB10 from kernels our hot paths don't use. CUDA 13.2 +
+CUTLASS 4.4.2 + FlashInfer 0.6.13 build + run correct but are **NEUTRAL** (524→564 tok/s,
+ComfyUI-contention noise) because projections=cuBLAS, MoE=hand-rolled FP4 grouped, GDN
+spine=our `gated_delta_rule_fla` — none adopt the new lib kernels. Two integration jobs
+(the FFI scaffolding for BOTH already exists — see ARCHIVE, this is wiring + perf, not from scratch):
+
+1. **MoE → CUTLASS 4.4.2 sm_121 NVFP4 grouped GEMM** (NVIDIA forum: 356 TFLOPS on DGX Spark —
+   the FP4 grouped GEMM the archive's 2026-06-22 entry said the sm_121 examples (`79d`) only hit
+   ~1-24 TFLOP at MoE routing density; v4.4.2 may have improved it — re-measure).
+   - Existing infra: native CUTLASS NVFP4 *dense* GEMM is already wired (`crates/spark-runtime/
+     src/cutlass.rs`, `cuda/cutlass_nvfp4_gemm.cu`, `build.rs`) and was +24% prefill (archive
+     2026-06-23). The grouped path is the new piece.
+   - Files: `crates/spark-model/src/layers/moe/forward_prefill_routed.rs` (dispatch, insertion
+     point), `.../moe/init.rs`, `crates/spark-runtime/src/cutlass.rs` (add grouped wrapper),
+     `crates/spark-runtime/build.rs`. Per-expert M from `expert_offsets` (moe_sort_by_expert).
+   - **CRITICAL (archive): Holo MoE routing density is M≈1 per expert at decode** (C·8/256) —
+     classic grouped GEMM lost there. The grouped GEMM win is for PREFILL (M large), not decode.
+   - cuBLAS's OWN grouped GEMM (CUDA 13.1) is a DEAD END — FP8/BF16 only, not 4-bit. Use CUTLASS.
+2. **GDN spine → FlashInfer 0.6.13 Blackwell GDN prefill** OR finish the in-tree varlen engine.
+   Our `chunk_delta_h` keeps the 64KB f32 state RESIDENT in smem (~96KB/CTA → 1 CTA/SM, ~7%
+   occupancy — the bottleneck). The archive concluded "GDN hardware-limited" — that was WRONG
+   (it's our smem-resident-state DESIGN; TFLA/FlashInfer keep state in HBM). TWO routes:
+   - (a) FlashInfer 0.6.13's Blackwell GDN prefill kernel (new; check issue #3170). Note the
+     FlashInfer ragged-prefill FFI is ALREADY built+validated for ATTENTION (archive 2026-06-23,
+     `crates/spark-runtime/src/flashinfer.rs`, cos 0.999998) — extend it for GDN.
+   - (b) The in-tree VARLEN engine (archive 2026-06-23, M0 built/engages, M1 part-1 done) — the
+     prior session's own path; M1 part-2 (hoist Phase-1 QKVZ GEMM) + M2 (varlen GDN kernel) remain.
+   - Files: `qwen3_ssm/trait_prefill_gdn.rs`, `ops/ssm_gdn_a.rs`, `kernels/gb10/common/gated_delta_rule_fla.cu`.
+3. **Clean perf A/B** in an Atlas-only window (ComfyUI down): `varlen_bench.py` + soak vs baseline
+   image and vs vLLM `results.csv`. Today's 524 tok/s is contended, not comparable.
+
+## 7. Fused mixed step (shipped, behind a flag)
+`ATLAS_HOLO_ALWAYS_MIXED=1` (default OFF → resting byte-identical). Fuses decode into every
+prefill chunk → decode keeps flowing during prefill bursts: max freeze **4406→1310ms**, p99
+TBT **2529→1271ms**, zero prefill penalty. Design: fuse the FULL chunk (the EWMA/slice-shrink
+approach was tested + REJECTED — the ~250ms full-forward floor dominates) + fuse chunk-0. Full
+design + 5 adversarial fixes: `HOLO_MIXED_STEP_SPEC.md`.
+
+## 8. Validation harnesses (gx10-9959 `/tmp/`, also repo `scripts/`)
+- `correctness.py <url>` — greedy primes/ocean/17×23 (readiness + correctness).
+- `single_bench.py <url> <tag>` — 1 req prefill+decode tok/s.
+- `varlen_bench.py <url> <tag>` — 4 concurrent varlen → aggregate prefill.
+- `burst_tbt.py` (repo `scripts/`) — streamed victim decode + VARIED staggered prefill burst →
+  TBT p50/p99/max (the mixed-step metric; keep requests varied, uniform misled).
+- `launch_bench.sh on|off` (repo `scripts/`) — flag-on/off bare-metal launcher.
+- `mixed_validate.py` + `launch_val.sh` — token-for-token mixed-step harness.
+- **Token-for-token method:** same prompt, greedy, N× (≥8 for race detection). Pass =
+  DETERMINISTIC + COHERENT (NOT necessarily bit-identical to standalone — MoE batch-composition
+  drift is accepted, same class as prefix-cache prose drift; bit-identical under grammar).
+
+## 9. Findings & corrections this session
+- **vLLM's 3x is software, not hardware** (corrects an earlier wrong "GB10 ceiling" — and the
+  archive's "GDN hardware-limited" conclusion). Same silicon, vLLM 3x+ in a CUDA 13.2 container.
+- **Our GDN spine is smem-occupancy-bound** (96KB f32 state → 1 CTA/SM → 7% occ); TFLA /
+  FlashInfer-GDN (state in HBM) is the fix.
+- **cuBLAS grouped GEMM = dead end for FP4** (FP8/BF16 only). Use CUTLASS's.
+- **Measure before optimizing** — 4 cold-load fixes-by-inspection measured null; the "EWMA
+  adaptive slice" looked clean in review but was empirically worse. Adversarial verify + A/B
+  caught both.
+
+## 10. Session commits (newest first)
+```
+246a614 build(holo): parameterize CUTLASS/FlashInfer pins as ARGs + /tank mount fix
+ce2084d build(holo): CUDA 13.2 container for Holo 3.1 — validated end-to-end
+16ade21 perf(holo): full-chunk fused slice + fuse chunk-0 — kill prefill-burst decode freeze
+66db44a test(holo): varied-length staggered burst harness + bench launcher
+4fb8187 fix(holo): collapse multi-prefill onto fused single-stream path when ALWAYS_MIXED
+c8a6fd7 test(holo): burst-TBT probe + mixed-step design spec
+c6f5358 feat(holo): always-on fused mixed step (decode keep-alive) behind ATLAS_HOLO_ALWAYS_MIXED
+212187e fix(holo): self-relative KV budget — auto-measure Atlas footprint
+25ae9f6 perf(holo): GPU-dequant SSM FP8 projections (cold load 145s->26s, 5.6x)
+f9511e1 perf(load): drop per-call sync in dequant_fp8_blockscaled_to_bf16 (~30k syncs)
+f92e798 perf(load): on-device FP32→BF16 truncate (kill 635 per-weight D2H/H2D syncs)
+```
+
+Pointers: `CLAUDE.md` (build block + perf map), `HOLO_MIXED_STEP_SPEC.md`, and persistent
+memory at `~/.claude/projects/-home-ms-atlas/memory/` (esp. `holo-cuda132-container-plan.md`,
+`holo-mixed-step-spec.md`, `holo-auto-kv-budget.md`, `holo-coldload-fix.md`).
+
+═══════════════════════════════════════════════════════════════════════════════════════════
+═══ ARCHIVE — historical experiment log (pre-2026-06-24); keep for "did we already try X?" ═══
+═══════════════════════════════════════════════════════════════════════════════════════════
+
 # Holo 3.1 Handoff
 
 Date: 2026-06-20
