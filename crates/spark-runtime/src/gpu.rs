@@ -175,6 +175,32 @@ pub trait GpuBackend: Send + Sync {
         self.copy_d2d(src, dst, bytes)
     }
 
+    /// Strided device-to-device 2D (pitched) copy: `height` rows of
+    /// `width_bytes`, source rows spaced by `src_pitch`, dest rows by
+    /// `dst_pitch`. Default = per-row `copy_d2d_async` loop; the CUDA backend
+    /// overrides with ONE `cudaMemcpy2DAsync` (replaces the per-token Z-copy
+    /// loop = up to num_tokens×num_ssm_layers launches/forward).
+    fn copy_d2d_2d_async(
+        &self,
+        src: DevicePtr,
+        src_pitch: usize,
+        dst: DevicePtr,
+        dst_pitch: usize,
+        width_bytes: usize,
+        height: usize,
+        stream: u64,
+    ) -> Result<()> {
+        for r in 0..height {
+            self.copy_d2d_async(
+                src.offset(r * src_pitch),
+                dst.offset(r * dst_pitch),
+                width_bytes,
+                stream,
+            )?;
+        }
+        Ok(())
+    }
+
     /// Begin capturing CUDA operations on `stream` into a graph.
     ///
     /// All kernel launches and async copies on this stream between

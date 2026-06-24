@@ -190,11 +190,16 @@ impl Qwen3SsmLayer {
         let z_src_base = deinterleaved.offset((key_dim * 2 + value_dim) * bf16);
         let z_dst_base = gdn_bufs.z.offset(token_offset * value_dim * bf16);
         let z_elem_bytes = value_dim * bf16;
-        for t in 0..num_tokens {
-            let z_src = z_src_base.offset(t * qkvz_size * bf16);
-            let z_dst = z_dst_base.offset(t * value_dim * bf16);
-            ctx.gpu.copy_d2d_async(z_src, z_dst, z_elem_bytes, stream)?;
-        }
+        // One pitched copy instead of a per-token D2D loop (num_tokens launches).
+        ctx.gpu.copy_d2d_2d_async(
+            z_src_base,
+            qkvz_size * bf16, // src row pitch
+            z_dst_base,
+            value_dim * bf16, // dst row pitch
+            z_elem_bytes,     // width per row
+            num_tokens,       // rows
+            stream,
+        )?;
 
         Ok(())
     }
@@ -300,11 +305,16 @@ impl Qwen3SsmLayer {
         // (stride value_dim) over all tokens.
         let z_src_base = deinterleaved.offset((key_dim * 2 + value_dim) * bf16);
         let z_elem_bytes = value_dim * bf16;
-        for t in 0..total_tokens {
-            let z_src = z_src_base.offset(t * qkvz_size * bf16);
-            let z_dst = gdn_bufs.z.offset(t * value_dim * bf16);
-            ctx.gpu.copy_d2d_async(z_src, z_dst, z_elem_bytes, stream)?;
-        }
+        // One pitched copy instead of a per-token D2D loop (total_tokens launches).
+        ctx.gpu.copy_d2d_2d_async(
+            z_src_base,
+            qkvz_size * bf16, // src row pitch
+            gdn_bufs.z,
+            value_dim * bf16, // dst row pitch
+            z_elem_bytes,     // width per row
+            total_tokens,     // rows
+            stream,
+        )?;
         Ok(())
     }
 
