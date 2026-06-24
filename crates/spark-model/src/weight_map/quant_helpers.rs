@@ -10,17 +10,6 @@ use spark_runtime::weights::{WeightDtype, WeightStore};
 
 use super::*;
 
-/// Shared CPU-side FP8 E4M3 → BF16 conversion.
-pub(super) fn dequant_fp8_bytes_to_bf16(fp8_buf: &[u8], scale: f32) -> Vec<u8> {
-    fp8_buf
-        .iter()
-        .flat_map(|&byte| {
-            let val = fp8_e4m3_to_f32(byte) * scale;
-            f32_to_bf16(val).to_le_bytes()
-        })
-        .collect()
-}
-
 /// Dequantize FP8 E4M3 block-scaled weight → BF16, entirely on the GPU.
 ///
 /// Block-scaled FP8 (e.g. `quant_method: "fp8"` with `weight_block_size: [128, 128]`):
