@@ -269,6 +269,27 @@ pub trait TransformerLayer: Send + Sync {
         )
     }
 
+    /// VARLEN batched GDN: process ragged co-dispatch lengths via `cu_seqlens` in
+    /// ONE `gdn_prefill_fla(batch=N, is_varlen)` call (replaces the non-uniform
+    /// per-request loop → fills chunk_delta_h's 32→32N CTAs). Returns `Ok(true)`
+    /// if it ran, `Ok(false)` if not eligible (caller falls back to the loop).
+    /// Default (non-SSM layers, or FLA disabled): `Ok(false)`.
+    #[allow(clippy::too_many_arguments)]
+    fn prefill_gdn_full_batched_fla_varlen(
+        &self,
+        _h_state_ptrs: DevicePtr,
+        _gdn_bufs: &GdnPrefillBuffers,
+        _batch_size: u32,
+        _cu_seqlens: DevicePtr,
+        _max_num_chunks: u32,
+        _total_nt: usize,
+        _max_seqlen: u32,
+        _ctx: &ForwardContext,
+        _stream: u64,
+    ) -> Result<bool> {
+        Ok(false)
+    }
+
     /// Two-phase SSM prefill — Phase 3: post-GDN processing.
     ///
     /// Reads GDN output and Z gate from `gdn_bufs` at `token_offset`,

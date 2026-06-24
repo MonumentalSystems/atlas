@@ -187,27 +187,56 @@ impl TransformerModel {
                 stream,
             )?;
         } else {
-            let nk = ctx.config.linear_num_key_heads;
-            let kd = ctx.config.linear_key_head_dim;
-            let nv = ctx.config.linear_num_value_heads;
-            let vd = ctx.config.linear_value_head_dim;
-            let key_dim = nk * kd;
-            let value_dim = nv * vd;
-            let conv_dim = key_dim * 2 + value_dim;
-            let bf16 = 2usize;
-            let fp32 = 4usize;
-            for (b, seq) in seqs.iter_mut().enumerate() {
-                let off = cu[b] as usize;
-                let len = (cu[b + 1] - cu[b]) as usize;
-                let gb = GdnPrefillBuffers {
-                    qkv: gdn_bufs.qkv.offset(off * conv_dim * bf16),
-                    gate_beta: gdn_bufs.gate_beta.offset(off * (nv * 2) * fp32),
-                    output: gdn_bufs.output.offset(off * value_dim * bf16),
-                    z: gdn_bufs.z.offset(off * value_dim * bf16),
-                    total_len: len,
-                };
-                let st = seq.layer_states[layer_idx].as_mut();
-                layer.prefill_gdn_full(st, &gb, ctx, stream)?;
+            // Ragged lengths: try ONE varlen batched FLA call (cu_seqlens) — fills
+            // chunk_delta_h's 32→32N CTAs — and fall back to the per-request loop
+            // if not eligible (FLA flag off / non-128-dim heads / NULL cu_seqlens).
+            let mut total_nt = 0usize;
+            let mut max_nc = 0u32;
+            let mut max_sl = 0u32;
+            for b in 0..n {
+                let len = (cu[b + 1] - cu[b]) as u32;
+                let ncc = len.div_ceil(64);
+                total_nt += ncc as usize;
+                max_nc = max_nc.max(ncc);
+                max_sl = max_sl.max(len);
+            }
+            let h_state_ptrs_dev =
+                self.stage_h_state_ptrs(layer_idx, seqs, h_state_ptrs_scratch_offset, stream)?;
+            let did_varlen = layer.prefill_gdn_full_batched_fla_varlen(
+                h_state_ptrs_dev,
+                gdn_bufs,
+                meta.batch_size,
+                meta.cu_seqlens,
+                max_nc,
+                total_nt,
+                max_sl,
+                ctx,
+                stream,
+            )?;
+            // Varlen FLA ran the whole GDN → Phase 3 continues below. Else loop.
+            if !did_varlen {
+                let nk = ctx.config.linear_num_key_heads;
+                let kd = ctx.config.linear_key_head_dim;
+                let nv = ctx.config.linear_num_value_heads;
+                let vd = ctx.config.linear_value_head_dim;
+                let key_dim = nk * kd;
+                let value_dim = nv * vd;
+                let conv_dim = key_dim * 2 + value_dim;
+                let bf16 = 2usize;
+                let fp32 = 4usize;
+                for (b, seq) in seqs.iter_mut().enumerate() {
+                    let off = cu[b] as usize;
+                    let len = (cu[b + 1] - cu[b]) as usize;
+                    let gb = GdnPrefillBuffers {
+                        qkv: gdn_bufs.qkv.offset(off * conv_dim * bf16),
+                        gate_beta: gdn_bufs.gate_beta.offset(off * (nv * 2) * fp32),
+                        output: gdn_bufs.output.offset(off * value_dim * bf16),
+                        z: gdn_bufs.z.offset(off * value_dim * bf16),
+                        total_len: len,
+                    };
+                    let st = seq.layer_states[layer_idx].as_mut();
+                    layer.prefill_gdn_full(st, &gb, ctx, stream)?;
+                }
             }
         }
 

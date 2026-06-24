@@ -143,6 +143,9 @@ impl Qwen3SsmLayer {
                 conv_dim as u32,
                 gb_stride,
                 false, // single-stream: contiguous h_state (not a pointer table)
+                spark_runtime::gpu::DevicePtr::NULL, // cu_seqlens (unused)
+                spark_runtime::gpu::DevicePtr::NULL, // cu_chunks (unused)
+                false, // not varlen
                 ctx.profile,
                 stream,
             );
@@ -399,6 +402,9 @@ impl Qwen3SsmLayer {
                     conv_dim as u32,
                     gb_stride,
                     true, // h_state_is_table
+                    spark_runtime::gpu::DevicePtr::NULL, // cu_seqlens (uniform)
+                    spark_runtime::gpu::DevicePtr::NULL, // cu_chunks (uniform)
+                    false, // uniform batched (not varlen)
                     ctx.profile,
                     stream,
                 );
@@ -517,5 +523,93 @@ impl Qwen3SsmLayer {
         }
 
         Ok(())
+    }
+
+    /// VARLEN batched GDN scan: route the ragged (non-uniform-length) co-dispatch
+    /// batch through ONE `gdn_prefill_fla(batch=N, is_varlen)` call instead of the
+    /// per-request loop. cu_seqlens (device) gives per-stream token offsets; the
+    /// kernel computes per-stream chunk offsets in-kernel. h_state via the pointer
+    /// table (is_table). Returns false if not eligible (caller loops).
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn prefill_gdn_full_batched_fla_varlen_inner(
+        &self,
+        h_state_ptrs: spark_runtime::gpu::DevicePtr,
+        gdn_bufs: &GdnPrefillBuffers,
+        batch_size: u32,
+        cu_seqlens: spark_runtime::gpu::DevicePtr,
+        max_num_chunks: u32,
+        total_nt: usize,
+        max_seqlen: u32,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<bool> {
+        let nk = ctx.config.linear_num_key_heads;
+        let kd = ctx.config.linear_key_head_dim;
+        let nv = ctx.config.linear_num_value_heads;
+        let vd = ctx.config.linear_value_head_dim;
+        let fla_scratch = ctx.buffers.gdn_fla_scratch();
+        if !gdn_batched_fla_enabled()
+            || kd != 128
+            || vd != 128
+            || fla_scratch.0 == 0
+            || cu_seqlens.0 == 0
+            || self.gdn_prefill_fla_recompute_wu_k.0 == 0
+            || self.gdn_prefill_fla_chunk_delta_h_k.0 == 0
+            || self.gdn_prefill_fla_chunk_fwd_o_k.0 == 0
+        {
+            return Ok(false); // not eligible → caller falls back to the per-request loop
+        }
+        let key_dim = nk * kd;
+        let value_dim = nv * vd;
+        let conv_dim = key_dim * 2 + value_dim;
+        let bf16 = 2usize;
+        let fp32 = 4usize;
+        let q_ptr = gdn_bufs.qkv;
+        let k_ptr = gdn_bufs.qkv.offset(key_dim * bf16);
+        let v_ptr = gdn_bufs.qkv.offset(key_dim * 2 * bf16);
+        let gate_ptr = gdn_bufs.gate_beta;
+        let beta_ptr = gdn_bufs.gate_beta.offset(nv * fp32);
+        let gb_stride = (nv * 2) as u32;
+        // Scratch regions span the whole batch: base=(choff+c)*nv, sized by total_nt.
+        let w_out = fla_scratch;
+        let u_out = w_out.offset(total_nt * nv * 64 * kd * bf16);
+        let s_out = u_out.offset(total_nt * nv * 64 * vd * bf16);
+        let uc_out = s_out.offset(total_nt * nv * kd * vd * bf16);
+        let gc_out = uc_out.offset(total_nt * nv * 64 * vd * bf16);
+        ops::gdn_prefill_fla(
+            ctx.gpu,
+            self.gdn_prefill_fla_recompute_wu_k,
+            self.gdn_prefill_fla_chunk_delta_h_k,
+            self.gdn_prefill_fla_chunk_fwd_o_k,
+            h_state_ptrs,
+            q_ptr,
+            k_ptr,
+            v_ptr,
+            gate_ptr,
+            beta_ptr,
+            gdn_bufs.output,
+            w_out,
+            u_out,
+            s_out,
+            uc_out,
+            gc_out,
+            batch_size,
+            max_seqlen,     // seq_len: cosmetic (varlen kernel reads cu_seqlens)
+            max_num_chunks, // grid x = MAX per-stream chunks
+            nk as u32,
+            nv as u32,
+            kd as u32,
+            vd as u32,
+            conv_dim as u32,
+            conv_dim as u32,
+            gb_stride,
+            true,                                // h_state_is_table
+            cu_seqlens,                          // device cu_seqlens (token offsets)
+            spark_runtime::gpu::DevicePtr::NULL, // cu_chunks (computed in-kernel)
+            true,                                // is_varlen
+            ctx.profile,
+            stream,
+        )?;
+        Ok(true)
     }
 }

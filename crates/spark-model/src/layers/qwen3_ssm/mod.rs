@@ -405,6 +405,31 @@ impl TransformerLayer for Qwen3SsmLayer {
         )
     }
 
+    fn prefill_gdn_full_batched_fla_varlen(
+        &self,
+        h_state_ptrs: DevicePtr,
+        gdn_bufs: &GdnPrefillBuffers,
+        batch_size: u32,
+        cu_seqlens: DevicePtr,
+        max_num_chunks: u32,
+        total_nt: usize,
+        max_seqlen: u32,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<bool> {
+        self.prefill_gdn_full_batched_fla_varlen_inner(
+            h_state_ptrs,
+            gdn_bufs,
+            batch_size,
+            cu_seqlens,
+            max_num_chunks,
+            total_nt,
+            max_seqlen,
+            ctx,
+            stream,
+        )
+    }
+
     fn prefill_phase3(
         &self,
         hidden: DevicePtr,

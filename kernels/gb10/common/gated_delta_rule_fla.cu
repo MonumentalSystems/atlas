@@ -28,6 +28,33 @@
 // is a no-op for any normal gate. (GATE-B used g∈[0.8,0.999], never hitting this.)
 #define GATE_FLOOR 1e-30f
 
+// Per-stream prefill geometry. VARLEN (ragged co-dispatch batch) reads
+// cu_seqlens[b]/cu_chunks[b]; uniform/single-stream (is_varlen=0) reduces to
+// b*seq_len / b*num_chunks (byte-identical to the pre-varlen path). Requires
+// b, seq_len, num_chunks, cu_seqlens, cu_chunks, is_varlen in scope. `tokoff` is
+// the token offset into the [Σ seqlen_b] packed inputs; `choff` the chunk offset
+// into the [Σ nchunks_b] scratch; in varlen `num_chunks` (grid x) = MAX nchunks.
+struct GdnGeom { unsigned int seqlen, nchunks, choff; unsigned long long tokoff; };
+#define GDN_GEOM(g)                                                            \
+    GdnGeom g;                                                                 \
+    (void)cu_chunks;                                                          \
+    if (is_varlen) {                                                           \
+        unsigned int _s0 = (unsigned int)cu_seqlens[b];                       \
+        g.seqlen  = (unsigned int)cu_seqlens[b + 1] - _s0;                    \
+        g.tokoff  = (unsigned long long)_s0;                                  \
+        unsigned int _co = 0; /* choff = Σ_{i<b} ceil(len_i/64), in-kernel */ \
+        for (unsigned int _i = 0; _i < b; _i++)                               \
+            _co += ((unsigned int)(cu_seqlens[_i + 1] - cu_seqlens[_i])       \
+                    + CHUNK - 1) / CHUNK;                                      \
+        g.choff   = _co;                                                       \
+        g.nchunks = (g.seqlen + CHUNK - 1) / CHUNK;                           \
+    } else {                                                                  \
+        g.seqlen  = seq_len;                                                   \
+        g.tokoff  = (unsigned long long)b * seq_len;                          \
+        g.choff   = b * num_chunks;                                            \
+        g.nchunks = num_chunks;                                                \
+    }
+
 // GB10 sm_121 has cp.async.cg (NO TMA). 16-byte async global→shared copy + group
 // commit/wait — used to double-buffer the per-chunk W/U/K loads in chunk_delta_h
 // so the serial state spine overlaps the next chunk's load with the current
@@ -122,27 +149,30 @@ gated_delta_rule_recompute_wu(
     unsigned int v_dim,
     unsigned int qk_stride,
     unsigned int v_stride,
-    unsigned int gb_stride
+    unsigned int gb_stride,
+    const int* __restrict__ cu_seqlens,
+    const int* __restrict__ cu_chunks,
+    unsigned int is_varlen
 ) {
-    const unsigned int c = blockIdx.x;     // chunk index
+    const unsigned int c = blockIdx.x;     // chunk index (grid x = MAX num_chunks)
     const unsigned int vh = blockIdx.y;
     const unsigned int b = blockIdx.z;
-    if (c >= num_chunks || vh >= num_v_heads || b >= batch_size) return;
+    if (vh >= num_v_heads || b >= batch_size) return;
+    GDN_GEOM(g);
+    if (c >= g.nchunks) return;            // per-stream chunk bound
 
     const unsigned int tid = threadIdx.x;
     const unsigned int head_repeat = num_v_heads / num_k_heads;
     const unsigned int kh = vh / head_repeat;
     const unsigned int cs = c * CHUNK;
-    const unsigned int ce = (seq_len - cs) < CHUNK ? (seq_len - cs) : CHUNK;
-    const unsigned long long base = ((unsigned long long)(b * num_chunks + c) * num_v_heads + vh);
+    const unsigned int ce = (g.seqlen - cs) < CHUNK ? (g.seqlen - cs) : CHUNK;
+    const unsigned long long base = ((unsigned long long)(g.choff + c) * num_v_heads + vh);
 
-    // Per-batch input offset (inputs stacked per-stream contiguous [batch,seq,*],
-    // uniform seq_len — mirrors gated_delta_rule_wy64_prefill.cu). b=0 → +0, so the
-    // single-stream (batch=1) path is byte-identical.
-    key   += (unsigned long long)b * seq_len * qk_stride;
-    value += (unsigned long long)b * seq_len * v_stride;
-    gate  += (unsigned long long)b * seq_len * gb_stride;
-    beta  += (unsigned long long)b * seq_len * gb_stride;
+    // Per-stream input offset (cu_seqlens[b] in varlen, else b*seq_len; b=0 → +0).
+    key   += g.tokoff * qk_stride;
+    value += g.tokoff * v_stride;
+    gate  += g.tokoff * gb_stride;
+    beta  += g.tokoff * gb_stride;
 
     extern __shared__ char smem_raw[];
     __nv_bfloat16* sk = (__nv_bfloat16*)smem_raw;       // [CHUNK*K_DIM] bf16
@@ -219,13 +249,16 @@ __device__ __forceinline__ void cdh_prefetch(
     const float* __restrict__ gc_in,
     unsigned int c, unsigned int b, unsigned int vh, unsigned int seq_len,
     unsigned int num_chunks, unsigned int num_v_heads, unsigned int k_dim,
-    unsigned int kh, unsigned int qk_stride, unsigned int gb_stride
+    unsigned int kh, unsigned int qk_stride, unsigned int gb_stride,
+    const int* __restrict__ cu_seqlens, const int* __restrict__ cu_chunks,
+    unsigned int is_varlen
 ) {
     const unsigned int tid = threadIdx.x;
+    GDN_GEOM(g);
     const unsigned int cs = c * CHUNK;
-    const unsigned int ce = (seq_len - cs) < CHUNK ? (seq_len - cs) : CHUNK;
-    const unsigned long long base = ((unsigned long long)(b * num_chunks + c) * num_v_heads + vh);
-    key += (unsigned long long)b * seq_len * qk_stride;   // per-batch offset (b=0 → identical)
+    const unsigned int ce = (g.seqlen - cs) < CHUNK ? (g.seqlen - cs) : CHUNK;
+    const unsigned long long base = ((unsigned long long)(g.choff + c) * num_v_heads + vh);
+    key += g.tokoff * qk_stride;   // per-stream token offset (cu_seqlens / uniform b*seq_len)
     __nv_bfloat16* Wp = buf + (unsigned long long)p * CDH_BUFSZ;
     __nv_bfloat16* Kp = Wp + CHUNK * K_DIM;
     __nv_bfloat16* Up = Kp + CHUNK * K_DIM;
@@ -313,7 +346,8 @@ gated_delta_rule_chunk_delta_h(
 
     // Prologue: kick off chunk 0's loads.
     cdh_prefetch(buf, gcb, decb, 0, W_in, U_in, key, gate, gc_in, 0, b, vh, seq_len,
-                 num_chunks, num_v_heads, k_dim, kh, qk_stride, gb_stride);
+                 num_chunks, num_v_heads, k_dim, kh, qk_stride, gb_stride,
+                 nullptr, nullptr, 0);  // scalar chunk_delta_h: uniform only
 
     for (unsigned int c = 0; c < num_chunks; c++) {
         const unsigned int cur = c & 1u;
@@ -323,7 +357,8 @@ gated_delta_rule_chunk_delta_h(
 
         if (c + 1 < num_chunks) {
             cdh_prefetch(buf, gcb, decb, (c + 1) & 1u, W_in, U_in, key, gate, gc_in, c + 1, b, vh, seq_len,
-                         num_chunks, num_v_heads, k_dim, kh, qk_stride, gb_stride);
+                         num_chunks, num_v_heads, k_dim, kh, qk_stride, gb_stride,
+                 nullptr, nullptr, 0);  // scalar chunk_delta_h: uniform only
             cp_wait<1>();   // chunk c's loads (older group) complete; keep c+1's in flight
         } else {
             cp_wait<0>();
@@ -502,12 +537,15 @@ __device__ __forceinline__ void cdh_ksplit_core(
     __nv_bfloat16* __restrict__ S_out, __nv_bfloat16* __restrict__ uc_out,
     unsigned int seq_len, unsigned int num_chunks, unsigned int num_k_heads,
     unsigned int num_v_heads, unsigned int k_dim, unsigned int v_dim,
-    unsigned int qk_stride, unsigned int gb_stride, unsigned int h_state_is_table
+    unsigned int qk_stride, unsigned int gb_stride, unsigned int h_state_is_table,
+    const int* __restrict__ cu_seqlens, const int* __restrict__ cu_chunks,
+    unsigned int is_varlen
 ) {
     constexpr int KH = K_DIM / SPLIT;            // per-thread slice of the state column
     const unsigned int vh = blockIdx.x;
     const unsigned int b = blockIdx.y;
     if (vh >= num_v_heads) return;
+    GDN_GEOM(g);
     const unsigned int t = threadIdx.x;          // 0..128·SPLIT-1
     const unsigned int v = t / SPLIT;            // v-column 0..127
     const unsigned int sub = t % SPLIT;          // which k-slice
@@ -531,17 +569,19 @@ __device__ __forceinline__ void cdh_ksplit_core(
     for (int kk = 0; kk < KH; kk++) Sreg[kk] = H[(k0 + kk) * V_DIM + v];
 
     cdh_prefetch(buf, gcb, decb, 0, W_in, U_in, key, gate, gc_in, 0, b, vh, seq_len,
-                 num_chunks, num_v_heads, k_dim, kh, qk_stride, gb_stride);
+                 num_chunks, num_v_heads, k_dim, kh, qk_stride, gb_stride,
+                 cu_seqlens, cu_chunks, is_varlen);
 
-    for (unsigned int c = 0; c < num_chunks; c++) {
+    for (unsigned int c = 0; c < g.nchunks; c++) {
         const unsigned int cur = c & 1u;
         const unsigned int cs = c * CHUNK;
-        const unsigned int ce = (seq_len - cs) < CHUNK ? (seq_len - cs) : CHUNK;
-        const unsigned long long base = ((unsigned long long)(b * num_chunks + c) * num_v_heads + vh);
+        const unsigned int ce = (g.seqlen - cs) < CHUNK ? (g.seqlen - cs) : CHUNK;
+        const unsigned long long base = ((unsigned long long)(g.choff + c) * num_v_heads + vh);
 
-        if (c + 1 < num_chunks) {
+        if (c + 1 < g.nchunks) {
             cdh_prefetch(buf, gcb, decb, (c + 1) & 1u, W_in, U_in, key, gate, gc_in, c + 1, b, vh, seq_len,
-                         num_chunks, num_v_heads, k_dim, kh, qk_stride, gb_stride);
+                         num_chunks, num_v_heads, k_dim, kh, qk_stride, gb_stride,
+                         cu_seqlens, cu_chunks, is_varlen);
             cp_wait<1>();
         } else {
             cp_wait<0>();
@@ -597,10 +637,13 @@ gated_delta_rule_chunk_delta_h_ksplit(
     unsigned int batch_size, unsigned int seq_len, unsigned int num_chunks,
     unsigned int num_k_heads, unsigned int num_v_heads, unsigned int k_dim,
     unsigned int v_dim, unsigned int qk_stride, unsigned int gb_stride,
-    unsigned int h_state_is_table
+    unsigned int h_state_is_table,
+    const int* __restrict__ cu_seqlens, const int* __restrict__ cu_chunks,
+    unsigned int is_varlen
 ) {
     cdh_ksplit_core<2>(h_state, W_in, U_in, key, gate, gc_in, S_out, uc_out, seq_len, num_chunks,
-                       num_k_heads, num_v_heads, k_dim, v_dim, qk_stride, gb_stride, h_state_is_table);
+                       num_k_heads, num_v_heads, k_dim, v_dim, qk_stride, gb_stride, h_state_is_table,
+                       cu_seqlens, cu_chunks, is_varlen);
 }
 
 // ── KERNEL 3: chunk_fwd_o ────────────────────────────────────────────────
@@ -629,23 +672,28 @@ gated_delta_rule_chunk_fwd_o(
     unsigned int k_dim,
     unsigned int v_dim,
     unsigned int qk_stride,
-    unsigned int gb_stride
+    unsigned int gb_stride,
+    const int* __restrict__ cu_seqlens,
+    const int* __restrict__ cu_chunks,
+    unsigned int is_varlen
 ) {
     const unsigned int c = blockIdx.x;
     const unsigned int vh = blockIdx.y;
     const unsigned int b = blockIdx.z;
-    if (c >= num_chunks || vh >= num_v_heads || b >= batch_size) return;
+    if (vh >= num_v_heads || b >= batch_size) return;
+    GDN_GEOM(g);
+    if (c >= g.nchunks) return;            // per-stream chunk bound
     const unsigned int tid = threadIdx.x;
     const unsigned int head_repeat = num_v_heads / num_k_heads;
     const unsigned int kh = vh / head_repeat;
     const float inv_sqrt_d = rsqrtf((float)k_dim);
     const unsigned int cs = c * CHUNK;
-    const unsigned int ce = (seq_len - cs) < CHUNK ? (seq_len - cs) : CHUNK;
-    const unsigned long long base = ((unsigned long long)(b * num_chunks + c) * num_v_heads + vh);
-    const unsigned long long out_base = ((unsigned long long)(b * seq_len) * num_v_heads + vh) * v_dim;
-    // Per-batch input offset (query/key stacked per-stream; b=0 → identical).
-    query += (unsigned long long)b * seq_len * qk_stride;
-    key   += (unsigned long long)b * seq_len * qk_stride;
+    const unsigned int ce = (g.seqlen - cs) < CHUNK ? (g.seqlen - cs) : CHUNK;
+    const unsigned long long base = ((unsigned long long)(g.choff + c) * num_v_heads + vh);
+    const unsigned long long out_base = (g.tokoff * num_v_heads + vh) * v_dim;
+    // Per-stream input offset (cu_seqlens[b] in varlen, else b*seq_len; b=0 → +0).
+    query += g.tokoff * qk_stride;
+    key   += g.tokoff * qk_stride;
 
     extern __shared__ char smem_raw[];
     __nv_bfloat16* sq = (__nv_bfloat16*)smem_raw;          // [CHUNK*K_DIM]

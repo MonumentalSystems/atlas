@@ -570,6 +570,13 @@ pub fn gdn_prefill_fla(
     // h_state passed as a device POINTER TABLE (one [nv,kd,vd] per request) when
     // batched co-dispatch reuses the per-request states; false = contiguous base.
     h_state_is_table: bool,
+    // VARLEN (ragged co-dispatch): per-stream cu_seqlens (token offsets, batch+1
+    // ints) + cu_chunks (chunk offsets, batch+1 ints) on device. When is_varlen,
+    // `num_chunks` must be the MAX over streams (grid x). is_varlen=false →
+    // cu_* unused (pass NULL).
+    cu_seqlens: DevicePtr,
+    cu_chunks: DevicePtr,
+    is_varlen: bool,
     profile: bool,
     stream: u64,
 ) -> Result<()> {
@@ -620,6 +627,9 @@ pub fn gdn_prefill_fla(
         .arg_u32(qk_stride)
         .arg_u32(v_stride)
         .arg_u32(gb_stride)
+        .arg_ptr(cu_seqlens)
+        .arg_ptr(cu_chunks)
+        .arg_u32(is_varlen as u32)
         .launch(stream)?;
     prof!("gdn_fla_recompute_wu", &mut t0);
 
@@ -646,6 +656,9 @@ pub fn gdn_prefill_fla(
         .arg_u32(qk_stride)
         .arg_u32(gb_stride)
         .arg_u32(h_state_is_table as u32)
+        .arg_ptr(cu_seqlens)
+        .arg_ptr(cu_chunks)
+        .arg_u32(is_varlen as u32)
         .launch(stream)?;
     prof!("gdn_fla_chunk_delta_h", &mut t0);
 
@@ -670,6 +683,9 @@ pub fn gdn_prefill_fla(
         .arg_u32(vd)
         .arg_u32(qk_stride)
         .arg_u32(gb_stride)
+        .arg_ptr(cu_seqlens)
+        .arg_ptr(cu_chunks)
+        .arg_u32(is_varlen as u32)
         .launch(stream)?;
     if let Some(t0) = t0 {
         gpu.synchronize(stream)?;

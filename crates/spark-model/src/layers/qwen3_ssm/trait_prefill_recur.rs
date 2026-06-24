@@ -140,6 +140,9 @@ impl Qwen3SsmLayer {
                 conv_dim as u32,
                 gb_stride,
                 false, // single-stream: contiguous h_state (not a pointer table)
+                spark_runtime::gpu::DevicePtr::NULL, // cu_seqlens (unused)
+                spark_runtime::gpu::DevicePtr::NULL, // cu_chunks (unused)
+                false, // not varlen
                 ctx.profile,
                 stream,
             )?;
