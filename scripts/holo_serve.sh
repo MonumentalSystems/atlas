@@ -42,11 +42,18 @@ ATTN_Q_T="${ATLAS_ATTN_PREFILL_Q_T:-1}"
 ATTN_T_PIPE="${ATLAS_ATTN_PREFILL_T_PIPE:-1}"
 EXACT_MOE_TILES="${ATLAS_MOE_PREFILL_EXACT_TILES:-1}"
 GDN_FUSED_NORM="${ATLAS_GDN_FUSED_NORM:-1}"
-# Native CUTLASS NVFP4 dense prefill projections (qkvz/Q/K/V/O + SSM out) — the
-# default prefill path (+~24% prefill, op-level cos 0.99 vs bf16, server-validated
-# coherent). REQUIRES the binary to be built with CUTLASS_HOME set; otherwise the
-# nvfp4 GEMM bails at runtime. Override with ATLAS_CUTLASS_NVFP4_GEMM=0 to fall back.
-CUTLASS_NVFP4_GEMM="${ATLAS_CUTLASS_NVFP4_GEMM:-1}"
+# Prefill DENSE PROJECTIONS (SSM qkvz + attn Q/K/V/O). Two paths, A/B'd on a quiet
+# GB10 (2026-06-24, prefill_ab/prefill_conc, lean config):
+#   - cuBLASLt BF16 (ATLAS_CUBLAS_GEMM=1): NOW DEFAULT. c1 best 3165 tok/s, agg
+#     2558 c4 / 2617 c8. W16A16 = MORE accurate than FP4. Costs only +0.6GB pre-KV
+#     (bf16 weight-dequant cache). Wins every conc: c1 +44% (noisy) / c4 +4.5% /
+#     c8 +13%. Requires a cuBLAS-linked binary (build after commit 0b32505).
+#   - cutlass NVFP4 (ATLAS_CUTLASS_NVFP4_GEMM=1): prior default, slower at every
+#     conc (c1 2202, c4 2448, c8 2311). REQUIRES CUTLASS_HOME at build. Kept as
+#     fallback. To revert: ATLAS_CUBLAS_GEMM=0 ATLAS_CUTLASS_NVFP4_GEMM=1.
+# SSM out_proj stays NVFP4 (separate gate below — not covered by the cuBLAS wiring).
+CUBLAS_GEMM="${ATLAS_CUBLAS_GEMM:-1}"
+CUTLASS_NVFP4_GEMM="${ATLAS_CUTLASS_NVFP4_GEMM:-0}"
 CUTLASS_NVFP4_SSM_OUT="${ATLAS_CUTLASS_NVFP4_SSM_OUT:-1}"
 # Prefix caching (radix-tree KV reuse + Marconi SSM-snapshot restore for the
 # hybrid GDN layers). Off by default. To enable, also give SSM-snapshot slots +
@@ -90,7 +97,7 @@ setsid -f env RUST_BACKTRACE=1 RUST_LOG=info \
   ATLAS_MOE_PREFILL_EXACT_TILES="$EXACT_MOE_TILES" ATLAS_GDN_FUSED_NORM="$GDN_FUSED_NORM" \
   ATLAS_MOE_PREFILL_FP8_DOWN="$FP8_DOWN" \
   ATLAS_HOLO_NATIVE_FP8_ATTN="$NATIVE_FP8_ATTN" ATLAS_ATTN_PREFILL_Q_T="$ATTN_Q_T" ATLAS_ATTN_PREFILL_T_PIPE="$ATTN_T_PIPE" \
-  ATLAS_CUTLASS_NVFP4_GEMM="$CUTLASS_NVFP4_GEMM" ATLAS_CUTLASS_NVFP4_SSM_OUT="$CUTLASS_NVFP4_SSM_OUT" \
+  ATLAS_CUBLAS_GEMM="$CUBLAS_GEMM" ATLAS_CUTLASS_NVFP4_GEMM="$CUTLASS_NVFP4_GEMM" ATLAS_CUTLASS_NVFP4_SSM_OUT="$CUTLASS_NVFP4_SSM_OUT" \
   "$BIN" serve \
     --model-from-path /tank/holo-bf16kv-test --model-name holo3.1-atlas-poc \
     --port 8890 --bind "$BIND" --max-seq-len "$MAX_SEQ_LEN" --max-num-seqs "$MAX_SEQS" --max-batch-size "$MAX_BATCH" \
