@@ -1,21 +1,27 @@
 #!/usr/bin/env python3
 # Burst-TBT probe for ATLAS_HOLO_ALWAYS_MIXED.
-# A streamed "victim" decode runs; mid-decode we fire a burst of big prefills.
-# Measures how much the victim's inter-token latency (TBT) stalls during the
-# prefill burst. Flag OFF: victim freezes while big chunks prefill. Flag ON:
-# the fused step keeps the victim advancing every iteration.
+# A streamed "victim" decode runs; mid-decode we fire a burst of prefills of
+# VARIED length with STAGGERED arrival (realistic traffic, not uniform). Measures
+# how much the victim's inter-token latency (TBT) stalls during the burst.
 import json, sys, time, threading, urllib.request
 
 BASE = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:8890"
 TAG  = sys.argv[2] if len(sys.argv) > 2 else "run"
-N_LOAD = int(sys.argv[3]) if len(sys.argv) > 3 else 5
 
 VICTIM = "Count slowly from 1 to 400, one integer per line, nothing else."
-# ~6K-token prefill load (unique-ish per request via index to dodge any caching)
 SENT = ("In the kingdom of Eldoria, scribes recorded grain, trade, taxes, and the "
         "turning of the seasons across many distant and varied provinces. ")
-def load_prompt(i):
-    return f"[doc {i}] " + SENT * 200 + "\nSummarize the passage in one short sentence."
+# Varied prefill lengths (SENT repeats → ~1.4K / 3.5K / 6K / 9K / 12K tokens) and
+# staggered arrival offsets (s) — real bursts don't arrive uniform or simultaneous.
+LOADS = [
+    (40,  0.0),
+    (110, 0.5),
+    (200, 0.3),
+    (300, 1.1),
+    (400, 0.8),
+]
+def load_prompt(i, reps):
+    return f"[doc {i}] " + SENT * reps + "\nSummarize the passage in one short sentence."
 
 def stream(prompt, max_tokens, ts=None):
     body = {"model": "holo3.1-atlas-poc",
@@ -43,23 +49,24 @@ def stream(prompt, max_tokens, ts=None):
 vts = []
 vt = threading.Thread(target=stream, args=(VICTIM, 400, vts))
 vt.start()
-time.sleep(1.5)              # let the victim get firmly into decode
+time.sleep(1.5)                         # let the victim get firmly into decode
 burst_start = time.time()
-loads = [threading.Thread(target=stream, args=(load_prompt(i), 16, None)) for i in range(N_LOAD)]
-for l in loads: l.start()
-for l in loads: l.join()
+threads = []
+def fire(i, reps, off):
+    time.sleep(off)                     # staggered arrival
+    stream(load_prompt(i, reps), 16, None)
+for i, (reps, off) in enumerate(LOADS):
+    t = threading.Thread(target=fire, args=(i, reps, off)); t.start(); threads.append(t)
+for t in threads: t.join()
 burst_end = time.time()
 vt.join()
 
 if len(vts) < 5:
     print(f"[{TAG}] victim produced too few tokens ({len(vts)}) — aborted"); sys.exit(1)
 
-gaps = [(vts[i+1] - vts[i]) * 1000.0 for i in range(len(vts) - 1)]  # ms
-gaps.sort()
+gaps = sorted((vts[i+1] - vts[i]) * 1000.0 for i in range(len(vts) - 1))
 def pct(a, q): return a[min(len(a) - 1, int(len(a) * q))]
-# victim tokens that arrived DURING the prefill burst window
 during = [t for t in vts if burst_start <= t <= burst_end]
-# the worst stall (max gap) and the gaps that fell inside the burst window
 burst_gaps = [(vts[i+1] - vts[i]) * 1000.0 for i in range(len(vts) - 1)
               if burst_start <= vts[i] <= burst_end]
 print(json.dumps({
@@ -71,5 +78,5 @@ print(json.dumps({
     "burst_window_s": round(burst_end - burst_start, 2),
     "victim_tokens_during_burst": len(during),
     "max_stall_during_burst_ms": round(max(burst_gaps), 1) if burst_gaps else None,
-    "n_load": N_LOAD,
+    "load_shape": "varied 1.4-12K, staggered",
 }))
