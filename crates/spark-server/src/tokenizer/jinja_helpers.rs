@@ -125,39 +125,55 @@ pub(super) fn build_jinja_env(chat_template: &str) -> Result<minijinja::Environm
         },
     );
 
-    // Override minijinja's builtin `tojson` with a python-`json.dumps`
-    // compatible serializer. transformers renders the chat-template
-    // `<tools>` block via `{{ tool | tojson }}`, where jinja2's `tojson`
-    // is `json.dumps(x, ensure_ascii=False, sort_keys=False)` — i.e.
-    // SPACES after `:` and `,` (separators `": "` / `", "`) and keys in
-    // insertion order. minijinja's builtin `tojson` is COMPACT (no
-    // spaces), so the tool-definition token stream diverged from
-    // vLLM/transformers at the first `:`. This filter restores byte
-    // parity. (Key order is preserved via the `preserve_order` feature
-    // on both serde_json and minijinja — see the Cargo.toml notes.)
-    env.add_filter(
-        "tojson",
-        |value: minijinja::Value| -> Result<minijinja::Value, minijinja::Error> {
-            let mut buf = Vec::new();
-            let mut ser = serde_json::Serializer::with_formatter(&mut buf, PythonJsonFormatter);
-            serde::Serialize::serialize(&value, &mut ser).map_err(|e| {
-                minijinja::Error::new(
-                    minijinja::ErrorKind::InvalidOperation,
-                    format!("tojson serialization failed: {e}"),
-                )
-            })?;
-            // serde_json writes valid UTF-8; ensure_ascii=False means we keep
-            // multi-byte characters verbatim (no \uXXXX escaping), which
-            // serde_json already does by default.
-            let s = String::from_utf8(buf).map_err(|e| {
-                minijinja::Error::new(
-                    minijinja::ErrorKind::InvalidOperation,
-                    format!("tojson produced invalid UTF-8: {e}"),
-                )
-            })?;
-            Ok(minijinja::Value::from_safe_string(s))
-        },
-    );
+    // Tool-definition JSON serialization for the chat template's `<tools>`
+    // block (`{{ tool | tojson }}`).
+    //
+    // jinja2's `tojson` is `json.dumps(x, ensure_ascii=False, sort_keys=False)`
+    // — SPACED (separators `": "` / `", "`), insertion-order keys. #90 overrode
+    // minijinja's COMPACT builtin with `PythonJsonFormatter` to byte-match
+    // transformers/vLLM (the "HF reference" tool-JSON serialization).
+    //
+    // DECISION (2026-06-24, ST-995): the spaced HF-reference serialization
+    // REGRESSES the GDN Qwen3.6-27B's BFCL irrelevance accuracy — the model
+    // over-emits tool calls on irrelevant prompts (hallucination 93.70 -> 30,
+    // verified by gating + rendered-prompt diffs; the rendered prompts differ
+    // ONLY in this serialization). The COMPACT form (pre-#90 / the shared
+    // 89.04-build behavior) restores it (-> ~96, parity with llama.cpp 93.70).
+    // The spacing is a pure byte-stream difference — no functional/content
+    // change — but this model is measurably sensitive to it. So we DEFAULT to
+    // minijinja's compact `tojson` (correct accuracy) and keep the spaced
+    // HF-reference path available behind an opt-in env var for callers that
+    // need exact transformers/vLLM byte parity:
+    //
+    //   ATLAS_USE_HF_REF_JSON_DUMPS=1   -> spaced, Python-json.dumps byte parity (#90)
+    //   unset / anything else (DEFAULT)  -> compact (fixes ST-995 GDN irrelevance)
+    //
+    // Key order is preserved via the `preserve_order` feature in BOTH modes.
+    if std::env::var("ATLAS_USE_HF_REF_JSON_DUMPS").as_deref() == Ok("1") {
+        env.add_filter(
+            "tojson",
+            |value: minijinja::Value| -> Result<minijinja::Value, minijinja::Error> {
+                let mut buf = Vec::new();
+                let mut ser = serde_json::Serializer::with_formatter(&mut buf, PythonJsonFormatter);
+                serde::Serialize::serialize(&value, &mut ser).map_err(|e| {
+                    minijinja::Error::new(
+                        minijinja::ErrorKind::InvalidOperation,
+                        format!("tojson serialization failed: {e}"),
+                    )
+                })?;
+                // serde_json writes valid UTF-8 (ensure_ascii=False — no \uXXXX).
+                let s = String::from_utf8(buf).map_err(|e| {
+                    minijinja::Error::new(
+                        minijinja::ErrorKind::InvalidOperation,
+                        format!("tojson produced invalid UTF-8: {e}"),
+                    )
+                })?;
+                Ok(minijinja::Value::from_safe_string(s))
+            },
+        );
+    }
+    // else: fall through to minijinja's builtin COMPACT `tojson` (DEFAULT) —
+    // the ST-995 fix. (PythonJsonFormatter below is retained for the env path.)
 
     env.add_template("chat", template_static)
         .context("Failed to compile Jinja chat template")?;
