@@ -136,6 +136,14 @@ gated_delta_rule_recompute_wu(
     const unsigned int ce = (seq_len - cs) < CHUNK ? (seq_len - cs) : CHUNK;
     const unsigned long long base = ((unsigned long long)(b * num_chunks + c) * num_v_heads + vh);
 
+    // Per-batch input offset (inputs stacked per-stream contiguous [batch,seq,*],
+    // uniform seq_len — mirrors gated_delta_rule_wy64_prefill.cu). b=0 → +0, so the
+    // single-stream (batch=1) path is byte-identical.
+    key   += (unsigned long long)b * seq_len * qk_stride;
+    value += (unsigned long long)b * seq_len * v_stride;
+    gate  += (unsigned long long)b * seq_len * gb_stride;
+    beta  += (unsigned long long)b * seq_len * gb_stride;
+
     extern __shared__ char smem_raw[];
     __nv_bfloat16* sk = (__nv_bfloat16*)smem_raw;       // [CHUNK*K_DIM] bf16
     float* kk = (float*)(sk + CHUNK * K_DIM);           // [CHUNK*CHUNK] f32 Gram
@@ -217,6 +225,7 @@ __device__ __forceinline__ void cdh_prefetch(
     const unsigned int cs = c * CHUNK;
     const unsigned int ce = (seq_len - cs) < CHUNK ? (seq_len - cs) : CHUNK;
     const unsigned long long base = ((unsigned long long)(b * num_chunks + c) * num_v_heads + vh);
+    key += (unsigned long long)b * seq_len * qk_stride;   // per-batch offset (b=0 → identical)
     __nv_bfloat16* Wp = buf + (unsigned long long)p * CDH_BUFSZ;
     __nv_bfloat16* Kp = Wp + CHUNK * K_DIM;
     __nv_bfloat16* Up = Kp + CHUNK * K_DIM;
@@ -628,6 +637,9 @@ gated_delta_rule_chunk_fwd_o(
     const unsigned int ce = (seq_len - cs) < CHUNK ? (seq_len - cs) : CHUNK;
     const unsigned long long base = ((unsigned long long)(b * num_chunks + c) * num_v_heads + vh);
     const unsigned long long out_base = ((unsigned long long)(b * seq_len) * num_v_heads + vh) * v_dim;
+    // Per-batch input offset (query/key stacked per-stream; b=0 → identical).
+    query += (unsigned long long)b * seq_len * qk_stride;
+    key   += (unsigned long long)b * seq_len * qk_stride;
 
     extern __shared__ char smem_raw[];
     __nv_bfloat16* sq = (__nv_bfloat16*)smem_raw;          // [CHUNK*K_DIM]
