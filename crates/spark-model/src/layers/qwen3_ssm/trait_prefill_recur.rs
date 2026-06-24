@@ -139,6 +139,7 @@ impl Qwen3SsmLayer {
                 conv_dim as u32,
                 conv_dim as u32,
                 gb_stride,
+                false, // single-stream: contiguous h_state (not a pointer table)
                 ctx.profile,
                 stream,
             )?;

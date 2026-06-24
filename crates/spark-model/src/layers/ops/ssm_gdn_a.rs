@@ -567,6 +567,9 @@ pub fn gdn_prefill_fla(
     qk_stride: u32,
     v_stride: u32,
     gb_stride: u32,
+    // h_state passed as a device POINTER TABLE (one [nv,kd,vd] per request) when
+    // batched co-dispatch reuses the per-request states; false = contiguous base.
+    h_state_is_table: bool,
     profile: bool,
     stream: u64,
 ) -> Result<()> {
@@ -642,6 +645,7 @@ pub fn gdn_prefill_fla(
         .arg_u32(vd)
         .arg_u32(qk_stride)
         .arg_u32(gb_stride)
+        .arg_u32(h_state_is_table as u32)
         .launch(stream)?;
     prof!("gdn_fla_chunk_delta_h", &mut t0);
 

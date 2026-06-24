@@ -502,7 +502,7 @@ __device__ __forceinline__ void cdh_ksplit_core(
     __nv_bfloat16* __restrict__ S_out, __nv_bfloat16* __restrict__ uc_out,
     unsigned int seq_len, unsigned int num_chunks, unsigned int num_k_heads,
     unsigned int num_v_heads, unsigned int k_dim, unsigned int v_dim,
-    unsigned int qk_stride, unsigned int gb_stride
+    unsigned int qk_stride, unsigned int gb_stride, unsigned int h_state_is_table
 ) {
     constexpr int KH = K_DIM / SPLIT;            // per-thread slice of the state column
     const unsigned int vh = blockIdx.x;
@@ -520,7 +520,12 @@ __device__ __forceinline__ void cdh_ksplit_core(
     float* gcb = (float*)(buf + 2 * CDH_BUFSZ);             // gcb[2][CHUNK]
     float* decb = gcb + 2 * CHUNK;                          // decb[2][CHUNK+1], [0]=exp(gc_last)
 
-    float* H = h_state + ((unsigned long long)(b * num_v_heads + vh) * K_DIM * V_DIM);
+    // Batched co-dispatch passes h_state as a device POINTER TABLE (one contiguous
+    // [nv,kd,vd] h_state per request, the same table wy64 uses); single-stream
+    // passes a contiguous base (is_table=0 → byte-identical to the original).
+    float* H = h_state_is_table
+        ? ((float* const*)h_state)[b] + (unsigned long long)vh * K_DIM * V_DIM
+        : h_state + ((unsigned long long)(b * num_v_heads + vh) * K_DIM * V_DIM);
     float Sreg[KH];
     #pragma unroll
     for (int kk = 0; kk < KH; kk++) Sreg[kk] = H[(k0 + kk) * V_DIM + v];
@@ -591,10 +596,11 @@ gated_delta_rule_chunk_delta_h_ksplit(
     __nv_bfloat16* __restrict__ S_out, __nv_bfloat16* __restrict__ uc_out,
     unsigned int batch_size, unsigned int seq_len, unsigned int num_chunks,
     unsigned int num_k_heads, unsigned int num_v_heads, unsigned int k_dim,
-    unsigned int v_dim, unsigned int qk_stride, unsigned int gb_stride
+    unsigned int v_dim, unsigned int qk_stride, unsigned int gb_stride,
+    unsigned int h_state_is_table
 ) {
     cdh_ksplit_core<2>(h_state, W_in, U_in, key, gate, gc_in, S_out, uc_out, seq_len, num_chunks,
-                       num_k_heads, num_v_heads, k_dim, v_dim, qk_stride, gb_stride);
+                       num_k_heads, num_v_heads, k_dim, v_dim, qk_stride, gb_stride, h_state_is_table);
 }
 
 // ── KERNEL 3: chunk_fwd_o ────────────────────────────────────────────────

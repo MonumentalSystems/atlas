@@ -4,6 +4,15 @@
 
 use super::*;
 
+/// `ATLAS_GDN_BATCHED_FLA=1` → route the co-dispatch batched GDN scan through the
+/// chunk-parallel FLA kernels at batch=N (fills chunk_delta_h's 32→32N CTAs)
+/// instead of the occupancy-starved wy64 family. Default off (opt-in A/B).
+fn gdn_batched_fla_enabled() -> bool {
+    use std::sync::OnceLock;
+    static EN: OnceLock<bool> = OnceLock::new();
+    *EN.get_or_init(|| std::env::var("ATLAS_GDN_BATCHED_FLA").ok().as_deref() == Some("1"))
+}
+
 impl Qwen3SsmLayer {
     pub(super) fn prefill_gdn_full_inner(
         &self,
@@ -133,6 +142,7 @@ impl Qwen3SsmLayer {
                 conv_dim as u32,
                 conv_dim as u32,
                 gb_stride,
+                false, // single-stream: contiguous h_state (not a pointer table)
                 ctx.profile,
                 stream,
             );
@@ -337,6 +347,63 @@ impl Qwen3SsmLayer {
         let gate_ptr = gdn_bufs.gate_beta;
         let beta_ptr = gdn_bufs.gate_beta.offset(nv * fp32);
         let gb_stride = (nv * 2) as u32;
+
+        // ── Batched FLA scan (ATLAS_GDN_BATCHED_FLA) ──
+        // Route the co-dispatched GDN through the chunk-parallel FLA kernels at
+        // batch=N instead of the occupancy-starved wy64 [nv,batch]. FLA's
+        // chunk_delta_h grid is [nv,batch] too, but at batch=N gives 32N CTAs
+        // (fills GB10's 48 SMs) vs wy64's same count on a slower persistent
+        // kernel; recompute_wu/chunk_fwd_o add a num_chunks grid axis. h_state is
+        // passed as the per-request POINTER TABLE (is_table=true) — same table
+        // wy64 uses, so no gather/scatter. Scratch regions span the whole batch:
+        // base=(b*num_chunks+c)*nv, so size by total_nt = batch*num_chunks.
+        if gdn_batched_fla_enabled() && kd == 128 && vd == 128 {
+            let fla_scratch = ctx.buffers.gdn_fla_scratch();
+            if fla_scratch.0 != 0
+                && self.gdn_prefill_fla_recompute_wu_k.0 != 0
+                && self.gdn_prefill_fla_chunk_delta_h_k.0 != 0
+                && self.gdn_prefill_fla_chunk_fwd_o_k.0 != 0
+            {
+                let num_chunks = chunk_len.div_ceil(64);
+                let total_nt = (batch_size * num_chunks) as usize;
+                let w_out = fla_scratch;
+                let u_out = w_out.offset(total_nt * nv * 64 * kd * bf16);
+                let s_out = u_out.offset(total_nt * nv * 64 * vd * bf16);
+                let uc_out = s_out.offset(total_nt * nv * kd * vd * bf16);
+                let gc_out = uc_out.offset(total_nt * nv * 64 * vd * bf16);
+                return ops::gdn_prefill_fla(
+                    ctx.gpu,
+                    self.gdn_prefill_fla_recompute_wu_k,
+                    self.gdn_prefill_fla_chunk_delta_h_k,
+                    self.gdn_prefill_fla_chunk_fwd_o_k,
+                    h_state_ptrs, // per-request pointer table
+                    q_ptr,
+                    k_ptr,
+                    v_ptr,
+                    gate_ptr,
+                    beta_ptr,
+                    gdn_bufs.output,
+                    w_out,
+                    u_out,
+                    s_out,
+                    uc_out,
+                    gc_out,
+                    batch_size,
+                    chunk_len,
+                    num_chunks,
+                    nk as u32,
+                    nv as u32,
+                    kd as u32,
+                    vd as u32,
+                    conv_dim as u32,
+                    conv_dim as u32,
+                    gb_stride,
+                    true, // h_state_is_table
+                    ctx.profile,
+                    stream,
+                );
+            }
+        }
 
         // Mirror the single-stream dispatch ladder. Total tokens per stream
         // is `chunk_len`; the kernel internally processes `batch_size` such

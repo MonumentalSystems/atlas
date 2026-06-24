@@ -219,7 +219,11 @@ impl BufferSizes {
             && config.linear_key_head_dim == 128
             && config.linear_value_head_dim == 128
         {
-            let nt = m.div_ceil(FLA_CHUNK);
+            // +margin: the batched FLA path (ATLAS_GDN_BATCHED_FLA) sizes its
+            // regions by total_nt = batch*ceil(chunk_len/64), which can exceed
+            // ceil(m/64) by up to `batch` chunks due to per-stream last-chunk
+            // rounding. 16 covers the co-dispatch max-seqs.
+            let nt = m.div_ceil(FLA_CHUNK) + 16;
             let nv = config.linear_num_value_heads;
             let kd = config.linear_key_head_dim;
             let vd = config.linear_value_head_dim;
