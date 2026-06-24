@@ -184,7 +184,15 @@ pub(super) fn continue_in_progress_prefills(
         .unwrap_or(false);
     let can_batch_prefill_only =
         !q12_dispatch_disabled && prefilling.len() >= 2 && active.is_empty() && !model.is_ep();
-    let can_batch_mixed = !q12_dispatch_disabled
+    // When ATLAS_HOLO_ALWAYS_MIXED is on, COLLAPSE the multi-prefill+decode
+    // case onto the single-stream fused path below (FIFO head prefill fused
+    // with all active decodes via mixed_forward, sized by the slice budget)
+    // instead of the serializing N-stream run_batched_mixed_step — that batched
+    // path does NOT keep decode flowing, so with 2+ concurrent prefills the
+    // fused step never fired (burst-TBT A/B showed Mixed forward = 0 and no TBT
+    // improvement). The non-head prefill streams advance on subsequent ticks.
+    let can_batch_mixed = !always_mixed
+        && !q12_dispatch_disabled
         && prefilling.len() >= 2
         && !active.is_empty()
         && !single_active_with_spec
