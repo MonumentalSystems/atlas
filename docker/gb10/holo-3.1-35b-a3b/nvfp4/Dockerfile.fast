@@ -1,0 +1,21 @@
+# Fast-path holo image: layer a PRE-BUILT spark binary onto the runtime stage of
+# the full image — skips the ~20-min in-container CUTLASS/FlashInfer clone +
+# cargo build. Use for iteration once `atlas-holo:cuda13.2` exists.
+#
+# The binary must be a HOLO-target build (ATLAS_TARGET_MODEL=holo-3.1-35b-a3b);
+# either the one baked into atlas-holo:cuda13.2, or a host build. For the FULL
+# CUDA-13.2-compiled benefit (newer CUTLASS/FlashInfer source) rebuild the full
+# Dockerfile (now cache-mounted → ~2 min incremental); this .fast path keeps the
+# 13.2 runtime libs but the binary's compiled kernels come from wherever it was
+# built (e.g. the host's nvcc).
+#
+# Build (host has a holo spark binary at ./spark-fastbin; target/ is dockerignored):
+#   cp <holo-spark-binary> spark-fastbin
+#   docker build -f docker/gb10/holo-3.1-35b-a3b/nvfp4/Dockerfile.fast -t atlas-holo:fast .
+#
+# Run: identical to the full image (mount /tank, -p 8890, serve ...).
+
+FROM atlas-holo:cuda13.2
+
+COPY spark-fastbin /usr/local/bin/spark
+COPY jinja-templates/ /jinja-templates/
