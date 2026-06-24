@@ -457,6 +457,21 @@ impl TransformerModel {
             )?;
         }
 
+        // ── Step 0 (spec blocker B1): per-chunk SSM state normalize ──
+        //
+        // Normalize the prefill seq's h_state on the SAME `stream`
+        // (= default_stream, reassigned near the top of this fn) that the
+        // GDN recurrence just wrote it on — in-order, no event, no race.
+        // This MUST cover EVERY mixed chunk INCLUDING the last: mixed_forward
+        // runs the GDN write on default_stream, so the terminal normalize
+        // also belongs here. Leaving the is_last normalize in run_standard.rs
+        // on prefill_stream (as the original Step 0 did) does NOT order these
+        // default_stream writes → the final chunk reads a stale state →
+        // nondeterministic corruption (the residual B1 race that failed
+        // token-for-token validation, 0/12). The standard prefill_chunk path
+        // keeps its own same-stream (prefill_stream) every-chunk normalize.
+        self.normalize_ssm_states_dispatch(prefill_seq, stream)?;
+
         // Restore decode layer_states to sequences
         for (seq, ls) in decode_seqs
             .iter_mut()

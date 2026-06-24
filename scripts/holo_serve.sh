@@ -76,6 +76,11 @@ SSM_CKPT_INTERVAL="${ATLAS_HOLO_SSM_CHECKPOINT_INTERVAL:-0}"
 # shortest-prompt-first prefill ordering). slai prevents a giant prefill from
 # starving concurrent decodes / blocking small prompts (the soak failure mode).
 SCHED_POLICY="${ATLAS_HOLO_SCHED_POLICY:-slai}"
+# Always-on fused mixed step (decode keep-alive during prefill bursts). Default
+# OFF — when off the scheduler is byte-identical to the resting production path
+# (binary should_prefill, no slice budget). Set to 1/true to enable the
+# slice-budget always-mixed path (see HOLO_MIXED_STEP_SPEC.md, Step 2).
+ALWAYS_MIXED="${ATLAS_HOLO_ALWAYS_MIXED:-false}"
 # MAX_PREFILL safety + prefix-cache alignment:
 #  (1) CUTLASS cap — the SSM out_proj NVFP4 GEMM (M = chunk size) FAILS (status -2)
 #      above ~4-8K M, so a chunk > 4096 crashes any prompt that prefills in one big
@@ -110,6 +115,7 @@ setsid -f env RUST_BACKTRACE=1 RUST_LOG=info \
   ATLAS_PREFILL_CODISPATCH="$CODISPATCH" ATLAS_FLASHINFER_PREFILL="$FLASHINFER_PREFILL" \
   ATLAS_Q12_BATCHED_FIRST_CHUNK="$Q12_BATCHED_FIRST_CHUNK" ATLAS_GDN_BATCHED_FLA="$GDN_BATCHED_FLA" \
   ATLAS_HOLO_NATIVE_FP8_ATTN="$NATIVE_FP8_ATTN" ATLAS_ATTN_PREFILL_Q_T="$ATTN_Q_T" ATLAS_ATTN_PREFILL_T_PIPE="$ATTN_T_PIPE" \
+  ATLAS_HOLO_ALWAYS_MIXED="$ALWAYS_MIXED" \
   ATLAS_CUBLAS_GEMM="$CUBLAS_GEMM" ATLAS_CUTLASS_NVFP4_GEMM="$CUTLASS_NVFP4_GEMM" ATLAS_CUTLASS_NVFP4_SSM_OUT="$CUTLASS_NVFP4_SSM_OUT" \
   "$BIN" serve \
     --model-from-path /tank/holo-bf16kv-test --model-name holo3.1-atlas-poc \

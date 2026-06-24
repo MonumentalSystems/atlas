@@ -42,9 +42,35 @@ pub trait SchedulingPolicy: Send {
     /// SLAI picks the N shortest prompts.
     fn select_prefills(&self, requests: &[PendingRequestInfo], capacity: usize) -> Vec<usize>;
 
+    /// Number of prefill tokens to inject this iteration when fusing a
+    /// prefill chunk into a decode step ("always-mixed" path).
+    ///
+    /// Returns a token budget in `[0, full_chunk]`:
+    /// - `full_chunk` when no decode is active (no TBT pressure) or the
+    ///   policy has no opinion (FIFO / default).
+    /// - A clamped, WY4-aligned slice (≥ `MIN_PREFILL_SLICE`) under
+    ///   moderate decode pressure so the fused step stays under the TBT
+    ///   target.
+    /// - `0` ONLY as a hard suppress when a decode has already blown its
+    ///   TBT deadline — the caller must then run decode-only this tick.
+    ///
+    /// This is driven by MEASURED step cost (seeded from conservative
+    /// constants), NOT by `now − last_token_time` (which the fused step
+    /// self-resets every iteration — see spec blocker B2).
+    fn prefill_slice_budget(&self, active_timings: &[ActiveSeqTiming], full_chunk: usize) -> usize {
+        // Default (FIFO / unaware): inject the full chunk — same as today.
+        let _ = active_timings;
+        full_chunk
+    }
+
     /// Policy name for logging.
     fn name(&self) -> &str;
 }
+
+/// Minimum prefill slice (tokens) injected into a fused mixed step.
+/// WY4-aligned; large enough to make forward progress on a long prompt,
+/// small enough to keep the fused step under the TBT target.
+pub const MIN_PREFILL_SLICE: usize = 32;
 
 /// FIFO scheduling: always prefill, take first N from queue.
 pub struct FifoPolicy;
@@ -71,12 +97,40 @@ impl SchedulingPolicy for FifoPolicy {
 /// - Selects the N shortest prompts from ALL pending (reduces median TTFT).
 pub struct SlaiPolicy {
     tbt_deadline: Duration,
+    /// Minimum fused prefill slice (tokens), WY4-aligned, read once from
+    /// `ATLAS_SLAI_MIN_PREFILL_SLICE` (default [`MIN_PREFILL_SLICE`]).
+    min_prefill_slice: usize,
+    /// Conservative seed for the decode-region step cost (ms) used to size
+    /// the prefill slice. TODO(holo-mixed Step 3): replace with an EWMA
+    /// updated from measured fused-step durations (a `record_step` hook
+    /// wired from the scheduler). Seeded high so the first slices are
+    /// conservative (small) until measurement lands.
+    t_dec_ms_seed: f64,
+    /// Conservative seed for marginal prefill cost (ms / token). TODO as
+    /// above — currently a constant. Tuned to GB10 Holo prefill (~0.6 ms
+    /// per WY4-aligned token at the resting chunk cap).
+    cost_per_tok_ms_seed: f64,
 }
 
 impl SlaiPolicy {
     pub fn new(tbt_deadline_ms: u64) -> Self {
+        // Read the minimum slice once; clamp ≥4 and WY4-align.
+        let min_prefill_slice = std::env::var("ATLAS_SLAI_MIN_PREFILL_SLICE")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .map(|v| {
+                let v = v.max(4);
+                (v / 4) * 4
+            })
+            .unwrap_or(MIN_PREFILL_SLICE);
         Self {
             tbt_deadline: Duration::from_millis(tbt_deadline_ms),
+            min_prefill_slice,
+            // Conservative constants (see field docs). Order of magnitude:
+            // a small decode batch costs a few ms/step; prefill marginal
+            // cost is sub-ms/token at the resting cap.
+            t_dec_ms_seed: 5.0,
+            cost_per_tok_ms_seed: 0.6,
         }
     }
 }
@@ -102,6 +156,42 @@ impl SchedulingPolicy for SlaiPolicy {
         indices.sort_by_key(|&i| requests[i].prompt_len);
         indices.truncate(capacity);
         indices
+    }
+
+    fn prefill_slice_budget(&self, active_timings: &[ActiveSeqTiming], full_chunk: usize) -> usize {
+        // No decode active → no TBT pressure → inject the full chunk.
+        if active_timings.is_empty() {
+            return full_chunk;
+        }
+
+        // Hard suppress: if ANY decode has already blown its TBT deadline,
+        // return 0 so the caller runs decode-only this tick. This is the
+        // ONLY case that returns 0 (spec B2 late-decode protection). Note
+        // `worst` is used ONLY as this hard guard, never to size the slice
+        // (the fused step self-resets last_token_time, so it cannot drive
+        // the budget — that is what makes B2's open-loop design fail).
+        let now = Instant::now();
+        let worst = active_timings
+            .iter()
+            .map(|t| now.duration_since(t.last_token_time))
+            .max()
+            .unwrap_or_default();
+        if worst >= self.tbt_deadline {
+            return 0;
+        }
+
+        // Cost-driven slice (spec B2 fix): size the prefill region from the
+        // measured (here: seeded) step cost so the fused step fits the TBT
+        // target. budget = (TBT_target − T_dec) / cost_per_tok.
+        let tbt_target_ms = self.tbt_deadline.as_secs_f64() * 1_000.0;
+        let headroom_ms = (tbt_target_ms - self.t_dec_ms_seed).max(0.0);
+        let raw = (headroom_ms / self.cost_per_tok_ms_seed).floor() as i64;
+        let raw = raw.clamp(0, full_chunk as i64) as usize;
+
+        // Clamp to [min_prefill_slice, full_chunk], WY4-align, floor at 4.
+        let budget = raw.clamp(self.min_prefill_slice.min(full_chunk), full_chunk);
+        let budget = (budget / 4) * 4;
+        budget.max(4).min(full_chunk)
     }
 
     fn name(&self) -> &str {
@@ -268,5 +358,58 @@ mod tests {
     fn select_prefills_empty() {
         assert!(FifoPolicy.select_prefills(&[], 5).is_empty());
         assert!(SlaiPolicy::new(100).select_prefills(&[], 5).is_empty());
+    }
+
+    #[test]
+    fn fifo_slice_budget_is_full_chunk() {
+        // Default trait impl: FIFO always injects the full chunk.
+        let policy = FifoPolicy;
+        assert_eq!(policy.prefill_slice_budget(&[], 4080), 4080);
+        let timings = vec![ActiveSeqTiming {
+            last_token_time: Instant::now(),
+        }];
+        assert_eq!(policy.prefill_slice_budget(&timings, 4080), 4080);
+    }
+
+    #[test]
+    fn slai_slice_budget_full_when_no_active() {
+        let policy = SlaiPolicy::new(100);
+        assert_eq!(policy.prefill_slice_budget(&[], 4080), 4080);
+    }
+
+    #[test]
+    fn slai_slice_budget_zero_past_deadline() {
+        // worst >= tbt_deadline → hard suppress (0), decode-only this tick.
+        let policy = SlaiPolicy::new(100);
+        let timings = vec![ActiveSeqTiming {
+            last_token_time: Instant::now() - Duration::from_millis(120),
+        }];
+        assert_eq!(policy.prefill_slice_budget(&timings, 4080), 0);
+    }
+
+    #[test]
+    fn slai_slice_budget_bounded_and_wy4_aligned() {
+        // Fresh decode, under deadline → a positive, WY4-aligned slice in
+        // [min, full_chunk], never 0.
+        let policy = SlaiPolicy::new(100);
+        let timings = vec![ActiveSeqTiming {
+            last_token_time: Instant::now(),
+        }];
+        let b = policy.prefill_slice_budget(&timings, 4080);
+        assert!(b > 0, "non-deadline budget must be > 0");
+        assert!(b <= 4080, "must never exceed full_chunk");
+        assert_eq!(b % 4, 0, "must be WY4-aligned");
+    }
+
+    #[test]
+    fn slai_slice_budget_never_exceeds_small_full_chunk() {
+        // Small chunk cap must clamp the slice (and stay WY4-aligned).
+        let policy = SlaiPolicy::new(100);
+        let timings = vec![ActiveSeqTiming {
+            last_token_time: Instant::now(),
+        }];
+        let b = policy.prefill_slice_budget(&timings, 64);
+        assert!(b <= 64);
+        assert_eq!(b % 4, 0);
     }
 }

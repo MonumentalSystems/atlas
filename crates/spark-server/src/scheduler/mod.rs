@@ -164,6 +164,18 @@ pub fn run(
         if chunked { max_prefill_tokens } else { 0 },
     );
 
+    // Holo "always-on fused mixed step" gate (default OFF). When OFF the
+    // scheduler behaves EXACTLY as today (binary should_prefill, no slice
+    // budget). When ON, an active decode + an in-progress prefill always
+    // takes a fused mixed step sized by the policy's prefill_slice_budget
+    // so decode never starves during a prefill burst. Read once at startup.
+    let always_mixed = std::env::var("ATLAS_HOLO_ALWAYS_MIXED")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if always_mixed {
+        tracing::info!("ATLAS_HOLO_ALWAYS_MIXED=on: fused mixed step always-on (slice-budget)");
+    }
+
     let pending = Arc::new((
         Mutex::new(PendingQueue {
             requests: Vec::new(),
@@ -286,6 +298,8 @@ pub fn run(
             &mut active,
             &mut prefilling,
             max_prefill_tokens,
+            max_batch_tokens,
+            always_mixed,
             prefill_stream,
             prefill_event,
             use_mtp,
