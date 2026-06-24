@@ -43,12 +43,17 @@ ENV CUDA_HOME=/usr/local/cuda
 # overrides rust-toolchain.toml's older pin.
 ENV RUSTUP_TOOLCHAIN=stable
 
-# CUTLASS (NVFP4 GEMM) + FlashInfer (varlen ragged prefill), pinned to the
-# known-good commits the bare-metal build validated under CUDA 13.2.
+# CUTLASS (NVFP4 GEMM) + FlashInfer (varlen ragged prefill). Default = the
+# known-good commits the bare-metal build validated under CUDA 13.2. Override via
+#   --build-arg CUTLASS_REF=v4.4.2 --build-arg FLASHINFER_REF=v0.6.13
+# to test the newer releases (sm_121 NVFP4 grouped GEMM + Blackwell GDN prefill —
+# the likely source of vLLM's 3x prefill).
+ARG CUTLASS_REF=cf064d2e6bad2886238ac565b3b49007764f4939
+ARG FLASHINFER_REF=a671c02ee2fbcdde7cc991f5a01c7cf5eb4a8972
 RUN git clone --filter=blob:none https://github.com/NVIDIA/cutlass /opt/cutlass && \
-    git -C /opt/cutlass checkout cf064d2e6bad2886238ac565b3b49007764f4939
+    git -C /opt/cutlass checkout ${CUTLASS_REF}
 RUN git clone --filter=blob:none https://github.com/flashinfer-ai/flashinfer.git /opt/flashinfer && \
-    git -C /opt/flashinfer checkout a671c02ee2fbcdde7cc991f5a01c7cf5eb4a8972 && \
+    git -C /opt/flashinfer checkout ${FLASHINFER_REF} && \
     git -C /opt/flashinfer submodule update --init --recursive --depth 1
 ENV CUTLASS_HOME=/opt/cutlass
 ENV FLASHINFER_HOME=/opt/flashinfer
