@@ -72,7 +72,7 @@ fn codispatch_window() -> Option<std::time::Duration> {
     let ms = std::env::var("ATLAS_PREFILL_CODISPATCH_WINDOW_MS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(5);
+        .unwrap_or(10);
     Some(std::time::Duration::from_millis(ms))
 }
 
@@ -94,21 +94,30 @@ pub(super) fn drain_pending_requests(
         if g.closed && g.requests.is_empty() {
             return Vec::new();
         }
-        // Co-dispatch micro-batch window (ATLAS_PREFILL_CODISPATCH=1): when idle
-        // and only one prefill request has arrived, wait a few ms for a 2nd
-        // concurrent request so they batch into one forward via
-        // run_batched_prefill_step. Bounded by a deadline, so a lone request's
-        // TTFT only grows by the (small) window. Off by default.
-        if g.requests.len() < 2
+        // Co-dispatch micro-batch window (ATLAS_PREFILL_CODISPATCH=1): when idle,
+        // gather a whole concurrent BURST into one forward (batched via
+        // run_batched_prefill_step) rather than stopping at the 2nd request — a
+        // 4-request burst used to split into 2+2 because the loop exited at len==2.
+        // Keep collecting up to `max_batch_size`, bounded by `window`, and dispatch
+        // EARLY once the burst settles (>=2 gathered and no new arrival within
+        // SETTLE) so latency stays low. A lone request pays at most `window` TTFT.
+        if g.requests.len() < max_batch_size
             && let Some(window) = codispatch_window()
         {
+            const SETTLE: std::time::Duration = std::time::Duration::from_millis(2);
             let deadline = std::time::Instant::now() + window;
-            while g.requests.len() < 2 && !g.closed {
+            while g.requests.len() < max_batch_size && !g.closed {
                 let now = std::time::Instant::now();
                 if now >= deadline {
                     break;
                 }
-                cv.wait_for(&mut g, deadline - now);
+                let wait = (deadline - now).min(SETTLE);
+                let res = cv.wait_for(&mut g, wait);
+                // Timed out with no new arrival in SETTLE → burst drained; dispatch
+                // what we have (if it's batchable). Otherwise keep gathering.
+                if res.timed_out() && g.requests.len() >= 2 {
+                    break;
+                }
             }
         }
     }
