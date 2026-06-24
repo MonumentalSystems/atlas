@@ -53,6 +53,17 @@ GDN_FUSED_NORM="${ATLAS_GDN_FUSED_NORM:-1}"
 #     fallback. To revert: ATLAS_CUBLAS_GEMM=0 ATLAS_CUTLASS_NVFP4_GEMM=1.
 # SSM out_proj stays NVFP4 (separate gate below — not covered by the cuBLAS wiring).
 CUBLAS_GEMM="${ATLAS_CUBLAS_GEMM:-1}"
+# Concurrency — NOW DEFAULT ON. Co-dispatch batches concurrent prefills into one
+# forward (+ FlashInfer ragged attention + chunk-0 batched fallback); the varlen
+# batched-GDN scan (ATLAS_GDN_BATCHED_FLA) batches the ragged GDN. Soak A/B
+# (2026-06-24, 6-client mixed, 768 thinking): co-dispatch ON = 24.3 tok/s agg / 0
+# errors vs OFF = 11.5 / 4 timeouts — 2× and no head-of-line blocking under real
+# concurrent load. (Synthetic prefill-only c4 TIES serial — GB10 has no L2 weight-
+# reuse — which hid this; the real-world soak is what shows it.) Off→ set each =0.
+CODISPATCH="${ATLAS_PREFILL_CODISPATCH:-1}"
+FLASHINFER_PREFILL="${ATLAS_FLASHINFER_PREFILL:-1}"
+Q12_BATCHED_FIRST_CHUNK="${ATLAS_Q12_BATCHED_FIRST_CHUNK:-1}"
+GDN_BATCHED_FLA="${ATLAS_GDN_BATCHED_FLA:-1}"
 CUTLASS_NVFP4_GEMM="${ATLAS_CUTLASS_NVFP4_GEMM:-0}"
 CUTLASS_NVFP4_SSM_OUT="${ATLAS_CUTLASS_NVFP4_SSM_OUT:-1}"
 # Prefix caching (radix-tree KV reuse + Marconi SSM-snapshot restore for the
@@ -96,6 +107,8 @@ setsid -f env RUST_BACKTRACE=1 RUST_LOG=info \
   ATLAS_HYBRID_MOE_LAYOUT="$HYBRID_MOE_LAYOUT" ATLAS_UNIFIED_MOE_LAYOUT="$UNIFIED_MOE_LAYOUT" \
   ATLAS_MOE_PREFILL_EXACT_TILES="$EXACT_MOE_TILES" ATLAS_GDN_FUSED_NORM="$GDN_FUSED_NORM" \
   ATLAS_MOE_PREFILL_FP8_DOWN="$FP8_DOWN" \
+  ATLAS_PREFILL_CODISPATCH="$CODISPATCH" ATLAS_FLASHINFER_PREFILL="$FLASHINFER_PREFILL" \
+  ATLAS_Q12_BATCHED_FIRST_CHUNK="$Q12_BATCHED_FIRST_CHUNK" ATLAS_GDN_BATCHED_FLA="$GDN_BATCHED_FLA" \
   ATLAS_HOLO_NATIVE_FP8_ATTN="$NATIVE_FP8_ATTN" ATLAS_ATTN_PREFILL_Q_T="$ATTN_Q_T" ATLAS_ATTN_PREFILL_T_PIPE="$ATTN_T_PIPE" \
   ATLAS_CUBLAS_GEMM="$CUBLAS_GEMM" ATLAS_CUTLASS_NVFP4_GEMM="$CUTLASS_NVFP4_GEMM" ATLAS_CUTLASS_NVFP4_SSM_OUT="$CUTLASS_NVFP4_SSM_OUT" \
   "$BIN" serve \
