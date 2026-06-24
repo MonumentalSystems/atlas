@@ -118,6 +118,74 @@ fn f32_to_e4m3(v: f32) -> u8 {
     best
 }
 
+// ───────────────────────── FP4 e2m1 / ue4m3 host packers ─────────────────────
+// Mirror the CUDA pack (float_to_e2m1 round-to-nearest, ue4m3 scale=max_abs/6).
+fn f32_to_e2m1(x: f32) -> u8 {
+    let sign: u8 = if x < 0.0 { 8 } else { 0 };
+    let ax = x.abs();
+    let mag: u8 = if ax <= 0.25 {
+        0
+    } else if ax <= 0.75 {
+        1
+    } else if ax <= 1.25 {
+        2
+    } else if ax <= 1.75 {
+        3
+    } else if ax <= 2.5 {
+        4
+    } else if ax <= 3.5 {
+        5
+    } else if ax <= 5.0 {
+        6
+    } else {
+        7
+    };
+    sign | mag
+}
+// ue4m3 (unsigned e4m3 magnitude byte) of a non-negative scale: same bit pattern
+// as the standard e4m3 of |scale| with the sign bit clear (scale>=0).
+fn f32_to_ue4m3(scale: f32) -> u8 {
+    f32_to_e4m3(scale) & 0x7F
+}
+fn ue4m3_to_f32(byte: u8) -> f32 {
+    e4m3_to_f32(byte & 0x7F)
+}
+
+/// Pack a bf16 weight `[N,K]` into the FP8-fused-kernel layout:
+/// packed `[K/2, N]` (K-major) nibbles + scales `[K/16, N]` ue4m3, per the
+/// production `moe_w4a16_fused_gate_up_t_k64` kernel's B_expert indexing
+/// (`B[(k/2)*N + n]`, `S[(k/16)*N + n]`). Returns (packed, scales).
+fn pack_weight_kmajor(b_bf16: &[u16], n: usize, k: usize) -> (Vec<u8>, Vec<u8>) {
+    let half_k = k / 2;
+    let groups = k / 16;
+    let mut packed = vec![0u8; half_k * n];
+    let mut scales = vec![0u8; groups * n];
+    for col in 0..n {
+        for g in 0..groups {
+            let base = g * 16;
+            let mut max_abs = 0.0f32;
+            for i in 0..16 {
+                let v = bf16_bits_to_f32(b_bf16[col * k + base + i]);
+                max_abs = max_abs.max(v.abs());
+            }
+            let scale = if max_abs > 0.0 { max_abs / 6.0 } else { 1.0 };
+            let sf = f32_to_ue4m3(scale);
+            scales[g * n + col] = sf;
+            let inv = {
+                let d = ue4m3_to_f32(sf);
+                if d > 0.0 { 1.0 / d } else { 0.0 }
+            };
+            for i in (0..16).step_by(2) {
+                let v0 = bf16_bits_to_f32(b_bf16[col * k + base + i]) * inv;
+                let v1 = bf16_bits_to_f32(b_bf16[col * k + base + i + 1]) * inv;
+                let kk = base + i;
+                packed[(kk / 2) * n + col] = f32_to_e2m1(v0) | (f32_to_e2m1(v1) << 4);
+            }
+        }
+    }
+    (packed, scales)
+}
+
 // ───────────────────────── upload helpers ─────────────────────────
 fn u16s_to_le(v: &[u16]) -> Vec<u8> {
     v.iter().flat_map(|x| x.to_le_bytes()).collect()
@@ -246,6 +314,12 @@ struct Row {
     grp_us: f64,
     grp_cos_vs_collective: f64, // MUST be >= 0.999 (same FP4 math)
     grp_cos_vs_oracle: f64,     // MUST be >= 0.98
+    // Phase-2 FUSED FP4 kernel (cp.async pipelined, single launch, no gather).
+    fused_us: f64,
+    fused_cos_vs_collective: f64, // MUST be >= 0.999
+    fused_cos_vs_oracle: f64,     // MUST be >= 0.98
+    // Production FP8 fused kernel (moe_w4a16_fused_gate_up_t_k64) — the REAL A/B.
+    fused_fp8_us: f64,
 }
 
 /// Cosine of two GPU bf16 outputs (both u16) in f32 space.
@@ -388,6 +462,101 @@ fn run_shape(
     let grp_us = time_gemm(gpu, stream, iters, grp_launch)?;
     let c_grp_gate = read_bf16(gpu, c_gate_grp, m, n)?;
 
+    // ── Phase-2 FUSED FP4 kernel (moe_w4a16_fused_gate_up_t_k64_fp4) ──
+    // Single launch, cp.async pipelined, in-kernel A-quant, no gather. Consumes
+    // the SAME N-major FP4 weight tables (packed_ptr/scale_ptr = gate,
+    // up_packed_ptr/up_scale_ptr = up) the fp4_gate_up path packs. Single
+    // expert covering all M rows; sorted_token_ids = null (identity).
+    let fused_handle = gpu.kernel("moe_w4a16", "moe_w4a16_fused_gate_up_t_k64_fp4")?;
+    // Device ptr-tables: one expert each (u64 device pointers).
+    let mk_ptr_tbl = |p: u64| -> Result<DevicePtr> {
+        let bytes = p.to_le_bytes();
+        let d = gpu.alloc(8)?;
+        gpu.copy_h2d(&bytes, d)?;
+        Ok(d)
+    };
+    let gate_packed_tbl = mk_ptr_tbl(packed_ptr.0)?;
+    let gate_scale_tbl = mk_ptr_tbl(scale_ptr.0)?;
+    let up_packed_tbl = mk_ptr_tbl(up_packed_ptr.0)?;
+    let up_scale_tbl = mk_ptr_tbl(up_scale_ptr.0)?;
+    let gate_scale2_tbl = upload_bytes(gpu, &1.0f32.to_le_bytes())?;
+    let up_scale2_tbl = upload_bytes(gpu, &1.0f32.to_le_bytes())?;
+    let eoff_dev = {
+        let mut b = Vec::new();
+        b.extend_from_slice(&0i32.to_le_bytes());
+        b.extend_from_slice(&(m as i32).to_le_bytes());
+        upload_bytes(gpu, &b)?
+    };
+    let c_gate_fused = gpu.alloc(m * n * 2)?;
+    let c_up_fused = gpu.alloc(m * n * 2)?;
+    let max_m_tiles = div_ceil(mu, 64).max(1);
+    let fused_launch = || -> Result<()> {
+        KernelLaunch::new(gpu, fused_handle)
+            .grid([div_ceil(2 * nu, 128), max_m_tiles, 1])
+            .block([128, 1, 1])
+            .arg_ptr(a_ptr)
+            .arg_ptr(gate_packed_tbl)
+            .arg_ptr(gate_scale_tbl)
+            .arg_ptr(gate_scale2_tbl)
+            .arg_ptr(up_packed_tbl)
+            .arg_ptr(up_scale_tbl)
+            .arg_ptr(up_scale2_tbl)
+            .arg_ptr(c_gate_fused)
+            .arg_ptr(c_up_fused)
+            .arg_ptr(eoff_dev)
+            .arg_u64(0) // sorted_token_ids = null
+            .arg_u32(1) // num_experts
+            .arg_u32(nu)
+            .arg_u32(ku)
+            .launch(stream)?;
+        Ok(())
+    };
+    fused_launch()?;
+    gpu.synchronize(stream)?;
+    let fused_us = time_gemm(gpu, stream, iters, fused_launch)?;
+    let c_fused_gate = read_bf16(gpu, c_gate_fused, m, n)?;
+
+    // ── Production FP8 fused kernel (moe_w4a16_fused_gate_up_t_k64) ──
+    // The REAL A/B for the speed signal. Needs K-major [K/2,N] packed +
+    // [K/16,N] ue4m3 scales (its own layout, distinct from the FP4 N-major).
+    let (gate_pk, gate_sk) = pack_weight_kmajor(&b_bf16, n, k);
+    let (up_pk, up_sk) = pack_weight_kmajor(&up_bf16, n, k);
+    let gate_pk_ptr = upload_bytes(gpu, &gate_pk)?;
+    let gate_sk_ptr = upload_bytes(gpu, &gate_sk)?;
+    let up_pk_ptr = upload_bytes(gpu, &up_pk)?;
+    let up_sk_ptr = upload_bytes(gpu, &up_sk)?;
+    let gate_pk_tbl = mk_ptr_tbl(gate_pk_ptr.0)?;
+    let gate_sk_tbl = mk_ptr_tbl(gate_sk_ptr.0)?;
+    let up_pk_tbl = mk_ptr_tbl(up_pk_ptr.0)?;
+    let up_sk_tbl = mk_ptr_tbl(up_sk_ptr.0)?;
+    let fp8_fused_handle = gpu.kernel("moe_w4a16", "moe_w4a16_fused_gate_up_t_k64")?;
+    let c_gate_fp8f = gpu.alloc(m * n * 2)?;
+    let c_up_fp8f = gpu.alloc(m * n * 2)?;
+    let fp8_fused_launch = || -> Result<()> {
+        KernelLaunch::new(gpu, fp8_fused_handle)
+            .grid([div_ceil(2 * nu, 128), max_m_tiles, 1])
+            .block([128, 1, 1])
+            .arg_ptr(a_ptr)
+            .arg_ptr(gate_pk_tbl)
+            .arg_ptr(gate_sk_tbl)
+            .arg_ptr(gate_scale2_tbl)
+            .arg_ptr(up_pk_tbl)
+            .arg_ptr(up_sk_tbl)
+            .arg_ptr(up_scale2_tbl)
+            .arg_ptr(c_gate_fp8f)
+            .arg_ptr(c_up_fp8f)
+            .arg_ptr(eoff_dev)
+            .arg_u64(0)
+            .arg_u32(1)
+            .arg_u32(nu)
+            .arg_u32(ku)
+            .launch(stream)?;
+        Ok(())
+    };
+    fp8_fused_launch()?;
+    gpu.synchronize(stream)?;
+    let fused_fp8_us = time_gemm(gpu, stream, iters, fp8_fused_launch)?;
+
     // ── FP8 GEMM (fp8_gemm_t kernel, module "w4a16") ──
     let fp8_handle = gpu.kernel("w4a16", "fp8_gemm_t")?;
     let fp8_launch = || -> Result<()> {
@@ -434,9 +603,18 @@ fn run_shape(
     let grp_cos_vs_collective = cosine_u16(&c_grp_gate, &c_fp4);
     let (grp_cos_vs_oracle, _grp_max_rel) = compare(&c_grp_gate, &c_ref);
 
+    // fused FP4 gate output uses the SAME gate weight (b_bf16) -> validate vs
+    // the collective (c_fp4) and the bf16 oracle (c_ref).
+    let fused_cos_vs_collective = cosine_u16(&c_fused_gate, &c_fp4);
+    let (fused_cos_vs_oracle, _ff_max_rel) = compare(&c_fused_gate, &c_ref);
+
     for p in [
         a_ptr, b_bf16_ptr, b_fp8_ptr, packed_ptr, scale_ptr, out_fp4, out_fp8, out_bf16,
         up_bf16_ptr, up_packed_ptr, up_scale_ptr, c_gate_grp, c_up_grp,
+        gate_packed_tbl, gate_scale_tbl, up_packed_tbl, up_scale_tbl,
+        gate_scale2_tbl, up_scale2_tbl, eoff_dev, c_gate_fused, c_up_fused,
+        gate_pk_ptr, gate_sk_ptr, up_pk_ptr, up_sk_ptr,
+        gate_pk_tbl, gate_sk_tbl, up_pk_tbl, up_sk_tbl, c_gate_fp8f, c_up_fp8f,
     ] {
         gpu.free(p).ok();
     }
@@ -453,6 +631,10 @@ fn run_shape(
         grp_us,
         grp_cos_vs_collective,
         grp_cos_vs_oracle,
+        fused_us,
+        fused_cos_vs_collective,
+        fused_cos_vs_oracle,
+        fused_fp8_us,
     })
 }
 
@@ -540,6 +722,56 @@ fn main() -> Result<()> {
     } else {
         eprintln!(
             "GROUPED RESULT: FAIL (collective min {min_grp_coll:.6} gate {GRP_COLLECTIVE_GATE}; oracle min {min_grp_orc:.6} gate {COSINE_GATE})"
+        );
+        all_pass = false;
+    }
+
+    // ── Phase-2 FUSED FP4 kernel gate + speed signal ──
+    println!();
+    println!("=== Phase-2 FUSED FP4 gate_up kernel (cp.async pipelined, single launch) ===");
+    println!(
+        "{:>6} {:>10} {:>22} {:>16} {:>12} {:>12}",
+        "M", "fused_us", "cos_vs_collective", "cos_vs_oracle", "fp8fused_us", "fp4/fp8"
+    );
+    println!("{}", "-".repeat(86));
+    let mut fused_pass = true;
+    let mut min_fu_coll = 1.0f64;
+    let mut min_fu_orc = 1.0f64;
+    for r in &rows {
+        let sp = if r.fused_us > 0.0 {
+            r.fused_fp8_us / r.fused_us
+        } else {
+            0.0
+        };
+        println!(
+            "{:>6} {:>10.2} {:>22.6} {:>16.6} {:>12.2} {:>12.3}",
+            r.m, r.fused_us, r.fused_cos_vs_collective, r.fused_cos_vs_oracle, r.fused_fp8_us, sp
+        );
+        min_fu_coll = min_fu_coll.min(r.fused_cos_vs_collective);
+        min_fu_orc = min_fu_orc.min(r.fused_cos_vs_oracle);
+        if r.fused_cos_vs_collective < GRP_COLLECTIVE_GATE || r.fused_cos_vs_oracle < COSINE_GATE {
+            fused_pass = false;
+        }
+    }
+    println!("{}", "-".repeat(86));
+    if let Some(r) = rows.iter().find(|r| r.m == 64) {
+        let sp = if r.fused_us > 0.0 {
+            r.fused_fp8_us / r.fused_us
+        } else {
+            0.0
+        };
+        println!(
+            "FUSED HEADLINE @M=64: cos_vs_collective={:.6} cos_vs_oracle={:.6} fused_us={:.2} fp8fused_us={:.2} fp4/fp8={:.3}x",
+            r.fused_cos_vs_collective, r.fused_cos_vs_oracle, r.fused_us, r.fused_fp8_us, sp
+        );
+    }
+    if fused_pass {
+        println!(
+            "FUSED RESULT: PASS (cos_vs_collective>={GRP_COLLECTIVE_GATE} min {min_fu_coll:.6}; cos_vs_oracle>={COSINE_GATE} min {min_fu_orc:.6})"
+        );
+    } else {
+        eprintln!(
+            "FUSED RESULT: FAIL (collective min {min_fu_coll:.6} gate {GRP_COLLECTIVE_GATE}; oracle min {min_fu_orc:.6} gate {COSINE_GATE})"
         );
         all_pass = false;
     }
