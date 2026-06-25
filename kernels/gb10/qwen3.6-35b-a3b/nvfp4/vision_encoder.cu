@@ -62,21 +62,8 @@ void vision_gemm_bias_nn(
     C[row * N + col] = f32_to_bf16(acc);
 }
 
-// ── Row-broadcast bias add: C[m,n] += bias[n] (in-place) ──
-// Used to fuse the bias for the tensor-core GEMM path (dense_gemm_bf16_pipelined,
-// ~40× the naive vision_gemm_bias) which has no built-in bias epilogue. The ViT
-// GEMMs (QKV/proj/fc1/fc2 × 27 blocks + merger + patch_embed) dominate image
-// prefill (~5s/image on the scalar kernel); pipelined-GEMM + this add is the fix.
-extern "C" __global__ void vision_add_bias(
-    __nv_bfloat16* __restrict__ C,         // [M, N] in-place
-    const __nv_bfloat16* __restrict__ bias,// [N]
-    unsigned int M, unsigned int N
-) {
-    unsigned long long idx = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= (unsigned long long)M * N) return;
-    unsigned int col = (unsigned int)(idx % N);
-    C[idx] = f32_to_bf16(bf16_to_f32(C[idx]) + bf16_to_f32(bias[col]));
-}
+// `vision_add_bias` moved to kernels/gb10/common/vision_add_bias.cu (module
+// `vision_add_bias`) so every VL target shares it — see VisionEncoder init.
 
 // ── LayerNorm: x = (x - mean) / sqrt(var + eps) * w + b ──
 // One block per row.  Block: (min(D, 1024), 1, 1)

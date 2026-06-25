@@ -9,6 +9,15 @@ use spark_runtime::kernel_args::{KernelLaunch, div_ceil};
 
 use super::super::{ViTBlock, VisionEncoder};
 
+/// Force the scalar `vision_gemm_bias` path (bypassing the tensor-core
+/// `dense_gemm_bf16_pipelined` + `vision_add_bias`) via `ATLAS_VISION_SCALAR=1`.
+/// A/B knob for measuring the ViT GEMM speedup; default off (tensor-core).
+fn vision_scalar_forced() -> bool {
+    use std::sync::OnceLock;
+    static EN: OnceLock<bool> = OnceLock::new();
+    *EN.get_or_init(|| std::env::var("ATLAS_VISION_SCALAR").as_deref() == Ok("1"))
+}
+
 impl VisionEncoder {
     /// ViT GEMM with bias: C[m,n] = A[m,k] @ B[n,k]^T + bias[n] (BF16).
     /// Prefers the tensor-core `dense_gemm_bf16_pipelined` (~40× the scalar
@@ -28,7 +37,7 @@ impl VisionEncoder {
         k: u32,
         stream: u64,
     ) -> Result<()> {
-        if self.k_gemm_pipelined.0 != 0 && self.k_add_bias.0 != 0 {
+        if !vision_scalar_forced() && self.k_gemm_pipelined.0 != 0 && self.k_add_bias.0 != 0 {
             KernelLaunch::new(gpu, self.k_gemm_pipelined)
                 .grid([div_ceil(n, 128), div_ceil(m, 128), 1])
                 .block([256, 1, 1])

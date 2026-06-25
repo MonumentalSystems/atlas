@@ -84,7 +84,10 @@ impl VisionEncoder {
             // the ViT's large-M GEMMs) + a row-broadcast bias add. Both gated to
             // 0 → fall back to vision_gemm_bias. The ViT GEMMs dominate image prefill.
             k_gemm_pipelined: crate::layers::try_kernel(gpu, "gemm", "dense_gemm_bf16_pipelined"),
-            k_add_bias: crate::layers::try_kernel(gpu, "vision_encoder", "vision_add_bias"),
+            // `vision_add_bias` now lives in common/ (module `vision_add_bias`) so
+            // every VL target gets the tensor-core ViT path, not just the one that
+            // defined it inline. KernelHandle(0) on miss → scalar fallback (safe).
+            k_add_bias: crate::layers::try_kernel(gpu, "vision_add_bias", "vision_add_bias"),
             k_norm: gpu.kernel("vision_encoder", "vision_layer_norm")?,
             k_add: gpu.kernel("vision_encoder", "vision_add_inplace")?,
             k_gelu: gpu.kernel("vision_encoder", "vision_gelu")?,
