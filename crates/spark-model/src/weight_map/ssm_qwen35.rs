@@ -43,15 +43,28 @@ pub(crate) fn load_ssm_qwen35(
 ) -> Result<SsmWeightsQwen35> {
     let p = format!("{layer_prefix}.linear_attn");
 
-    // For FP8 models: in_proj_qkv, in_proj_z, out_proj are FP8 block-scaled.
-    // conv1d, in_proj_a, in_proj_b are BF16 (in modules_to_not_convert).
-    let load_proj = |name: &str| -> Result<DenseWeight> { dense_auto(store, name, gpu) };
+    // Per-projection load by on-disk dtype. FP8 (Holo, block-scaled) and BF16
+    // (AEON, in modules_to_not_convert) ship plain `.weight` → `dense_auto`.
+    // The sakamakismile AgentWorld re-quant instead quantizes the GDN/SSM
+    // projections to NVFP4 (`weight_packed`); dequant those to BF16, with dims
+    // inferred from the packed shape (rows = packed[0], cols = packed[1] * 2,
+    // since E2M1 packs 2 values/byte). Mirrors the dense loader's `load_ssm_proj`
+    // (qwen35_dense.rs) — without this the NVFP4 SSM projections fail with
+    // "linear_attn.in_proj_qkv.weight not found in store".
+    let load_proj = |prefix: &str| -> Result<DenseWeight> {
+        if store.contains(&format!("{prefix}.weight_packed")) {
+            let shape = store.get(&format!("{prefix}.weight_packed"))?.shape.clone();
+            dequant_nvfp4_to_bf16(store, prefix, shape[0], shape[1] * 2, gpu)
+        } else {
+            dense_auto(store, &format!("{prefix}.weight"), gpu)
+        }
+    };
 
     Ok(SsmWeightsQwen35 {
-        in_proj_qkv: load_proj(&format!("{p}.in_proj_qkv.weight"))?,
-        in_proj_z: load_proj(&format!("{p}.in_proj_z.weight"))?,
-        in_proj_a: dense_auto(store, &format!("{p}.in_proj_a.weight"), gpu)?,
-        in_proj_b: dense_auto(store, &format!("{p}.in_proj_b.weight"), gpu)?,
+        in_proj_qkv: load_proj(&format!("{p}.in_proj_qkv"))?,
+        in_proj_z: load_proj(&format!("{p}.in_proj_z"))?,
+        in_proj_a: load_proj(&format!("{p}.in_proj_a"))?,
+        in_proj_b: load_proj(&format!("{p}.in_proj_b"))?,
         conv1d: dense_auto(store, &format!("{p}.conv1d.weight"), gpu)?,
         // A_log and dt_bias MUST be FP32 — BF16 precision causes exponential
         // error amplification in the GDR decay gate at 8k+ tokens.
@@ -59,7 +72,7 @@ pub(crate) fn load_ssm_qwen35(
         dt_bias: dense_keep_f32(store, &format!("{p}.dt_bias"), gpu)?,
         // norm.weight is safe as BF16 (no recurrent amplification)
         norm: dense_f32_safe(store, &format!("{p}.norm.weight"), gpu)?,
-        out_proj: load_proj(&format!("{p}.out_proj.weight"))?,
+        out_proj: load_proj(&format!("{p}.out_proj"))?,
     })
 }
 
