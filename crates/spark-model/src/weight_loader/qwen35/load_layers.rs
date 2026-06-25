@@ -174,6 +174,16 @@ pub(super) fn load_layers(
         // FP8 paths byte-unchanged. `variant` is already Fp8Dequanted for an FP8
         // checkpoint, so the NVFP4 attention branch requants from FP8 directly.
         let force_nvfp4_all = std::env::var("ATLAS_FORCE_NVFP4_ALL").ok().as_deref() == Some("1");
+        // FP4 dense PROJECTIONS only: route the SSM (in_proj_qkvz + out_proj) and
+        // full-attention (q/k/v/o) projection DECODE through w4a16_gemv (NVFP4,
+        // 0.5 byte/weight) instead of w8a16_gemv (FP8, 1 byte/weight), while the
+        // MoE experts stay on their native-FP8 fast path. Deliberately NOT folded
+        // into force_nvfp4_moe → skip_nvfp4_experts stays true. For the Holo
+        // modelopt MIXED_PRECISION checkpoint this drops the modelopt SSM arm
+        // (L685) and native-FP8 attn arm so both fall through to the NVFP4
+        // builders. (decode ~1.8x cheaper on these GEMVs — DRAM-bound, GB10 13.2.)
+        let fp4_proj_decode =
+            std::env::var("ATLAS_HOLO_FP4_PROJ_DECODE").ok().as_deref() == Some("1");
         let force_nvfp4_moe =
             force_nvfp4_all || std::env::var("ATLAS_FORCE_NVFP4_MOE").ok().as_deref() == Some("1");
         let skip_nvfp4_experts = native_fp8 && !force_nvfp4_moe;
@@ -462,8 +472,10 @@ pub(super) fn load_layers(
 
         match lt {
             LayerType::FullAttention
-                if (native_fp8 && dequant_attn_to_bf16 && !force_nvfp4_all)
-                    || (modelopt_mixed_precision && !native_modelopt_attn) =>
+                if (native_fp8 && dequant_attn_to_bf16 && !(force_nvfp4_all || fp4_proj_decode))
+                    || (modelopt_mixed_precision
+                        && !native_modelopt_attn
+                        && !fp4_proj_decode) =>
             {
                 // ── BF16-dequant attention (diagnostic, TP=1) ──
                 // Dequant FP8 Q/K/V/O → BF16 on GPU, store as dense weights,
@@ -529,7 +541,8 @@ pub(super) fn load_layers(
                 attn_idx += 1;
             }
             LayerType::FullAttention
-                if (native_fp8 || native_modelopt_attn) && !force_nvfp4_all =>
+                if (native_fp8 || native_modelopt_attn)
+                    && !(force_nvfp4_all || fp4_proj_decode) =>
             {
                 // ── Native FP8 path: FP8 for both decode AND prefill ──
                 // NO NVFP4 dequant — saves ~30 GB peak memory on 122B EP=2.
@@ -682,7 +695,10 @@ pub(super) fn load_layers(
                         post_attn_norm,
                         ffn,
                     )?,
-                    _ if modelopt_mixed_precision => {
+                    // fp4_proj_decode drops Holo's modelopt SSM out of the BF16-
+                    // dense + FP8-overlay build so it falls through to the NVFP4
+                    // builder below → in_proj_qkvz/out_proj decode on w4a16_gemv.
+                    _ if modelopt_mixed_precision && !fp4_proj_decode => {
                         linear_attn_arms::build_linear_attention_dense_bf16(
                             i,
                             store,
@@ -698,7 +714,7 @@ pub(super) fn load_layers(
                     }
                     // force_nvfp4_all routes the FP8 SSM through the NVFP4 builder
                     // (Fp8Dequanted requant) instead of the native-FP8 build.
-                    Nvfp4Variant::Fp8Dequanted if !force_nvfp4_all => {
+                    Nvfp4Variant::Fp8Dequanted if !(force_nvfp4_all || fp4_proj_decode) => {
                         linear_attn_arms::build_linear_attention_fp8(
                             i,
                             store,

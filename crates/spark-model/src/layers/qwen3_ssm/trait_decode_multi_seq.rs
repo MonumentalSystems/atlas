@@ -297,8 +297,14 @@ impl Qwen3SsmLayer {
         let use_f32_gdn = self.gdn_f32_k.0 != 0 && self.gated_rms_norm_f32_k.0 != 0;
         // QKVZ via dense BF16 GEMM or block-scaled FP8 GEMM (w8a16). NVFP4 and
         // interleaved-QKVZ layouts take the proven per-seq loop.
-        let qkvz_ok = self.qkvz_nvfp4.is_none() && self.w8a16_gemm_k.0 != 0;
-        let out_ok = self.out_proj_fp8w.is_some() || self.out_proj_dense.is_some();
+        // FP8 build → batched w8a16 GEMM; NVFP4 build → batched w4a16 GEMV
+        // (batch4/16, M<=16). Either amortizes the QKVZ/out_proj weight read
+        // across the n seqs; otherwise the per-seq loop re-streams it n times.
+        let qkvz_ok = (self.qkvz_nvfp4.is_none() && self.w8a16_gemm_k.0 != 0)
+            || (self.qkvz_nvfp4.is_some() && self.w4a16_gemv_batch4_k.0 != 0 && n <= 16);
+        let out_ok = self.out_proj_fp8w.is_some()
+            || self.out_proj_dense.is_some()
+            || self.qkvz_nvfp4.is_some();
         if n < 2 || !self.sequential_qkvz || !use_f32_conv || !use_f32_gdn || !qkvz_ok || !out_ok {
             return Ok(false);
         }
@@ -388,6 +394,13 @@ impl Qwen3SsmLayer {
         let use_batch4 = gemv_batch_k.0 != 0
             && n <= 16
             && std::env::var("ATLAS_SSM_GEMV_BATCH4").ok().as_deref() != Some("0");
+        // FP4 sibling: w4a16_gemv batch4 (M<=4) / batch16 (M<=16). Single NVFP4
+        // weight pass for the QKVZ + out_proj GEMVs (amortizes the weight read).
+        let fp4_gemv_batch_k = if n <= 4 {
+            self.w4a16_gemv_batch4_k
+        } else {
+            self.w4a16_gemv_batch16_k
+        };
         if let Some(ref fp8) = self.qkvz_fp8w {
             if use_batch4 {
                 ops::w8a16_gemv_batch4(
@@ -429,6 +442,20 @@ impl Qwen3SsmLayer {
                     stream,
                 )?;
             }
+        } else if let Some(ref nvfp4) = self.qkvz_nvfp4 {
+            // FP4 batched QKVZ: ONE NVFP4 weight pass for all n seqs
+            // (sequential layout writes the deinterleaved buffer directly).
+            ops::w4a16_gemv_batchm(
+                ctx.gpu,
+                fp4_gemv_batch_k,
+                normed_base,
+                nvfp4,
+                deinterleaved,
+                n as u32,
+                qkvz_size as u32,
+                h as u32,
+                stream,
+            )?;
         } else {
             ops::dense_gemm(
                 ctx.gpu,
@@ -846,6 +873,21 @@ impl Qwen3SsmLayer {
                 self.dense_gemm_k,
                 normed_out_base,
                 out_proj_dense,
+                ssm_out_base,
+                n as u32,
+                h as u32,
+                value_dim as u32,
+                stream,
+            )?;
+        } else if self.qkvz_nvfp4.is_some() {
+            // FP4 batched out_proj: ONE NVFP4 weight pass for all n seqs.
+            // (qkvz_nvfp4.is_some() ⇒ the NVFP4 SSM build, where ssm.out_proj
+            // is the NVFP4 weight the per-seq path also uses via w4a16_gemv.)
+            ops::w4a16_gemv_batchm(
+                ctx.gpu,
+                fp4_gemv_batch_k,
+                normed_out_base,
+                &self.ssm.out_proj,
                 ssm_out_base,
                 n as u32,
                 h as u32,

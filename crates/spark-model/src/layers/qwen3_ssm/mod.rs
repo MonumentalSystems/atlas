@@ -116,6 +116,11 @@ pub struct Qwen3SsmLayer {
     // Kernels — fused chunk3 path (3-token verification)
     gdn_chunk3_k: KernelHandle,
     w4a16_gemv_batch3_k: KernelHandle,
+    // NVFP4 batched decode GEMV (multi-seq concurrency): batch4 (M<=4) /
+    // batch16 (M<=16) — siblings of w8a16_gemv_batch4/16 for the FP4 QKVZ +
+    // out_proj, so FP4 decode amortizes the weight read at C=4..16 like FP8.
+    w4a16_gemv_batch4_k: KernelHandle,
+    w4a16_gemv_batch16_k: KernelHandle,
     // Kernels — WY-chunkwise path (2-pass verification)
     gdn_wy2_k: KernelHandle,
     gdn_wy3_k: KernelHandle,
