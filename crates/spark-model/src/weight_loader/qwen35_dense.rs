@@ -483,4 +483,19 @@ impl ModelWeightLoader for Qwen35DenseWeightLoader {
         }
         Ok(Some(mtp))
     }
+
+    fn load_vision_encoder(
+        &self,
+        store: &WeightStore,
+        config: &ModelConfig,
+        gpu: &dyn GpuBackend,
+    ) -> Result<Option<crate::layers::VisionEncoder>> {
+        // Dense Qwen3.5 / Holo VL checkpoints (e.g. Holo-3.1-0.8B, Ornith-1.0-9B)
+        // ship the SAME Qwen3-VL ViT tower as their MoE siblings. The MoE
+        // loader's `load_vision_encoder` reads only `store` + `config.vision`
+        // (no MoE-specific state), so reuse it verbatim. The shared model
+        // forward (`model/trait_impl/*`, gated on `vision_encoder.is_some()`)
+        // then merges image embeddings — no dense-specific forward changes.
+        super::qwen35::Qwen35WeightLoader.load_vision_encoder(store, config, gpu)
+    }
 }
