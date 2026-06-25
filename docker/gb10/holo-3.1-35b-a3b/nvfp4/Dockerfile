@@ -13,20 +13,23 @@
 # runtime stage.
 #
 # Build from repo root:
-#   docker build -f docker/gb10/holo-3.1-35b-a3b/nvfp4/Dockerfile -t atlas-holo:cuda13.2 .
+#   docker build -f docker/gb10/holo-3.1-35b-a3b/nvfp4/Dockerfile -t atlas-holo:cuda13.2-perf .
 #
 # Run (mount the WHOLE /tank, not just the model dir: the weights are symlinks
 # into /tank/hf/hub/... so mounting only the model subdir leaves them dangling →
-# "No safetensor files found"):
+# "No safetensor files found"). Validated config 2026-06-25 — 32K chunk, ~300K-KV
+# static with overcommit (util 0.54), co-dispatch ON, prefix-caching OFF (REQUIRED
+# while co-dispatch is baked; see the ENV note below):
 #   docker run -d --name atlas-holo --gpus all --ipc=host -p 8890:8890 \
 #     -v /tank:/tank:ro \
-#     -e ATLAS_HOLO_FAST_MOE_MODE=off -e ATLAS_KV_OVERCOMMIT=1 \
-#     atlas-holo:cuda13.2 \
+#     -e ATLAS_HOLO_FAST_MOE_MODE=full -e ATLAS_HOLO_FAST_MOE_LAYERS=0-39 \
+#     -e ATLAS_KV_OVERCOMMIT=1 \
+#     atlas-holo:cuda13.2-perf \
 #     serve --model-from-path /tank/holo-bf16kv-test --model-name holo3.1-atlas-poc \
 #           --port 8890 --bind 0.0.0.0 --kv-cache-dtype bf16 \
-#           --gpu-memory-utilization 0.40 --max-seq-len 200000 --max-num-seqs 16 \
-#           --max-batch-size 12 --scheduling-policy slai --tool-call-parser qwen3_coder \
-#           --enable-prefix-caching true --ssm-cache-slots 32 --ssm-checkpoint-interval 256 \
+#           --gpu-memory-utilization 0.54 --max-seq-len 200000 --max-num-seqs 8 \
+#           --max-batch-size 8 --max-prefill-tokens 32768 --scheduling-policy slai \
+#           --tool-call-parser qwen3_coder --enable-prefix-caching false \
 #           --default-chat-template-kwargs '{"enable_thinking":true}' --vision-max-pixels 262144
 
 # ── Build stage ──────────────────────────────────────────────────
@@ -124,8 +127,12 @@ ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64
 # it beats cuBLAS by ~13% on large-M prefill (1978-tok big-single 1336->1516 tok/s,
 # clean dgx-00 2026-06-24) — the version bump flipped the bare-metal verdict (old
 # CUTLASS FP4 lost to cuBLAS). cuBLAS stays ON as the fallback for shapes FP4 skips.
-# Safe with --max-prefill-tokens <= 4096 (the CUTLASS SSM-out NVFP4 GEMM fails at
-# larger chunks); raise max-prefill only with ATLAS_CUTLASS_NVFP4_GEMM=0.
+# Large chunks are now SAFE: the old "status -2 above ~4-8K M" was a 64MB-workspace
+# overflow guard in the NVFP4 GEMM wrapper, not a kernel limit — fixed by M-tiling
+# into <=4096-row sub-GEMMs (cutlass_nvfp4_gemm.cu, commit 3a6bda8). The server
+# also clamps --max-prefill-tokens to a block-aligned <65535 at startup (the prefill
+# kernels map one grid-Y block per token; CUDA caps grid.y at 65535), so any chunk
+# size — incl. the 32768 default — is safe with FP4 SSM-out ON.
 ENV ATLAS_CUTLASS_NVFP4_GEMM=1 \
     ATLAS_CUBLAS_GEMM=1 \
     ATLAS_CUTLASS_NVFP4_SSM_OUT=1 \
@@ -140,11 +147,17 @@ ENV ATLAS_CUTLASS_NVFP4_GEMM=1 \
     ATLAS_ATTN_PREFILL_Q_T=1 \
     ATLAS_ATTN_PREFILL_T_PIPE=1 \
     ATLAS_DECODE_GRAPHS_MULTISEQ=1 \
-    ATLAS_HOLO_FP8_SSM_DECODE=1
-# NOTE: the varlen co-dispatch flags (ATLAS_PREFILL_CODISPATCH / _FLASHINFER_PREFILL
-# / _Q12_BATCHED_FIRST_CHUNK) are deliberately NOT baked: varlen co-dispatch
-# SEGFAULTS when prefix-caching is on (partial-prefill geometry bug, 2026-06-24).
-# Enable them only with --enable-prefix-caching false until that is fixed.
+    ATLAS_HOLO_FP8_SSM_DECODE=1 \
+    ATLAS_PREFILL_CODISPATCH=1 \
+    ATLAS_FLASHINFER_PREFILL=1 \
+    ATLAS_Q12_BATCHED_FIRST_CHUNK=1
+# Varlen co-dispatch (ATLAS_PREFILL_CODISPATCH / _FLASHINFER_PREFILL /
+# _Q12_BATCHED_FIRST_CHUNK) is now BAKED ON: 2x agg throughput + 0 timeouts vs OFF
+# under real concurrent mixed load (soak 2026-06-24), validated at parity inside
+# this container 2026-06-25.
+# ⚠️  It SEGFAULTS when prefix-caching is on (partial-prefill geometry bug). The
+# default --enable-prefix-caching is FALSE, which is safe; do NOT pass
+# --enable-prefix-caching true with this image until that bug is fixed.
 # FAST_MOE_MODE is left to the run command (memory<->speed tradeoff for co-tenancy).
 
 EXPOSE 8890

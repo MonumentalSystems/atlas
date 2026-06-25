@@ -4,23 +4,33 @@
 set -u
 LOG="${1:-/tmp/holo-atlas.log}"
 BIN=/home/ms/atlas/target/release/spark
-GPU_UTIL="${ATLAS_HOLO_GPU_UTIL:-0.70}"
-MAX_SEQ_LEN="${ATLAS_HOLO_MAX_SEQ_LEN:-32768}"
+# GPU mem util. Default 0.54 — sized so the KV pool lands at ~300-315K tokens
+# (measured native config: util 0.70 → 1.34M tokens; 0.54 → ~315K). This caps
+# static KV to ~300K and hands the freed ~20GB back to the shared GB10 (ComfyUI
+# /voxel co-tenants). Long-context bursts beyond the static pool are admitted on
+# demand via ATLAS_KV_OVERCOMMIT=1 (below) — flagged at boot by the "KV
+# OVERCOMMIT: pool fits N seq(s) at full --max-seq-len" WARN. Raise util to grow
+# the static pool if a workload genuinely sustains many concurrent long seqs.
+GPU_UTIL="${ATLAS_HOLO_GPU_UTIL:-0.54}"
+# Long context (200K) with a small static KV pool + overcommit (see GPU_UTIL).
+# 8 seqs × 200K = 1.6M worst-case >> 300K static, so bursts page in on demand.
+MAX_SEQ_LEN="${ATLAS_HOLO_MAX_SEQ_LEN:-200000}"
 MAX_SEQS="${ATLAS_HOLO_MAX_SEQS:-8}"
 MAX_BATCH="${ATLAS_HOLO_MAX_BATCH:-8}"
-# Prefill chunk (tokens/scheduler step). Default 2048 — the soak-validated +
-# profile-derived sweet spot on the 64K target. Why 2048 specifically: the MoE
-# routes top_k=8 over 256 experts, so a C-token chunk gives C/32 tokens/expert;
-# the fused gate_up kernel tiles M in 64-blocks, so C=2048 → exactly 64 tok/expert
-# = one FULL tile (100% MoE GEMM efficiency, 96% SM). C=1024 → 32/expert → HALF-
-# empty tiles → ~50% MoE eff (~85% SM) AND 2× the kernel launches (1 CPU dispatch
-# core is the bottleneck during prefill — no CUDA graphs there). Soak 2048 vs 1024:
-# 24 vs 17 completions, big_ctx 53s vs 72s, needles 6/6 vs 4/4, tools 9/9 vs 3/4.
-# 1024 only wins raw agg tok/s on a 128K-streaming worker (more decode interleaving)
-# — not representative of agent traffic. HARD CEILING: the SSM out_proj CUTLASS
-# NVFP4 GEMM (M=chunk) FAILS (status -2) above ~4-8K M, so chunk=16384 crashes any
-# >~4K prompt with HTTP 500. Capped at 4096 below until that kernel tiles M.
-MAX_PREFILL="${ATLAS_HOLO_MAX_PREFILL:-2048}"
+# Prefill chunk (tokens/scheduler step). Default 32768 — the chunk-size sweep
+# (2026-06-25, clean GB10) shows long-prompt prefill rises monotonically with
+# chunk size: at a ~38K-token prompt, 4K=2369, 16K=2466, 32K=2735 tok/s (+15% vs
+# 4K). 64K is +6% more again BUT --max-prefill-tokens>=65536 hard-crashes any
+# prompt that fills the chunk (the prefill kernels launch one grid-Y block per
+# token; CUDA caps grid.y at 65535 → cuLaunchKernel CUDA_ERROR_INVALID_VALUE).
+# The server now clamps to a block-aligned <65535 at startup, so 32768 is the
+# safe high-throughput default. Cost: the prefill arena grows ~linearly with the
+# chunk (~53GB pre-KV at 32K vs ~47GB at 4K) — a memory, not a correctness, cost,
+# offset here by the lower --gpu-memory-utilization (KV capped to ~300K tokens).
+# For small-prompt-only traffic (image+short), chunk size never engages and any
+# value behaves identically; it only matters for prompts longer than the chunk.
+# Checkpoint alignment (below) still applies when prefix caching is on.
+MAX_PREFILL="${ATLAS_HOLO_MAX_PREFILL:-32768}"
 # Bind address: 127.0.0.1 (loopback, default) or 0.0.0.0 to expose on the LAN
 # (so it can be driven without an ssh tunnel). LAN exposure on an untrusted
 # network should be paired with --require-auth/--auth-tokens-file.
@@ -107,7 +117,7 @@ export LD_LIBRARY_PATH="/usr/local/cuda/lib64:/home/ms/nccl/build/lib${LD_LIBRAR
 for pid in $(pgrep -f "release/spark serve --model" 2>/dev/null); do kill -9 "$pid" 2>/dev/null; done
 sleep 2
 setsid -f env RUST_BACKTRACE=1 RUST_LOG=info \
-  ATLAS_DECODE_GRAPHS_MULTISEQ=1 ATLAS_HOLO_FP8_SSM_DECODE=1 ATLAS_KV_OVERCOMMIT="${ATLAS_KV_OVERCOMMIT:-0}" \
+  ATLAS_DECODE_GRAPHS_MULTISEQ=1 ATLAS_HOLO_FP8_SSM_DECODE=1 ATLAS_KV_OVERCOMMIT="${ATLAS_KV_OVERCOMMIT:-1}" \
   ATLAS_KV_EXTERNAL_RESERVE_GB="${ATLAS_KV_EXTERNAL_RESERVE_GB:-0}" \
   ATLAS_TARGET_HW=gb10 ATLAS_TARGET_MODEL=holo-3.1-35b-a3b ATLAS_TARGET_QUANT=nvfp4 \
   ATLAS_FAST_LOAD_PREFETCH_SHARDS=1 ATLAS_HOLO_LOW_MEMORY_MOE="$LOW_MEMORY_MOE" \
