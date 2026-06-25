@@ -68,9 +68,16 @@ ENV CUDARC_CUDA_VERSION=13000
 # nccl from libnccl-dev (aarch64 = GB10/Grace) + cuda libs, for the -lnccl link.
 ENV RUSTFLAGS="-L/usr/lib/aarch64-linux-gnu -L/usr/local/cuda/lib64"
 
+# Kernel target — overridable so the same image builds sibling models (e.g. the
+# dense Qwen3.5/Ornith VL family). Default = the 35B-A3B MoE. Override with:
+#   --build-arg ATLAS_TARGET_MODEL=ornith-1.0-9b
+# (the build context already COPYs all of kernels/ + crates/, so any target dir
+# under kernels/gb10/<name>/ is buildable without further Dockerfile changes).
+ARG ATLAS_TARGET_MODEL=holo-3.1-35b-a3b
+ARG ATLAS_TARGET_QUANT=nvfp4
 ENV ATLAS_TARGET_HW=gb10
-ENV ATLAS_TARGET_MODEL=holo-3.1-35b-a3b
-ENV ATLAS_TARGET_QUANT=nvfp4
+ENV ATLAS_TARGET_MODEL=${ATLAS_TARGET_MODEL}
+ENV ATLAS_TARGET_QUANT=${ATLAS_TARGET_QUANT}
 
 WORKDIR /build
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
