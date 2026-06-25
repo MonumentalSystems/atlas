@@ -646,6 +646,185 @@ gated_delta_rule_chunk_delta_h_ksplit(
                        cu_seqlens, cu_chunks, is_varlen);
 }
 
+// ── KERNEL 2-KSPLIT-VBLOCK: chunk_delta_h_ksplit_vblock<SPLIT,VTILES> ─────
+// V-block (DV) split of the ksplit spine for the BATCH=1 single-stream wall:
+// ksplit fills only nv·batch = 32 CTAs at batch=1 (< GB10's ~48 SMs), so the
+// SMs are starved and more warps/CTA (SPLIT) no longer help (8 warps already
+// saturate latency hiding — see line 627). The only math-preserving way to add
+// CTAs at batch=1 is to PARTITION the v-columns across CTAs: blockIdx.y = vtile
+// owns v in [vtile·VW, (vtile+1)·VW), VW = V_DIM/VTILES. That lifts CTAs to
+// nv·VTILES·batch (128 at VTILES=4, batch=1). Each v-column's state evolves
+// INDEPENDENTLY (the W·S contraction reduces over k, never over v; S_{c+1}[k,v]
+// = edl·S_c[k,v] + Σ duc_i·k_i[k] has no cross-v term), so the per-CTA work
+// shrinks by VTILES while the output is byte-identical to ksplit — bit-parity.
+// COST/RISK: each vtile CTA still cdh_prefetches the FULL W/U/K chunk (W/K are
+// needed fully; only 1/VTILES of U is used) — VTILES× the chunk DRAM reads, but
+// the VTILES CTAs of a head are co-resident so L2 serves the re-reads (W+U+K ≈
+// 48KB/chunk). The bet: L2 reuse + the shrunk per-CTA v-loop beat the idle-SM
+// loss. The OLD naive V-tiling regressed (line 298) by re-running the serial
+// loop redundantly AND dropping the double-buffer; this keeps both. The microtest
+// (gdn_cdh_vblock_microtest) is the gate — bit-parity vs ksplit + per-(t,batch)
+// ms/iter A/B.
+//
+// VERDICT (2026-06-25, gdn_cdh_vblock_microtest on GB10, bit-parity 18/18 PASS):
+// the clean double-buffered V-split STILL REGRESSES — 0.71x/0.65x/0.34x at
+// batch=1 for VTILES=2/4/8, slower at batch=2/4 too, monotonically worse with
+// more tiles. So the prior comment (line 298) stands with hard numbers: adding
+// CTAs does NOT help here. chunk_delta_h is NOT occupancy-starved at batch=1 —
+// it is bound by the SERIAL CHUNK DEPENDENCY (S_{c+1} needs S_c) + per-CTA
+// latency hiding (already saturated at SPLIT=2 → 8 warps). More CTAs only add
+// redundant W/U/K re-reads and SHRINK warps/CTA, hurting latency hiding. NOT
+// wired into any dispatch — kept for the record + the microtest A/B. The real
+// single-stream GDN lever is the serial recurrence itself (parallel/associative
+// chunk scan or the wmma rewrite), not occupancy.
+template <int SPLIT, int VTILES>
+__device__ __forceinline__ void cdh_ksplit_vblock_core(
+    float* __restrict__ h_state, const __nv_bfloat16* __restrict__ W_in,
+    const __nv_bfloat16* __restrict__ U_in, const __nv_bfloat16* __restrict__ key,
+    const float* __restrict__ gate, const float* __restrict__ gc_in,
+    __nv_bfloat16* __restrict__ S_out, __nv_bfloat16* __restrict__ uc_out,
+    unsigned int seq_len, unsigned int num_chunks, unsigned int num_k_heads,
+    unsigned int num_v_heads, unsigned int k_dim, unsigned int v_dim,
+    unsigned int qk_stride, unsigned int gb_stride, unsigned int h_state_is_table,
+    const int* __restrict__ cu_seqlens, const int* __restrict__ cu_chunks,
+    unsigned int is_varlen
+) {
+    constexpr int KH = K_DIM / SPLIT;            // per-thread slice of the state column
+    constexpr int VW = V_DIM / VTILES;           // v-columns this CTA owns
+    const unsigned int vh = blockIdx.x;
+    const unsigned int vtile = blockIdx.y;       // 0..VTILES-1  (NEW axis)
+    const unsigned int b = blockIdx.z;           // batch (was blockIdx.y in ksplit)
+    if (vh >= num_v_heads) return;
+    GDN_GEOM(g);
+    const unsigned int t = threadIdx.x;          // 0..VW·SPLIT-1
+    const unsigned int v = vtile * VW + (t / SPLIT);   // absolute v-column
+    const unsigned int sub = t % SPLIT;          // which k-slice
+    const unsigned int k0 = sub * KH;
+    const unsigned int head_repeat = num_v_heads / num_k_heads;
+    const unsigned int kh = vh / head_repeat;
+
+    extern __shared__ char smem_raw[];
+    __nv_bfloat16* buf = (__nv_bfloat16*)smem_raw;          // buf[2][CDH_BUFSZ]
+    float* gcb = (float*)(buf + 2 * CDH_BUFSZ);             // gcb[2][CHUNK]
+    float* decb = gcb + 2 * CHUNK;                          // decb[2][CHUNK+1]
+
+    float* H = h_state_is_table
+        ? ((float* const*)h_state)[b] + (unsigned long long)vh * K_DIM * V_DIM
+        : h_state + ((unsigned long long)(b * num_v_heads + vh) * K_DIM * V_DIM);
+    float Sreg[KH];
+    #pragma unroll
+    for (int kk = 0; kk < KH; kk++) Sreg[kk] = H[(k0 + kk) * V_DIM + v];
+
+    cdh_prefetch(buf, gcb, decb, 0, W_in, U_in, key, gate, gc_in, 0, b, vh, seq_len,
+                 num_chunks, num_v_heads, k_dim, kh, qk_stride, gb_stride,
+                 cu_seqlens, cu_chunks, is_varlen);
+
+    for (unsigned int c = 0; c < g.nchunks; c++) {
+        const unsigned int cur = c & 1u;
+        const unsigned int cs = c * CHUNK;
+        const unsigned int ce = (g.seqlen - cs) < CHUNK ? (g.seqlen - cs) : CHUNK;
+        const unsigned long long base = ((unsigned long long)(g.choff + c) * num_v_heads + vh);
+
+        if (c + 1 < g.nchunks) {
+            cdh_prefetch(buf, gcb, decb, (c + 1) & 1u, W_in, U_in, key, gate, gc_in, c + 1, b, vh, seq_len,
+                         num_chunks, num_v_heads, k_dim, kh, qk_stride, gb_stride,
+                         cu_seqlens, cu_chunks, is_varlen);
+            cp_wait<1>();
+        } else {
+            cp_wait<0>();
+        }
+        __syncthreads();
+
+        __nv_bfloat16* Wp = buf + (unsigned long long)cur * CDH_BUFSZ;
+        __nv_bfloat16* Kp = Wp + CHUNK * K_DIM;
+        __nv_bfloat16* Up = Kp + CHUNK * K_DIM;
+        const float* dec = decb + cur * (CHUNK + 1);
+
+        #pragma unroll
+        for (int kk = 0; kk < KH; kk++)
+            S_out[base * K_DIM * V_DIM + (k0 + kk) * V_DIM + v] = __float2bfloat16(Sreg[kk]);
+
+        const float edl = dec[0];
+        float duc[CHUNK];
+        for (unsigned int i = 0; i < ce; i++) {
+            float wsp = 0.0f;
+            #pragma unroll
+            for (int kk = 0; kk < KH; kk++)
+                wsp += (float)Wp[i * K_DIM + k0 + kk] * Sreg[kk];
+            #pragma unroll
+            for (int s = 1; s < SPLIT; s <<= 1) wsp += __shfl_xor_sync(0xffffffffu, wsp, s);
+            float uci = (float)Up[i * V_DIM + v] - wsp;
+            if (sub == 0) uc_out[base * CHUNK * V_DIM + i * v_dim + v] = __float2bfloat16(uci);
+            duc[i] = dec[1 + i] * uci;
+        }
+        #pragma unroll
+        for (int kk = 0; kk < KH; kk++) {
+            float hv = edl * Sreg[kk];
+            for (unsigned int i = 0; i < ce; i++)
+                hv += duc[i] * (float)Kp[i * K_DIM + k0 + kk];
+            Sreg[kk] = hv;
+        }
+        __syncthreads();
+    }
+
+    #pragma unroll
+    for (int kk = 0; kk < KH; kk++) H[(k0 + kk) * V_DIM + v] = Sreg[kk];
+}
+
+// Block = (V_DIM/VTILES)·SPLIT threads: VTILES=2→128, 4→64, 8→32 (all warp-mult).
+// Grid: [num_v_heads, VTILES, batch]. Same smem as ksplit (full double-buffer).
+extern "C" __global__ void __launch_bounds__(128, 2)
+gated_delta_rule_chunk_delta_h_ksplit_vblock2(
+    float* __restrict__ h_state, const __nv_bfloat16* __restrict__ W_in,
+    const __nv_bfloat16* __restrict__ U_in, const __nv_bfloat16* __restrict__ key,
+    const float* __restrict__ gate, const float* __restrict__ gc_in,
+    __nv_bfloat16* __restrict__ S_out, __nv_bfloat16* __restrict__ uc_out,
+    unsigned int batch_size, unsigned int seq_len, unsigned int num_chunks,
+    unsigned int num_k_heads, unsigned int num_v_heads, unsigned int k_dim,
+    unsigned int v_dim, unsigned int qk_stride, unsigned int gb_stride,
+    unsigned int h_state_is_table,
+    const int* __restrict__ cu_seqlens, const int* __restrict__ cu_chunks,
+    unsigned int is_varlen
+) {
+    cdh_ksplit_vblock_core<2, 2>(h_state, W_in, U_in, key, gate, gc_in, S_out, uc_out, seq_len,
+        num_chunks, num_k_heads, num_v_heads, k_dim, v_dim, qk_stride, gb_stride,
+        h_state_is_table, cu_seqlens, cu_chunks, is_varlen);
+}
+extern "C" __global__ void __launch_bounds__(64, 4)
+gated_delta_rule_chunk_delta_h_ksplit_vblock4(
+    float* __restrict__ h_state, const __nv_bfloat16* __restrict__ W_in,
+    const __nv_bfloat16* __restrict__ U_in, const __nv_bfloat16* __restrict__ key,
+    const float* __restrict__ gate, const float* __restrict__ gc_in,
+    __nv_bfloat16* __restrict__ S_out, __nv_bfloat16* __restrict__ uc_out,
+    unsigned int batch_size, unsigned int seq_len, unsigned int num_chunks,
+    unsigned int num_k_heads, unsigned int num_v_heads, unsigned int k_dim,
+    unsigned int v_dim, unsigned int qk_stride, unsigned int gb_stride,
+    unsigned int h_state_is_table,
+    const int* __restrict__ cu_seqlens, const int* __restrict__ cu_chunks,
+    unsigned int is_varlen
+) {
+    cdh_ksplit_vblock_core<2, 4>(h_state, W_in, U_in, key, gate, gc_in, S_out, uc_out, seq_len,
+        num_chunks, num_k_heads, num_v_heads, k_dim, v_dim, qk_stride, gb_stride,
+        h_state_is_table, cu_seqlens, cu_chunks, is_varlen);
+}
+extern "C" __global__ void __launch_bounds__(32, 8)
+gated_delta_rule_chunk_delta_h_ksplit_vblock8(
+    float* __restrict__ h_state, const __nv_bfloat16* __restrict__ W_in,
+    const __nv_bfloat16* __restrict__ U_in, const __nv_bfloat16* __restrict__ key,
+    const float* __restrict__ gate, const float* __restrict__ gc_in,
+    __nv_bfloat16* __restrict__ S_out, __nv_bfloat16* __restrict__ uc_out,
+    unsigned int batch_size, unsigned int seq_len, unsigned int num_chunks,
+    unsigned int num_k_heads, unsigned int num_v_heads, unsigned int k_dim,
+    unsigned int v_dim, unsigned int qk_stride, unsigned int gb_stride,
+    unsigned int h_state_is_table,
+    const int* __restrict__ cu_seqlens, const int* __restrict__ cu_chunks,
+    unsigned int is_varlen
+) {
+    cdh_ksplit_vblock_core<2, 8>(h_state, W_in, U_in, key, gate, gc_in, S_out, uc_out, seq_len,
+        num_chunks, num_k_heads, num_v_heads, k_dim, v_dim, qk_stride, gb_stride,
+        h_state_is_table, cu_seqlens, cu_chunks, is_varlen);
+}
+
 // ── KERNEL 3: chunk_fwd_o ────────────────────────────────────────────────
 // The PARALLEL output pass. Grid: (NT, num_v_heads, batch). One CTA per (chunk,head).
 // O_i = (exp(gc_i)·<S_c[:,v],q_i> + Σ_{l<=i} exp(gc_i-gc_l)·<k_l,q_i>·uc_l[v])·rsqrt(d).
