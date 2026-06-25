@@ -224,7 +224,9 @@ size_t align_up(size_t x, size_t a) {
 
 #endif
 
-extern "C" int atlas_cutlass_nvfp4_gemm_bf16_act_weight_t(
+// Single-tile NVFP4 GEMM (M bounded so the packed-act + scale reservations fit the
+// shared workspace). The public entry point below tiles M into calls of this.
+static int nvfp4_gemm_single_tile(
     const void* act_bf16,
     const void* weight_packed_t,
     const void* weight_scale_t,
@@ -339,6 +341,46 @@ extern "C" int atlas_cutlass_nvfp4_gemm_bf16_act_weight_t(
   (void)stream;
   return -120;
 #endif
+}
+
+// Public NVFP4 GEMM: C[m,n] = quant(act[m,k]) @ weight_t[n,k]. The single-tile path
+// reserves packed-act + scale-factor workspace ∝ M, which overflows the shared 64MB
+// CUTLASS workspace at large M (status -2, e.g. M>~12K at K=4096 — was the cause of
+// the "max-prefill 4096 cap"). Tile M into ≤4096-row sub-GEMMs: each fits the
+// workspace and is a known-valid problem size; the weight (and its scales) are shared
+// across tiles, only the activation rows and output rows are sliced. Bit-identical to
+// a single call for m≤4096; for larger m the partials are independent rows (no cross-
+// tile reduction), so the result is exact.
+extern "C" int atlas_cutlass_nvfp4_gemm_bf16_act_weight_t(
+    const void* act_bf16,
+    const void* weight_packed_t,
+    const void* weight_scale_t,
+    float weight_scale_2,
+    void* out_bf16,
+    int m,
+    int n,
+    int k,
+    void* workspace,
+    size_t workspace_size,
+    cudaStream_t stream) {
+  const int M_TILE = 4096;
+  if (m <= M_TILE) {
+    return nvfp4_gemm_single_tile(act_bf16, weight_packed_t, weight_scale_t,
+        weight_scale_2, out_bf16, m, n, k, workspace, workspace_size, stream);
+  }
+  for (int m0 = 0; m0 < m; m0 += M_TILE) {
+    int sub_m = (m - m0 < M_TILE) ? (m - m0) : M_TILE;
+    const void* a_off = static_cast<const void*>(
+        static_cast<const __nv_bfloat16*>(act_bf16) + static_cast<size_t>(m0) * k);
+    void* c_off = static_cast<void*>(
+        static_cast<__nv_bfloat16*>(out_bf16) + static_cast<size_t>(m0) * n);
+    int rc = nvfp4_gemm_single_tile(a_off, weight_packed_t, weight_scale_t,
+        weight_scale_2, c_off, sub_m, n, k, workspace, workspace_size, stream);
+    if (rc != 0) {
+      return rc;
+    }
+  }
+  return 0;
 }
 
 // Transpose an Atlas-packed NVFP4 weight from `[K/2, N]` (N-contiguous, the

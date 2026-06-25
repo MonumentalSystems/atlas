@@ -81,18 +81,14 @@ SCHED_POLICY="${ATLAS_HOLO_SCHED_POLICY:-slai}"
 # (binary should_prefill, no slice budget). Set to 1/true to enable the
 # slice-budget always-mixed path (see HOLO_MIXED_STEP_SPEC.md, Step 2).
 ALWAYS_MIXED="${ATLAS_HOLO_ALWAYS_MIXED:-false}"
-# MAX_PREFILL safety + prefix-cache alignment:
-#  (1) CUTLASS cap — the SSM out_proj NVFP4 GEMM (M = chunk size) FAILS (status -2)
-#      above ~4-8K M, so a chunk > 4096 crashes any prompt that prefills in one big
-#      chunk (soak @16384: every >4K prompt returned HTTP 500). Hard-cap at 4096.
-#  (2) Checkpoint alignment — Marconi intermediate checkpoints save only when a
-#      chunk boundary lands on SSM_CKPT_INTERVAL*16 tokens, i.e. chunk must divide
-#      (SSM_CKPT_INTERVAL*16). The 1024 default divides 4096 (interval 256) ✓, so a
-#      checkpoint fires every 4 chunks; warm prefix hits skip in 4096-token steps.
-if [ "$MAX_PREFILL" -gt 4096 ]; then
-    echo "WARN: MAX_PREFILL=$MAX_PREFILL exceeds the SSM NVFP4 GEMM M-limit (~4-8K); capping to 4096 to avoid status-2 crash" >&2
-    MAX_PREFILL=4096
-fi
+# MAX_PREFILL note (the old hard-cap at 4096 is LIFTED):
+#  The CUTLASS NVFP4 GEMM "status -2 above ~4-8K M" was a workspace-overflow guard in
+#  the wrapper (packed-act reservation ∝ M overflowed the 64MB shared buffer), NOT a
+#  kernel limit. `cutlass_nvfp4_gemm.cu` now M-tiles into ≤4096-row sub-GEMMs, so any
+#  chunk size is safe with FP4 (validated: 16384 chunk, full FP4, needle 3/3, no crash).
+#  Larger chunks just grow the prefill arena (≈ MAX_PREFILL-proportional) — a memory,
+#  not a correctness, cost. Checkpoint alignment (below) still applies: the chunk must
+#  divide SSM_CKPT_INTERVAL*16 for Marconi intermediate prefix-cache checkpoints to fire.
 if [ "$PREFIX_CACHING" = "true" ] && [ "${SSM_CKPT_INTERVAL:-0}" -gt 0 ] \
    && [ $(( (SSM_CKPT_INTERVAL * 16) % MAX_PREFILL )) -ne 0 ]; then
     echo "WARN: MAX_PREFILL=$MAX_PREFILL does not divide checkpoint interval $((SSM_CKPT_INTERVAL*16))t; prefix-cache checkpoints may not fire" >&2
