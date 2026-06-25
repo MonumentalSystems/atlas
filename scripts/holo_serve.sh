@@ -97,6 +97,13 @@ if [ "$PREFIX_CACHING" = "true" ] && [ "${SSM_CKPT_INTERVAL:-0}" -gt 0 ] \
    && [ $(( (SSM_CKPT_INTERVAL * 16) % MAX_PREFILL )) -ne 0 ]; then
     echo "WARN: MAX_PREFILL=$MAX_PREFILL does not divide checkpoint interval $((SSM_CKPT_INTERVAL*16))t; prefix-cache checkpoints may not fire" >&2
 fi
+# fp8 KV needs calibrated k/v scales or it clips BF16 to E4M3 and destroys dynamic
+# range (hallucinations at long context). Default to online calibration + a few
+# bf16 high-precision layers when KV dtype is fp8. Override via the env vars.
+KV_EXTRA=""
+if [ "${ATLAS_HOLO_KV_DTYPE:-bf16}" = "fp8" ]; then
+  KV_EXTRA="--fp8-kv-calibration-tokens ${ATLAS_HOLO_FP8_KV_CALIB:-256} --kv-high-precision-layers ${ATLAS_HOLO_KV_HIGH_PREC_LAYERS:-3}"
+fi
 # cudart/cublasLt (+nccl) for the runtime dynamic links; keep any caller value.
 export LD_LIBRARY_PATH="/usr/local/cuda/lib64:/home/ms/nccl/build/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 # Self-clean: kill any prior server (setsid -f detaches, so a stale instance
@@ -120,7 +127,7 @@ setsid -f env RUST_BACKTRACE=1 RUST_LOG=info \
   "$BIN" serve \
     --model-from-path /tank/holo-bf16kv-test --model-name holo3.1-atlas-poc \
     --port 8890 --bind "$BIND" --max-seq-len "$MAX_SEQ_LEN" --max-num-seqs "$MAX_SEQS" --max-batch-size "$MAX_BATCH" \
-    --max-prefill-tokens "$MAX_PREFILL" --kv-cache-dtype bf16 \
+    --max-prefill-tokens "$MAX_PREFILL" --kv-cache-dtype "${ATLAS_HOLO_KV_DTYPE:-bf16}" $KV_EXTRA \
     --gpu-memory-utilization "$GPU_UTIL" --oom-guard-mb 256 --ssm-cache-slots "$SSM_CACHE_SLOTS" --ssm-checkpoint-interval "$SSM_CKPT_INTERVAL" \
     --enable-prefix-caching "$PREFIX_CACHING" --scheduling-policy "$SCHED_POLICY" --tool-call-parser qwen3_coder \
     --default-chat-template-kwargs '{"enable_thinking":true}' \

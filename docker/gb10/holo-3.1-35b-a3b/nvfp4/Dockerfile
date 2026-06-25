@@ -112,6 +112,41 @@ COPY LICENSE /LICENSE
 COPY README.md /README.md
 
 ENV RUST_LOG=info
+
+# ── Perf defaults (the holo_serve.sh-validated stack) ────────────────
+# WITHOUT these the container runs Holo prefill ~2x slower than bare-metal:
+# they are NOT code-defaults (holo_serve.sh sets them with `:-` fallbacks, so
+# the in-binary default is OFF). Measured 2026-06-24 on a clean GPU: baking
+# these took big-single (1978 tok) 575 -> 1120 tok/s (+95%) and varlen-x4 agg
+# 550 -> 1225. All overridable via `-e`. cuBLASLt needs the CUDA lib path.
+ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64
+# FP4 dense GEMM (CUTLASS NVFP4) is the PRIMARY projection path: on CUTLASS 4.4.2
+# it beats cuBLAS by ~13% on large-M prefill (1978-tok big-single 1336->1516 tok/s,
+# clean dgx-00 2026-06-24) — the version bump flipped the bare-metal verdict (old
+# CUTLASS FP4 lost to cuBLAS). cuBLAS stays ON as the fallback for shapes FP4 skips.
+# Safe with --max-prefill-tokens <= 4096 (the CUTLASS SSM-out NVFP4 GEMM fails at
+# larger chunks); raise max-prefill only with ATLAS_CUTLASS_NVFP4_GEMM=0.
+ENV ATLAS_CUTLASS_NVFP4_GEMM=1 \
+    ATLAS_CUBLAS_GEMM=1 \
+    ATLAS_CUTLASS_NVFP4_SSM_OUT=1 \
+    ATLAS_GDN_BATCHED_FLA=1 \
+    ATLAS_GDN_FUSED_NORM=1 \
+    ATLAS_MOE_PREFILL_FP8_DOWN=1 \
+    ATLAS_MOE_PREFILL_EXACT_TILES=1 \
+    ATLAS_HYBRID_MOE_LAYOUT=1 \
+    ATLAS_UNIFIED_MOE_LAYOUT=0 \
+    ATLAS_HOLO_LOW_MEMORY_MOE=1 \
+    ATLAS_HOLO_NATIVE_FP8_ATTN=1 \
+    ATLAS_ATTN_PREFILL_Q_T=1 \
+    ATLAS_ATTN_PREFILL_T_PIPE=1 \
+    ATLAS_DECODE_GRAPHS_MULTISEQ=1 \
+    ATLAS_HOLO_FP8_SSM_DECODE=1
+# NOTE: the varlen co-dispatch flags (ATLAS_PREFILL_CODISPATCH / _FLASHINFER_PREFILL
+# / _Q12_BATCHED_FIRST_CHUNK) are deliberately NOT baked: varlen co-dispatch
+# SEGFAULTS when prefix-caching is on (partial-prefill geometry bug, 2026-06-24).
+# Enable them only with --enable-prefix-caching false until that is fixed.
+# FAST_MOE_MODE is left to the run command (memory<->speed tradeoff for co-tenancy).
+
 EXPOSE 8890
 
 ENTRYPOINT ["spark"]
