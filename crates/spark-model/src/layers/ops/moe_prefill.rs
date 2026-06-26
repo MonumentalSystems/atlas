@@ -185,6 +185,66 @@ pub fn w4a16_gemv_dual(
         .launch(stream)
 }
 
+/// Single-warp-per-output variant of `w4a16_gemv_dual` (8 outputs/block → N/8
+/// grid). Bit-identical output (see w4a16_gemv_fused.cu); opt-in via ATLAS_DECODE_OPT.
+#[allow(clippy::too_many_arguments)]
+pub fn w4a16_gemv_dual_sw(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    input: DevicePtr,
+    weight1: &QuantizedWeight,
+    output1: DevicePtr,
+    weight2: &QuantizedWeight,
+    output2: DevicePtr,
+    n: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(n, 8), 1, 2])
+        .block([256, 1, 1])
+        .arg_ptr(input)
+        .arg_ptr(weight1.weight)
+        .arg_ptr(weight1.weight_scale)
+        .arg_f32(weight1.weight_scale_2)
+        .arg_ptr(output1)
+        .arg_ptr(weight2.weight)
+        .arg_ptr(weight2.weight_scale)
+        .arg_f32(weight2.weight_scale_2)
+        .arg_ptr(output2)
+        .arg_u32(n)
+        .arg_u32(k)
+        .launch(stream)
+}
+
+/// Single-warp-per-output variant of `w4a16_gemv_silu_input` (N/8 grid).
+/// Bit-identical; opt-in via ATLAS_DECODE_OPT.
+#[allow(clippy::too_many_arguments)]
+pub fn w4a16_gemv_silu_input_sw(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    gate_out: DevicePtr,
+    up_out: DevicePtr,
+    weight: &QuantizedWeight,
+    output: DevicePtr,
+    n: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(n, 8), 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(gate_out)
+        .arg_ptr(up_out)
+        .arg_ptr(weight.weight)
+        .arg_ptr(weight.weight_scale)
+        .arg_f32(weight.weight_scale_2)
+        .arg_ptr(output)
+        .arg_u32(n)
+        .arg_u32(k)
+        .launch(stream)
+}
+
 /// W4A16 GEMV with fused SiLU input: silu(gate)*up as activation, GEMV with down weights.
 ///
 /// Reads `gate_out[K]` and `up_out[K]` BF16, computes silu(gate)*up per element

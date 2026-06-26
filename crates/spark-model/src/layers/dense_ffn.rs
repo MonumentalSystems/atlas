@@ -49,6 +49,13 @@ pub struct DenseFfnLayer {
     w4a16_gemv: KernelHandle,
     w4a16_gemv_dual: KernelHandle,
     w4a16_gemv_silu_input: KernelHandle,
+    // LOSSLESS single-warp-per-output decode variants (8 outputs/block, no smem
+    // cross-warp reduce). Bit-identical to the 64-thread kernels (proven by the
+    // w4a16_gemv_sw microtest). Opt-in via ATLAS_DECODE_OPT (default off →
+    // dispatch unchanged). KernelHandle(0) on miss → fall back to base kernels.
+    w4a16_gemv_dual_sw: KernelHandle,
+    w4a16_gemv_silu_input_sw: KernelHandle,
+    decode_opt: bool,
     w4a16_gemv_dual_batch2: KernelHandle,
     w4a16_gemv_dual_batch3: KernelHandle,
     w4a16_gemv_batch2: KernelHandle,
@@ -62,6 +69,19 @@ pub struct DenseFfnLayer {
     // v2: 8-warp (256-thread) variant of t_m128 — parallel chunk MMAs, 3 CTAs/SM.
     // Preferred over t_m128 for dense-FFN prefill when present. KernelHandle(0) → use t_m128.
     w4a16_gemm_t_m128_v2_k: KernelHandle,
+    // LOSSLESS BF16 variant of t_m128: same 128x128 cp.async tiling, but FP4→BF16
+    // dequant + BF16 m16n8k16 MMA (FP32 accum) instead of the FP8-E4M3 crush the
+    // default NVIDIA t_m128 uses. The FP8 path perturbs generation (measured
+    // length-truncations / accuracy risk on Qwen3.6-27B); this kernel keeps prefill
+    // outputs bit-for-bit vs the base `w4a16_gemm`. OPT-IN only, gated by
+    // ATLAS_BF16_TC_PREFILL (default off → dispatch unchanged). KernelHandle(0) on miss.
+    w4a16_gemm_t_m128_bf16_k: KernelHandle,
+    // v2 of the LOSSLESS BF16 128x128 prefill kernel: same MMA instruction order
+    // (so BIT-IDENTICAL to bf16_k, proven by w4a16_bf16_v2_microtest) but a
+    // smaller A-tile smem pad lifts occupancy from 2→3 CTAs/SM (~+50% resident
+    // warps), giving a measured ~3-8% faster prefill GEMM on this latency-bound
+    // kernel. Preferred over bf16_k when present. KernelHandle(0) on miss → bf16_k.
+    w4a16_gemm_t_m128_bf16_v2_k: KernelHandle,
     /// SiLU(gate)*up or GELU(gate)*up depending on activation.
     act_mul: KernelHandle,
     /// BF16 dense MLP weights — when `Some`, all forward paths use the
@@ -111,6 +131,13 @@ impl DenseFfnLayer {
             w4a16_gemv: gpu.kernel("w4a16_gemv", "w4a16_gemv")?,
             w4a16_gemv_dual: gpu.kernel("w4a16_gemv_fused", "w4a16_gemv_dual")?,
             w4a16_gemv_silu_input: gpu.kernel("w4a16_gemv_fused", "w4a16_gemv_silu_input")?,
+            w4a16_gemv_dual_sw: super::try_kernel(gpu, "w4a16_gemv_fused", "w4a16_gemv_dual_sw"),
+            w4a16_gemv_silu_input_sw: super::try_kernel(
+                gpu,
+                "w4a16_gemv_fused",
+                "w4a16_gemv_silu_input_sw",
+            ),
+            decode_opt: std::env::var_os("ATLAS_DECODE_OPT").is_some(),
             w4a16_gemv_dual_batch2: gpu.kernel("w4a16_gemv", "w4a16_gemv_dual_batch2")?,
             w4a16_gemv_dual_batch3: gpu.kernel("w4a16_gemv", "w4a16_gemv_dual_batch3")?,
             w4a16_gemv_batch2: gpu.kernel("w4a16_gemv", "w4a16_gemv_batch2")?,
@@ -118,6 +145,12 @@ impl DenseFfnLayer {
             w4a16_gemm: gpu.kernel("w4a16", "w4a16_gemm")?,
             w4a16_gemm_t_m128_k: super::try_kernel(gpu, "w4a16", "w4a16_gemm_t_m128"),
             w4a16_gemm_t_m128_v2_k: super::try_kernel(gpu, "w4a16_v2", "w4a16_gemm_t_m128_v2"),
+            w4a16_gemm_t_m128_bf16_k: super::try_kernel(gpu, "w4a16", "w4a16_gemm_t_m128_bf16"),
+            w4a16_gemm_t_m128_bf16_v2_k: super::try_kernel(
+                gpu,
+                "w4a16",
+                "w4a16_gemm_t_m128_bf16_v2",
+            ),
             act_mul,
             bf16_weights: None,
             dense_gemv_bf16_k,
@@ -204,35 +237,69 @@ impl DenseFfnLayer {
             return Ok(output);
         }
 
-        // Fused gate_proj + up_proj: [1, H] → [1, inter] × 2
-        ops::w4a16_gemv_dual(
-            ctx.gpu,
-            self.w4a16_gemv_dual,
-            input,
-            &self.weights.gate_proj,
-            gate_out,
-            &self.weights.up_proj,
-            up_out,
-            inter,
-            h,
-            stream,
-        )?;
+        // Fused gate_proj + up_proj: [1, H] → [1, inter] × 2.
+        // Single-warp variant (lossless) when ATLAS_DECODE_OPT is on and the
+        // _sw kernel is present; otherwise the proven 64-thread kernel.
+        let use_sw = self.decode_opt
+            && self.w4a16_gemv_dual_sw.0 != 0
+            && self.w4a16_gemv_silu_input_sw.0 != 0;
+        if use_sw {
+            ops::w4a16_gemv_dual_sw(
+                ctx.gpu,
+                self.w4a16_gemv_dual_sw,
+                input,
+                &self.weights.gate_proj,
+                gate_out,
+                &self.weights.up_proj,
+                up_out,
+                inter,
+                h,
+                stream,
+            )?;
+        } else {
+            ops::w4a16_gemv_dual(
+                ctx.gpu,
+                self.w4a16_gemv_dual,
+                input,
+                &self.weights.gate_proj,
+                gate_out,
+                &self.weights.up_proj,
+                up_out,
+                inter,
+                h,
+                stream,
+            )?;
+        }
 
         let output = ctx.buffers.moe_output();
         match self.activation {
             FfnActivation::SiLU => {
                 // Fused SiLU(gate)*up + down_proj: [1, inter] → [1, H]
-                ops::w4a16_gemv_silu_input(
-                    ctx.gpu,
-                    self.w4a16_gemv_silu_input,
-                    gate_out,
-                    up_out,
-                    &self.weights.down_proj,
-                    output,
-                    h,
-                    inter,
-                    stream,
-                )?;
+                if use_sw {
+                    ops::w4a16_gemv_silu_input_sw(
+                        ctx.gpu,
+                        self.w4a16_gemv_silu_input_sw,
+                        gate_out,
+                        up_out,
+                        &self.weights.down_proj,
+                        output,
+                        h,
+                        inter,
+                        stream,
+                    )?;
+                } else {
+                    ops::w4a16_gemv_silu_input(
+                        ctx.gpu,
+                        self.w4a16_gemv_silu_input,
+                        gate_out,
+                        up_out,
+                        &self.weights.down_proj,
+                        output,
+                        h,
+                        inter,
+                        stream,
+                    )?;
+                }
             }
             FfnActivation::GeLU => {
                 // GELU(gate)*up → gate_out, then down_proj GEMV
@@ -429,9 +496,47 @@ impl DenseFfnLayer {
         // load (decode keeps the non-transposed weights via gemv → TPOT/
         // coherence unaffected). Falls back to base when no transposed copy /
         // kernel is present.
+        // LOSSLESS prefill opt-in: when ATLAS_BF16_TC_PREFILL is set AND the
+        // BF16 128x128 kernel is present, route prefill GEMMs through the
+        // bit-equivalent BF16 tensor-core path instead of the default FP8-E4M3
+        // `t_m128`. The FP8 crush is fast but perturbs generation (measured
+        // length-truncations / accuracy risk on Qwen3.6-27B); the BF16 variant
+        // keeps the same 128x128 cp.async speed at base-kernel precision.
+        // Unset (default) → every arm below is byte-for-byte the prior behavior
+        // (PCND: explicit opt-in, no silent default change). Read once per call.
+        let bf16_tc_prefill = self.w4a16_gemm_t_m128_bf16_k.0 != 0
+            && std::env::var_os("ATLAS_BF16_TC_PREFILL").is_some();
+        // A/B escape hatch (benchmark only): force the proven v1 BF16 kernel even
+        // when v2 is loaded, so v1-vs-v2 prefill TTFT can be compared in one
+        // binary. Default unset → prefer v2 (the faster, bit-identical variant).
+        let use_v2 = self.w4a16_gemm_t_m128_bf16_v2_k.0 != 0
+            && std::env::var_os("ATLAS_DISABLE_PREFILL_V2").is_none();
+        let bf16_kernel = if use_v2 {
+            self.w4a16_gemm_t_m128_bf16_v2_k
+        } else {
+            self.w4a16_gemm_t_m128_bf16_k
+        };
+
         macro_rules! w4_gemm {
             ($w:expr, $wt:expr, $in:expr, $out:expr, $n:expr, $k:expr) => {
                 match $wt {
+                    // Lossless opt-in: BF16 128x128 tensor-core prefill (bit-equivalent
+                    // to base `w4a16_gemm`). Preferred over the FP8 t_m128/v2 paths only
+                    // when ATLAS_BF16_TC_PREFILL is set and the kernel is loaded. Within
+                    // the lossless path, prefer the higher-occupancy v2 kernel (3 CTAs/SM,
+                    // bit-identical to v1) when it is loaded; else the proven v1 kernel.
+                    // Both go through the same launch helper (identical grid/block/args).
+                    Some(wt) if bf16_tc_prefill => ops::w4a16_gemm_n128_m128_bf16(
+                        ctx.gpu,
+                        bf16_kernel,
+                        $in,
+                        &wt,
+                        $out,
+                        m,
+                        $n,
+                        $k,
+                        stream,
+                    )?,
                     // Prefer v2 (8-warp) > t_m128 (4-warp) > scalar-tile base.
                     Some(wt) if self.w4a16_gemm_t_m128_v2_k.0 != 0 => ops::w4a16_gemm_n128_m128_v2(
                         ctx.gpu,
