@@ -104,7 +104,16 @@ pub(crate) fn load_moe_qwen35(
 
     let load_bf16_then_nvfp4 = |full_prefix: &str, n: usize, k: usize| -> Result<QuantizedWeight> {
         let bf16 = dense(store, &format!("{full_prefix}.weight"))?;
-        quantize_to_nvfp4(&bf16, n, k, gpu, absmax_k, quantize_k, stream)
+        let q = quantize_to_nvfp4(&bf16, n, k, gpu, absmax_k, quantize_k, stream)?;
+        // Free the BF16 source: the runtime NVFP4 buffer is a fresh allocation,
+        // so the on-disk BF16 expert weight is now redundant. Without this a 35B
+        // BF16 MoE (Bf16Raw) holds BOTH the ~60GB BF16 experts AND the NVFP4
+        // copies (~109GB pre-KV → no room left for KV). Each expert's
+        // gate/up/down is its own store tensor (SEPARATE layout), so freeing
+        // here is safe and mirrors `quantized_from_fp8`, which frees its BF16
+        // intermediate the same way right after `quantize_to_nvfp4`.
+        gpu.free(bf16.weight)?;
+        Ok(q)
     };
 
     // Qwen3.6-35B-A3B BF16 release ships a FUSED MoE layout: one
@@ -201,6 +210,20 @@ pub(crate) fn load_moe_qwen35(
             experts.push(load_expert_fused(e)?);
         } else {
             experts.push(load_expert(&format!("{p}.experts.{e}"))?);
+        }
+    }
+
+    // Fused Bf16Raw layout shares ONE `experts.gate_up_proj` + `experts.down_proj`
+    // BF16 tensor across all experts (sliced by offset), so it can't be freed
+    // per-expert like the separate path above — free it here now that every
+    // expert has been quantized to NVFP4. Same rationale: drop the redundant
+    // ~60GB BF16 originals so the NVFP4 copies are all that remains resident.
+    if is_fused_bf16 {
+        if let Ok(w) = store.get(&fused_gate_up_key) {
+            let _ = gpu.free(w.ptr);
+        }
+        if let Ok(w) = store.get(&fused_down_key) {
+            let _ = gpu.free(w.ptr);
         }
     }
 
