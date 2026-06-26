@@ -95,7 +95,16 @@ pub(super) fn load_layers(
         QuantFormat::Nvfp4
     };
     let native_fp8 = quant_format == QuantFormat::Fp8;
-    let low_memory_modelopt_moe = modelopt_mixed_precision
+    // FAST_MOE=full (transposed prefill tables + the CUTLASS grouped NVFP4 MoE)
+    // applies to any Holo-family (holo3_1_moe) NVFP4 MoE — both modelopt
+    // MIXED_PRECISION (Holo-3.1) and uniform NVFP4 (e.g. compressed-tensors,
+    // Ornith-35B). The transpose/grouped path operates on the loaded NVFP4 experts
+    // regardless of source quant format; the mixed-precision-specific handling
+    // (fp8 experts, native-modelopt SSM/attn) stays gated on
+    // `modelopt_mixed_precision` and simply doesn't fire for the uniform case.
+    let holo_nvfp4_moe =
+        config.model_type == "holo3_1_moe" && quant_format == QuantFormat::Nvfp4;
+    let low_memory_modelopt_moe = (modelopt_mixed_precision || holo_nvfp4_moe)
         && std::env::var("ATLAS_HOLO_LOW_MEMORY_MOE").ok().as_deref() == Some("1");
     let holo_fast_moe_mode = if low_memory_modelopt_moe {
         holo_fast_moe_mode()
