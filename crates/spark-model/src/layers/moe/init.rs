@@ -182,6 +182,9 @@ impl MoeLayer {
             gate_ptrs_t: None,
             up_ptrs_t: None,
             down_ptrs_t: None,
+            gate_sfb_cutlass: None,
+            up_sfb_cutlass: None,
+            _cutlass_sfb_owned: Vec::new(),
             down_t_scratch_packed: None,
             down_t_scratch_scale: None,
             moe_transpose_u8_batched_k: gpu

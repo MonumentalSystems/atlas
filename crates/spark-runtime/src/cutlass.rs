@@ -188,7 +188,17 @@ fn ctx() -> Result<&'static Ctx> {
     if let Some(c) = CTX.get() {
         return Ok(c);
     }
-    let ws_size = 64 * 1024 * 1024;
+    // Shared scratch for all CUTLASS host wrappers. The grouped NVFP4 MoE path
+    // (single-launch kGrouped over up to 256 experts) stages packed-A + SFA +
+    // per-group arrays + the gemm workspace here; at large prefill M the 256-group
+    // gemm workspace alone exceeds the old 64 MB (-> status -2 + an OOB context
+    // corruption). 512 MB by default; override with ATLAS_CUTLASS_WORKSPACE_MB.
+    let ws_size = std::env::var("ATLAS_CUTLASS_WORKSPACE_MB")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(512)
+        * 1024
+        * 1024;
     let mut workspace = 0u64;
     let status = unsafe { cuMemAlloc_v2(&mut workspace, ws_size) };
     if status != 0 {

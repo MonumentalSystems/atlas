@@ -123,16 +123,20 @@ impl MoeLayer {
         }
         if max_m_tiles > 0 {
             if let (Some(gp), Some(up)) = (&self.gate_ptrs_t, &self.up_ptrs_t) {
-              if grouped_cutlass_gate_up_enabled() && self.moe_permute_tokens_k.0 != 0 {
+              if grouped_cutlass_gate_up_enabled()
+                  && self.moe_permute_tokens_k.0 != 0
+                  && self.gate_sfb_cutlass.is_some()
+                  && self.up_sfb_cutlass.is_some()
+              {
                 // ── SINGLE-LAUNCH CUTLASS grouped NVFP4 gate_up
                 // (ATLAS_HOLO_MOE_GROUPED_CUTLASS=1) ── one
                 // GemmUniversalMode::kGrouped launch over all active experts in
-                // place of the per-expert collective loop. Reads the SHARED
-                // FAST_MOE=full pointer tables (gate_ptrs_t/up_ptrs_t): packed
-                // weights, SFB scales (scale_ptrs), and per-expert scale2; writes
+                // place of the per-expert collective loop. Weights: the decode
+                // `gate_ptrs`/`up_ptrs` packed `[N,K/2]` (CUTLASS ColumnMajor B) +
+                // the load-built swizzled SFB tables (`gate_sfb_cutlass`) + the real
+                // per-expert scale2 (applied as the epilogue alpha). Writes
                 // C_gate/C_up in the same sorted layout so silu+down+unpermute are
-                // unchanged. The op snapshots the offset/pointer/scale tables
-                // host-side (the grouped C entry indexes them on the host).
+                // unchanged.
                 //
                 // The grouped collective needs EXPERT-CONTIGUOUS activation rows;
                 // expert_input is token-major. Permute it into expert_down_out
@@ -152,12 +156,12 @@ impl MoeLayer {
                 ops::moe_grouped_gate_up_cutlass(
                     ctx.gpu,
                     permuted,
-                    gp.packed_ptrs,
-                    gp.scale_ptrs,
-                    gp.scale2_vals,
-                    up.packed_ptrs,
-                    up.scale_ptrs,
-                    up.scale2_vals,
+                    self.gate_ptrs.packed_ptrs,
+                    self.gate_sfb_cutlass.expect("gate sfb checked above"),
+                    self.gate_ptrs.scale2_vals,
+                    self.up_ptrs.packed_ptrs,
+                    self.up_sfb_cutlass.expect("up sfb checked above"),
+                    self.up_ptrs.scale2_vals,
                     expert_gate_out,
                     expert_up_out,
                     expert_offsets,

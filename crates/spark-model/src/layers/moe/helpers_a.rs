@@ -269,4 +269,70 @@ impl MoeLayer {
 
         Ok(())
     }
+
+    /// Build per-expert swizzled SFB weight-scale tables for the CUTLASS grouped
+    /// NVFP4 path (`ATLAS_HOLO_MOE_GROUPED_CUTLASS`). For each expert, swizzle the
+    /// `[K/16,N]` `gate_ptrs_t`/`up_ptrs_t` scale into the CUTLASS SFB atom via
+    /// `pack_weight_sfb`, then upload the per-expert pointer arrays. The grouped
+    /// kernel pairs these with `gate_ptrs.packed` (`[N,K/2]`) + the real per-expert
+    /// `scale2`. Requires FAST_MOE=full (gate_ptrs_t/up_ptrs_t present); no-op else.
+    pub fn build_cutlass_grouped_sfb(
+        &mut self,
+        gpu: &dyn GpuBackend,
+        config: &atlas_core::config::ModelConfig,
+        stream: u64,
+    ) -> Result<()> {
+        let h = config.hidden_size;
+        let inter = config.moe_intermediate_size;
+        // Swizzled SFB atom size (bytes), matching the shapetest:
+        // round_up(N,128) * round_up(K/16,4), N=inter, K=hidden.
+        let sfb_len = inter.div_ceil(128) * 128 * (h / 16).div_ceil(4) * 4;
+        let num = self.weights.experts.len();
+        let (gate_scale_dev, up_scale_dev) =
+            match (self.gate_ptrs_t.as_ref(), self.up_ptrs_t.as_ref()) {
+                (Some(g), Some(u)) => (g.scale_ptrs, u.scale_ptrs),
+                _ => return Ok(()),
+            };
+        let mut owned: Vec<DevicePtr> = Vec::new();
+        let mut build_one = |scale_ptrs_dev: DevicePtr| -> Result<DevicePtr> {
+            let mut sp = vec![0u8; num * 8];
+            gpu.copy_d2h(scale_ptrs_dev, &mut sp)?;
+            let scale_ptrs: Vec<u64> = sp
+                .chunks_exact(8)
+                .map(|c| u64::from_le_bytes(c.try_into().expect("8 bytes")))
+                .collect();
+            let mut sfb_ptrs = vec![0u64; num];
+            for (e, &sptr) in scale_ptrs.iter().enumerate() {
+                if sptr == 0 {
+                    continue; // remote/placeholder expert
+                }
+                let sfb = gpu.alloc(sfb_len)?;
+                spark_runtime::cutlass::pack_weight_sfb(
+                    sptr,
+                    sfb.0,
+                    inter as u32,
+                    h as u32,
+                    stream,
+                )?;
+                sfb_ptrs[e] = sfb.0;
+                owned.push(sfb);
+            }
+            gpu.synchronize(stream)?;
+            let bytes: Vec<u8> = sfb_ptrs.iter().flat_map(|p| p.to_le_bytes()).collect();
+            let arr = gpu.alloc(bytes.len().max(8))?;
+            gpu.copy_h2d(&bytes, arr)?;
+            owned.push(arr);
+            Ok(arr)
+        };
+        let gate_arr = build_one(gate_scale_dev)?;
+        let up_arr = build_one(up_scale_dev)?;
+        drop(build_one);
+        self.gate_sfb_cutlass = Some(gate_arr);
+        self.up_sfb_cutlass = Some(up_arr);
+        self._cutlass_sfb_owned = owned;
+        tracing::info!(
+            "CUTLASS grouped SFB: built {num} experts (N={inter} K={h}, sfb_len={sfb_len})"
+        );
+        Ok(())
+    }
 }
