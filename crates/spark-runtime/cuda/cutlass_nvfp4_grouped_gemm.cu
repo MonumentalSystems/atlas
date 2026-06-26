@@ -251,84 +251,77 @@ extern "C" int atlas_cutlass_pack_weight_sfb(
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// Core: one grouped NVFP4 projection as a single kGrouped launch (gate, up, or
-// down). A_global is TOKEN-MAJOR; sorted_token_ids (null=identity) selects each
-// group's rows — the gather is FUSED into the per-group A-pack (lever 2: no
-// separate permute pass). Workspace carve: [ packed-A | SFA | arrays | gemm_ws ].
+// Grouped NVFP4 MoE: A-pack (shared across projections) + per-projection GEMM.
+// A_global is TOKEN-MAJOR; sorted_token_ids (null=identity) selects each group's
+// rows — the gather is FUSED into the per-group A-pack (lever 2: no permute pass).
+// gate_up packs A ONCE and runs gate+up against it (lever: pack-A-once); down packs
+// its own (different) A. Workspace carve: [ packed-A | SFA | A-arrays | B-arrays+gemm_ws ].
 // ════════════════════════════════════════════════════════════════════════════
 #if defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED) || defined(CUTLASS_ARCH_MMA_SM121_SUPPORTED)
-static int run_grouped_one(
+
+// Shared per-forward A-pack result: packed-A + SFA staged in ws, A-side argument
+// arrays uploaded. Reused by every projection that shares this A.
+struct GroupedAPrep {
+  int status = 0;                          // non-zero on failure
+  int G = 0;                               // active groups
+  std::vector<ProblemShape> host_shapes;   // {m_e, n, k} per group
+  std::vector<int> ms;                     // sorted-row start per group (C offset)
+  std::vector<int> me;                     // m_e per group
+  std::vector<int> eidx;                   // expert index per group (B/scale2 lookup)
+  ProblemShape* dShapes = nullptr;
+  const ElementA::DataType** dA = nullptr;
+  const ElementSF** dSFA = nullptr;
+  StrideA* dsA = nullptr;
+  LayoutSFA* dlSFA = nullptr;
+  size_t cursor = 0;                       // free ws offset after the A-side arrays
+};
+
+// Gather+pack A once (per active group), upload the A-side argument arrays.
+static GroupedAPrep prep_grouped_a(
     const __nv_bfloat16* A_global,
     const int* sorted_token_ids,
-    const unsigned long long* packed_ptrs,
-    const unsigned long long* sfb_ptrs,
-    const float* scale2_vals,
-    __nv_bfloat16* C_bf16,
     const int* expert_offsets_host,
     int num_experts,
     int n,
     int k,
     unsigned char* ws,
-    size_t workspace_size,
-    cudaStream_t stream,
-    int tag) {
-  std::vector<ProblemShape> host_shapes;
-  host_shapes.reserve(num_experts);
+    cudaStream_t stream) {
+  GroupedAPrep p;
   std::vector<const ElementA::DataType*> hA;
-  std::vector<const ElementB::DataType*> hB;
   std::vector<const ElementSF*> hSFA;
-  std::vector<const ElementSF*> hSFB;
-  std::vector<const ElementC*> hC;
-  std::vector<ElementD*> hD;
   std::vector<StrideA> sA;
-  std::vector<StrideB> sB;
-  std::vector<StrideC> sC;
-  std::vector<StrideD> sD;
-  std::vector<LayoutSFA> lSFA;
-  std::vector<LayoutSFB> lSFB;
-  std::vector<float> alpha_host;
 
   // First pass: per-group padded sizes for the packed-A / SFA staging carve.
   std::vector<size_t> a_grp_off;
   std::vector<size_t> sfa_grp_off;
-  size_t a_off = 0;
-  size_t sfa_off = 0;
-  size_t cursor = 0;
-  {
-    size_t a_acc = 0;
-    size_t sfa_acc = 0;
-    for (int e = 0; e < num_experts; ++e) {
-      int ms = expert_offsets_host[e];
-      int me = expert_offsets_host[e + 1];
-      int m_e = me - ms;
-      if (m_e <= 0) {
-        continue;
-      }
-      auto lsa =
-          Sm1xxBlkScaledConfig::tile_atom_to_shape_SFA(cute::make_shape(m_e, n, k, 1));
-      a_grp_off.push_back(a_acc);
-      sfa_grp_off.push_back(sfa_acc);
-      a_acc += align_up_((size_t)m_e * (k / 2), 256);
-      sfa_acc += align_up_((size_t)size(filter_zeros(lsa)), 256);
-    }
-    a_off = 0;
-    sfa_off = align_up_(a_acc, 256);
-    cursor = align_up_(sfa_off + sfa_acc, 256);
-  }
-
-  // Second pass: gather+pack A per group, build the device argument arrays.
-  int gi = 0;
+  size_t a_acc = 0;
+  size_t sfa_acc = 0;
   for (int e = 0; e < num_experts; ++e) {
-    int ms = expert_offsets_host[e];
-    int me = expert_offsets_host[e + 1];
-    int m_e = me - ms;
+    int m_e = expert_offsets_host[e + 1] - expert_offsets_host[e];
     if (m_e <= 0) {
       continue;
     }
     auto lsa =
         Sm1xxBlkScaledConfig::tile_atom_to_shape_SFA(cute::make_shape(m_e, n, k, 1));
-    auto lsb =
-        Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(cute::make_shape(m_e, n, k, 1));
+    a_grp_off.push_back(a_acc);
+    sfa_grp_off.push_back(sfa_acc);
+    a_acc += align_up_((size_t)m_e * (k / 2), 256);
+    sfa_acc += align_up_((size_t)size(filter_zeros(lsa)), 256);
+  }
+  size_t a_off = 0;
+  size_t sfa_off = align_up_(a_acc, 256);
+  size_t cursor = align_up_(sfa_off + sfa_acc, 256);
+
+  // Second pass: pack A per active group + build A-side host arrays.
+  int gi = 0;
+  for (int e = 0; e < num_experts; ++e) {
+    int ms = expert_offsets_host[e];
+    int m_e = expert_offsets_host[e + 1] - ms;
+    if (m_e <= 0) {
+      continue;
+    }
+    auto lsa =
+        Sm1xxBlkScaledConfig::tile_atom_to_shape_SFA(cute::make_shape(m_e, n, k, 1));
     unsigned char* a_e = ws + a_off + a_grp_off[gi];
     unsigned char* sfa_e = ws + sfa_off + sfa_grp_off[gi];
 
@@ -337,25 +330,19 @@ static int run_grouped_one(
     pack_act_group<<<grd, blk, 0, stream>>>(
         A_global, sorted_token_ids, ms, a_e, sfa_e, m_e, k, lsa);
 
-    host_shapes.push_back(ProblemShape{m_e, n, k});
+    p.host_shapes.push_back(ProblemShape{m_e, n, k});
+    p.ms.push_back(ms);
+    p.me.push_back(m_e);
+    p.eidx.push_back(e);
     hA.push_back(reinterpret_cast<const ElementA::DataType*>(a_e));
-    hB.push_back(reinterpret_cast<const ElementB::DataType*>(packed_ptrs[e]));
     hSFA.push_back(reinterpret_cast<const ElementSF*>(sfa_e));
-    hSFB.push_back(reinterpret_cast<const ElementSF*>(sfb_ptrs[e]));
-    hC.push_back(reinterpret_cast<const ElementC*>(C_bf16 + (size_t)ms * n));
-    hD.push_back(reinterpret_cast<ElementD*>(C_bf16 + (size_t)ms * n));
     sA.push_back(cutlass::make_cute_packed_stride(StrideA{}, {m_e, k, 1}));
-    sB.push_back(cutlass::make_cute_packed_stride(StrideB{}, {n, k, 1}));
-    sC.push_back(cutlass::make_cute_packed_stride(StrideC{}, {m_e, n, 1}));
-    sD.push_back(cutlass::make_cute_packed_stride(StrideD{}, {m_e, n, 1}));
-    lSFA.push_back(lsa);
-    lSFB.push_back(lsb);
-    alpha_host.push_back(scale2_vals[e]);
     ++gi;
   }
-  int G = (int)host_shapes.size();
-  if (G == 0) {
-    return 0;
+  p.G = (int)p.host_shapes.size();
+  if (p.G == 0) {
+    p.cursor = cursor;
+    return p;
   }
 
   auto put = [&](const void* src, size_t bytes) -> void* {
@@ -364,23 +351,84 @@ static int run_grouped_one(
     cudaMemcpyAsync(dst, src, bytes, cudaMemcpyHostToDevice, stream);
     return dst;
   };
-  auto* dShapes = (ProblemShape*)put(host_shapes.data(), G * sizeof(ProblemShape));
-  auto* dA = (const ElementA::DataType**)put(hA.data(), G * sizeof(void*));
+  p.dShapes = (ProblemShape*)put(p.host_shapes.data(), p.G * sizeof(ProblemShape));
+  p.dA = (const ElementA::DataType**)put(hA.data(), p.G * sizeof(void*));
+  p.dSFA = (const ElementSF**)put(hSFA.data(), p.G * sizeof(void*));
+  p.dsA = (StrideA*)put(sA.data(), p.G * sizeof(StrideA));
+  {
+    std::vector<LayoutSFA> lSFA(p.G);
+    for (int g = 0; g < p.G; ++g) {
+      lSFA[g] =
+          Sm1xxBlkScaledConfig::tile_atom_to_shape_SFA(cute::make_shape(p.me[g], n, k, 1));
+    }
+    p.dlSFA = (LayoutSFA*)put(lSFA.data(), p.G * sizeof(LayoutSFA));
+  }
+  p.cursor = cursor;
+  return p;
+}
+
+// One grouped projection GEMM reusing a shared A-prep. B-side arrays + gemm_ws are
+// carved starting at `cursor_start` (reused across the projections sharing `a`).
+static int launch_projection(
+    const GroupedAPrep& a,
+    const unsigned long long* packed_ptrs,
+    const unsigned long long* sfb_ptrs,
+    const float* scale2_vals,
+    __nv_bfloat16* C_bf16,
+    int n,
+    int k,
+    unsigned char* ws,
+    size_t cursor_start,
+    size_t workspace_size,
+    cudaStream_t stream,
+    int tag) {
+  int G = a.G;
+  if (G == 0) {
+    return 0;
+  }
+  std::vector<const ElementB::DataType*> hB(G);
+  std::vector<const ElementSF*> hSFB(G);
+  std::vector<const ElementC*> hC(G);
+  std::vector<ElementD*> hD(G);
+  std::vector<StrideB> sB(G);
+  std::vector<StrideC> sC(G);
+  std::vector<StrideD> sD(G);
+  std::vector<LayoutSFB> lSFB(G);
+  std::vector<float> alpha_host(G);
+  for (int g = 0; g < G; ++g) {
+    int e = a.eidx[g];
+    int m_e = a.me[g];
+    size_t ms = (size_t)a.ms[g];
+    hB[g] = reinterpret_cast<const ElementB::DataType*>(packed_ptrs[e]);
+    hSFB[g] = reinterpret_cast<const ElementSF*>(sfb_ptrs[e]);
+    hC[g] = reinterpret_cast<const ElementC*>(C_bf16 + ms * n);
+    hD[g] = reinterpret_cast<ElementD*>(C_bf16 + ms * n);
+    sB[g] = cutlass::make_cute_packed_stride(StrideB{}, {n, k, 1});
+    sC[g] = cutlass::make_cute_packed_stride(StrideC{}, {m_e, n, 1});
+    sD[g] = cutlass::make_cute_packed_stride(StrideD{}, {m_e, n, 1});
+    lSFB[g] =
+        Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(cute::make_shape(m_e, n, k, 1));
+    alpha_host[g] = scale2_vals[e];
+  }
+
+  size_t cursor = cursor_start;
+  auto put = [&](const void* src, size_t bytes) -> void* {
+    void* dst = ws + cursor;
+    cursor = align_up_(cursor + bytes, 256);
+    cudaMemcpyAsync(dst, src, bytes, cudaMemcpyHostToDevice, stream);
+    return dst;
+  };
   auto* dB = (const ElementB::DataType**)put(hB.data(), G * sizeof(void*));
-  auto* dSFA = (const ElementSF**)put(hSFA.data(), G * sizeof(void*));
   auto* dSFB = (const ElementSF**)put(hSFB.data(), G * sizeof(void*));
   auto* dC = (const ElementC**)put(hC.data(), G * sizeof(void*));
   auto* dD = (ElementD**)put(hD.data(), G * sizeof(void*));
-  auto* dsA = (StrideA*)put(sA.data(), G * sizeof(StrideA));
   auto* dsB = (StrideB*)put(sB.data(), G * sizeof(StrideB));
   auto* dsC = (StrideC*)put(sC.data(), G * sizeof(StrideC));
   auto* dsD = (StrideD*)put(sD.data(), G * sizeof(StrideD));
-  auto* dlSFA = (LayoutSFA*)put(lSFA.data(), G * sizeof(LayoutSFA));
   auto* dlSFB = (LayoutSFB*)put(lSFB.data(), G * sizeof(LayoutSFB));
   auto* dAlpha = (float*)put(alpha_host.data(), G * sizeof(float));
-  // Per-group alpha (scale2) needs alpha_ptr_array — an array of G POINTERS, one
-  // per group → &dAlpha[g]. Setting the scalar `alpha_ptr = dAlpha` instead makes
-  // EVERY group read dAlpha[0] (expert-0's scale2) — the production correctness bug.
+  // Per-group alpha (scale2) needs alpha_ptr_array (G POINTERS, one per group →
+  // &dAlpha[g]); the scalar alpha_ptr would apply dAlpha[0] to every group.
   std::vector<const float*> hAlphaPtr(G);
   for (int g = 0; g < G; ++g) {
     hAlphaPtr[g] = dAlpha + g;
@@ -392,10 +440,8 @@ static int run_grouped_one(
   hw.sm_count = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(0);
 
   typename Gemm::GemmKernel::CollectiveMainloop::Arguments mainloop_args{
-      dA, dsA, dB, dsB, dSFA, dlSFA, dSFB, dlSFB};
+      a.dA, a.dsA, dB, dsB, a.dSFA, a.dlSFA, dSFB, dlSFB};
 
-  // LinearCombination: D = alpha*acc + beta*C; per-group alpha (scale2) via the
-  // grouped alpha_ptr_array (one device pointer per group), NOT the scalar alpha_ptr.
   typename Gemm::GemmKernel::CollectiveEpilogue::Arguments epi_args{};
   epi_args.thread.alpha = 1.0f;
   epi_args.thread.beta = 0.0f;
@@ -407,7 +453,7 @@ static int run_grouped_one(
 
   typename Gemm::Arguments args{
       cutlass::gemm::GemmUniversalMode::kGrouped,
-      {G, dShapes, host_shapes.data()},
+      {G, a.dShapes, const_cast<ProblemShape*>(a.host_shapes.data())},
       mainloop_args,
       epi_args,
       hw};
@@ -427,18 +473,13 @@ static int run_grouped_one(
   st = gemm.run(stream);
   return st == cutlass::Status::kSuccess ? 0 : tag + static_cast<int>(st);
 }
-#endif  // arch guard for run_grouped_one
+#endif  // arch guard
 
 // ════════════════════════════════════════════════════════════════════════════
-// PUBLIC ENTRY — single-launch grouped gate_up (gather FUSED; lever 2).
-//   A_bf16              : [num_tokens, K] bf16 TOKEN-MAJOR (NOT pre-permuted)
-//   sorted_token_ids    : device int[M_total] — each sorted row's token index
-//   *_packed_ptrs[e]    : device ptr -> [N,K/2] e2m1            (decode gate_ptrs)
-//   *_sfb_ptrs[e]       : device ptr -> swizzled SFB (ue4m3)    (load-built)
-//   *_scale2_vals       : HOST f32[num_experts]  (per-expert weight_scale_2)
-//   C_gate/C_up         : [M_total, N] bf16, expert-contiguous (sorted) output
-//   expert_offsets_host : HOST int32[num_experts+1]
-// Runs gate then up as two kGrouped launches.
+// PUBLIC ENTRY — grouped gate_up. A_bf16 [num_tokens,K] TOKEN-MAJOR; the gather is
+// fused into the A-pack via sorted_token_ids. A is packed ONCE and shared by the
+// gate and up kGrouped launches. *_packed_ptrs[e]=[N,K/2] e2m1, *_sfb_ptrs[e]=
+// swizzled SFB, *_scale2_vals=HOST f32[num_experts]. C_*=[M_total,N] sorted output.
 // ════════════════════════════════════════════════════════════════════════════
 extern "C" int atlas_cutlass_nvfp4_grouped_gate_up_fused(
     const void* A_bf16,
@@ -463,17 +504,24 @@ extern "C" int atlas_cutlass_nvfp4_grouped_gate_up_fused(
     return -1;
   }
   unsigned char* ws = static_cast<unsigned char*>(workspace);
-  int rc = run_grouped_one(
-      static_cast<const __nv_bfloat16*>(A_bf16), sorted_token_ids, gate_packed_ptrs,
-      gate_sfb_ptrs, gate_scale2_vals, static_cast<__nv_bfloat16*>(C_gate_bf16),
-      expert_offsets_host, num_experts, n, k, ws, workspace_size, stream, 100000);
+  // Pack A ONCE (gate + up share the same activation).
+  GroupedAPrep a = prep_grouped_a(static_cast<const __nv_bfloat16*>(A_bf16),
+                                  sorted_token_ids, expert_offsets_host, num_experts,
+                                  n, k, ws, stream);
+  if (a.G == 0) {
+    return 0;
+  }
+  // Both projections carve their B-arrays + gemm_ws from a.cursor (gate's launch
+  // completes on the stream before up's overwrites the region — serialized).
+  int rc = launch_projection(a, gate_packed_ptrs, gate_sfb_ptrs, gate_scale2_vals,
+                             static_cast<__nv_bfloat16*>(C_gate_bf16), n, k, ws,
+                             a.cursor, workspace_size, stream, 100000);
   if (rc) {
     return rc;
   }
-  rc = run_grouped_one(
-      static_cast<const __nv_bfloat16*>(A_bf16), sorted_token_ids, up_packed_ptrs,
-      up_sfb_ptrs, up_scale2_vals, static_cast<__nv_bfloat16*>(C_up_bf16),
-      expert_offsets_host, num_experts, n, k, ws, workspace_size, stream, 200000);
+  rc = launch_projection(a, up_packed_ptrs, up_sfb_ptrs, up_scale2_vals,
+                         static_cast<__nv_bfloat16*>(C_up_bf16), n, k, ws, a.cursor,
+                         workspace_size, stream, 200000);
   return rc;
 #else
   (void)A_bf16;
@@ -498,9 +546,8 @@ extern "C" int atlas_cutlass_nvfp4_grouped_gate_up_fused(
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// PUBLIC ENTRY — single-launch grouped DOWN (lever 1). A is the post-SiLU
-// intermediate [M_total, K=inter], ALREADY expert-contiguous (sorted) — no gather
-// (sorted_token_ids=null). B = down_proj [N=hidden, K/2], C = [M_total, N=hidden].
+// PUBLIC ENTRY — grouped DOWN. A = post-SiLU intermediate [M_total, K=inter],
+// ALREADY expert-contiguous (sorted_token_ids=null). B = down_proj [N=hidden,K/2].
 // ════════════════════════════════════════════════════════════════════════════
 extern "C" int atlas_cutlass_nvfp4_grouped_down(
     const void* A_bf16,
@@ -519,11 +566,15 @@ extern "C" int atlas_cutlass_nvfp4_grouped_down(
   if (n <= 0 || k <= 0 || (k % 16) != 0 || num_experts <= 0) {
     return -1;
   }
-  return run_grouped_one(
-      static_cast<const __nv_bfloat16*>(A_bf16), nullptr, packed_ptrs, sfb_ptrs,
-      scale2_vals, static_cast<__nv_bfloat16*>(C_bf16), expert_offsets_host,
-      num_experts, n, k, static_cast<unsigned char*>(workspace), workspace_size,
-      stream, 300000);
+  unsigned char* ws = static_cast<unsigned char*>(workspace);
+  GroupedAPrep a = prep_grouped_a(static_cast<const __nv_bfloat16*>(A_bf16), nullptr,
+                                  expert_offsets_host, num_experts, n, k, ws, stream);
+  if (a.G == 0) {
+    return 0;
+  }
+  return launch_projection(a, packed_ptrs, sfb_ptrs, scale2_vals,
+                           static_cast<__nv_bfloat16*>(C_bf16), n, k, ws, a.cursor,
+                           workspace_size, stream, 300000);
 #else
   (void)A_bf16;
   (void)packed_ptrs;
