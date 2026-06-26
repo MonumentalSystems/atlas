@@ -1378,9 +1378,11 @@ extern "C" __global__ void moe_fp8_grouped_gemm_ptrtable_t(
 //
 // Differences vs the FP8 kernel:
 //  - B is consumed as native e2m1 nibbles + ue4m3 per-16-group scales
-//    (NO FP4→FP8 dequant). Weight layout: packed [N, K/2] (N-major,
-//    K-contiguous) + scales [K/16, N] — the pack_bf16_weight_to_nvfp4_t
-//    layout used by the fp4_gate_up ptr-tables.
+//    (NO FP4→FP8 dequant). Weight layout: SHARED transpose_for_gemm tables —
+//    packed [K/2, N] (K-major, N-contiguous) + scales [K/16, N] (the FAST_MOE=full
+//    gate_ptrs_t/up_ptrs_t set). Loaded coalesced K-major into smem_BpT, then
+//    re-gathered N-major into smem_Bp by FP4_TRANSPOSE before the MMA. No second
+//    [N,K/2] copy is built — this is the zero-extra-MoE-memory path.
 //  - A (bf16) is quantized IN-REGISTER to e2m1 + ue4m3 per-16-group
 //    scale (mirrors atlas_cutlass_pack_bf16_act_nvfp4: scale=max_abs/6).
 //  - Per k64 step we materialize natural-layout smem fragments
@@ -1464,9 +1466,16 @@ extern "C" __global__ void moe_w4a16_fused_gate_up_t_k64_fp4(
     // Double-buffered raw loads (same as FP8 kernel): bf16 A, packed B nibbles,
     // ue4m3 B scales.
     __shared__ __nv_bfloat16 smem_A_fp4[2][M_TILE][K_STEP_T64 + PAD_T64];
-    // B packed: [N_TILE_LG][K_STEP_T64/2] bytes, K-contiguous (already FP4).
-    __shared__ unsigned char smem_Bp_fp4[2][N_TILE_LG][K_STEP_T64 / 2 + 16];
-    // B scales: [K_STEP_T64/16][N_TILE_LG] (group-major, like gmem).
+    // B nibble STAGING: [K_STEP_T64/2][N_TILE_LG] K-major / N-contiguous, double-
+    // buffered — the coalesced cp.async target for the shared [K/2,N] tables
+    // (gate_ptrs_t). Byte-identical load to the FP8 _t kernel's smem_Bp_fgu64.
+    __shared__ unsigned char smem_BpT[2][K_STEP_T64 / 2][N_TILE_LG + BP_PAD];
+    // B nibble MMA-ready: [N_TILE_LG][K_STEP_T64/2] N-major / K-contiguous, SINGLE-
+    // buffered — regenerated each k64 step from smem_BpT[cur] by FP4_TRANSPOSE,
+    // then byte-identical to the old [N,K/2] direct load (FP4_FRAG reads verbatim).
+    __shared__ unsigned char smem_Bp[N_TILE_LG][K_STEP_T64 / 2 + 16];
+    // B scales: [K_STEP_T64/16][N_TILE_LG] (group-major, like gmem) — UNCHANGED,
+    // scales are [K/16,N] in both the [N,K/2] re-pack and the [K/2,N] shared table.
     __shared__ unsigned char smem_Bs_fp4[2][K_STEP_T64 / GROUP_SIZE][N_TILE_LG + BP_PAD];
     // A quantized to FP4: packed [M_TILE][K_STEP_T64/2] + scales [M_TILE][4].
     __shared__ unsigned char smem_Ap_fp4[M_TILE][K_STEP_T64 / 2 + 4];
@@ -1491,13 +1500,12 @@ extern "C" __global__ void moe_w4a16_fused_gate_up_t_k64_fp4(
 
     const unsigned int ast = K_STEP_T64 + PAD_T64;
     const unsigned int M_eff = (unsigned int)M_expert;
-    const unsigned int half_K = K / 2;
     const unsigned int num_groups = K / GROUP_SIZE;
 
     // ── raw loads into double-buffered smem (cp.async) ──
     // A: 4 rounds × 128 threads × 16B = 64×64 bf16.
-    // Bp: each thread loads 16 contiguous K-bytes for one (n, k-octet);
-    //     128 threads × 16B = 2048B = 128 N × 16 bytes = full [128][32] in 2 rounds.
+    // Bp: COALESCED K-major read of the shared [K/2,N] table (N-contiguous) into
+    //     K-major staging smem_BpT — 16 N-bytes/thread/round, mirrors FP8 _t.
     // Bs: 4 groups × 128 N, loaded per-byte.
     #define FP4_ISSUE_LOADS(buf, kb) do { \
         { \
@@ -1514,16 +1522,16 @@ extern "C" __global__ void moe_w4a16_fused_gate_up_t_k64_fp4(
             } \
         } \
         { \
-            unsigned int n_base = threadIdx.x >> 1; \
-            unsigned int kbyte = (threadIdx.x & 1) << 4; \
-            unsigned int gke = (kb) + (kbyte << 1); \
+            unsigned int kp = threadIdx.x >> 3; \
+            unsigned int ns = (threadIdx.x & 7) << 4; \
+            unsigned int gns = cta_n + ns; \
             _Pragma("unroll") \
             for (int rnd = 0; rnd < 2; rnd++) { \
-                unsigned int n_cur = rnd * 64 + n_base; \
-                unsigned int gns = cta_n + n_cur; \
-                moe_cp_async_pred_16(&smem_Bp_fp4[(buf)][n_cur][kbyte], \
-                    &B_expert[(unsigned long long)gns * half_K + (gke >> 1)], \
-                    (gns < N) && (gke + 31 < K)); \
+                unsigned int kp_cur = rnd * 16 + kp; \
+                unsigned int gke = (kb) + (kp_cur << 1); \
+                moe_cp_async_pred_16(&smem_BpT[(buf)][kp_cur][ns], \
+                    &B_expert[(unsigned long long)(gke >> 1) * N + gns], \
+                    (gke + 1 < K) && (gns + 15 < N)); \
             } \
         } \
         { \
@@ -1596,6 +1604,27 @@ extern "C" __global__ void moe_w4a16_fused_gate_up_t_k64_fp4(
     // KK is even and KK/2 ∈ {tid*4, 16+tid*4} → 4-byte aligned.
     #define FP4_FRAG(P, ROW, KK) (*(const unsigned int*)&(P)[(ROW)][(KK) / 2])
 
+    // ── transpose K-major staging → N-major MMA tile (replaces FP8 dequant) ──
+    // Each of 128 lanes owns one N-row, gathers its 32 packed K-bytes from the
+    // K-major staging tile into a contiguous K-run, vectorized to u32 stores.
+    // Pure byte copy: transpose_for_gemm preserved the (2j,2j+1) e2m1 pairing,
+    // so smem_Bp is byte-identical to the old [N,K/2] direct load — no nibble swap.
+    // Reads: 128 lanes read row q*4+r at consecutive my_n → conflict-free 128B row.
+    // Writes: lane my_n → row my_n, stride 48 (the +16 pad spreads lanes off banks).
+    #define FP4_TRANSPOSE(buf) do { \
+        unsigned int my_n = threadIdx.x; \
+        if (my_n < N_TILE_LG) { \
+            _Pragma("unroll") \
+            for (int q = 0; q < (K_STEP_T64 / 2) / 4; q++) { \
+                unsigned int w = (unsigned int)smem_BpT[(buf)][q * 4 + 0][my_n] \
+                    | ((unsigned int)smem_BpT[(buf)][q * 4 + 1][my_n] << 8) \
+                    | ((unsigned int)smem_BpT[(buf)][q * 4 + 2][my_n] << 16) \
+                    | ((unsigned int)smem_BpT[(buf)][q * 4 + 3][my_n] << 24); \
+                *(unsigned int*)&smem_Bp[my_n][q * 4] = w; \
+            } \
+        } \
+    } while(0)
+
     // ── compute: one m16n8k64 block-scaled FP4 MMA per N-tile ──
     // local k0 = 0 within the step (k64 = exactly one MMA k-tile).
     #define FP4_COMPUTE_MMA() do { \
@@ -1612,8 +1641,8 @@ extern "C" __global__ void moe_w4a16_fused_gate_up_t_k64_fp4(
         _Pragma("unroll") \
         for (int nt = 0; nt < 16; nt++) { \
             unsigned int nc = nt * 8 + group_id; \
-            unsigned int b0 = FP4_FRAG(smem_Bp_cur, nc, tid * 8); \
-            unsigned int b1 = FP4_FRAG(smem_Bp_cur, nc, 32 + tid * 8); \
+            unsigned int b0 = FP4_FRAG(smem_Bp, nc, tid * 8); \
+            unsigned int b1 = FP4_FRAG(smem_Bp, nc, 32 + tid * 8); \
             unsigned int sfn = nt * 8 + (lane_id >> 2); \
             unsigned int sfb_raw = (unsigned int)smem_Bs_cur[0][sfn] \
                          | ((unsigned int)smem_Bs_cur[1][sfn] << 8) \
@@ -1639,6 +1668,7 @@ extern "C" __global__ void moe_w4a16_fused_gate_up_t_k64_fp4(
     moe_cp_async_wait_all();
     __syncthreads();
     FP4_QUANT_A(0);
+    FP4_TRANSPOSE(0);
     __syncthreads();
 
     int cur = 0;
@@ -1647,18 +1677,17 @@ extern "C" __global__ void moe_w4a16_fused_gate_up_t_k64_fp4(
         FP4_ISSUE_LOADS(nxt, k_base);
         moe_cp_async_commit();
         {
-            const unsigned char (*smem_Bp_cur)[K_STEP_T64 / 2 + 16] = smem_Bp_fp4[cur];
             const unsigned char (*smem_Bs_cur)[N_TILE_LG + BP_PAD] = smem_Bs_fp4[cur];
             FP4_COMPUTE_MMA();
         }
         moe_cp_async_wait_all();
         __syncthreads();
         FP4_QUANT_A(nxt);
+        FP4_TRANSPOSE(nxt);
         __syncthreads();
         cur = nxt;
     }
     {
-        const unsigned char (*smem_Bp_cur)[K_STEP_T64 / 2 + 16] = smem_Bp_fp4[cur];
         const unsigned char (*smem_Bs_cur)[N_TILE_LG + BP_PAD] = smem_Bs_fp4[cur];
         FP4_COMPUTE_MMA();
     }
@@ -1666,6 +1695,7 @@ extern "C" __global__ void moe_w4a16_fused_gate_up_t_k64_fp4(
     #undef FP4_ISSUE_LOADS
     #undef FP4_QUANT_A
     #undef FP4_FRAG
+    #undef FP4_TRANSPOSE
     #undef FP4_COMPUTE_MMA
 
     #pragma unroll
@@ -1689,8 +1719,8 @@ extern "C" __global__ void moe_w4a16_fused_gate_up_t_k64_fp4(
 // tile (mma.sync...mxf4nvf4.scale_vec::4X.m16n8k64), cp.async double-buffer,
 // in-register e2m1 act-quant. Used for the routed-expert down projection:
 //   input  A = post-SiLU intermediate  [M, K=inter=512] (bf16)
-//   weight B = down_proj per-expert     packed [N=hidden=2048, K/2] e2m1
-//              + scales [K/16, N] ue4m3 (pack_bf16_weight_to_nvfp4_t layout)
+//   weight B = down_proj per-expert     SHARED down_ptrs_t: packed [K/2, N=hidden=2048]
+//              e2m1 (K-major) + scales [K/16, N] ue4m3 (transpose_for_gemm layout)
 //   output C = [M, N=2048]
 //
 // Differs from the fused gate_up FP4 kernel ONLY in being a single GEMM (no
@@ -1739,7 +1769,11 @@ extern "C" __global__ void moe_w4a16_down_t_k64_fp4(
     const unsigned int tid = lane_id & 3;          // q = 0..3
 
     __shared__ __nv_bfloat16 smem_A_fp4[2][M_TILE][K_STEP_T64 + PAD_T64];
-    __shared__ unsigned char smem_Bp_fp4[2][N_TILE_LG][K_STEP_T64 / 2 + 16];
+    // B nibble STAGING (K-major, double-buffered) + MMA-ready tile (N-major, single-
+    // buffered) — see the gate_up kernel for the layout rationale. Shared [K/2,N]
+    // down_ptrs_t table loaded coalesced K-major, re-gathered by DN4_TRANSPOSE.
+    __shared__ unsigned char smem_BpT[2][K_STEP_T64 / 2][N_TILE_LG + BP_PAD];
+    __shared__ unsigned char smem_Bp[N_TILE_LG][K_STEP_T64 / 2 + 16];
     __shared__ unsigned char smem_Bs_fp4[2][K_STEP_T64 / GROUP_SIZE][N_TILE_LG + BP_PAD];
     __shared__ unsigned char smem_Ap_fp4[M_TILE][K_STEP_T64 / 2 + 4];
     __shared__ unsigned char smem_As_fp4[M_TILE][K_STEP_T64 / GROUP_SIZE];
@@ -1762,7 +1796,6 @@ extern "C" __global__ void moe_w4a16_down_t_k64_fp4(
     }
 
     const unsigned int M_eff = (unsigned int)M_expert;
-    const unsigned int half_K = K / 2;
     const unsigned int num_groups = K / GROUP_SIZE;
 
     #define DN4_ISSUE_LOADS(buf, kb) do { \
@@ -1780,16 +1813,16 @@ extern "C" __global__ void moe_w4a16_down_t_k64_fp4(
             } \
         } \
         { \
-            unsigned int n_base = threadIdx.x >> 1; \
-            unsigned int kbyte = (threadIdx.x & 1) << 4; \
-            unsigned int gke = (kb) + (kbyte << 1); \
+            unsigned int kp = threadIdx.x >> 3; \
+            unsigned int ns = (threadIdx.x & 7) << 4; \
+            unsigned int gns = cta_n + ns; \
             _Pragma("unroll") \
             for (int rnd = 0; rnd < 2; rnd++) { \
-                unsigned int n_cur = rnd * 64 + n_base; \
-                unsigned int gns = cta_n + n_cur; \
-                moe_cp_async_pred_16(&smem_Bp_fp4[(buf)][n_cur][kbyte], \
-                    &B_expert[(unsigned long long)gns * half_K + (gke >> 1)], \
-                    (gns < N) && (gke + 31 < K)); \
+                unsigned int kp_cur = rnd * 16 + kp; \
+                unsigned int gke = (kb) + (kp_cur << 1); \
+                moe_cp_async_pred_16(&smem_BpT[(buf)][kp_cur][ns], \
+                    &B_expert[(unsigned long long)(gke >> 1) * N + gns], \
+                    (gke + 1 < K) && (gns + 15 < N)); \
             } \
         } \
         { \
@@ -1853,6 +1886,21 @@ extern "C" __global__ void moe_w4a16_down_t_k64_fp4(
 
     #define DN4_FRAG(P, ROW, KK) (*(const unsigned int*)&(P)[(ROW)][(KK) / 2])
 
+    // K-major staging → N-major MMA tile (see gate_up FP4_TRANSPOSE). Pure byte copy.
+    #define DN4_TRANSPOSE(buf) do { \
+        unsigned int my_n = threadIdx.x; \
+        if (my_n < N_TILE_LG) { \
+            _Pragma("unroll") \
+            for (int q = 0; q < (K_STEP_T64 / 2) / 4; q++) { \
+                unsigned int w = (unsigned int)smem_BpT[(buf)][q * 4 + 0][my_n] \
+                    | ((unsigned int)smem_BpT[(buf)][q * 4 + 1][my_n] << 8) \
+                    | ((unsigned int)smem_BpT[(buf)][q * 4 + 2][my_n] << 16) \
+                    | ((unsigned int)smem_BpT[(buf)][q * 4 + 3][my_n] << 24); \
+                *(unsigned int*)&smem_Bp[my_n][q * 4] = w; \
+            } \
+        } \
+    } while(0)
+
     #define DN4_COMPUTE_MMA() do { \
         unsigned int ra = warp_m_offset + group_id; \
         unsigned int a0 = DN4_FRAG(smem_Ap_fp4, ra,     tid * 8); \
@@ -1867,8 +1915,8 @@ extern "C" __global__ void moe_w4a16_down_t_k64_fp4(
         _Pragma("unroll") \
         for (int nt = 0; nt < 16; nt++) { \
             unsigned int nc = nt * 8 + group_id; \
-            unsigned int b0 = DN4_FRAG(smem_Bp_cur, nc, tid * 8); \
-            unsigned int b1 = DN4_FRAG(smem_Bp_cur, nc, 32 + tid * 8); \
+            unsigned int b0 = DN4_FRAG(smem_Bp, nc, tid * 8); \
+            unsigned int b1 = DN4_FRAG(smem_Bp, nc, 32 + tid * 8); \
             unsigned int sfn = nt * 8 + (lane_id >> 2); \
             unsigned int sfb_raw = (unsigned int)smem_Bs_cur[0][sfn] \
                          | ((unsigned int)smem_Bs_cur[1][sfn] << 8) \
@@ -1894,6 +1942,7 @@ extern "C" __global__ void moe_w4a16_down_t_k64_fp4(
     moe_cp_async_wait_all();
     __syncthreads();
     DN4_QUANT_A(0);
+    DN4_TRANSPOSE(0);
     __syncthreads();
 
     int cur = 0;
@@ -1902,18 +1951,17 @@ extern "C" __global__ void moe_w4a16_down_t_k64_fp4(
         DN4_ISSUE_LOADS(nxt, k_base);
         moe_cp_async_commit();
         {
-            const unsigned char (*smem_Bp_cur)[K_STEP_T64 / 2 + 16] = smem_Bp_fp4[cur];
             const unsigned char (*smem_Bs_cur)[N_TILE_LG + BP_PAD] = smem_Bs_fp4[cur];
             DN4_COMPUTE_MMA();
         }
         moe_cp_async_wait_all();
         __syncthreads();
         DN4_QUANT_A(nxt);
+        DN4_TRANSPOSE(nxt);
         __syncthreads();
         cur = nxt;
     }
     {
-        const unsigned char (*smem_Bp_cur)[K_STEP_T64 / 2 + 16] = smem_Bp_fp4[cur];
         const unsigned char (*smem_Bs_cur)[N_TILE_LG + BP_PAD] = smem_Bs_fp4[cur];
         DN4_COMPUTE_MMA();
     }
@@ -1921,6 +1969,7 @@ extern "C" __global__ void moe_w4a16_down_t_k64_fp4(
     #undef DN4_ISSUE_LOADS
     #undef DN4_QUANT_A
     #undef DN4_FRAG
+    #undef DN4_TRANSPOSE
     #undef DN4_COMPUTE_MMA
 
     #pragma unroll

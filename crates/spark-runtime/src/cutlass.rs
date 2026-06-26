@@ -336,9 +336,10 @@ pub fn nvfp4_grouped_gate_up(
     }
 }
 
-/// Pack BF16 row-major weight `[N,K]` into Atlas transposed NVFP4 layout:
-/// packed `[K/2,N]` and E4M3 scales `[K/16,N]`. `weight_scale_2` is assumed
-/// to be 1.0 by the caller when feeding this into the native CUTLASS wrapper.
+/// Pack BF16 row-major weight `[N,K]` into the native CUTLASS NVFP4 layout:
+/// packed `[N,K/2]` (N-major, K-contiguous — NOT the Atlas transposed `[K/2,N]`)
+/// and E4M3 scales `[K/16,N]`. `weight_scale_2` is assumed to be 1.0 by the
+/// caller when feeding this into the native CUTLASS wrapper.
 pub fn pack_bf16_weight_to_nvfp4_t(
     weight_bf16: u64,
     packed_t: u64,

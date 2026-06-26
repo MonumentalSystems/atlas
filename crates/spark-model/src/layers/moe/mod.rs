@@ -29,53 +29,6 @@ pub(crate) struct ExpertPtrTable {
     pub(crate) scale2_vals: DevicePtr,
 }
 
-/// Host-side per-expert NVFP4 weight tables for the FP4 gate_up prefill path
-/// (`ATLAS_HOLO_MOE_GATEUP_FP4`). Mirrors the CUTLASS escape-hatch
-/// `spark_runtime::cutlass::nvfp4_grouped_gate_up` contract: HOST arrays of
-/// per-expert device pointers in the `pack_bf16_weight_to_nvfp4_t` layout
-/// (`[N,K/2]` packed + `[K/16,N]` scale) plus host scale2 vals. Built at load
-/// time when the flag is on; `None` (and thus the field absent) keeps the
-/// existing FP8 fused gate_up path bit-identical.
-pub(crate) struct MoeFp4GateUp {
-    /// `[num_experts]` device pointers to each gate expert's packed `[N,K/2]`.
-    pub(crate) gate_packed_ptrs: Vec<u64>,
-    /// `[num_experts]` device pointers to each gate expert's scale `[K/16,N]`.
-    pub(crate) gate_scale_ptrs: Vec<u64>,
-    /// `[num_experts]` gate scale2 (always 1.0 — folded into the pack).
-    pub(crate) gate_scale2_vals: Vec<f32>,
-    pub(crate) up_packed_ptrs: Vec<u64>,
-    pub(crate) up_scale_ptrs: Vec<u64>,
-    pub(crate) up_scale2_vals: Vec<f32>,
-    /// Owning device allocations (packed + scale, gate then up) so they are
-    /// freed with the layer. Pointers above alias into these.
-    pub(crate) _owned: Vec<DevicePtr>,
-    /// Device-side ptr-tables for the FUSED FP4 kernel
-    /// (`moe_w4a16_fused_gate_up_t_k64_fp4`). The fused kernel — unlike the
-    /// CUTLASS escape-hatch collective — reads its per-expert weight pointers
-    /// from device memory (one `unsigned long long*` array per projection),
-    /// exactly like the FP8 fused kernel's `gate_ptrs_t`. These are the host
-    /// `*_packed_ptrs` / `*_scale_ptrs` / `*_scale2_vals` uploaded to device.
-    pub(crate) gate_t: ExpertPtrTable,
-    pub(crate) up_t: ExpertPtrTable,
-}
-
-/// Host-side per-expert NVFP4 weight table for the FP4 DOWN prefill path
-/// (`ATLAS_HOLO_MOE_DOWN_FP4`). Single projection (no gate/up fusion). Mirrors
-/// [`MoeFp4GateUp`] but for `down_proj` (`[N=hidden, K=inter]`): the down weight
-/// is dequanted to BF16 then re-packed via `pack_bf16_weight_to_nvfp4_t` into the
-/// `[N,K/2]` packed + `[K/16,N]` E4M3-scale layout the FP4 down kernel reads.
-/// Built at load when the flag is on; `None` (field absent) keeps the existing
-/// FP8/w4a16 down path bit-identical.
-pub(crate) struct MoeFp4Down {
-    /// Device-side ptr-table for the FP4 down kernel (`moe_w4a16_down_t_k64_fp4`):
-    /// one `unsigned long long*` array of per-expert packed pointers, one of
-    /// scale pointers, one f32 scale2 array — exactly like `down_ptrs_t`.
-    pub(crate) down_t: ExpertPtrTable,
-    /// Owning device allocations (per-expert packed + scale buffers + the three
-    /// uploaded ptr-table arrays) so they are freed with the layer.
-    pub(crate) _owned: Vec<DevicePtr>,
-}
-
 /// Device-side pointer table for FP8 expert dispatch (one projection).
 ///
 /// FP8 experts use 2 pointer arrays (weight + block_scale) instead of
@@ -220,6 +173,14 @@ pub struct MoeLayer {
     /// `moe_fused_gate_up_t_k64_m128 == KernelHandle(0)` and dispatch
     /// falls through to the M=64 path even when the env var is set.
     nvfp4_gate_up_m128: bool,
+    /// `ATLAS_HOLO_MOE_GATEUP_FP4=1` opts the prefill fused gate_up onto the
+    /// block-scaled FP4 kernel. Reads the SHARED FAST_MOE=full `gate_ptrs_t`/
+    /// `up_ptrs_t` `[K/2,N]` tables (no extra MoE memory); dispatch also requires
+    /// those tables present + the FP4 kernel handle != 0.
+    gateup_fp4: bool,
+    /// `ATLAS_HOLO_MOE_DOWN_FP4=1` — same, for the prefill down projection over
+    /// the shared `down_ptrs_t` table.
+    down_fp4: bool,
     /// `ATLAS_HYBRID_MOE_LAYOUT=1` opts in to the hybrid-layout path:
     /// keep BOTH original `[N, K/2]` weights (for decode + MTP verify) AND
     /// transposed `[K/2, N]` weights (for prefill). Doubles MoE-weight
@@ -246,8 +207,9 @@ pub struct MoeLayer {
     /// (`ATLAS_HOLO_MOE_GATEUP_FP4`). Same signature as `moe_fused_gate_up_t_k64`
     /// but runs one `mma.sync.kind::mxf4nvf4.scale_vec::4X.m16n8k64` per k64
     /// tile (vs 2× m16n8k32 e4m3). `try_kernel` — `KernelHandle(0)` on images
-    /// lacking it; the dispatch in `forward_prefill_routed` only fires when both
-    /// this handle and `fp4_gate_up` are set.
+    /// lacking it; the dispatch in `forward_prefill_routed` only fires when this
+    /// handle != 0, `gateup_fp4` is set, and the shared `gate_ptrs_t`/`up_ptrs_t`
+    /// tables are present (FAST_MOE=full).
     moe_fused_gate_up_t_k64_fp4: KernelHandle,
     moe_fp8_grouped_gemm_t: KernelHandle,
     w4a16_gemm_t: KernelHandle,
@@ -334,18 +296,9 @@ pub struct MoeLayer {
     bf16_shared_down: Option<DevicePtr>,
     // FP8 shared expert weights (None when shared expert is NVFP4)
     fp8_shared_expert: Option<Fp8ExpertWeight>,
-    /// FP4 gate_up prefill tables (`ATLAS_HOLO_MOE_GATEUP_FP4`). `None` =>
-    /// the existing FP8 fused gate_up path runs unchanged (default).
-    /// Populated at load by `build_fp4_gate_up` when the flag is on.
-    pub(crate) fp4_gate_up: Option<MoeFp4GateUp>,
-    /// FP4 down prefill table (`ATLAS_HOLO_MOE_DOWN_FP4`). `None` => the existing
-    /// FP8/w4a16 down path runs unchanged (default). Populated at load by
-    /// `build_fp4_down` when the flag is on. Compounds with `fp4_gate_up` to run
-    /// the whole MoE FFN at FP4.
-    pub(crate) fp4_down: Option<MoeFp4Down>,
     /// FP4 down kernel handle (`moe_w4a16_down_t_k64_fp4`). `try_kernel` =>
     /// `KernelHandle(0)` on images lacking it; the FP4-down dispatch checks this
-    /// handle != 0 AND `fp4_down` is set before firing.
+    /// handle != 0, `down_fp4` is set, and the shared `down_ptrs_t` table is present.
     pub(crate) moe_down_t_k64_fp4: KernelHandle,
     /// `moe_permute_tokens` gather kernel — only needed by the FP4 escape-hatch
     /// (which consumes expert-sorted contiguous rows, unlike the FP8 fused

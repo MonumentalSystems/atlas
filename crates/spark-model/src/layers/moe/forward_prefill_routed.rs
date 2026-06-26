@@ -112,28 +112,27 @@ impl MoeLayer {
                 .memset_async(ctx.buffers.expert_down_out(), 0, down_bytes, stream)?;
         }
         if max_m_tiles > 0 {
-            if let Some(fp4) = self.fp4_gate_up.as_ref().filter(|_| {
-                self.moe_fused_gate_up_t_k64_fp4.0 != 0
-            }) {
+            if let (Some(gp), Some(up)) = (&self.gate_ptrs_t, &self.up_ptrs_t) {
+              if self.gateup_fp4 && self.moe_fused_gate_up_t_k64_fp4.0 != 0 {
                 // ── FUSED FP4 gate_up (ATLAS_HOLO_MOE_GATEUP_FP4) ──
-                // Single launch over the whole batch: grid z = num_experts,
-                // each block gathers its A rows in-kernel via sorted_token_ids
-                // (no permute), reads its weights from the device ptr-tables,
-                // and writes C_gate/C_up in the SAME sorted layout the FP8 fused
-                // kernel produces — so silu+down+unpermute downstream are
-                // unchanged. No gather, no D2H offset copy, no per-expert sync:
-                // identical orchestration to the FP8 fused path, just FP4 math
-                // (one m16n8k64 mxf4 MMA per k64 tile vs 2× m16n8k32 e4m3).
+                // Block-scaled FP4 over the SHARED FAST_MOE=full [K/2,N] tables
+                // (gate_ptrs_t/up_ptrs_t — the SAME bytes the FP8 fused path
+                // reads, selected here only by kernel handle, so NO extra MoE
+                // memory). The kernel loads them coalesced K-major and re-gathers
+                // N-major on-chip (FP4_TRANSPOSE). gp/up carry the REAL per-expert
+                // scale2 (applied at writeback) — not the legacy hardcoded 1.0.
+                // Single launch, grid z = num_experts; writes C_gate/C_up in the
+                // same sorted layout as FP8 so silu+down+unpermute are unchanged.
                 ops::moe_w4a16_fused_gate_up_k64_n128(
                     ctx.gpu,
                     self.moe_fused_gate_up_t_k64_fp4,
                     expert_input,
-                    fp4.gate_t.packed_ptrs,
-                    fp4.gate_t.scale_ptrs,
-                    fp4.gate_t.scale2_vals,
-                    fp4.up_t.packed_ptrs,
-                    fp4.up_t.scale_ptrs,
-                    fp4.up_t.scale2_vals,
+                    gp.packed_ptrs,
+                    gp.scale_ptrs,
+                    gp.scale2_vals,
+                    up.packed_ptrs,
+                    up.scale_ptrs,
+                    up.scale2_vals,
                     expert_gate_out,
                     expert_up_out,
                     expert_offsets,
@@ -144,7 +143,7 @@ impl MoeLayer {
                     max_m_tiles,
                     stream,
                 )?;
-            } else if let (Some(gp), Some(up)) = (&self.gate_ptrs_t, &self.up_ptrs_t) {
+              } else {
                 // Block D #3 dispatch: M=128 path needs the env var on AND
                 // the kernel actually loaded (try_kernel returns 0 on
                 // models that don't ship it). max_m_tiles_m128 = ceil(...
@@ -195,6 +194,7 @@ impl MoeLayer {
                         stream,
                     )?;
                 }
+              }
             } else {
                 let (gp, up) = (&self.gate_ptrs, &self.up_ptrs);
                 ops::moe_w4a16_grouped_gemm_ptrtable(
@@ -251,18 +251,20 @@ impl MoeLayer {
             // down tables. Same sorted layout + null sorted_token_ids as the
             // FP8/w4a16 down kernels, so unpermute downstream is unchanged.
             // Compounds with the FP4 gate_up path to run the whole FFN at FP4.
-            if let Some(fp4d) = self
-                .fp4_down
-                .as_ref()
-                .filter(|_| self.moe_down_t_k64_fp4.0 != 0)
-            {
+            if let Some(dp) = &self.down_ptrs_t {
+              if self.down_fp4 && self.moe_down_t_k64_fp4.0 != 0 {
+                // ── FP4 down (ATLAS_HOLO_MOE_DOWN_FP4) over the SHARED down_ptrs_t
+                // [K/2,N] table (real per-expert scale2; coalesced K-major load +
+                // on-chip DN4_TRANSPOSE). Same sorted layout + null
+                // sorted_token_ids as the FP8/w4a16 down kernels, so unpermute is
+                // unchanged. No extra MoE memory (shared table).
                 ops::moe_w4a16_grouped_gemm_ptrtable_n128(
                     ctx.gpu,
                     self.moe_down_t_k64_fp4,
                     expert_gate_out,
-                    fp4d.down_t.packed_ptrs,
-                    fp4d.down_t.scale_ptrs,
-                    fp4d.down_t.scale2_vals,
+                    dp.packed_ptrs,
+                    dp.scale_ptrs,
+                    dp.scale2_vals,
                     expert_down_out,
                     expert_offsets,
                     DevicePtr(0),
@@ -272,7 +274,7 @@ impl MoeLayer {
                     max_m_tiles,
                     stream,
                 )?;
-            } else if let Some(dp) = &self.down_ptrs_t {
+              } else {
                 let fp8_down = std::env::var("ATLAS_MOE_PREFILL_FP8_DOWN").ok().as_deref()
                     == Some("1")
                     && self.moe_fp8_grouped_gemm_t.0 != 0
@@ -320,6 +322,7 @@ impl MoeLayer {
                         stream,
                     )?;
                 }
+              }
             } else {
                 ops::moe_w4a16_grouped_gemm_ptrtable(
                     ctx.gpu,

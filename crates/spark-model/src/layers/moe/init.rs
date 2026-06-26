@@ -241,6 +241,13 @@ impl MoeLayer {
             nvfp4_gate_up_m128: std::env::var("ATLAS_NVFP4_GATE_UP_M128")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false),
+            // FP4 prefill MoE over the shared FAST_MOE=full [K/2,N] tables.
+            gateup_fp4: std::env::var("ATLAS_HOLO_MOE_GATEUP_FP4")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false),
+            down_fp4: std::env::var("ATLAS_HOLO_MOE_DOWN_FP4")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false),
             shared_gate_t: None,
             shared_up_t: None,
             shared_down_t: None,
@@ -294,14 +301,6 @@ impl MoeLayer {
             bf16_shared_up: None,
             bf16_shared_down: None,
             fp8_shared_expert: None,
-            // FP4 gate_up tables (ATLAS_HOLO_MOE_GATEUP_FP4) — built post-
-            // construction by the loader when the flag is on; None => the FP8
-            // fused gate_up path runs unchanged.
-            fp4_gate_up: None,
-            // FP4 down path (ATLAS_HOLO_MOE_DOWN_FP4): table populated at load
-            // by build_fp4_down when the flag is on; None keeps the FP8/w4a16
-            // down path unchanged.
-            fp4_down: None,
             moe_down_t_k64_fp4: super::super::try_kernel(
                 gpu,
                 "moe_w4a16",

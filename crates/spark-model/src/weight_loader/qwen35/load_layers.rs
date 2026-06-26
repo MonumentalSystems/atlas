@@ -273,23 +273,23 @@ pub(super) fn load_layers(
         // capture-layer indices are already offset-adjusted in factory.rs
         // before being placed on `config.dflash_capture_layers`.
         moe_layer.is_dflash_capture_layer = config.dflash_capture_layers.contains(&i);
-        // FP4 MoE gate_up (ATLAS_HOLO_MOE_GATEUP_FP4): pack each expert's
-        // gate/up NVFP4 weight into the CUTLASS NVFP4 escape-hatch layout for
-        // the FP4 grouped gate_up prefill path. Built from the untransposed
-        // NVFP4 expert weights (present here before any transpose/free), so it
-        // is intended for ATLAS_HOLO_FAST_MOE_MODE=off (skip prefill copies).
-        // Default OFF => bit-identical to the FP8 fused path.
-        if holo_moe_gateup_fp4() {
-            moe_layer.build_fp4_gate_up(gpu, config, stream)?;
-        }
-        // FP4 MoE down (ATLAS_HOLO_MOE_DOWN_FP4): pack each expert's down_proj
-        // NVFP4 weight into the FP4 down-kernel layout. Compounds with the FP4
-        // gate_up path to run the whole MoE FFN at FP4. Same constraint: built
-        // from untransposed NVFP4 down weights (present here before any
-        // transpose/free), so intended for ATLAS_HOLO_FAST_MOE_MODE=off.
-        // Default OFF => bit-identical to the FP8/w4a16 down path.
-        if holo_moe_down_fp4() {
-            moe_layer.build_fp4_down(gpu, config, stream)?;
+        // FP4 prefill MoE (ATLAS_HOLO_MOE_GATEUP_FP4 / _DOWN_FP4) consumes the
+        // SHARED FAST_MOE=full [K/2,N] tables (gate_ptrs_t/up_ptrs_t/down_ptrs_t)
+        // built by transpose_for_prefill below — NO separate [N,K/2] re-pack, NO
+        // extra MoE memory. The rewritten FP4 kernels load those tables coalesced
+        // K-major and re-gather N-major on-chip (FP4_TRANSPOSE). It therefore only
+        // engages under ATLAS_HOLO_FAST_MOE_MODE=full; with the shared tables
+        // absent the dispatch falls back to FP8. Warn once if the flags are set
+        // without the tables so the opt-in isn't silently ignored.
+        if i == 0
+            && (holo_moe_gateup_fp4() || holo_moe_down_fp4())
+            && holo_fast_moe_mode.is_none()
+        {
+            tracing::warn!(
+                "ATLAS_HOLO_MOE_GATEUP_FP4/_DOWN_FP4 set but ATLAS_HOLO_FAST_MOE_MODE \
+                 is not full: the FP4 MoE prefill path needs the shared [K/2,N] tables \
+                 and will be IGNORED (FP8 fused path used instead)."
+            );
         }
         // With native FP8, the FP8 fused MoE kernel handles both prefill and decode.
         // Skip transposition and predequant (saves ~30 GB + CPU time for 122B EP=2).

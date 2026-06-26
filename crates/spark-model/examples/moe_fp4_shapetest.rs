@@ -186,6 +186,32 @@ fn pack_weight_kmajor(b_bf16: &[u16], n: usize, k: usize) -> (Vec<u8>, Vec<u8>) 
     (packed, scales)
 }
 
+/// Byte-transpose GPU-packed NVFP4 nibbles `[N,K/2]` (the
+/// `pack_bf16_weight_to_nvfp4_t` layout the CUTLASS collective consumes) into the
+/// Atlas shared-table `[K/2,N]` layout (exactly `transpose_for_gemm`:
+/// `t[j*n+i] = src[i*half_k+j]`). Pure index remap — preserves each byte's
+/// `(2j,2j+1)` e2m1 nibble pair, so NO re-quantization. The ue4m3 group scales are
+/// already `[K/16,N]` in BOTH layouts, so the caller reuses the scale pointer
+/// unchanged. Feeding these byte-identical nibbles to the rewritten FP4 kernel
+/// makes `cos_vs_collective` a pure transpose-correctness gate (no packer drift).
+fn packed_nmajor_to_kmajor(
+    gpu: &dyn GpuBackend,
+    packed_nmajor: DevicePtr,
+    n: usize,
+    k: usize,
+) -> Result<DevicePtr> {
+    let half_k = k / 2;
+    let mut src = vec![0u8; half_k * n];
+    gpu.copy_d2h(packed_nmajor, &mut src)?;
+    let mut dst = vec![0u8; half_k * n];
+    for i in 0..n {
+        for j in 0..half_k {
+            dst[j * n + i] = src[i * half_k + j];
+        }
+    }
+    upload_bytes(gpu, &dst)
+}
+
 // ───────────────────────── upload helpers ─────────────────────────
 fn u16s_to_le(v: &[u16]) -> Vec<u8> {
     v.iter().flat_map(|x| x.to_le_bytes()).collect()
@@ -464,9 +490,10 @@ fn run_shape(
 
     // ── Phase-2 FUSED FP4 kernel (moe_w4a16_fused_gate_up_t_k64_fp4) ──
     // Single launch, cp.async pipelined, in-kernel A-quant, no gather. Consumes
-    // the SAME N-major FP4 weight tables (packed_ptr/scale_ptr = gate,
-    // up_packed_ptr/up_scale_ptr = up) the fp4_gate_up path packs. Single
-    // expert covering all M rows; sorted_token_ids = null (identity).
+    // the SHARED [K/2,N] tables (transpose_for_gemm layout) the rewritten kernel
+    // now reads — here the byte-transpose of the collective's [N,K/2] nibbles +
+    // the [K/16,N] scales. Single expert covering all M rows; sorted_token_ids =
+    // null (identity).
     let fused_handle = gpu.kernel("moe_w4a16", "moe_w4a16_fused_gate_up_t_k64_fp4")?;
     // Device ptr-tables: one expert each (u64 device pointers).
     let mk_ptr_tbl = |p: u64| -> Result<DevicePtr> {
@@ -475,9 +502,14 @@ fn run_shape(
         gpu.copy_h2d(&bytes, d)?;
         Ok(d)
     };
-    let gate_packed_tbl = mk_ptr_tbl(packed_ptr.0)?;
+    // FP4 fused now reads the SHARED [K/2,N] layout: byte-transpose the
+    // collective's [N,K/2] nibbles (bit-identical, no re-quant) so cos_vs_collective
+    // is a pure transpose-correctness gate. Scales are [K/16,N] in both → reuse.
+    let gate_packed_kt = packed_nmajor_to_kmajor(gpu, packed_ptr, n, k)?;
+    let up_packed_kt = packed_nmajor_to_kmajor(gpu, up_packed_ptr, n, k)?;
+    let gate_packed_tbl = mk_ptr_tbl(gate_packed_kt.0)?;
     let gate_scale_tbl = mk_ptr_tbl(scale_ptr.0)?;
-    let up_packed_tbl = mk_ptr_tbl(up_packed_ptr.0)?;
+    let up_packed_tbl = mk_ptr_tbl(up_packed_kt.0)?;
     let up_scale_tbl = mk_ptr_tbl(up_scale_ptr.0)?;
     let gate_scale2_tbl = upload_bytes(gpu, &1.0f32.to_le_bytes())?;
     let up_scale2_tbl = upload_bytes(gpu, &1.0f32.to_le_bytes())?;
@@ -611,6 +643,7 @@ fn run_shape(
     for p in [
         a_ptr, b_bf16_ptr, b_fp8_ptr, packed_ptr, scale_ptr, out_fp4, out_fp8, out_bf16,
         up_bf16_ptr, up_packed_ptr, up_scale_ptr, c_gate_grp, c_up_grp,
+        gate_packed_kt, up_packed_kt,
         gate_packed_tbl, gate_scale_tbl, up_packed_tbl, up_scale_tbl,
         gate_scale2_tbl, up_scale2_tbl, eoff_dev, c_gate_fused, c_up_fused,
         gate_pk_ptr, gate_sk_ptr, up_pk_ptr, up_sk_ptr,
@@ -667,7 +700,8 @@ fn run_down_shape(
     let b_bf16_ptr = upload_bytes(gpu, &u16s_to_le(&b_bf16))?;
     let (mu, nu, ku) = (m as u32, n as u32, k as u32);
 
-    // FP4 N-major weight (pack_bf16_weight_to_nvfp4_t: packed [N,K/2], scale [K/16,N]).
+    // Collective FP4 weight (pack_bf16_weight_to_nvfp4_t: packed [N,K/2], scale
+    // [K/16,N]); the FP4 down kernel reads the [K/2,N] byte-transpose of this.
     let packed_len = (k / 2) * n;
     let scale_len = (k / 16) * n;
     let packed_ptr = gpu.alloc(packed_len)?;
@@ -696,7 +730,11 @@ fn run_down_shape(
         gpu.copy_h2d(&bytes, d)?;
         Ok(d)
     };
-    let packed_tbl = mk_ptr_tbl(packed_ptr.0)?;
+    // The rewritten FP4 down kernel reads the SHARED [K/2,N] layout: byte-transpose
+    // the collective's [N,K/2] nibbles (bit-identical) so cos_vs_collective is a
+    // pure transpose gate. Scales [K/16,N] reused unchanged.
+    let packed_kt = packed_nmajor_to_kmajor(gpu, packed_ptr, n, k)?;
+    let packed_tbl = mk_ptr_tbl(packed_kt.0)?;
     let scale_tbl = mk_ptr_tbl(scale_ptr.0)?;
     let scale2_tbl = upload_bytes(gpu, &1.0f32.to_le_bytes())?;
     let eoff_dev = {
@@ -798,8 +836,9 @@ fn run_down_shape(
     let (cos_vs_oracle, _) = compare(&c_down, &c_ref);
 
     for p in [
-        a_ptr, b_bf16_ptr, packed_ptr, scale_ptr, out_collective, packed_tbl, scale_tbl,
-        scale2_tbl, eoff_dev, out_down, b_pk_ptr, b_sk_ptr, b_pk_tbl, b_sk_tbl, out_w4a16,
+        a_ptr, b_bf16_ptr, packed_ptr, scale_ptr, out_collective, packed_kt, packed_tbl,
+        scale_tbl, scale2_tbl, eoff_dev, out_down, b_pk_ptr, b_sk_ptr, b_pk_tbl, b_sk_tbl,
+        out_w4a16,
         a_fp8_ptr, out_fp8,
     ] {
         gpu.free(p).ok();

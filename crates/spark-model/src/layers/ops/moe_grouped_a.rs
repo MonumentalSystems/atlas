@@ -8,7 +8,6 @@ use anyhow::Result;
 use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 use spark_runtime::kernel_args::{KernelLaunch, div_ceil};
 
-use crate::layers::moe;
 use crate::weight_map::{DenseWeight, Fp8DenseWeight, Fp8Weight, QuantizedWeight};
 
 use super::*;
@@ -327,47 +326,6 @@ pub fn moe_permute_tokens(
         .arg_u32(hidden)
         .arg_u32(total_expanded)
         .launch(stream)
-}
-
-/// FP4 grouped fused gate+up GEMM (`ATLAS_HOLO_MOE_GATEUP_FP4`).
-///
-/// Dispatches the proven Sm120 NVFP4 block-scaled collective once per active
-/// expert over its token slice (escape-hatch), writing `c_gate`/`c_up`
-/// `[M_total, N]` to match the FP8 fused kernel's output layout. `a` is the
-/// sorted/expert-contiguous `expert_input` (`[M_total, K]`); `expert_offsets`
-/// is the HOST copy of the device offsets. Per-expert weight tables come from
-/// the load-time [`moe::MoeFp4GateUp`] (CUTLASS `[N,K/2]` packed + `[K/16,N]`
-/// scale, scale2 = 1.0).
-///
-/// Legacy escape-hatch: superseded by the fused FP4 kernel dispatch in
-/// `forward_prefill_routed`. Kept (and referencing the host `MoeFp4GateUp`
-/// pointer arrays) for A/B fallback; currently uncalled.
-#[allow(clippy::too_many_arguments, dead_code)]
-pub(crate) fn moe_nvfp4_fused_gate_up_grouped(
-    fp4: &moe::MoeFp4GateUp,
-    a: DevicePtr,
-    c_gate: DevicePtr,
-    c_up: DevicePtr,
-    expert_offsets_host: &[i32],
-    n: u32,
-    k: u32,
-    stream: u64,
-) -> Result<()> {
-    spark_runtime::cutlass::nvfp4_grouped_gate_up(
-        a.0,
-        &fp4.gate_packed_ptrs,
-        &fp4.gate_scale_ptrs,
-        &fp4.gate_scale2_vals,
-        &fp4.up_packed_ptrs,
-        &fp4.up_scale_ptrs,
-        &fp4.up_scale2_vals,
-        c_gate.0,
-        c_up.0,
-        expert_offsets_host,
-        n,
-        k,
-        stream,
-    )
 }
 
 /// K64 fused gate+up GEMM — M=128 variant (Block D #3 — Avarok pattern).
