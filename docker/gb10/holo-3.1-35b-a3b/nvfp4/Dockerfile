@@ -158,7 +158,19 @@ ENV ATLAS_CUTLASS_NVFP4_GEMM=1 \
     ATLAS_HOLO_FP4_PROJ_DECODE=1 \
     ATLAS_PREFILL_CODISPATCH=1 \
     ATLAS_FLASHINFER_PREFILL=1 \
-    ATLAS_Q12_BATCHED_FIRST_CHUNK=1
+    ATLAS_Q12_BATCHED_FIRST_CHUNK=1 \
+    ATLAS_HOLO_MOE_GROUPED_CUTLASS=1 \
+    ATLAS_HOLO_MOE_GROUPED_DOWN=1
+# CUTLASS 4.4.2 sm120 NVFP4 single-launch GROUPED MoE gate_up + down
+# (ATLAS_HOLO_MOE_GROUPED_CUTLASS / _GROUPED_DOWN). Default-ON: correct + the FP4
+# MoE win — single-stream prefill +11-12% vs FP8-full (8K/11K 4240/4222 vs
+# 3824/3774), +9-12% concurrent at large prompts, parity at small (2026-06-26).
+# Engages ONLY under ATLAS_HOLO_FAST_MOE_MODE=full (it shares gate_ptrs_t + builds
+# per-expert swizzled SFB at load); a safe no-op otherwise (falls back to FP8/FP4
+# fused). Needs CUTLASS 4.4.2 (this image) + the 512MB shared CUTLASS workspace
+# (code default; override ATLAS_CUTLASS_WORKSPACE_MB). Beats the hand-rolled
+# transposed-FP4 MoE (which only reached ~parity). The down path also keys on
+# ATLAS_MOE_PREFILL_FP8_DOWN below as its fallback when grouped-down is off.
 # Varlen co-dispatch (ATLAS_PREFILL_CODISPATCH / _FLASHINFER_PREFILL /
 # _Q12_BATCHED_FIRST_CHUNK) is now BAKED ON: 2x agg throughput + 0 timeouts vs OFF
 # under real concurrent mixed load (soak 2026-06-24), validated at parity inside
