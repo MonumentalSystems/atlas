@@ -531,3 +531,83 @@ pub fn moe_batched_blend(
         .arg_u32(num_tokens)
         .launch(stream)
 }
+
+/// Single-launch CUTLASS grouped NVFP4 fused gate_up GEMM (Phase-2).
+///
+/// Bridges the device-resident per-expert pointer/scale tables to the host-side
+/// [`spark_runtime::cutlass::nvfp4_grouped_gate_up_fused`] entry. `a` is the
+/// expert-contiguous bf16 activation `[total_expanded, k]`. `gate_packed`/
+/// `gate_sfb`/`up_packed`/`up_sfb` are device `[num_experts]` u64 pointer arrays
+/// (into the CUTLASS-layout weight + swizzled-SFB tables); `gate_scale2`/
+/// `up_scale2` are device `[num_experts]` f32 arrays; `expert_offsets` is the
+/// device i32 `[num_experts+1]` prefix sum. This op copies all of those host-side
+/// (the C entry indexes offsets/scale2 on the host and needs the pointer values),
+/// syncs the stream so they are valid, then dispatches the single grouped launch.
+#[allow(clippy::too_many_arguments)]
+pub fn moe_grouped_gate_up_cutlass(
+    gpu: &dyn GpuBackend,
+    a: DevicePtr,
+    gate_packed: DevicePtr,
+    gate_sfb: DevicePtr,
+    gate_scale2: DevicePtr,
+    up_packed: DevicePtr,
+    up_sfb: DevicePtr,
+    up_scale2: DevicePtr,
+    c_gate: DevicePtr,
+    c_up: DevicePtr,
+    expert_offsets: DevicePtr,
+    num_experts: usize,
+    inter: u32,
+    hidden: u32,
+    stream: u64,
+) -> Result<()> {
+    let read_u64 = |p: DevicePtr| -> Result<Vec<u64>> {
+        let mut raw = vec![0u8; num_experts * 8];
+        gpu.copy_d2h_on_stream(p, &mut raw, stream)?;
+        Ok(raw
+            .chunks_exact(8)
+            .map(|c| u64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]))
+            .collect())
+    };
+    let read_f32 = |p: DevicePtr| -> Result<Vec<f32>> {
+        let mut raw = vec![0u8; num_experts * 4];
+        gpu.copy_d2h_on_stream(p, &mut raw, stream)?;
+        Ok(raw
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect())
+    };
+
+    let gate_packed_h = read_u64(gate_packed)?;
+    let gate_sfb_h = read_u64(gate_sfb)?;
+    let up_packed_h = read_u64(up_packed)?;
+    let up_sfb_h = read_u64(up_sfb)?;
+    let gate_scale2_h = read_f32(gate_scale2)?;
+    let up_scale2_h = read_f32(up_scale2)?;
+
+    let mut off_raw = vec![0u8; (num_experts + 1) * 4];
+    gpu.copy_d2h_on_stream(expert_offsets, &mut off_raw, stream)?;
+    // The pointer/scale/offset host snapshots above are needed by the C entry
+    // before it can launch — make sure the async D2H copies have landed.
+    gpu.synchronize(stream)?;
+    let eoff: Vec<i32> = off_raw
+        .chunks_exact(4)
+        .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+
+    spark_runtime::cutlass::nvfp4_grouped_gate_up_fused(
+        a.0,
+        &gate_packed_h,
+        &gate_sfb_h,
+        &gate_scale2_h,
+        &up_packed_h,
+        &up_sfb_h,
+        &up_scale2_h,
+        c_gate.0,
+        c_up.0,
+        &eoff,
+        inter,
+        hidden,
+        stream,
+    )
+}

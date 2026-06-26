@@ -134,6 +134,7 @@ fn build_cutlass_object(cutlass_home: std::path::PathBuf) {
     let sources = [
         std::path::PathBuf::from("cuda/cutlass_bf16_gemm.cu"),
         std::path::PathBuf::from("cuda/cutlass_nvfp4_gemm.cu"),
+        std::path::PathBuf::from("cuda/cutlass_nvfp4_grouped_gemm.cu"),
     ];
     for src in &sources {
         println!("cargo:rerun-if-changed={}", src.display());

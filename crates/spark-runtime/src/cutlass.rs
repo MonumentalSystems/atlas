@@ -60,6 +60,31 @@ unsafe extern "C" {
         workspace_size: usize,
         stream: *mut c_void,
     ) -> i32;
+    fn atlas_cutlass_nvfp4_grouped_gate_up_fused(
+        a_bf16: *const c_void,
+        gate_packed_ptrs: *const u64,
+        gate_sfb_ptrs: *const u64,
+        gate_scale2_vals: *const f32,
+        up_packed_ptrs: *const u64,
+        up_sfb_ptrs: *const u64,
+        up_scale2_vals: *const f32,
+        c_gate_bf16: *mut c_void,
+        c_up_bf16: *mut c_void,
+        expert_offsets_host: *const i32,
+        num_experts: i32,
+        n: i32,
+        k: i32,
+        workspace: *mut c_void,
+        workspace_size: usize,
+        stream: *mut c_void,
+    ) -> i32;
+    fn atlas_cutlass_pack_weight_sfb(
+        scale_in: *const c_void,
+        scale_out: *mut c_void,
+        n: i32,
+        k: i32,
+        stream: *mut c_void,
+    ) -> i32;
     fn atlas_cutlass_transpose_nvfp4_packed_kton(
         src_packed_t: *const c_void,
         dst_packed: *mut c_void,
@@ -332,6 +357,115 @@ pub fn nvfp4_grouped_gate_up(
             up_packed_ptrs, up_scale_ptrs, up_scale2_vals, c_gate, c_up,
             expert_offsets, n, k, stream,
         );
+        bail!("CUTLASS support was not built; set CUTLASS_HOME when building")
+    }
+}
+
+/// Single-launch grouped (`GemmUniversalMode::kGrouped`) NVFP4 fused gate_up
+/// GEMM — the Phase-2 successor to [`nvfp4_grouped_gate_up`]. Replaces the
+/// per-expert collective loop with ONE grouped launch over all active experts,
+/// eliminating the N-launch overhead.
+///
+/// `a` is bf16 `[M_total, K]`, expert-contiguous (caller permuted so expert `e`
+/// owns rows `[expert_offsets_host[e], expert_offsets_host[e+1])`).
+/// `*_packed_ptrs` are device-pointer arrays (one per expert) into the CUTLASS
+/// `[N,K/2]` packed weight tables; `*_sfb_ptrs` are device-pointer arrays into
+/// the swizzled SFB (ue4m3) scale tables (see [`pack_weight_sfb`]).
+/// `*_scale2_vals` and `expert_offsets_host` are HOST arrays.
+#[allow(clippy::too_many_arguments)]
+pub fn nvfp4_grouped_gate_up_fused(
+    a: u64,
+    gate_packed_ptrs: &[u64],
+    gate_sfb_ptrs: &[u64],
+    gate_scale2_vals: &[f32],
+    up_packed_ptrs: &[u64],
+    up_sfb_ptrs: &[u64],
+    up_scale2_vals: &[f32],
+    c_gate: u64,
+    c_up: u64,
+    expert_offsets_host: &[i32],
+    n: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
+    #[cfg(atlas_cutlass)]
+    {
+        let num_experts = gate_packed_ptrs.len();
+        if expert_offsets_host.len() != num_experts + 1 {
+            bail!(
+                "nvfp4_grouped_gate_up_fused: expert_offsets len {} != num_experts+1 {}",
+                expert_offsets_host.len(),
+                num_experts + 1
+            );
+        }
+        let ctx = ctx()?;
+        let status = unsafe {
+            atlas_cutlass_nvfp4_grouped_gate_up_fused(
+                a as *const c_void,
+                gate_packed_ptrs.as_ptr(),
+                gate_sfb_ptrs.as_ptr(),
+                gate_scale2_vals.as_ptr(),
+                up_packed_ptrs.as_ptr(),
+                up_sfb_ptrs.as_ptr(),
+                up_scale2_vals.as_ptr(),
+                c_gate as *mut c_void,
+                c_up as *mut c_void,
+                expert_offsets_host.as_ptr(),
+                num_experts as i32,
+                n as i32,
+                k as i32,
+                ctx.workspace as *mut c_void,
+                ctx.ws_size,
+                stream as *mut c_void,
+            )
+        };
+        if status != 0 {
+            bail!("CUTLASS nvfp4 grouped(fused) gate_up failed: status {status}");
+        }
+        Ok(())
+    }
+    #[cfg(not(atlas_cutlass))]
+    {
+        let _ = (
+            a, gate_packed_ptrs, gate_sfb_ptrs, gate_scale2_vals,
+            up_packed_ptrs, up_sfb_ptrs, up_scale2_vals, c_gate, c_up,
+            expert_offsets_host, n, k, stream,
+        );
+        bail!("CUTLASS support was not built; set CUTLASS_HOME when building")
+    }
+}
+
+/// Repack an Atlas E4M3 weight scale `[K/16,N]` (or `[N,K/16]`) into the CUTLASS
+/// SM120 blockscaled SFB swizzle atom (`tile_atom_to_shape_SFB`, ue4m3) that the
+/// grouped collective reads. M-independent (the SFB atom depends only on N,K) so
+/// this runs once per expert at load. `scale_out` must hold the swizzled SFB
+/// region the grouped kernel consumes.
+pub fn pack_weight_sfb(
+    scale_in: u64,
+    scale_out: u64,
+    n: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
+    #[cfg(atlas_cutlass)]
+    {
+        let status = unsafe {
+            atlas_cutlass_pack_weight_sfb(
+                scale_in as *const c_void,
+                scale_out as *mut c_void,
+                n as i32,
+                k as i32,
+                stream as *mut c_void,
+            )
+        };
+        if status != 0 {
+            bail!("CUTLASS weight SFB pack failed: status {status} for {n}x{k}");
+        }
+        Ok(())
+    }
+    #[cfg(not(atlas_cutlass))]
+    {
+        let _ = (scale_in, scale_out, n, k, stream);
         bail!("CUTLASS support was not built; set CUTLASS_HOME when building")
     }
 }

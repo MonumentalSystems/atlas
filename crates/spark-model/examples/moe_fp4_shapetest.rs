@@ -847,6 +847,207 @@ fn run_down_shape(
     Ok((down_us, fp8_down_us, w4a16_down_us, cos_vs_collective, cos_vs_oracle))
 }
 
+/// Single-launch grouped NVFP4 gate_up proof (`atlas_cutlass_nvfp4_grouped_gate_up_fused`).
+/// Builds a >=2-expert grouped problem with NON-TRIVIAL `expert_offsets` (a
+/// permutation of M into uneven per-expert blocks) and distinct per-expert gate/up
+/// weights, then launches the SINGLE `GemmUniversalMode::kGrouped` path and asserts:
+///   (a) cos >= 0.999 vs the per-expert dense collective `_t` reference (identical FP4
+///       math + SF/layout plumbing — any divergence is the grouped single-launch
+///       assembly), block-for-block, gate AND up; and
+///   (b) cos >= 0.98 vs the CPU bf16 oracle (proves the FP4 numerics).
+/// A is pre-sorted expert-contiguous (what `moe_permute_tokens` produces in prod),
+/// so the only piece not exercised here is the permute itself.
+/// Returns (min_cos_vs_collective, min_cos_vs_oracle) over {gate,up}×{experts}.
+fn run_grouped_fused_shape(
+    gpu: &dyn GpuBackend,
+    stream: u64,
+    m: usize,
+    n: usize,
+    k: usize,
+    num_experts: usize,
+    seed: u64,
+) -> Result<(f64, f64)> {
+    assert!(num_experts >= 2, "grouped-fused proof needs >=2 experts");
+    let (nu, ku) = (n as u32, k as u32);
+    let packed_len = (k / 2) * n; // [N,K/2] bytes, native CUTLASS pack layout
+    let scale_len = (k / 16) * n; // [K/16,N] E4M3 bytes (pack output)
+    // Swizzled SFB upper-bound bytes: SF atom rounds N->mult of 128, K/16->mult of 4.
+    let round_up = |x: usize, a: usize| -> usize { x.div_ceil(a) * a };
+    let sfb_len = round_up(n, 128) * round_up(k / 16, 4);
+
+    // ── NON-TRIVIAL expert_offsets: split M into uneven blocks (a permutation of
+    //    token rows into experts). For 2 experts: [0, m*3/8, m] (uneven). For >2,
+    //    a roughly-even split with a deliberate first-block skew. ──
+    let mut expert_offsets: Vec<i32> = Vec::with_capacity(num_experts + 1);
+    expert_offsets.push(0);
+    if num_experts == 2 {
+        expert_offsets.push((m * 3 / 8) as i32); // uneven: e0 gets 3/8, e1 gets 5/8
+        expert_offsets.push(m as i32);
+    } else {
+        // skew the first block smaller, distribute the rest evenly
+        let first = (m / (num_experts * 2)).max(1);
+        let rest = m - first;
+        let per = rest / (num_experts - 1);
+        let mut acc = first;
+        expert_offsets.push(acc as i32);
+        for e in 1..num_experts {
+            acc += if e == num_experts - 1 { m - acc } else { per };
+            expert_offsets.push(acc as i32);
+        }
+    }
+    // sanity: monotone, covers [0,m]
+    assert_eq!(expert_offsets[0], 0);
+    assert_eq!(*expert_offsets.last().unwrap(), m as i32);
+
+    // ── A: [M,K] bf16, expert-contiguous (rows of expert e occupy its offset span) ──
+    let mut rng = Rng(seed);
+    let a_bf16: Vec<u16> = (0..m * k)
+        .map(|_| f32_to_bf16_bits(rng.uniform(-1.0, 1.0)))
+        .collect();
+    let a_ptr = upload_bytes(gpu, &u16s_to_le(&a_bf16))?;
+
+    // ── per-expert distinct gate + up weights, packed to native CUTLASS layout +
+    //    swizzled SFB ──
+    let mut gate_bf16: Vec<Vec<u16>> = Vec::with_capacity(num_experts);
+    let mut up_bf16: Vec<Vec<u16>> = Vec::with_capacity(num_experts);
+    let mut gate_packed_ptrs: Vec<u64> = Vec::with_capacity(num_experts);
+    let mut gate_sfb_ptrs: Vec<u64> = Vec::with_capacity(num_experts);
+    let mut up_packed_ptrs: Vec<u64> = Vec::with_capacity(num_experts);
+    let mut up_sfb_ptrs: Vec<u64> = Vec::with_capacity(num_experts);
+    // collective reference also needs the [K/16,N] scale (NOT the swizzled SFB).
+    let mut gate_scale_ptrs: Vec<DevicePtr> = Vec::with_capacity(num_experts);
+    let mut up_scale_ptrs: Vec<DevicePtr> = Vec::with_capacity(num_experts);
+    let gate_scale2: Vec<f32> = vec![1.0f32; num_experts];
+    let up_scale2: Vec<f32> = vec![1.0f32; num_experts];
+    let mut to_free: Vec<DevicePtr> = vec![a_ptr];
+
+    for _e in 0..num_experts {
+        let g: Vec<u16> = (0..n * k)
+            .map(|_| f32_to_bf16_bits(rng.uniform(-0.5, 0.5)))
+            .collect();
+        let u: Vec<u16> = (0..n * k)
+            .map(|_| f32_to_bf16_bits(rng.uniform(-0.5, 0.5)))
+            .collect();
+        let g_bf16_ptr = upload_bytes(gpu, &u16s_to_le(&g))?;
+        let u_bf16_ptr = upload_bytes(gpu, &u16s_to_le(&u))?;
+        // native CUTLASS pack: packed [N,K/2], scale [K/16,N]
+        let g_packed = gpu.alloc(packed_len)?;
+        let g_scale = gpu.alloc(scale_len)?;
+        let u_packed = gpu.alloc(packed_len)?;
+        let u_scale = gpu.alloc(scale_len)?;
+        spark_runtime::cutlass::pack_bf16_weight_to_nvfp4_t(
+            g_bf16_ptr.0, g_packed.0, g_scale.0, nu, ku, stream,
+        )?;
+        spark_runtime::cutlass::pack_bf16_weight_to_nvfp4_t(
+            u_bf16_ptr.0, u_packed.0, u_scale.0, nu, ku, stream,
+        )?;
+        // load-time SFB swizzle repack ([K/16,N] E4M3 -> CUTLASS SFB atom)
+        let g_sfb = gpu.alloc(sfb_len)?;
+        let u_sfb = gpu.alloc(sfb_len)?;
+        spark_runtime::cutlass::pack_weight_sfb(g_scale.0, g_sfb.0, nu, ku, stream)?;
+        spark_runtime::cutlass::pack_weight_sfb(u_scale.0, u_sfb.0, nu, ku, stream)?;
+        gpu.synchronize(stream)?;
+
+        gate_packed_ptrs.push(g_packed.0);
+        gate_sfb_ptrs.push(g_sfb.0);
+        up_packed_ptrs.push(u_packed.0);
+        up_sfb_ptrs.push(u_sfb.0);
+        gate_scale_ptrs.push(g_scale);
+        up_scale_ptrs.push(u_scale);
+        gate_bf16.push(g);
+        up_bf16.push(u);
+        to_free.extend_from_slice(&[
+            g_bf16_ptr, u_bf16_ptr, g_packed, u_packed, g_sfb, u_sfb,
+        ]);
+    }
+
+    // ── single-launch grouped gate_up ──
+    let c_gate = gpu.alloc(m * n * 2)?;
+    let c_up = gpu.alloc(m * n * 2)?;
+    spark_runtime::cutlass::nvfp4_grouped_gate_up_fused(
+        a_ptr.0,
+        &gate_packed_ptrs,
+        &gate_sfb_ptrs,
+        &gate_scale2,
+        &up_packed_ptrs,
+        &up_sfb_ptrs,
+        &up_scale2,
+        c_gate.0,
+        c_up.0,
+        &expert_offsets,
+        nu,
+        ku,
+        stream,
+    )?;
+    gpu.synchronize(stream)?;
+    let c_gate_grp = read_bf16(gpu, c_gate, m, n)?;
+    let c_up_grp = read_bf16(gpu, c_up, m, n)?;
+    to_free.extend_from_slice(&[c_gate, c_up]);
+
+    // ── references: per-expert dense collective + CPU bf16 oracle, block-for-block ──
+    let mut min_coll = 1.0f64;
+    let mut min_orc = 1.0f64;
+    let coll_out = gpu.alloc(m * n * 2)?; // scratch for collective per-block runs
+    to_free.push(coll_out);
+    for e in 0..num_experts {
+        let r0 = expert_offsets[e] as usize;
+        let r1 = expert_offsets[e + 1] as usize;
+        let m_e = r1 - r0;
+        if m_e == 0 {
+            continue;
+        }
+        let a_e: Vec<u16> = a_bf16[r0 * k..r1 * k].to_vec();
+        let a_e_ptr = upload_bytes(gpu, &u16s_to_le(&a_e))?;
+
+        for (proj, packed, scale, weight, c_grp) in [
+            (
+                "gate",
+                gate_packed_ptrs[e],
+                gate_scale_ptrs[e].0,
+                &gate_bf16[e],
+                &c_gate_grp,
+            ),
+            (
+                "up",
+                up_packed_ptrs[e],
+                up_scale_ptrs[e].0,
+                &up_bf16[e],
+                &c_up_grp,
+            ),
+        ] {
+            // (a) dense collective on this expert's A-rows + packed weight
+            spark_runtime::cutlass::nvfp4_gemm_bf16_act_weight_t(
+                a_e_ptr.0,
+                packed,
+                scale,
+                1.0,
+                coll_out.0,
+                m_e as u32,
+                nu,
+                ku,
+                stream,
+            )?;
+            gpu.synchronize(stream)?;
+            let c_coll = read_bf16(gpu, coll_out, m_e, n)?;
+            // corresponding grouped output block for this expert
+            let grp_block = &c_grp[r0 * n..r1 * n];
+            let cos_coll = cosine_u16(grp_block, &c_coll);
+            // (b) CPU bf16 oracle on this expert's block
+            let c_ref = cpu_reference(&a_e, weight, m_e, n, k);
+            let (cos_orc, _) = compare(grp_block, &c_ref);
+            min_coll = min_coll.min(cos_coll);
+            min_orc = min_orc.min(cos_orc);
+            let _ = proj;
+        }
+        gpu.free(a_e_ptr).ok();
+    }
+
+    for p in to_free.into_iter().chain(gate_scale_ptrs).chain(up_scale_ptrs) {
+        gpu.free(p).ok();
+    }
+    Ok((min_coll, min_orc))
+}
+
 fn main() -> Result<()> {
     // Holo 3.1 MoE gate_up: N = 2*moe_intermediate = 1024, K = hidden = 2048.
     let n = 1024usize;
@@ -931,6 +1132,57 @@ fn main() -> Result<()> {
     } else {
         eprintln!(
             "GROUPED RESULT: FAIL (collective min {min_grp_coll:.6} gate {GRP_COLLECTIVE_GATE}; oracle min {min_grp_orc:.6} gate {COSINE_GATE})"
+        );
+        all_pass = false;
+    }
+
+    // ── Single-launch GROUPED-FUSED FP4 gate_up (kGrouped, >=2 experts) ──
+    // Validates atlas_cutlass_nvfp4_grouped_gate_up_fused: one GemmUniversalMode::
+    // kGrouped launch over multiple experts with non-trivial expert_offsets, vs the
+    // per-expert dense collective (cos>=0.999) and the bf16 oracle (cos>=0.98).
+    println!();
+    println!("=== Single-launch GROUPED-FUSED FP4 gate_up (kGrouped, >=2 experts) ===");
+    println!(
+        "{:>6} {:>5} {:>22} {:>18}",
+        "M", "ne", "cos_vs_collective", "cos_vs_oracle"
+    );
+    println!("{}", "-".repeat(56));
+    const GFUSED_COLLECTIVE_GATE: f64 = 0.999;
+    let mut gfused_pass = true;
+    let mut min_gf_coll = 1.0f64;
+    let mut min_gf_orc = 1.0f64;
+    // Sweep the realistic per-expert tile sizes; 2 and 4 experts to exercise
+    // non-trivial expert_offsets + multi-group assembly. Skip M too small to split.
+    for &gm in &[64usize, 128, 2048] {
+        for &ne in &[2usize, 4] {
+            if gm < ne * 2 {
+                continue; // need >=2 rows/expert for a meaningful split
+            }
+            let (coll, orc) = run_grouped_fused_shape(
+                gpu,
+                stream,
+                gm,
+                n,
+                k,
+                ne,
+                seed ^ (gm as u64).wrapping_mul(0x1357) ^ (ne as u64).wrapping_mul(0x2468),
+            )?;
+            println!("{gm:>6} {ne:>5} {coll:>22.6} {orc:>18.6}");
+            min_gf_coll = min_gf_coll.min(coll);
+            min_gf_orc = min_gf_orc.min(orc);
+            if coll < GFUSED_COLLECTIVE_GATE || orc < COSINE_GATE {
+                gfused_pass = false;
+            }
+        }
+    }
+    println!("{}", "-".repeat(56));
+    if gfused_pass {
+        println!(
+            "GROUPED-FUSED RESULT: PASS (cos_vs_collective>={GFUSED_COLLECTIVE_GATE} min {min_gf_coll:.6}; cos_vs_oracle>={COSINE_GATE} min {min_gf_orc:.6})"
+        );
+    } else {
+        eprintln!(
+            "GROUPED-FUSED RESULT: FAIL (collective min {min_gf_coll:.6} gate {GFUSED_COLLECTIVE_GATE}; oracle min {min_gf_orc:.6} gate {COSINE_GATE})"
         );
         all_pass = false;
     }

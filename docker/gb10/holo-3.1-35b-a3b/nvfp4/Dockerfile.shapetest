@@ -1,0 +1,49 @@
+# Builds + packages the moe_fp4_shapetest example (CUTLASS 4.4.2, nvcc 13.2) so we
+# can validate the new grouped-NVFP4 kernel on the GB10 GPU. Mirrors the main
+# Dockerfile builder env; only the cargo target differs (the example, not spark).
+FROM nvidia/cuda:13.2.0-devel-ubuntu24.04 AS builder
+
+RUN apt-get update -qq && \
+    apt-get install -y -qq curl build-essential pkg-config git cmake libclang-dev libnccl-dev && \
+    rm -rf /var/lib/apt/lists/*
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+ENV PATH="/root/.cargo/bin:${PATH}"
+ENV CUDA_HOME=/usr/local/cuda
+ENV RUSTUP_TOOLCHAIN=stable
+
+ARG CUTLASS_REF=v4.4.2
+ARG FLASHINFER_REF=v0.6.13
+RUN git clone --filter=blob:none https://github.com/NVIDIA/cutlass /opt/cutlass && \
+    git -C /opt/cutlass checkout ${CUTLASS_REF}
+RUN git clone --filter=blob:none https://github.com/flashinfer-ai/flashinfer.git /opt/flashinfer && \
+    git -C /opt/flashinfer checkout ${FLASHINFER_REF} && \
+    git -C /opt/flashinfer submodule update --init --recursive --depth 1
+ENV CUTLASS_HOME=/opt/cutlass
+ENV FLASHINFER_HOME=/opt/flashinfer
+ENV CUDARC_CUDA_VERSION=13000
+ENV RUSTFLAGS="-L/usr/lib/aarch64-linux-gnu -L/usr/local/cuda/lib64"
+ENV ATLAS_TARGET_HW=gb10
+ENV ATLAS_TARGET_MODEL=holo-3.1-35b-a3b
+ENV ATLAS_TARGET_QUANT=nvfp4
+
+WORKDIR /build
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY crates/ crates/
+COPY vendor/ vendor/
+COPY kernels/ kernels/
+COPY jinja-templates/ jinja-templates/
+
+RUN --mount=type=cache,target=/root/.cargo/registry \
+    --mount=type=cache,target=/build/target \
+    cargo build --release -p spark-model --example moe_fp4_shapetest \
+      --no-default-features --features "cuda gpu-examples" && \
+    cp /build/target/release/examples/moe_fp4_shapetest /usr/local/bin/moe_fp4_shapetest
+
+FROM nvidia/cuda:13.2.0-runtime-ubuntu24.04
+RUN apt-get update -qq && \
+    apt-get install -y -qq --no-install-recommends --allow-change-held-packages \
+      libnccl2 libibverbs1 librdmacm1 ibverbs-providers libnl-3-200 libnl-route-3-200 && \
+    rm -rf /var/lib/apt/lists/*
+ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64
+COPY --from=builder /usr/local/bin/moe_fp4_shapetest /usr/local/bin/moe_fp4_shapetest
+ENTRYPOINT ["/usr/local/bin/moe_fp4_shapetest"]

@@ -10,6 +10,16 @@
 
 use super::*;
 
+/// Whether the single-launch CUTLASS grouped NVFP4 gate_up path is enabled
+/// (`ATLAS_HOLO_MOE_GROUPED_CUTLASS=1`). Off by default; falls back to the
+/// hand-rolled fused FP4/FP8 grouped kernels when unset.
+fn grouped_cutlass_gate_up_enabled() -> bool {
+    std::env::var("ATLAS_HOLO_MOE_GROUPED_CUTLASS")
+        .ok()
+        .as_deref()
+        == Some("1")
+}
+
 impl MoeLayer {
     /// Routed-expert grouped-GEMM path: upper-bound grid sizing → grouped
     /// gate+up GEMM → SiLU+mul → grouped down GEMM.
@@ -113,7 +123,50 @@ impl MoeLayer {
         }
         if max_m_tiles > 0 {
             if let (Some(gp), Some(up)) = (&self.gate_ptrs_t, &self.up_ptrs_t) {
-              if self.gateup_fp4 && self.moe_fused_gate_up_t_k64_fp4.0 != 0 {
+              if grouped_cutlass_gate_up_enabled() && self.moe_permute_tokens_k.0 != 0 {
+                // ── SINGLE-LAUNCH CUTLASS grouped NVFP4 gate_up
+                // (ATLAS_HOLO_MOE_GROUPED_CUTLASS=1) ── one
+                // GemmUniversalMode::kGrouped launch over all active experts in
+                // place of the per-expert collective loop. Reads the SHARED
+                // FAST_MOE=full pointer tables (gate_ptrs_t/up_ptrs_t): packed
+                // weights, SFB scales (scale_ptrs), and per-expert scale2; writes
+                // C_gate/C_up in the same sorted layout so silu+down+unpermute are
+                // unchanged. The op snapshots the offset/pointer/scale tables
+                // host-side (the grouped C entry indexes them on the host).
+                //
+                // The grouped collective needs EXPERT-CONTIGUOUS activation rows;
+                // expert_input is token-major. Permute it into expert_down_out
+                // (which is [total_expanded, h] and is not yet live — the down
+                // phase overwrites it after gate_up consumes it here).
+                let permuted = ctx.buffers.expert_down_out();
+                ops::moe_permute_tokens(
+                    ctx.gpu,
+                    self.moe_permute_tokens_k,
+                    expert_input,
+                    permuted,
+                    sorted_token_ids,
+                    h,
+                    total_expanded,
+                    stream,
+                )?;
+                ops::moe_grouped_gate_up_cutlass(
+                    ctx.gpu,
+                    permuted,
+                    gp.packed_ptrs,
+                    gp.scale_ptrs,
+                    gp.scale2_vals,
+                    up.packed_ptrs,
+                    up.scale_ptrs,
+                    up.scale2_vals,
+                    expert_gate_out,
+                    expert_up_out,
+                    expert_offsets,
+                    num_experts as usize,
+                    inter,
+                    h,
+                    stream,
+                )?;
+              } else if self.gateup_fp4 && self.moe_fused_gate_up_t_k64_fp4.0 != 0 {
                 // ── FUSED FP4 gate_up (ATLAS_HOLO_MOE_GATEUP_FP4) ──
                 // Block-scaled FP4 over the SHARED FAST_MOE=full [K/2,N] tables
                 // (gate_ptrs_t/up_ptrs_t — the SAME bytes the FP8 fused path
