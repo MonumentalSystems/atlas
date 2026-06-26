@@ -365,6 +365,20 @@ fn cosine_u16(a: &[u16], b: &[u16]) -> f64 {
     }
 }
 
+/// L2 norm ratio ‖a‖/‖b‖. Unlike cosine (scale-invariant), this is SENSITIVE to a
+/// wrong per-group scale (e.g. a scalar-alpha bug that applies the wrong expert's
+/// scale2) — the ratio deviates from 1.
+fn norm_ratio_u16(a: &[u16], b: &[u16]) -> f64 {
+    let (mut na, mut nb) = (0f64, 0f64);
+    for i in 0..a.len() {
+        let x = bf16_bits_to_f32(a[i]) as f64;
+        let y = bf16_bits_to_f32(b[i]) as f64;
+        na += x * x;
+        nb += y * y;
+    }
+    if nb > 0.0 { na.sqrt() / nb.sqrt() } else { 0.0 }
+}
+
 fn run_shape(
     gpu: &dyn GpuBackend,
     stream: u64,
@@ -866,7 +880,7 @@ fn run_grouped_fused_shape(
     k: usize,
     num_experts: usize,
     seed: u64,
-) -> Result<(f64, f64)> {
+) -> Result<(f64, f64, f64)> {
     assert!(num_experts >= 2, "grouped-fused proof needs >=2 experts");
     let (nu, ku) = (n as u32, k as u32);
     let packed_len = (k / 2) * n; // [N,K/2] bytes, native CUTLASS pack layout
@@ -917,8 +931,17 @@ fn run_grouped_fused_shape(
     // collective reference also needs the [K/16,N] scale (NOT the swizzled SFB).
     let mut gate_scale_ptrs: Vec<DevicePtr> = Vec::with_capacity(num_experts);
     let mut up_scale_ptrs: Vec<DevicePtr> = Vec::with_capacity(num_experts);
-    let gate_scale2: Vec<f32> = vec![1.0f32; num_experts];
-    let up_scale2: Vec<f32> = vec![1.0f32; num_experts];
+    // DISTINCT per-expert scale2 (NOT all 1.0): exercises the grouped epilogue's
+    // per-group alpha (alpha_ptr_array). A scalar-alpha bug applies expert-0's
+    // scale2 to all experts — invisible to cosine (scale-invariant) but caught by
+    // the norm-ratio check below.
+    let d = (num_experts.max(2) - 1) as f32;
+    let gate_scale2: Vec<f32> = (0..num_experts)
+        .map(|e| 0.35 + 0.60 * e as f32 / d)
+        .collect();
+    let up_scale2: Vec<f32> = (0..num_experts)
+        .map(|e| 0.90 - 0.50 * e as f32 / d)
+        .collect();
     let mut to_free: Vec<DevicePtr> = vec![a_ptr];
 
     for _e in 0..num_experts {
@@ -988,6 +1011,7 @@ fn run_grouped_fused_shape(
     // ── references: per-expert dense collective + CPU bf16 oracle, block-for-block ──
     let mut min_coll = 1.0f64;
     let mut min_orc = 1.0f64;
+    let mut max_nr_dev = 0.0f64; // max |‖grouped‖/‖collective‖ - 1| (scale2 check)
     let coll_out = gpu.alloc(m * n * 2)?; // scratch for collective per-block runs
     to_free.push(coll_out);
     for e in 0..num_experts {
@@ -1000,11 +1024,12 @@ fn run_grouped_fused_shape(
         let a_e: Vec<u16> = a_bf16[r0 * k..r1 * k].to_vec();
         let a_e_ptr = upload_bytes(gpu, &u16s_to_le(&a_e))?;
 
-        for (proj, packed, scale, weight, c_grp) in [
+        for (proj, packed, scale, s2, weight, c_grp) in [
             (
                 "gate",
                 gate_packed_ptrs[e],
                 gate_scale_ptrs[e].0,
+                gate_scale2[e],
                 &gate_bf16[e],
                 &c_gate_grp,
             ),
@@ -1012,16 +1037,18 @@ fn run_grouped_fused_shape(
                 "up",
                 up_packed_ptrs[e],
                 up_scale_ptrs[e].0,
+                up_scale2[e],
                 &up_bf16[e],
                 &c_up_grp,
             ),
         ] {
-            // (a) dense collective on this expert's A-rows + packed weight
+            // (a) dense collective on this expert's A-rows + packed weight, with the
+            //     SAME per-expert scale2 the grouped path applies as alpha.
             spark_runtime::cutlass::nvfp4_gemm_bf16_act_weight_t(
                 a_e_ptr.0,
                 packed,
                 scale,
-                1.0,
+                s2,
                 coll_out.0,
                 m_e as u32,
                 nu,
@@ -1033,7 +1060,10 @@ fn run_grouped_fused_shape(
             // corresponding grouped output block for this expert
             let grp_block = &c_grp[r0 * n..r1 * n];
             let cos_coll = cosine_u16(grp_block, &c_coll);
-            // (b) CPU bf16 oracle on this expert's block
+            // SCALE-SENSITIVE: cosine is scale-invariant and can't catch a wrong
+            // per-group scale2; the norm ratio must be ~1 (both have scale2 applied).
+            max_nr_dev = max_nr_dev.max((norm_ratio_u16(grp_block, &c_coll) - 1.0).abs());
+            // (b) CPU bf16 oracle on this expert's block (cosine — direction only).
             let c_ref = cpu_reference(&a_e, weight, m_e, n, k);
             let (cos_orc, _) = compare(grp_block, &c_ref);
             min_coll = min_coll.min(cos_coll);
@@ -1046,7 +1076,7 @@ fn run_grouped_fused_shape(
     for p in to_free.into_iter().chain(gate_scale_ptrs).chain(up_scale_ptrs) {
         gpu.free(p).ok();
     }
-    Ok((min_coll, min_orc))
+    Ok((min_coll, min_orc, max_nr_dev))
 }
 
 fn main() -> Result<()> {
@@ -1144,14 +1174,19 @@ fn main() -> Result<()> {
     println!();
     println!("=== Single-launch GROUPED-FUSED FP4 gate_up (kGrouped, >=2 experts) ===");
     println!(
-        "{:>6} {:>5} {:>22} {:>18}",
-        "M", "ne", "cos_vs_collective", "cos_vs_oracle"
+        "{:>6} {:>5} {:>22} {:>18} {:>12}",
+        "M", "ne", "cos_vs_collective", "cos_vs_oracle", "scale2_nrdev"
     );
-    println!("{}", "-".repeat(56));
+    println!("{}", "-".repeat(70));
     const GFUSED_COLLECTIVE_GATE: f64 = 0.999;
+    // Per-group scale2 (alpha_ptr_array) correctness: ‖grouped‖/‖collective‖ must be
+    // ~1 per expert. A scalar-alpha bug (all experts use expert-0's scale2) blows
+    // this up while leaving cosine at 1.0. FP4 noise keeps it well under 0.05.
+    const GFUSED_NR_GATE: f64 = 0.05;
     let mut gfused_pass = true;
     let mut min_gf_coll = 1.0f64;
     let mut min_gf_orc = 1.0f64;
+    let mut max_gf_nrdev = 0.0f64;
     // Sweep the realistic per-expert tile sizes; 2 and 4 experts to exercise
     // non-trivial expert_offsets + multi-group assembly. Skip M too small to split.
     for &gm in &[64usize, 128, 2048] {
@@ -1159,7 +1194,7 @@ fn main() -> Result<()> {
             if gm < ne * 2 {
                 continue; // need >=2 rows/expert for a meaningful split
             }
-            let (coll, orc) = run_grouped_fused_shape(
+            let (coll, orc, nrdev) = run_grouped_fused_shape(
                 gpu,
                 stream,
                 gm,
@@ -1168,10 +1203,11 @@ fn main() -> Result<()> {
                 ne,
                 seed ^ (gm as u64).wrapping_mul(0x1357) ^ (ne as u64).wrapping_mul(0x2468),
             )?;
-            println!("{gm:>6} {ne:>5} {coll:>22.6} {orc:>18.6}");
+            println!("{gm:>6} {ne:>5} {coll:>22.6} {orc:>18.6} {nrdev:>12.4}");
             min_gf_coll = min_gf_coll.min(coll);
             min_gf_orc = min_gf_orc.min(orc);
-            if coll < GFUSED_COLLECTIVE_GATE || orc < COSINE_GATE {
+            max_gf_nrdev = max_gf_nrdev.max(nrdev);
+            if coll < GFUSED_COLLECTIVE_GATE || orc < COSINE_GATE || nrdev > GFUSED_NR_GATE {
                 gfused_pass = false;
             }
         }
@@ -1179,11 +1215,11 @@ fn main() -> Result<()> {
     println!("{}", "-".repeat(56));
     if gfused_pass {
         println!(
-            "GROUPED-FUSED RESULT: PASS (cos_vs_collective>={GFUSED_COLLECTIVE_GATE} min {min_gf_coll:.6}; cos_vs_oracle>={COSINE_GATE} min {min_gf_orc:.6})"
+            "GROUPED-FUSED RESULT: PASS (cos_vs_collective>={GFUSED_COLLECTIVE_GATE} min {min_gf_coll:.6}; cos_vs_oracle>={COSINE_GATE} min {min_gf_orc:.6}; scale2_nrdev<{GFUSED_NR_GATE} max {max_gf_nrdev:.4})"
         );
     } else {
         eprintln!(
-            "GROUPED-FUSED RESULT: FAIL (collective min {min_gf_coll:.6} gate {GFUSED_COLLECTIVE_GATE}; oracle min {min_gf_orc:.6} gate {COSINE_GATE})"
+            "GROUPED-FUSED RESULT: FAIL (collective min {min_gf_coll:.6} gate {GFUSED_COLLECTIVE_GATE}; oracle min {min_gf_orc:.6} gate {COSINE_GATE}; scale2_nrdev max {max_gf_nrdev:.4} gate {GFUSED_NR_GATE})"
         );
         all_pass = false;
     }

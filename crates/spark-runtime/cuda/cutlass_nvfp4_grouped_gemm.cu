@@ -378,6 +378,14 @@ static int run_grouped_one(
   auto* dlSFA = (LayoutSFA*)put(lSFA.data(), G * sizeof(LayoutSFA));
   auto* dlSFB = (LayoutSFB*)put(lSFB.data(), G * sizeof(LayoutSFB));
   auto* dAlpha = (float*)put(alpha_host.data(), G * sizeof(float));
+  // Per-group alpha (scale2) needs alpha_ptr_array — an array of G POINTERS, one
+  // per group → &dAlpha[g]. Setting the scalar `alpha_ptr = dAlpha` instead makes
+  // EVERY group read dAlpha[0] (expert-0's scale2) — the production correctness bug.
+  std::vector<const float*> hAlphaPtr(G);
+  for (int g = 0; g < G; ++g) {
+    hAlphaPtr[g] = dAlpha + g;
+  }
+  auto* dAlphaPtr = (const float**)put(hAlphaPtr.data(), G * sizeof(const float*));
 
   cutlass::KernelHardwareInfo hw{};
   hw.device_id = 0;
@@ -386,11 +394,12 @@ static int run_grouped_one(
   typename Gemm::GemmKernel::CollectiveMainloop::Arguments mainloop_args{
       dA, dsA, dB, dsB, dSFA, dlSFA, dSFB, dlSFB};
 
-  // LinearCombination: D = alpha*acc + beta*C, alpha per-group via ptr (scale2).
+  // LinearCombination: D = alpha*acc + beta*C; per-group alpha (scale2) via the
+  // grouped alpha_ptr_array (one device pointer per group), NOT the scalar alpha_ptr.
   typename Gemm::GemmKernel::CollectiveEpilogue::Arguments epi_args{};
   epi_args.thread.alpha = 1.0f;
   epi_args.thread.beta = 0.0f;
-  epi_args.thread.alpha_ptr = dAlpha;
+  epi_args.thread.alpha_ptr_array = dAlphaPtr;
   epi_args.ptr_C = dC;
   epi_args.dC = dsC;
   epi_args.ptr_D = dD;
