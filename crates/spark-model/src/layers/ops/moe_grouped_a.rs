@@ -547,6 +547,7 @@ pub fn moe_batched_blend(
 pub fn moe_grouped_gate_up_cutlass(
     gpu: &dyn GpuBackend,
     a: DevicePtr,
+    sorted_token_ids: DevicePtr,
     gate_packed: DevicePtr,
     gate_sfb: DevicePtr,
     gate_scale2: DevicePtr,
@@ -597,6 +598,7 @@ pub fn moe_grouped_gate_up_cutlass(
 
     spark_runtime::cutlass::nvfp4_grouped_gate_up_fused(
         a.0,
+        sorted_token_ids.0,
         &gate_packed_h,
         &gate_sfb_h,
         &gate_scale2_h,
@@ -609,5 +611,55 @@ pub fn moe_grouped_gate_up_cutlass(
         inter,
         hidden,
         stream,
+    )
+}
+
+/// Single-launch CUTLASS grouped NVFP4 DOWN projection. `a` is the post-SiLU
+/// intermediate `[total_expanded, inter]` (already expert-contiguous — no gather).
+/// `packed`/`sfb` are device `[num_experts]` u64 pointer arrays into the
+/// `[N=hidden,K/2]` down packed + swizzled-SFB tables; `scale2` is the device
+/// `[num_experts]` f32 array; `expert_offsets` is the device i32 `[num_experts+1]`
+/// prefix sum. Snapshots the pointer/offset tables host-side, then dispatches.
+#[allow(clippy::too_many_arguments)]
+pub fn moe_grouped_down_cutlass(
+    gpu: &dyn GpuBackend,
+    a: DevicePtr,
+    packed: DevicePtr,
+    sfb: DevicePtr,
+    scale2: DevicePtr,
+    c: DevicePtr,
+    expert_offsets: DevicePtr,
+    num_experts: usize,
+    hidden: u32,
+    inter: u32,
+    stream: u64,
+) -> Result<()> {
+    let mut praw = vec![0u8; num_experts * 8];
+    gpu.copy_d2h_on_stream(packed, &mut praw, stream)?;
+    let mut sraw = vec![0u8; num_experts * 8];
+    gpu.copy_d2h_on_stream(sfb, &mut sraw, stream)?;
+    let mut s2raw = vec![0u8; num_experts * 4];
+    gpu.copy_d2h_on_stream(scale2, &mut s2raw, stream)?;
+    let mut off_raw = vec![0u8; (num_experts + 1) * 4];
+    gpu.copy_d2h_on_stream(expert_offsets, &mut off_raw, stream)?;
+    gpu.synchronize(stream)?;
+    let packed_h: Vec<u64> = praw
+        .chunks_exact(8)
+        .map(|c| u64::from_le_bytes(c.try_into().expect("8")))
+        .collect();
+    let sfb_h: Vec<u64> = sraw
+        .chunks_exact(8)
+        .map(|c| u64::from_le_bytes(c.try_into().expect("8")))
+        .collect();
+    let scale2_h: Vec<f32> = s2raw
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().expect("4")))
+        .collect();
+    let eoff: Vec<i32> = off_raw
+        .chunks_exact(4)
+        .map(|c| i32::from_le_bytes(c.try_into().expect("4")))
+        .collect();
+    spark_runtime::cutlass::nvfp4_grouped_down(
+        a.0, &packed_h, &sfb_h, &scale2_h, c.0, &eoff, hidden, inter, stream,
     )
 }

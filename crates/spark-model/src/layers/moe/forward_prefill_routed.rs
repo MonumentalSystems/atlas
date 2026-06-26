@@ -124,7 +124,6 @@ impl MoeLayer {
         if max_m_tiles > 0 {
             if let (Some(gp), Some(up)) = (&self.gate_ptrs_t, &self.up_ptrs_t) {
               if grouped_cutlass_gate_up_enabled()
-                  && self.moe_permute_tokens_k.0 != 0
                   && self.gate_sfb_cutlass.is_some()
                   && self.up_sfb_cutlass.is_some()
               {
@@ -134,28 +133,15 @@ impl MoeLayer {
                 // place of the per-expert collective loop. Weights: the decode
                 // `gate_ptrs`/`up_ptrs` packed `[N,K/2]` (CUTLASS ColumnMajor B) +
                 // the load-built swizzled SFB tables (`gate_sfb_cutlass`) + the real
-                // per-expert scale2 (applied as the epilogue alpha). Writes
-                // C_gate/C_up in the same sorted layout so silu+down+unpermute are
+                // per-expert scale2 (epilogue alpha). The token gather is FUSED into
+                // the kernel's per-group A-pack (lever 2): pass token-major
+                // expert_input + sorted_token_ids directly, no separate permute pass.
+                // Writes C_gate/C_up in the sorted layout so silu+down+unpermute are
                 // unchanged.
-                //
-                // The grouped collective needs EXPERT-CONTIGUOUS activation rows;
-                // expert_input is token-major. Permute it into expert_down_out
-                // (which is [total_expanded, h] and is not yet live — the down
-                // phase overwrites it after gate_up consumes it here).
-                let permuted = ctx.buffers.expert_down_out();
-                ops::moe_permute_tokens(
-                    ctx.gpu,
-                    self.moe_permute_tokens_k,
-                    expert_input,
-                    permuted,
-                    sorted_token_ids,
-                    h,
-                    total_expanded,
-                    stream,
-                )?;
                 ops::moe_grouped_gate_up_cutlass(
                     ctx.gpu,
-                    permuted,
+                    expert_input,
+                    sorted_token_ids,
                     self.gate_ptrs.packed_ptrs,
                     self.gate_sfb_cutlass.expect("gate sfb checked above"),
                     self.gate_ptrs.scale2_vals,
@@ -309,7 +295,30 @@ impl MoeLayer {
             // FP8/w4a16 down kernels, so unpermute downstream is unchanged.
             // Compounds with the FP4 gate_up path to run the whole FFN at FP4.
             if let Some(dp) = &self.down_ptrs_t {
-              if self.down_fp4 && self.moe_down_t_k64_fp4.0 != 0 {
+              if grouped_cutlass_gate_up_enabled()
+                  && self.down_sfb_cutlass.is_some()
+                  && std::env::var("ATLAS_HOLO_MOE_GROUPED_DOWN").ok().as_deref() == Some("1")
+              {
+                // ── CUTLASS grouped NVFP4 down (ATLAS_HOLO_MOE_GROUPED_CUTLASS
+                //    + ATLAS_HOLO_MOE_GROUPED_DOWN) ──
+                // A = post-SiLU expert_gate_out, already expert-contiguous (the grouped
+                // gate_up wrote it sorted), so NO gather. Weights = decode down_ptrs
+                // packed [N=hidden,K/2] + load-built swizzled SFB + real scale2. Writes
+                // expert_down_out in the sorted layout (unpermute downstream unchanged).
+                ops::moe_grouped_down_cutlass(
+                    ctx.gpu,
+                    expert_gate_out,
+                    self.down_ptrs.packed_ptrs,
+                    self.down_sfb_cutlass.expect("down sfb checked above"),
+                    self.down_ptrs.scale2_vals,
+                    expert_down_out,
+                    expert_offsets,
+                    num_experts as usize,
+                    h,
+                    inter,
+                    stream,
+                )?;
+              } else if self.down_fp4 && self.moe_down_t_k64_fp4.0 != 0 {
                 // ── FP4 down (ATLAS_HOLO_MOE_DOWN_FP4) over the SHARED down_ptrs_t
                 // [K/2,N] table (real per-expert scale2; coalesced K-major load +
                 // on-chip DN4_TRANSPOSE). Same sorted layout + null

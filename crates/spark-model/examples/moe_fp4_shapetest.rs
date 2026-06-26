@@ -966,6 +966,7 @@ fn run_grouped_fused_shape(
     let c_up = gpu.alloc(m * n * 2)?;
     spark_runtime::cutlass::nvfp4_grouped_gate_up_fused(
         a_ptr.0,
+        0, // sorted_token_ids = null (A is already expert-contiguous in this test)
         &gate_packed_ptrs,
         &gate_sfb_ptrs,
         &gate_scale2,

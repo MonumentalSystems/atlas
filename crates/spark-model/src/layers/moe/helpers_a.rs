@@ -284,17 +284,20 @@ impl MoeLayer {
     ) -> Result<()> {
         let h = config.hidden_size;
         let inter = config.moe_intermediate_size;
-        // Swizzled SFB atom size (bytes), matching the shapetest:
-        // round_up(N,128) * round_up(K/16,4), N=inter, K=hidden.
-        let sfb_len = inter.div_ceil(128) * 128 * (h / 16).div_ceil(4) * 4;
         let num = self.weights.experts.len();
+        // Swizzled SFB atom size (bytes): round_up(N,128) * round_up(K/16,4).
+        let sfb_len = |n: usize, k: usize| n.div_ceil(128) * 128 * (k / 16).div_ceil(4) * 4;
         let (gate_scale_dev, up_scale_dev) =
             match (self.gate_ptrs_t.as_ref(), self.up_ptrs_t.as_ref()) {
                 (Some(g), Some(u)) => (g.scale_ptrs, u.scale_ptrs),
                 _ => return Ok(()),
             };
+        let down_scale_dev = self.down_ptrs_t.as_ref().map(|d| d.scale_ptrs);
         let mut owned: Vec<DevicePtr> = Vec::new();
-        let mut build_one = |scale_ptrs_dev: DevicePtr| -> Result<DevicePtr> {
+        // Swizzle each expert's [K/16,N] scale into the CUTLASS SFB atom. `n`/`k`
+        // are the projection's GEMM dims: gate/up = (inter, hidden); down = (hidden, inter).
+        let mut build_one = |scale_ptrs_dev: DevicePtr, n: usize, k: usize| -> Result<DevicePtr> {
+            let len = sfb_len(n, k);
             let mut sp = vec![0u8; num * 8];
             gpu.copy_d2h(scale_ptrs_dev, &mut sp)?;
             let scale_ptrs: Vec<u64> = sp
@@ -306,14 +309,8 @@ impl MoeLayer {
                 if sptr == 0 {
                     continue; // remote/placeholder expert
                 }
-                let sfb = gpu.alloc(sfb_len)?;
-                spark_runtime::cutlass::pack_weight_sfb(
-                    sptr,
-                    sfb.0,
-                    inter as u32,
-                    h as u32,
-                    stream,
-                )?;
+                let sfb = gpu.alloc(len)?;
+                spark_runtime::cutlass::pack_weight_sfb(sptr, sfb.0, n as u32, k as u32, stream)?;
                 sfb_ptrs[e] = sfb.0;
                 owned.push(sfb);
             }
@@ -324,14 +321,15 @@ impl MoeLayer {
             owned.push(arr);
             Ok(arr)
         };
-        let gate_arr = build_one(gate_scale_dev)?;
-        let up_arr = build_one(up_scale_dev)?;
+        self.gate_sfb_cutlass = Some(build_one(gate_scale_dev, inter, h)?);
+        self.up_sfb_cutlass = Some(build_one(up_scale_dev, inter, h)?);
+        if let Some(ds) = down_scale_dev {
+            self.down_sfb_cutlass = Some(build_one(ds, h, inter)?);
+        }
         drop(build_one);
-        self.gate_sfb_cutlass = Some(gate_arr);
-        self.up_sfb_cutlass = Some(up_arr);
         self._cutlass_sfb_owned = owned;
         tracing::info!(
-            "CUTLASS grouped SFB: built {num} experts (N={inter} K={h}, sfb_len={sfb_len})"
+            "CUTLASS grouped SFB: built {num} experts gate/up (N={inter} K={h}) + down (N={h} K={inter})"
         );
         Ok(())
     }

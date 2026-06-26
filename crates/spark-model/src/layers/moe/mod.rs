@@ -136,6 +136,7 @@ pub struct MoeLayer {
     /// real per-expert `scale2`. `None` => the CUTLASS grouped path is unavailable.
     gate_sfb_cutlass: Option<DevicePtr>,
     up_sfb_cutlass: Option<DevicePtr>,
+    down_sfb_cutlass: Option<DevicePtr>,
     /// Keeps the per-expert SFB buffers + the two pointer arrays alive.
     _cutlass_sfb_owned: Vec<DevicePtr>,
     /// Lazy down_proj transpose scratch — populated at the start of each
@@ -313,8 +314,9 @@ pub struct MoeLayer {
     /// `moe_permute_tokens` gather kernel — only needed by the FP4 escape-hatch
     /// (which consumes expert-sorted contiguous rows, unlike the FP8 fused
     /// kernel that gathers via `sorted_token_ids` internally). `try_kernel`
-    /// (handle may be 0 on images lacking it); never dispatched unless the FP4
-    /// path is active.
+    /// (handle may be 0 on images lacking it). Now unused — the CUTLASS grouped
+    /// path fuses the gather into its A-pack — kept for potential reuse.
+    #[allow(dead_code)]
     pub(crate) moe_permute_tokens_k: KernelHandle,
     // Phase 2.7 Tier C — Frankenstein dispatch flag.
     // True when this layer's index is in `config.dflash_capture_layers`.
