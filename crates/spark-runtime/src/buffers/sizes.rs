@@ -31,7 +31,13 @@ pub fn q12_batched_scratch_bytes(n: usize, chunk_len: usize, top_k: usize, mrope
     let pos_streams = if mrope { 3 } else { 1 };
     let slot = (total * 8 + 7) & !7;
     let ptrs = ((n * std::mem::size_of::<u64>()) + 7) & !7;
-    let stage_meta = pos_streams * pos + slot + 2 * ptrs;
+    // VARLEN cu_seqlens [n+1] i32 prefix-sum, staged after the pointer arrays
+    // (stage_batched.rs:122-126). This term scales with n, so omitting it made
+    // the SSOT under-count grow with batch size: at n>=4 the h_state_ptrs JIT
+    // slot overlapped a live per-stream pointer table → cross-stream KV/GDN
+    // bleed in decode (n<=3 clean, absorbed by over-provisioning slack).
+    let cu_seqlens = (((n + 1) * 4) + 7) & !7;
+    let stage_meta = pos_streams * pos + slot + 2 * ptrs + cu_seqlens;
     // h_state_ptrs JIT slot consumed per SSM layer (N device pointers).
     let h_state_ptrs = n * std::mem::size_of::<u64>();
     moe + n * per_stream_meta + stage_meta + h_state_ptrs

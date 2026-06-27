@@ -522,6 +522,27 @@ impl TransformerModel {
             }
         }
 
+        // DIAG: detect cross-stream physical-block sharing (co-dispatch KV
+        // double-issue hypothesis for the n>=5 decode-bleed bug). Gated.
+        if std::env::var("ATLAS_CODISPATCH_BTCHECK").ok().as_deref() == Some("1") {
+            let mut owner: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
+            let mut bt_dump: Vec<(usize, Vec<u32>)> = Vec::new();
+            for (b, slice) in streams.iter().enumerate() {
+                let bt = slice.seq.block_table.clone();
+                for &blk in &bt {
+                    if let Some(&prev) = owner.get(&blk) {
+                        tracing::warn!(
+                            "ATLAS_BTSHARE n={n}: physical block {blk} SHARED by stream {prev} and stream {b}"
+                        );
+                    } else {
+                        owner.insert(blk, b);
+                    }
+                }
+                bt_dump.push((b, bt));
+            }
+            tracing::warn!("ATLAS_BTDUMP n={n}: {bt_dump:?}");
+        }
+
         // ── PHASE C: per-stream finalize ──
         let mut logits_out: Vec<DevicePtr> = Vec::with_capacity(n);
         for (b, slice) in streams.iter_mut().enumerate() {
