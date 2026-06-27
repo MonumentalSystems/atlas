@@ -70,6 +70,10 @@ pub struct BufferArena {
     /// GDN FLA chunked-prefill scratch (W|U|S|uc sub-divided). NULL unless the
     /// model is a 128-dim-linear-head GDN model (ATLAS_GDN_FLA path).
     gdn_fla_scratch: DevicePtr,
+    /// Persistent FP8 block-scaled activation scratch for prefill projections.
+    fp8_act: DevicePtr,
+    /// Persistent per-128-block FP32 scales paired with `fp8_act`.
+    fp8_act_scale: DevicePtr,
     /// Maximum batch tokens this arena was sized for.
     max_batch_tokens: usize,
     /// Sizes in bytes for each buffer (for debug/logging).
@@ -114,6 +118,8 @@ impl BufferArena {
         } else {
             DevicePtr::NULL
         };
+        let fp8_act = gpu.alloc(sizes.fp8_act)?;
+        let fp8_act_scale = gpu.alloc(sizes.fp8_act_scale)?;
 
         tracing::info!(
             "Buffer arena: {} tokens × {:.1} MB total (attn_out={:.1}MB, ssm_deint={:.1}MB, kv_lora_rank={})",
@@ -146,6 +152,8 @@ impl BufferArena {
             expert_down_out,
             splitk_workspace,
             gdn_fla_scratch,
+            fp8_act,
+            fp8_act_scale,
             max_batch_tokens,
             sizes,
         })
@@ -225,6 +233,19 @@ impl BufferArena {
     /// `DevicePtr::NULL` unless this is a 128-dim-linear-head GDN model.
     pub fn gdn_fla_scratch(&self) -> DevicePtr {
         self.gdn_fla_scratch
+    }
+    /// Persistent FP8 block-scaled activation scratch for prefill projections.
+    /// Replaces a per-projection alloc/sync/free in the W8A8+FP32-epilogue path.
+    pub fn fp8_act(&self) -> DevicePtr {
+        self.fp8_act
+    }
+    /// Allocated byte size of `fp8_act` (debug bounds-check at call sites).
+    pub fn fp8_act_bytes(&self) -> usize {
+        self.sizes.fp8_act
+    }
+    /// Persistent per-128-block FP32 scales paired with `fp8_act`.
+    pub fn fp8_act_scale(&self) -> DevicePtr {
+        self.fp8_act_scale
     }
     pub fn splitk_workspace(&self) -> DevicePtr {
         self.splitk_workspace

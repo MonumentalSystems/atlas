@@ -342,6 +342,145 @@ extern "C" __global__ void w4a16_gemv_batch2(
 }
 
 // ============================================================
+// W4A16 batched GEMV (M<=MAX_M) — the NVFP4 sibling of w8a16_gemv_batch4/16.
+// ============================================================
+// At M-token batched decode the SSM QKVZ / out_proj projections share the same
+// NVFP4 weight matrix across all M sequences, so a SINGLE DRAM pass over the
+// packed 4-bit weight (dequantized E2M1*scale ONCE) serves all M rows — MAC'd
+// into M independent FP32 accumulators. This is what lets FP4 amortize the
+// weight read the way w8a16_gemv_batch4/16 does for FP8; without it the FP4
+// multi-seq path capped at batch3 and re-streamed the weight ~3x at C=8.
+//
+// Per-row accumulation order is IDENTICAL to `w4a16_gemv` (M=1), so the output
+// is bit-identical to running w4a16_gemv M times.
+// A:[M,K] BF16, B_packed:[N,K/2], B_scale:[N,K/16] FP8-E4M3, scale2 FP32,
+// C:[M,N] BF16. Grid: (ceil(N/4),1,1) Block: (256,1,1).
+template <int MAX_M>
+__device__ __forceinline__ void w4a16_gemv_batchm_impl(
+    const __nv_bfloat16* __restrict__ A,         // [M, K]
+    const unsigned char* __restrict__ B_packed,   // [N, K/2] uint8
+    const unsigned char* __restrict__ B_scale,    // [N, K/GROUP_SIZE] FP8-E4M3
+    const float scale2,
+    __nv_bfloat16* __restrict__ C,                // [M, N]
+    unsigned int M,
+    unsigned int N,
+    unsigned int K
+) {
+    const unsigned int threads_per_out = BLOCK_SIZE / N_PER_BLOCK;  // 64
+    const unsigned int local_out = threadIdx.x / threads_per_out;
+    const unsigned int lane = threadIdx.x % threads_per_out;
+    const unsigned int n = blockIdx.x * N_PER_BLOCK + local_out;
+
+    __shared__ float s_lut[16];
+    if (threadIdx.x < 16) s_lut[threadIdx.x] = E2M1_LUT[threadIdx.x];
+    __syncthreads();
+
+    if (n >= N) return;
+
+    const unsigned int half_K = K / 2;
+    const unsigned int num_groups = K / GROUP_SIZE;
+    const unsigned int K16 = K / 16;
+
+    float acc[MAX_M];
+    #pragma unroll
+    for (int t = 0; t < MAX_M; t++) acc[t] = 0.0f;
+
+    for (unsigned int k16 = lane; k16 < K16; k16 += threads_per_out) {
+        const unsigned int base_k = k16 * 16;
+
+        // 8 packed weight bytes (16 FP4) + 1 group scale → dequant ONCE.
+        unsigned long long packed8 =
+            *(const unsigned long long*)(B_packed + (unsigned long long)n * half_K + k16 * 8);
+        const unsigned int scale_group = base_k / GROUP_SIZE;  // == k16 (GROUP_SIZE=16)
+        unsigned char scale_byte = B_scale[(unsigned long long)n * num_groups + scale_group];
+        __nv_fp8_e4m3 fp8;
+        *(unsigned char*)&fp8 = scale_byte;
+#if defined(__SCALE__) || defined(__HIP_PLATFORM_AMD__)
+        float scale = scl_fp8(scale_byte) * scale2;
+#else
+        float scale = (float)fp8 * scale2;
+#endif
+        float wf[16];
+        #pragma unroll
+        for (int b = 0; b < 8; b++) {
+            unsigned char byte_val = (unsigned char)(packed8 >> (b * 8));
+            wf[b * 2]     = s_lut[byte_val & 0xF] * scale;   // W[2j]   <-> act 2j
+            wf[b * 2 + 1] = s_lut[byte_val >> 4] * scale;    // W[2j+1] <-> act 2j+1
+        }
+
+        // Reuse the scaled weights across each activation row.
+        #pragma unroll
+        for (int t = 0; t < MAX_M; t++) {
+            if ((unsigned int)t >= M) continue;
+            const __nv_bfloat16* At = A + (unsigned long long)t * K;
+            uint4 a_lo = ((const uint4*)At)[k16 * 2];
+            uint4 a_hi = ((const uint4*)At)[k16 * 2 + 1];
+            const unsigned int ar[8] = {a_lo.x, a_lo.y, a_lo.z, a_lo.w,
+                                        a_hi.x, a_hi.y, a_hi.z, a_hi.w};
+            #pragma unroll
+            for (int j = 0; j < 8; j++) {
+                __nv_bfloat16 lo, hi;
+                *(unsigned short*)&lo = (unsigned short)(ar[j] & 0xFFFF);
+                *(unsigned short*)&hi = (unsigned short)(ar[j] >> 16);
+                acc[t] += __bfloat162float(lo) * wf[j * 2]
+                        + __bfloat162float(hi) * wf[j * 2 + 1];
+            }
+        }
+    }
+
+    __shared__ float smem[MAX_M][N_PER_BLOCK * 2];  // 2 warps/output, per row
+    const unsigned int warp_in_out = lane / WARP_SIZE;
+    #pragma unroll
+    for (int t = 0; t < MAX_M; t++) {
+        if ((unsigned int)t >= M) continue;
+        float a = acc[t];
+        #pragma unroll
+        for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+            a += __shfl_down_sync(0xFFFFFFFF, a, offset);
+        }
+        if (lane % WARP_SIZE == 0) smem[t][local_out * 2 + warp_in_out] = a;
+    }
+    __syncthreads();
+
+    if (lane == 0) {
+        #pragma unroll
+        for (int t = 0; t < MAX_M; t++) {
+            if ((unsigned int)t >= M) continue;
+            float r = smem[t][local_out * 2] + smem[t][local_out * 2 + 1];
+            C[(unsigned long long)t * N + n] = __float2bfloat16(r);
+        }
+    }
+}
+
+// M<=4 (common-path batched decode) — sibling of w8a16_gemv_batch4.
+extern "C" __global__ void w4a16_gemv_batch4(
+    const __nv_bfloat16* __restrict__ A,
+    const unsigned char* __restrict__ B_packed,
+    const unsigned char* __restrict__ B_scale,
+    const float scale2,
+    __nv_bfloat16* __restrict__ C,
+    unsigned int M,
+    unsigned int N,
+    unsigned int K
+) {
+    w4a16_gemv_batchm_impl<4>(A, B_packed, B_scale, scale2, C, M, N, K);
+}
+
+// M<=16 (high-concurrency decode, n=5..16) — sibling of w8a16_gemv_batch16.
+extern "C" __global__ void w4a16_gemv_batch16(
+    const __nv_bfloat16* __restrict__ A,
+    const unsigned char* __restrict__ B_packed,
+    const unsigned char* __restrict__ B_scale,
+    const float scale2,
+    __nv_bfloat16* __restrict__ C,
+    unsigned int M,
+    unsigned int N,
+    unsigned int K
+) {
+    w4a16_gemv_batchm_impl<16>(A, B_packed, B_scale, scale2, C, M, N, K);
+}
+
+// ============================================================
 // W4A16 GEMV with inline Q/Gate deinterleave on output write
 // ============================================================
 // Same GEMV as w4a16_gemv but writes Q and Gate to separate halves.
