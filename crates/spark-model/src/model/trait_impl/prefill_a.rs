@@ -44,21 +44,26 @@ impl TransformerModel {
             None => return Ok(()),
         };
         let stream = self.gpu.default_stream();
-        let mut total_patches = 0usize;
-        let mut post_merge_grids: Vec<(usize, usize)> = Vec::with_capacity(images.len());
-        let sms = ve.spatial_merge_size.max(1);
-        for (pixels, grid_h, grid_w) in images {
-            let p = ve.forward(pixels, *grid_h, *grid_w, self.gpu.as_ref(), stream)?;
-            total_patches += p;
-            // Record post-merge dimensions for downstream MRoPE position
-            // computation. The ViT folds `sms × sms` pre-merge patches into
-            // a single output embedding, so the effective spatial grid
-            // shrinks by that factor in each axis.
-            post_merge_grids.push((grid_h / sms, grid_w / sms));
-        }
-        *self.vision_embed_patches.lock() = total_patches;
+        // ONE batched ViT forward over all images in this request — block GEMM
+        // weights read once over Σpatches instead of N× (the per-image loop also
+        // overwrote buf_out row 0 every call, corrupting multi-image requests).
+        // Each returned (post_h, post_w, merged_p) preserves image order, so the
+        // packed buf_out matches the pad-token splice order downstream.
+        let img_refs: Vec<(&[f32], usize, usize)> = images
+            .iter()
+            .map(|(px, gh, gw)| (px.as_slice(), *gh, *gw))
+            .collect();
+        let per_image = ve.forward_batched(&img_refs, self.gpu.as_ref(), stream)?;
+        let post_merge_grids: Vec<(usize, usize)> =
+            per_image.iter().map(|(h, w, _)| (*h, *w)).collect();
+        let total_merged: usize = per_image.iter().map(|(_, _, mp)| *mp).sum();
+        *self.vision_embed_patches.lock() = total_merged;
         *self.vision_image_grids.lock() = post_merge_grids;
-        tracing::info!("Vision encoder: {} patches encoded", total_patches);
+        tracing::info!(
+            "Vision encoder (batched): {} images, {} merged patches encoded",
+            images.len(),
+            total_merged
+        );
         Ok(())
     }
 
