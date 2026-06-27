@@ -4164,3 +4164,100 @@ void int8_gemm_faith4(
 #undef F4_TILE
 #undef F4_SB
 #undef F4W
+
+// ═══════════════════════════════════════════════════════════════════
+// REQUANT kernels feeding the int8 W4A8 prefill GEMM (faith2).
+//   requant_w_nvfp4_int8 : NVFP4 weights [N,K/2] packed E2M1 + [N,K/16] E4M3
+//     scales + per-tensor scale2  ->  int8 [N,K] + per-32 float scale [N,K/32].
+//     Run ONCE per weight at load. E2M1 levels {0,.5,1,1.5,2,3,4,6} map cleanly
+//     into int8 (max level 6 -> 127), so this is near-lossless. One thread per
+//     (n, 32-block): reads 32 nibbles (2 E4M3 sub-block scales), finds the block
+//     max, writes 32 int8 + 1 scale = max/127.
+//   requant_a_bf16_int8 : bf16 activations [M,K] -> int8 [M,K] + per-32 float
+//     scale [M,K/32]. Run per-prefill (~1.4% of GEMM time). One thread per
+//     (m, 32-block): block max-abs -> scale=max/127 -> round.
+// Layout matches faith2's A_i8[M,K]/B_i8[N,K] + A_scale[M,K/32]/B_scale[N,K/32].
+// ═══════════════════════════════════════════════════════════════════
+// Portable E4M3 decode: standard on real NVIDIA (__nv_fp8_e4m3), software on SCALE/HIP.
+__device__ __forceinline__ float atlas_e4m3_decode_any(unsigned char b) {
+#if defined(__SCALE__) || defined(__HIP_PLATFORM_AMD__)
+    return scl_fp8(b);
+#else
+    __nv_fp8_e4m3 fp8; *(unsigned char*)&fp8 = b; return (float)fp8;
+#endif
+}
+
+extern "C" __global__
+void requant_w_nvfp4_int8(
+    const unsigned char* __restrict__ W_packed,  // [N, K/2] E2M1 nibbles
+    const unsigned char* __restrict__ W_e4m3,    // [N, K/16] per-16 E4M3 scales
+    const float scale2,                          // per-tensor
+    signed char* __restrict__ W_i8,              // [N, K] out
+    float* __restrict__ W_scale,                 // [N, K/32] out
+    unsigned int N, unsigned int K
+) {
+    unsigned long long blk = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned long long nblocks = (unsigned long long)N * (K >> 5);
+    if (blk >= nblocks) return;
+    unsigned int nb = K >> 5;
+    unsigned int n  = (unsigned int)(blk / nb);
+    unsigned int kb = (unsigned int)(blk % nb) * 32;   // K base of this 32-block
+
+    // dequant 32 values, track max-abs
+    float vals[32];
+    float maxa = 0.f;
+    #pragma unroll
+    for (int i = 0; i < 32; i++) {
+        unsigned int k = kb + i;
+        unsigned char pb = W_packed[(unsigned long long)n * (K>>1) + (k>>1)];
+        unsigned int nib = (k & 1) ? (pb >> 4) : (pb & 0xF);
+        float s16 = atlas_e4m3_decode_any(W_e4m3[(unsigned long long)n * (K>>4) + (k>>4)]) * scale2;
+        float v = E2M1_LUT[nib] * s16;
+        vals[i] = v;
+        float a = fabsf(v);
+        if (a > maxa) maxa = a;
+    }
+    float sc = (maxa > 0.f) ? (maxa / 127.0f) : 1.0f;
+    float inv = 1.0f / sc;
+    W_scale[blk] = sc;
+    #pragma unroll
+    for (int i = 0; i < 32; i++) {
+        int q = __float2int_rn(vals[i] * inv);
+        q = max(-127, min(127, q));
+        W_i8[(unsigned long long)n * K + kb + i] = (signed char)q;
+    }
+}
+
+extern "C" __global__
+void requant_a_bf16_int8(
+    const __nv_bfloat16* __restrict__ A_bf16,    // [M, K]
+    signed char* __restrict__ A_i8,              // [M, K] out
+    float* __restrict__ A_scale,                 // [M, K/32] out
+    unsigned int M, unsigned int K
+) {
+    unsigned long long blk = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned long long nblocks = (unsigned long long)M * (K >> 5);
+    if (blk >= nblocks) return;
+    unsigned int nb = K >> 5;
+    unsigned int m  = (unsigned int)(blk / nb);
+    unsigned int kb = (unsigned int)(blk % nb) * 32;
+
+    float vals[32];
+    float maxa = 0.f;
+    #pragma unroll
+    for (int i = 0; i < 32; i++) {
+        float v = __bfloat162float(A_bf16[(unsigned long long)m * K + kb + i]);
+        vals[i] = v;
+        float a = fabsf(v);
+        if (a > maxa) maxa = a;
+    }
+    float sc = (maxa > 0.f) ? (maxa / 127.0f) : 1.0f;
+    float inv = 1.0f / sc;
+    A_scale[blk] = sc;
+    #pragma unroll
+    for (int i = 0; i < 32; i++) {
+        int q = __float2int_rn(vals[i] * inv);
+        q = max(-127, min(127, q));
+        A_i8[(unsigned long long)m * K + kb + i] = (signed char)q;
+    }
+}
