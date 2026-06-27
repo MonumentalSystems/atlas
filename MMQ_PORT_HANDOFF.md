@@ -98,6 +98,32 @@ llama's `mmq` (q8_0/q4_K int8 path) differs STRUCTURALLY from every Atlas varian
    `w4a16_gemm_t_k` handle + `ATLAS_FP8_M64_PREFILL` flag + highest-priority macro arm) + requant kernels
    (NVFP4→int8-per32 weights at load; bf16→int8-per32 activations per-prefill — task #15). Quality-gate, then agentic.
 
+## 3.5 INTEGRATION STATE (06-27 PM) — requant pipeline VALIDATED, model wiring next
+**Kernel pipeline COMPLETE + gated.** Three pieces, all cosine ≥0.9999:
+- `int8_gemm_faith2` — 44.7/48.9 TFLOP/s gate/up/down, cosine 0.999999 (the GEMM).
+- `requant_w_nvfp4_int8` — NVFP4 [N,K/2]+E4M3[N,K/16]+scale2 → int8[N,K]+f32 scale[N,K/32], load-time.
+- `requant_a_bf16_int8` — bf16[M,K] → int8[M,K]+f32 scale[M,K/32], per-prefill (~1.4% of GEMM).
+- **END-TO-END test (int8_gemm_test.rs REQUANT block): cosine 0.999978** vs host full-precision
+  dequant GEMM, on REAL NVFP4-format weights. (FP8-prefill path = 0.99972 → int8 is the coherent win.)
+All on PR #201 (perf/int8-prefill-faith2, base feat/agentic-2.5h-bf16tc-prefill), 4 commits, NOT merged.
+
+**REAL agentic picture (measured 06-27):** llama target = **8369.87s wall, TTFT median 1393ms, IoU 0.6326**
+(/workspace/endpoints-agentic/results/agentic_coding_perf_2.5h_gb10_cfff1fc). Atlas bf16-TC COLD prefill
+curve (time_prefill.sh, no cache): 2k→4.5s, 4.5k→9.9s, 9k→20.3s, 18k→41.5s (~2.3ms/tok = the "41s/it").
+TWO levers, BOTH needed (per [[project_agentic25h_prefill_iter_2026_06_25]]):
+  (A) PREFIX CACHING — DOMINANT. Multi-turn agentic re-prefills full ctx each turn w/o it (→11h, invalid).
+      spark flags EXIST: `--enable-prefix-caching --ssm-cache-slots 128 --kv-cache-dtype fp8`. 128 slots
+      (19GB @ util 0.90) avoids exhaustion; Marconi SSM snapshot = full prefix skip on hit (5s vs 43s).
+  (B) PREFILL GEMM SPEED — secondary 1.49×. bf16-TC 30 (lossless ceiling) → int8 faith2 44.7 (coherent)
+      or FP8 1.35× (lossy, IoU-risk). int8 is the coherent upgrade over the existing ATLAS_FP8_PREFILL.
+**llama uses int8 MMQ k32 (= what faith2 ports) AND prefix caching.** Win = (A)+(B) together.
+
+REMAINING (model integration, multi-file): wire faith2 behind ATLAS_INT8_PREFILL in dense_ffn.rs
+mirroring ATLAS_FP8_PREFILL (commit 3adf30dc): (1) load-time requant_w → int8 weight+scale buffers on
+the layer (from ORIGINAL NVFP4 [N,K/2], no transpose); (2) per-prefill requant_a on the activation;
+(3) faith2 launcher in ops/gemm_dense.rs; (4) handles. Then: coherence N≥10 + ST subset + agentic-2.5h
+wall+IoU vs 8369.87s/0.6326, with prefix-caching + FP8-KV ON.
+
 ## 4. INFRA (all on dgx1, all WORKING)
 ```
 cd /workspace/atlas-prefill32k
