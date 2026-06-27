@@ -545,6 +545,7 @@ impl TransformerModel {
                     cl,
                     m.proc_count,
                     cu_off[b],
+                    b,
                     stream,
                 )?
             } else {
