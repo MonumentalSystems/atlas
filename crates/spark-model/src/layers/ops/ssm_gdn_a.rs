@@ -544,6 +544,10 @@ pub fn gdn_prefill_fla(
     gpu: &dyn GpuBackend,
     k_recompute_wu: KernelHandle,
     k_chunk_delta_h: KernelHandle,
+    // wmma + DV-block-split spine (gated_delta_rule_chunk_delta_h_tc_vblock). When
+    // non-zero AND ATLAS_GDN_TC_VBLOCK=1, replaces the scalar ksplit spine (drop-in
+    // ABI; grid y = batch·num_dv_blocks, smem 81KB vs 97KB). KernelHandle(0) = off.
+    k_chunk_delta_h_tc_vblock: KernelHandle,
     k_chunk_fwd_o: KernelHandle,
     h_state: DevicePtr,
     query: DevicePtr,
@@ -633,11 +637,26 @@ pub fn gdn_prefill_fla(
         .launch(stream)?;
     prof!("gdn_fla_recompute_wu", &mut t0);
 
-    // Kernel 2: chunk_delta_h_ksplit (256-thread block = 2 threads / v-column).
-    KernelLaunch::new(gpu, k_chunk_delta_h)
-        .grid([num_v_heads, batch_size, 1])
+    // Kernel 2: chunk_delta_h — scalar ksplit OR the wmma + DV-block-split tc_vblock
+    // (gated). tc_vblock is a drop-in ABI; only the grid-y extent (batch·num_dv_blocks)
+    // and the dynamic smem differ. The DV axis is never a contraction axis so the
+    // per-DV-block slices are independent → bit-parity with ksplit (validated isolated).
+    let use_tcvb = k_chunk_delta_h_tc_vblock.0 != 0
+        && std::env::var("ATLAS_GDN_TC_VBLOCK").ok().as_deref() == Some("1");
+    const DV_BLK: u32 = 64; // matches the kernel's compile-time DV_BLK
+    let num_dv_blk = (vd / DV_BLK).max(1); // 2 for Holo (vd=128)
+    // tc_vblock smem: St[DV_BLK*kd] + ws[C*DV_BLK]f32 + buf[2][C*kd + C*DV_BLK] + gcb + decb
+    let smem_tcvb =
+        DV_BLK * kd * 2 + C * DV_BLK * 4 + 2 * (C * kd + C * DV_BLK) * 2 + 2 * C * 4 + 2 * (C + 1) * 4;
+    let (k_cdh, cdh_grid_y, cdh_smem) = if use_tcvb {
+        (k_chunk_delta_h_tc_vblock, batch_size * num_dv_blk, smem_tcvb)
+    } else {
+        (k_chunk_delta_h, batch_size, smem_dh)
+    };
+    KernelLaunch::new(gpu, k_cdh)
+        .grid([num_v_heads, cdh_grid_y, 1])
         .block([256, 1, 1])
-        .shared_mem(smem_dh)
+        .shared_mem(cdh_smem)
         .arg_ptr(h_state)
         .arg_ptr(w_out)
         .arg_ptr(u_out)
