@@ -197,6 +197,15 @@ impl TransformerModel {
         let mut logits_out: Vec<DevicePtr> = Vec::with_capacity(n);
 
         for (stream_idx, slice) in streams.iter_mut().enumerate() {
+            // Fault isolation (scheduler-hardening): a single stream's prefill
+            // error must fail ONLY that stream, not the whole co-dispatched
+            // batch. Wrap the per-stream body so an Err pushes NULL logits (the
+            // caller marks just that stream failed in `completed_indices`) and
+            // the loop continues with the others. Each stream is independent
+            // here — own seq, own KV/SSM-pool slot; the shared hidden buffer at
+            // offset 0 is re-embedded fresh by the next stream — so a mid-stream
+            // failure cannot corrupt its peers.
+            let stream_res: Result<DevicePtr> = (|| {
             let tokens = slice.prompt_tokens;
             let chunk_start = slice.chunk_start;
             let chunk_len = slice.chunk_len;
@@ -272,8 +281,7 @@ impl TransformerModel {
                         .extend_from_slice(&tokens[chunk_start..chunk_start + chunk_len]);
                     seq.seq_len = chunk_start + chunk_len;
                     seq.last_decode_ckpt_block = seq.tokens.len() / bs;
-                    logits_out.push(ptr);
-                    continue;
+                    return Ok(ptr);
                 }
             };
 
@@ -374,7 +382,18 @@ impl TransformerModel {
                 )?;
                 DevicePtr::NULL
             };
-            logits_out.push(logits);
+            Ok(logits)
+            })();
+            match stream_res {
+                Ok(l) => logits_out.push(l),
+                Err(e) => {
+                    tracing::error!(
+                        "Batched prefill fallback: stream {stream_idx} failed: {e:#} \
+                         — isolating (NULL logits; only this stream fails, batch continues)"
+                    );
+                    logits_out.push(DevicePtr::NULL);
+                }
+            }
         }
 
         Ok(logits_out)
