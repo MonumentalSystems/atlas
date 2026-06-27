@@ -44,9 +44,23 @@ gate/up M=4096: bf16-v2 **30** | int8 M128 24 | M64 12(spill) | K64 18 | split-K
   Change 2: ROLLING weight pre-stage — sb-loop OUTER, j-loop INNER, so only WA[2][4]=8 regs live per
   sub-block (vs 32 for full pre-stage of 4 sub-blocks atop acc[2][8][4]); decouples tile size from regs.
   Swept F2_TILE: 64→34, **128→44.75/48.93 (best)**, 256→37.6/39.9 (smem cuts occupancy). 128 = sweet spot.
-  NEXT levers to close to 60: (a) occupancy 1→2 CTA/SM (launch_bounds(256,2); regs+smem permitting at
-  F2_TILE=128 sW+sA=36.8KB→2 CTA=73.6KB<100KB ✓ — try it); (b) ldmatrix-B (collapse 16 scalar B-loads);
-  (c) double-buffer smem to drop the trailing sync; (d) STRETCH: native NVFP4 block-scale MMA (Colfax SM12x).
+  TUNING LADDER (06-27, all cosine 0.999999, gate/up TFLOP/s):
+   - faith2 (big-K-128 + rolling pre-stage)          44.75  ← BEST, the structural win
+   - launch_bounds(256,2) on faith2                  32.4   REGRESSED (register spill; occ via CTA dead)
+   - faith3 (= faith2 + B-frag/scale pre-stage)      44.71  NEUTRAL (compiler already had the B-load ILP)
+   - faith4 (512-thread CTA, acc[2][4][4], 16 warp)  44.57  NEUTRAL — ncu CONFIRMS occ rose 16.6%→32.2%
+                                                            but throughput flat; NOTHING saturates
+                                                            (Compute 26%, Mem 33%); pure dependency-latency.
+  VERDICT: occupancy AND smem-read ILP are BOTH exhausted. faith2's 44.75 is the plateau for this tile
+  skeleton. Closing the last 1.34× to llama (60) needs a DIFFERENT structure: deep multi-stage software
+  pipeline (cp.async depth≥2 + q8_1 INTERLEAVED weight layout so B loads via ldmatrix, llama's actual
+  trick) OR the native NVFP4 block-scale MMA (Colfax SM12x, mma...mxf4nvf4.block_scale.m16n8k64 — 2× K/instr,
+  zero software dequant, weights already E2M1+per-16-E4M3). Those are the two ceiling-breakers.
+  INTEGRATION INSIGHT: dense_ffn.rs ALREADY has an FP8-M64 prefill path (w4a16_gemm_t_k, ATLAS_FP8_M64_PREFILL)
+  at ~44 TFLOP/s — but LOSSY (FP8 E4M3 cosine 0.9997, breaks coherence). int8 faith2 = SAME 44 TFLOP/s at
+  cosine 0.999999 → it is the COHERENT version of that win. Wire faith2 behind ATLAS_INT8_PREFILL mirroring
+  the FP8-M64 dispatch + add int8 requant (NVFP4 w→int8/per32 at load; bf16 act→int8/per32 per-prefill,
+  ~1.4% of GEMM time). Then coherence-gate (N≥10) + ST subset + agentic-2.5h wall vs llama 8369.87s.
 down M=4096: int8 split-K **sk8 35** (beats bf16 30 — the one int8 win; few base CTAs + big K).
 ncu (int8_gemm_8w_ldm gate/up): **stall = SHORT_SCOREBOARD (smem-read dep) 37%, 11.5 warp-cyc/instr**,
   occupancy 33%, L1/TEX 30%, DRAM 38% — nothing saturated; it's smem-read *latency* with no ILP to hide it.

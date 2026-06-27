@@ -69,6 +69,8 @@ fn main() -> Result<()> {
     let hpada = gpu.kernel("w4a16", "int8_gemm_padA")?;
     let hfaith = gpu.kernel("w4a16", "int8_gemm_faith")?;
     let hfaith2 = gpu.kernel("w4a16", "int8_gemm_faith2")?;
+    let hfaith3 = gpu.kernel("w4a16", "int8_gemm_faith3")?;
+    let hfaith4 = gpu.kernel("w4a16", "int8_gemm_faith4")?;
     let hmmq = gpu.kernel("w4a16", "int8_gemm_mmq")?;
     let hsk = gpu.kernel("w4a16", "int8_gemm_splitk")?;
     let hred = gpu.kernel("w4a16", "int8_splitk_reduce")?;
@@ -248,6 +250,38 @@ fn main() -> Result<()> {
             if d/(nr.sqrt()*ng.sqrt())>0.999 {"PASS"} else {"FAIL"});
         let _ = gpu.free(c8);
     }
+    {
+        let c9 = gpu.alloc(m * n * 2)?;
+        KernelLaunch::new(gpu, hfaith3)
+            .grid([n.div_ceil(128) as u32, m.div_ceil(128) as u32, 1]).block([256, 1, 1])
+            .arg_ptr(a_p).arg_ptr(b_p).arg_ptr(as_p).arg_ptr(bs_p).arg_ptr(c9)
+            .arg_u32(m as u32).arg_u32(n as u32).arg_u32(k as u32).launch(stream)?;
+        gpu.synchronize(stream)?;
+        let mut r9 = vec![0u8; m * n * 2];
+        gpu.copy_d2h(c9, &mut r9)?;
+        let cg: Vec<f32> = r9.chunks_exact(2).map(|c| bf16_bits_to_f32(u16::from_le_bytes([c[0], c[1]]))).collect();
+        let (mut d, mut nr, mut ng) = (0f64, 0f64, 0f64);
+        for i in 0..m*n { let (x,y)=(c_ref[i] as f64, cg[i] as f64); d+=x*y; nr+=x*x; ng+=y*y; }
+        println!("FAITH3 (B-frag ILP) correctness: cosine={:.6}  RESULT: {}", d/(nr.sqrt()*ng.sqrt()),
+            if d/(nr.sqrt()*ng.sqrt())>0.999 {"PASS"} else {"FAIL"});
+        let _ = gpu.free(c9);
+    }
+    {
+        let c10 = gpu.alloc(m * n * 2)?;
+        KernelLaunch::new(gpu, hfaith4)
+            .grid([n.div_ceil(128) as u32, m.div_ceil(128) as u32, 1]).block([512, 1, 1])
+            .arg_ptr(a_p).arg_ptr(b_p).arg_ptr(as_p).arg_ptr(bs_p).arg_ptr(c10)
+            .arg_u32(m as u32).arg_u32(n as u32).arg_u32(k as u32).launch(stream)?;
+        gpu.synchronize(stream)?;
+        let mut r10 = vec![0u8; m * n * 2];
+        gpu.copy_d2h(c10, &mut r10)?;
+        let cg: Vec<f32> = r10.chunks_exact(2).map(|c| bf16_bits_to_f32(u16::from_le_bytes([c[0], c[1]]))).collect();
+        let (mut d, mut nr, mut ng) = (0f64, 0f64, 0f64);
+        for i in 0..m*n { let (x,y)=(c_ref[i] as f64, cg[i] as f64); d+=x*y; nr+=x*x; ng+=y*y; }
+        println!("FAITH4 (512-thread occ) correctness: cosine={:.6}  RESULT: {}", d/(nr.sqrt()*ng.sqrt()),
+            if d/(nr.sqrt()*ng.sqrt())>0.999 {"PASS"} else {"FAIL"});
+        let _ = gpu.free(c10);
+    }
 
     // ---- speed: prefill shapes ----
     println!("\n=== int8 speed (TFLOP/s) ===");
@@ -426,8 +460,32 @@ fn main() -> Result<()> {
         for _ in 0..iters { launchfaith2()?; }
         gpu.synchronize(stream)?;
         let tffaith2 = flops / (tf2.elapsed().as_secs_f64() / iters as f64) / 1e12;
+        let launchfaith3 = || -> Result<()> {
+            KernelLaunch::new(gpu, hfaith3)
+                .grid([n.div_ceil(128) as u32, m.div_ceil(128) as u32, 1]).block([256, 1, 1])
+                .arg_ptr(a_p).arg_ptr(b_p).arg_ptr(as_p).arg_ptr(bs_p).arg_ptr(c_p)
+                .arg_u32(m as u32).arg_u32(n as u32).arg_u32(k as u32).launch(stream)
+        };
+        for _ in 0..3 { launchfaith3()?; }
+        gpu.synchronize(stream)?;
+        let tf3 = Instant::now();
+        for _ in 0..iters { launchfaith3()?; }
+        gpu.synchronize(stream)?;
+        let tffaith3 = flops / (tf3.elapsed().as_secs_f64() / iters as f64) / 1e12;
+        let launchfaith4 = || -> Result<()> {
+            KernelLaunch::new(gpu, hfaith4)
+                .grid([n.div_ceil(128) as u32, m.div_ceil(128) as u32, 1]).block([512, 1, 1])
+                .arg_ptr(a_p).arg_ptr(b_p).arg_ptr(as_p).arg_ptr(bs_p).arg_ptr(c_p)
+                .arg_u32(m as u32).arg_u32(n as u32).arg_u32(k as u32).launch(stream)
+        };
+        for _ in 0..3 { launchfaith4()?; }
+        gpu.synchronize(stream)?;
+        let tf4 = Instant::now();
+        for _ in 0..iters { launchfaith4()?; }
+        gpu.synchronize(stream)?;
+        let tffaith4 = flops / (tf4.elapsed().as_secs_f64() / iters as f64) / 1e12;
         let _ = (tf64, tfk64, tf8w3, tf8w, tf8wl, tf8wi, tfpipe, tfpada, tf8wab);
-        print!("{label}: M128 {tf128:.2} | padA {tfpada:.2} | FAITH {tffaith:.2} | FAITH2 {tffaith2:.2} | MMQ {tfmmq:.2}  (bf16=30, llama=60)");
+        print!("{label}: M128 {tf128:.2} | padA {tfpada:.2} | FAITH {tffaith:.2} | FAITH2 {tffaith2:.2} | FAITH3 {tffaith3:.2} | FAITH4 {tffaith4:.2} | MMQ {tfmmq:.2}  (bf16=30, llama=60)");
         // split-K sweep (partial + reduce)
         for &ks in &[2u32, 4, 8, 16] {
             let cp = gpu.alloc(ks as usize * m * n * 4)?;
