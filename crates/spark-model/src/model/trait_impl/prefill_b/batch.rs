@@ -255,6 +255,8 @@ impl TransformerModel {
                     is_last_chunk,
                     kv_write_start,
                     marconi_skip,
+                    // Per-stream fallback: hidden at offset 0 ⇒ base (byte-identical).
+                    self.buffers.hidden_states(),
                     stream,
                 )? {
                 ProcRange::Compute {

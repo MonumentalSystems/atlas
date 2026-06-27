@@ -128,6 +128,8 @@ impl TransformerModel {
             is_last_chunk,
             kv_write_start,
             marconi_skip,
+            // Single-stream: hidden lives at offset 0 ⇒ pass base (byte-identical).
+            self.buffers.hidden_states(),
             stream,
         )? {
             proc_range::ProcRange::Compute {

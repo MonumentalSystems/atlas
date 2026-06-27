@@ -177,21 +177,17 @@ impl TransformerModel {
         let h = self.config.hidden_size;
         let dtype_bytes = 2usize;
         let varlen = varlen_prefill_enabled();
-        // Packed per-stream token offsets (prefix-sum of per-stream chunk_len).
-        // For the legacy same-length path this is exactly `b*chunk_len`; for
-        // VARLEN it packs tightly so the stacked buffers have no padding. Used
-        // for embed / per-stream slice offsets / finalize.
-        let cu_off: Vec<usize> = {
-            let mut v = Vec::with_capacity(n + 1);
-            let mut acc = 0usize;
-            v.push(0);
-            for s in streams.iter() {
-                acc += s.chunk_len;
-                v.push(acc);
-            }
-            v
-        };
-        let total_tokens = cu_off[n];
+        // DEFECT 2 fix: the stacked hidden buffer MUST be packed by the same
+        // cu_seqlens SSOT (Σ proc_count) that Phase1/GDN/Phase3/attn + the staged
+        // BatchedAttnMetadata (stage_batched.rs) and GdnPrefillBuffers.total_len
+        // consume — NOT by cu_off = Σ chunk_len. On a partial prefix-cache hit
+        // proc_count < chunk_len so the two prefix-sums diverge and downstream
+        // reads land on the wrong stream's hidden region. proc_count is only
+        // known AFTER proc_range, so proc_off is built as a running prefix-sum
+        // inside the PHASE-A loop below; proc_off[b] = Σ_{j<b} proc_count[j] is
+        // fully known before stream b is processed. (Cold / no-cache:
+        // proc_count == chunk_len ⇒ proc_off == old cu_off ⇒ byte-identical.)
+        let mut running_proc_off = 0usize;
         // Largest per-stream chunk (VARLEN). All per-stream scratch slots must be
         // sized for this, not streams[0].chunk_len, or a longer stream's meta /
         // MoE topk staging overruns its slot (CUDA 700).
@@ -234,6 +230,9 @@ impl TransformerModel {
             block_table_dev: DevicePtr,
             seq_len_dev: DevicePtr,
             num_blocks: usize,
+            // Σ proc_count of prior streams — this stream's hidden packing offset
+            // (== cu_seqlens layout). Used by PHASE-C finalize.
+            proc_off: usize,
         }
         let mut per_stream: Vec<PerStreamMeta> = Vec::with_capacity(n);
         let force_paged_first_chunk = streams[0].chunk_start == 0 && first_chunk_batched_enabled();
@@ -261,9 +260,16 @@ impl TransformerModel {
             let total = tokens.len();
             let seq = &mut *slice.seq;
 
-            // Embed at the packed cu_off[b] offset into shared hidden buffer
-            // (== b*chunk_len for the uniform legacy path).
-            let hidden_b = hidden_base.offset(cu_off[b] * h * dtype_bytes);
+            // Embed the FULL `cl` tokens at this stream's proc_off slot (==
+            // Σ proc_count of prior streams, the cu_seqlens layout). proc_range
+            // below re-embeds the processed suffix at the SAME slot on a
+            // partial cache hit. A full-cl embed may write a stale tail past
+            // proc_count, but that tail is in stream b+1's region which b+1's
+            // own embed (next iteration) overwrites — every region
+            // [proc_off[j], proc_off[j]+proc_count[j]) is LAST-written by
+            // stream j's own embed, so correctness holds without reordering.
+            let proc_off_b = running_proc_off;
+            let hidden_b = hidden_base.offset(proc_off_b * h * dtype_bytes);
             self.prefill_b_embed_chunk_at(tokens, chunk_start, cl, hidden_b, stream)?;
 
             // Prefix-cache lookup, EP-sync, Marconi restore.
@@ -289,7 +295,9 @@ impl TransformerModel {
                 stream,
             )?;
 
-            // Effective processing range.
+            // Effective processing range. DEFECT 1 fix: pass this stream's
+            // proc_off hidden slot so any cache-hit re-embed lands in THIS
+            // stream's region, not the offset-0 base buffer.
             let (proc_start, proc_count, effective_seq_len_start) = match self
                 .prefill_b_proc_range(
                     tokens,
@@ -299,6 +307,7 @@ impl TransformerModel {
                     is_last_chunk,
                     kv_write_start,
                     marconi_skip,
+                    hidden_b,
                     stream,
                 )? {
                 ProcRange::Compute {
@@ -399,7 +408,11 @@ impl TransformerModel {
                 block_table_dev,
                 seq_len_dev,
                 num_blocks,
+                proc_off: proc_off_b,
             });
+            // Advance the running prefix-sum AFTER proc_count is known so the
+            // next stream packs at Σ proc_count (cu_seqlens SSOT).
+            running_proc_off += proc_count;
         }
 
         // H2D barrier before kernel compute (GB10 DMA quirk).
@@ -459,8 +472,11 @@ impl TransformerModel {
             gate_beta: self.gdn_buf_gate_beta,
             output: self.gdn_buf_out,
             z: self.gdn_buf_z,
-            // VARLEN: packed total (Σ per-stream). Legacy uniform: proc_count*n.
-            total_len: if varlen { total_tokens } else { proc_count * n },
+            // VARLEN: packed total = Σ proc_count (running_proc_off after the
+            // PHASE-A loop) — the cu_seqlens SSOT. Was Σ chunk_len (total_tokens),
+            // which over-counts on a partial cache hit and makes the GDN scan
+            // walk phantom tokens past the packed data. Legacy uniform: proc_count*n.
+            total_len: if varlen { running_proc_off } else { proc_count * n },
         };
 
         // ForwardContext for batched layer calls. attn_metadata is
@@ -583,7 +599,10 @@ impl TransformerModel {
                     chunk_start,
                     cl,
                     m.proc_count,
-                    cu_off[b],
+                    // hidden_stream_offset_tokens = proc_off[b] (Σ proc_count of
+                    // prior streams, the cu_seqlens layout) — NOT cu_off[b].
+                    // finalize reads last_token = proc_off + proc_count - 1.
+                    m.proc_off,
                     b,
                     stream,
                 )?
