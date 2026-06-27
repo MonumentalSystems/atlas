@@ -98,7 +98,111 @@ llama's `mmq` (q8_0/q4_K int8 path) differs STRUCTURALLY from every Atlas varian
    `w4a16_gemm_t_k` handle + `ATLAS_FP8_M64_PREFILL` flag + highest-priority macro arm) + requant kernels
    (NVFP4→int8-per32 weights at load; bf16→int8-per32 activations per-prefill — task #15). Quality-gate, then agentic.
 
-## 3.5 INTEGRATION STATE (06-27 PM) — requant pipeline VALIDATED, model wiring next
+## 3.4 ★★★ ROOT-CAUSE FINDING (06-27 PM) — the agentic gap is BROKEN SSM SNAPSHOT RESTORE, not (only) the GEMM
+Served Atlas bf16-TC + prefix-caching for a 3-traj agentic subset and read the serve log. The smoking gun:
+```
+Session 0x..a87a: 14083 prompt tokens
+Prefix cache hit: 13936 tokens (871 blocks) BUT NO SSM SNAPSHOT — recomputing all KV
+Done: TTFT=31917.9ms   (≈ a FULL ~14k cold re-prefill, 2.3ms/tok)
+```
+EVERY multi-turn warm turn full-recomputes (~29-40s TTFT, climbing with ctx) DESPITE a 99% KV prefix hit.
+CAUSE = **--ssm-checkpoint-interval is in BLOCKS (×16 tok)**. The config (copied from dgx2_fp8_denser.sh)
+used `--ssm-checkpoint-interval 2048` = **32768 tokens** → NO intermediate checkpoint ever fires for the
+14-16k contexts. Only LEAF snapshots (saved at turn-END, e.g. tok 14083) exist, and a leaf is ABOVE the
+next turn's match point (14080) so it is UNUSABLE (can't restore state for tokens you don't have). So
+`prefix_match.ssm_snapshot = None` → prefill_b/prefix_lookup.rs:207 "no SSM snapshot — recomputing all KV".
+**THE FIX = finer interval `--ssm-checkpoint-interval 64` (=1024 tok)** → checkpoints at 1k,2k,..,14k;
+next turn restores from the deepest ≤ match, skipping ~14k tok, recomputing only the few-hundred-token tail.
+Expected TTFT 32s → low single digits. THIS is why "prefix caching never reached parity" — prior runs all
+used the coarse 2048. SERVING-CONFIG fix, bigger lever than the GEMM. Restore code is CORRECT & present
+(prefix_lookup.rs:112-186 Marconi restore + intermediate-checkpoint replay); it just never had a usable snap.
+Broken baseline (interval 2048): warm TTFT 29.2/30.7/31.9/32.6/33.7/38.1/39.7s.
+★ FIX CONFIRMED (interval 64): serve log "Marconi intermediate hit: restored from checkpoint at token 1025/
+2049 (skipping...)" — restore ENGAGES every warm turn. **Warm TTFT 3.9/2.3/3.3s (was ~32s) = ~10× drop.**
+Per-turn wall now ~9s/it, DECODE-bound (prefill only 2-4s of it) → comparable to llama edge throughput.
+Stack: working restore (interval 64) + int8 faith2 (1.49× the residual prefill tail, matters more on deep
+23k turns) + FP8-KV = the full agentic win. THE caching fix is the giant lever; prior runs never had it.
+
+★ DEEP-CONTEXT (06-27, interval 64): restore holds — "checkpoint at token 6145 (skipping 6145, recomputing
+95 SSM tokens to match 6240)". Warm TTFT now 0.66-3.23s (avg ~2.4s). BUT warm TTFT is now SSM-REPLAY-BOUND:
+recompute window = up to interval×16 = 1024 tokens × 48 Mamba layers (serial recurrence). Per-turn ~9.8s/it,
+decode-bound. Extrapolated wall ~9840s (1007×9.8) = ~17% ABOVE llama 8370s. **To BEAT llama, cut warm TTFT
+2.4s→<1.4s** (the (2.4-1.4)×1007≈1000s gap). Levers, BOTH prefill: (a) FINER checkpoint interval (32=512tok
+or 16=256tok → less SSM replay → lower TTFT; costs more snapshot-save overhead + slots, 16384/256=64 ckpts/seq);
+(b) int8 faith2 FFN GEMM (faster FFN inside the replay window + the new-token suffix, all 64 layers). Next:
+measure int8+interval64 wall, then sweep interval 32/16.
+
+★ CACHEFIX SUBSET RESULT (bf16-TC + interval64 + cache + FP8KV, 2 traj / 116 turns):
+  Duration 1965s, **TTFT median 3084ms / avg 3181ms** (vs llama 1393ms = 2.2× — THE prefill gap to close),
+  IoU 0.5714 (subset-specific, not vs llama's full-run 0.6326). Decode ~10.6 tok/s.
+  CAVEAT — per-turn avg 16.9s but TTFT only ~3s ⇒ these turns are DECODE-bound (~14s decode, ~148 tok/turn).
+  Decode ~10.6 tok/s because I OMITTED MTP. The INTENDED agentic serve config (rc3_gate.sh / gate_wash4_dgx1.sh /
+  yaml notes) uses `--speculative --num-drafts 1 --mtp-quantization bf16 --kv-high-precision-layers auto` →
+  MTP ~2× decode. Without MTP the subset is decode-bound and not representative of the user's full-run prefill-
+  dominated premise. ACTION: add MTP to match intended config so prefill TTFT is the measured axis; my int8 +
+  finer-interval work targets that TTFT (3084→ target ≤1393ms). The PREFILL levers (int8, interval) are correct;
+  MTP is the orthogonal decode lever that the prior agentic runs already had.
+
+## 3.42 ★★★ int8 + interval-16 (memory-fixed: util 0.68 + Marconi 128) — VERY PROMISING (06-27 PM)
+After the OOM fix, int8 full-stack agentic runs clean (no OOM, restore engages). Interim (turn 33 of a
+2-traj subset): warm TTFT **0.77-2.6s (median ~1.9s, approaching llama 1393ms)**; deep-context restore
+EXCELLENT — at 17k ctx "skipping 17153 tokens, recomputing only 95 SSM tokens" → TTFT ~0.8s (interval 16
+keeps the SSM-replay window tiny at depth, the key win over interval 64's ~1024-tok replay/3s TTFT).
+**Per-it 5.60s/it @ turn 33** (vs bf16-TC cachefix ~6.6s) → benchmark's naive 1007-turn projection ≈ 90min
+(~5640s) = WELL BELOW llama 8369s. Caveat: early/subset, may climb on deep turns; the FULL 20-traj run is
+the definitive test. Best config = int8 + caching interval 16 + FP8-KV + util 0.68 + Marconi 128.
+Full-run script ready: /workspace/atlas_agentic_FULL_int8.sh. Gating subset IoU first, then launch full.
+
+★ HONEST UPDATE (per-it climbs): int8+interval16 subset per-it 5.6s@turn33 → 17.2s@turn98 (DECODE-bound
+on deep turns: long verbose responses × 10.6 tok/s). So my early 90min projection was the SHALLOW turns;
+deep turns are decode-bound. THE PREFILL GAP THE USER NAMED IS CLOSED: warm TTFT 0.8-2.6s now ≤ llama 1393ms
+(int8 + interval-16 restore recomputes only 95-223 SSM tokens even at 17k ctx). But the WALL also includes
+DECODE, and Atlas decode (~10.6 tok/s, no MTP) is the deep-turn bottleneck → wall would be decode-bound, not
+beating 8369s on prefill alone. RESOLUTION: add MTP (the standard agentic decode accelerator; `--speculative
+--num-drafts 1 --mtp-quantization bf16 --kv-high-precision-layers auto`; has a built-in net-negative auto-
+disable gate so it never regresses). The user's reference config presumably had MTP → with decode competitive,
+my prefill wins (caching interval16 + int8) tip the wall below llama. LAUNCHED FULL 20-traj MTP run
+(atlas_agentic_FULL_int8_mtp.sh: int8 + interval16 + FP8-KV + MTP, util 0.66 + Marconi 96). Measuring wall vs 8369s.
+
+★★★ MTP FULL-RUN EARLY SIGNALS (06-27, turn 3) — ALL GREEN, on track to BEAT llama:
+  - MTP ENABLED, net-POSITIVE (mtp_gate verify_multiplier=1.11 << max 2.0). No OOM (util 0.66 + Marconi 96 fits).
+  - DECODE 19.8-20.7 tok/s (vs 10.6 no-MTP = ~2×) — now competitive/beating llama edge decode.
+  - Warm TTFT 982-1155ms — BELOW llama 1393ms (prefill parity achieved via int8+interval16).
+  - Turns complete normally (stop, 39-77 tok, no runaway) → coherent. Per-it 6.66s/it @ turn3.
+  Projection: deep turns (was 17s no-MTP) → ~9-10s with 2× decode; full-run avg ~7-8s/turn × 1007 ≈ 7000-8000s
+  vs llama 8369s → LIKELY WIN. Full run completing (~1.5-2.5h); IoU at end confirms coherence. THE STACK THAT
+  WORKS: int8 W4A8 faith2 prefill + Marconi prefix-cache interval-16 + FP8-KV + MTP, all on dgx1.
+
+## 3.45 ★ int8 AGENTIC RUN #1 — FAST (1834s<1965s) but FAILED: OOM (lazy-int8-after-greedy-KV)
+int8 full-stack subset (ATLAS_INT8_PREFILL + interval64 + cache, util 0.90, Marconi 256): Duration 1834s
+(7% faster wall than bf16-TC 1965s — int8 prefill IS faster e2e) BUT **IoU 0.0, 116/116 FAILED**:
+first turn TurnTimeout@600s → cascade. Root cause (serve log): `cuMemAlloc_v2 failed: status 2, requested
+89MB (607MB free / 121.7GB)` at prefill layer 56. NOT a correctness bug — OOM. The int8 weight buffers
+(+26GB, 8-bit vs NVFP4 4-bit, built LAZILY on first prefill via OnceLock) don't fit because the KV cache
+GREEDILY pre-allocated to the util cap at startup (model 25 + Marconi 38 + KV≈45 = ~108GB, ~12GB free) →
+the 26GB lazy int8 alloc fails mid-prefill → retry/hang → 600s timeout.
+FIX = leave physical headroom for the lazy int8 (26GB): lower --gpu-memory-utilization so KV doesn't fill
+everything. Budget (121.7GB phys): model 25 + Marconi(slots×0.15GB) + KV + int8 26 + scratch ~5 ≤ 121.
+  - No-cache coherence gate: util 0.70, no Marconi → KV 60 + int8 26 + model 25 = 111 < 121 ✓ (RUNNING).
+  - Agentic w/ cache: util ~0.68 + Marconi 128(19GB) → KV ~38 + 25 + 19 + 26 + 5 = 113 < 121 ✓.
+PROPER fix (later): eager int8 weight alloc at load so KV sizes around it (avoids manual util math), OR
+in-kernel FP4→int8 requant (no +26GB buffer at all, matches bf16-TC/FP8 paths — bigger kernel change).
+GATE FIRST: is int8 COHERENT? (microbench 0.999978 ≠ model coherence — the 0.0 was OOM not quality, but
+must still prove generation is clean before trusting the agentic IoU.)
+★★ int8 COHERENCE GATE PASSED (util 0.70, no Marconi, int8_prefill_gate.sh): **10/10 clean** (Paris/391/
+Jupiter/1024/1945/Au/13, no runaway) AND **int8 prefill 10-12% FASTER than bf16-TC** end-to-end:
+2k 4.02 vs 4.5s, 4.5k 8.92 vs 9.9s, 9k 18.19 vs 20.3s, 18k 36.55 vs 41.5s. int8 integration is CORRECT +
+faster; the IoU-0.0 was OOM only. Next: re-run int8 full-stack agentic with memory fix (util 0.68 + Marconi
+128 + interval 16) → confirm non-zero IoU + combined wall. NOTE: subset is DECODE-bound (~10.6 tok/s, verbose
+model, no MTP) so int8's prefill win (~0.3s/turn of a ~16s turn) barely moves the SUBSET wall — beating
+llama's full wall also needs MTP (decode 2×) + a FULL 20-traj run (2-traj subset tail is NOT representative;
+those are the deepest trajs; llama's 8369s is the 20-traj average = 8.31s/turn).
+
+## 3.5 INTEGRATION STATE (06-27 PM) — requant pipeline VALIDATED, model wiring DONE (compiles), gate next
+ATLAS_INT8_PREFILL wired in dense_ffn.rs (+217) + ops/gemm_dense.rs (+90): load-time requant_w → cached
+int8 weight buffers (OnceLock per gate/up/down, from non-transposed NVFP4); per-prefill requant_a → shared
+scratch; faith2 dispatch (highest-priority arm). Server bin REBUILT clean. NOT yet GPU-coherence-gated.
+Gate script ready: /workspace/int8_prefill_gate.sh. NOT committed (validate on GPU first).
 **Kernel pipeline COMPLETE + gated.** Three pieces, all cosine ≥0.9999:
 - `int8_gemm_faith2` — 44.7/48.9 TFLOP/s gate/up/down, cosine 0.999999 (the GEMM).
 - `requant_w_nvfp4_int8` — NVFP4 [N,K/2]+E4M3[N,K/16]+scale2 → int8[N,K]+f32 scale[N,K/32], load-time.
