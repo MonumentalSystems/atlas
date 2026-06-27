@@ -59,6 +59,31 @@ impl TransformerModel {
     /// streams. Cheap upfront check — caller (dispatch) falls back to
     /// per-stream when false.
     pub(in crate::model) fn kernel_batched_eligible(&self, streams: &[PrefillSlice<'_>]) -> bool {
+        // Fix #4 (mixed-length cache + co-dispatch silent failure): when the
+        // prefix cache is active a co-dispatched batch can contain streams with
+        // DIFFERENT cache-hit depths (the first arrival recomputes →
+        // effective_seq_len_start=0; later arrivals restore the just-saved
+        // snapshot → effective_seq_len_start>0). The kernel-batched PHASE A
+        // mutates each stream IN ORDER (snapshot restore into the SSM pool slot,
+        // KV block alloc, kv_valid_tokens/seq_len) BEFORE it discovers the
+        // effective_seq_len_start mismatch and bails Err — leaving streams
+        // 0..b partially mutated. The dispatch then re-runs the per-stream loop
+        // on those dirty seqs (double snapshot-restore / double block-alloc),
+        // and any surfaced Err drops ALL streams in the scheduler
+        // (run_batched_prefill.rs: every stream marked failed → client sees a
+        // connection reset, server survives). Route cache-possible batches
+        // STRAIGHT to the per-stream loop (batch.rs:199) on pristine seqs — that
+        // loop is structurally equivalent to the proven single-stream cache path
+        // (prefill_chunk_dispatch) and already handles hits correctly, with
+        // per-stream logits rows (fix #1). NoPrefixCaching::is_active()==false,
+        // so no-cache co-dispatch (the +35% PHASE-C scaling) and the cold path
+        // stay byte-identical — the gate only fires when a real radix cache holds
+        // refs. Trade: cold requests under active caching lose kernel-batched
+        // co-dispatch, but with caching on most requests hit and a hit's
+        // processed suffix is tiny, so the co-dispatch scaling is moot.
+        if self.prefix_cache.is_active() {
+            return false;
+        }
         let varlen = varlen_prefill_enabled();
         check_kernel_batched_eligible(
             streams
