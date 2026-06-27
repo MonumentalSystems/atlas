@@ -13,6 +13,10 @@
 
 #[path = "ops/activations.rs"]
 mod activations;
+#[path = "ops/dispatch_helpers.rs"]
+mod dispatch_helpers;
+#[path = "ops/dispatch_proj.rs"]
+mod dispatch_proj;
 #[path = "ops/embeddings.rs"]
 mod embeddings;
 #[path = "ops/fp8_gemv_batch.rs"]
@@ -37,10 +41,14 @@ mod kv_cache_turbok;
 mod moe_expert;
 #[path = "ops/moe_expert_more.rs"]
 mod moe_expert_more;
+#[path = "ops/moe_atomic_c4.rs"]
+mod moe_atomic_c4;
 #[path = "ops/moe_gate.rs"]
 mod moe_gate;
 #[path = "ops/moe_grouped_a.rs"]
 mod moe_grouped_a;
+#[path = "ops/moe_grouped_a2.rs"]
+mod moe_grouped_a2;
 #[path = "ops/moe_grouped_b.rs"]
 mod moe_grouped_b;
 #[path = "ops/moe_prefill.rs"]
@@ -67,6 +75,8 @@ mod quant_dispatch;
 mod sampling;
 #[path = "ops/ssm_gdn_a.rs"]
 mod ssm_gdn_a;
+#[path = "ops/ssm_gdn_a2.rs"]
+mod ssm_gdn_a2;
 #[path = "ops/ssm_gdn_b.rs"]
 mod ssm_gdn_b;
 #[path = "ops/ssm_gdn_batched.rs"]
@@ -77,6 +87,8 @@ mod ssm_mamba;
 mod ssm_preproc;
 
 pub use activations::*;
+pub use dispatch_helpers::*;
+pub use dispatch_proj::*;
 pub use embeddings::*;
 pub use fp8_gemv_batch::*;
 pub use fp8_moe::*;
@@ -89,8 +101,10 @@ pub use kv_cache_fp8k::*;
 pub use kv_cache_turbok::*;
 pub use moe_expert::*;
 pub use moe_expert_more::*;
+pub use moe_atomic_c4::*;
 pub use moe_gate::*;
 pub use moe_grouped_a::*;
+pub use moe_grouped_a2::*;
 #[allow(unused_imports)]
 pub(crate) use moe_grouped_b::*;
 pub use moe_prefill::*;
@@ -105,6 +119,7 @@ pub use prefill_attn_turbok::*;
 pub use quant_dispatch::*;
 pub use sampling::*;
 pub use ssm_gdn_a::*;
+pub use ssm_gdn_a2::*;
 pub use ssm_gdn_b::*;
 pub use ssm_gdn_batched::*;
 pub use ssm_mamba::*;
