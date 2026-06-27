@@ -526,21 +526,39 @@ impl TransformerModel {
         // double-issue hypothesis for the n>=5 decode-bleed bug). Gated.
         if std::env::var("ATLAS_CODISPATCH_BTCHECK").ok().as_deref() == Some("1") {
             let mut owner: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
-            let mut bt_dump: Vec<(usize, Vec<u32>)> = Vec::new();
+            let mut slot_owner: std::collections::HashMap<usize, usize> =
+                std::collections::HashMap::new();
+            let mut dump: Vec<(usize, usize, Option<usize>, usize, u32)> = Vec::new();
             for (b, slice) in streams.iter().enumerate() {
                 let bt = slice.seq.block_table.clone();
+                let slot = slice.seq.slot_idx;
+                // Authoritative owned slot from the RAII guard (slot_idx may be
+                // stale post-compaction); plus prompt length + first token to
+                // prove two DIFFERENT prompts share a slot.
+                let guard_slot = slice.seq.ssm_slot.as_ref().and_then(|g| g.idx());
+                let ptoks = slice.prompt_tokens.len();
+                let tok0 = slice.prompt_tokens.first().copied().unwrap_or(0);
+                if let Some(gs) = guard_slot {
+                    if let Some(&prev) = slot_owner.get(&gs) {
+                        tracing::warn!(
+                            "ATLAS_GUARDSHARE n={n}: GUARD slot {gs} SHARED by stream {prev} and {b}"
+                        );
+                    } else {
+                        slot_owner.insert(gs, b);
+                    }
+                }
                 for &blk in &bt {
                     if let Some(&prev) = owner.get(&blk) {
                         tracing::warn!(
-                            "ATLAS_BTSHARE n={n}: physical block {blk} SHARED by stream {prev} and stream {b}"
+                            "ATLAS_BTSHARE n={n}: KV block {blk} SHARED by stream {prev} and {b}"
                         );
                     } else {
                         owner.insert(blk, b);
                     }
                 }
-                bt_dump.push((b, bt));
+                dump.push((b, slot, guard_slot, ptoks, tok0));
             }
-            tracing::warn!("ATLAS_BTDUMP n={n}: {bt_dump:?}");
+            tracing::warn!("ATLAS_BTDUMP n={n} (stream,slot_idx,guard_slot,ptoks,tok0): {dump:?}");
         }
 
         // ── PHASE C: per-stream finalize ──

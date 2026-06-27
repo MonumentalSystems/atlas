@@ -186,26 +186,66 @@ pub(super) fn drain_pending_requests(
 /// in place across the swap_remove, and the per-slot CUDA graph cache
 /// stays warm because the seq never moved.
 pub(super) fn retire_finished_sequences(model: &dyn Model, active: &mut Vec<ActiveSeq>) {
-    let skip_compaction = model.ep_protocol_v2();
-    let mut i = 0;
-    while i < active.len() {
-        if active[i].finished {
-            let mut a = active.swap_remove(i);
-            if !skip_compaction && i < active.len() && active[i].seq.slot_idx != i {
-                // Compact the swapped-in sequence to reuse the retired
-                // seq's slot. Mark the retired seq's slot as reused so
-                // free_sequence doesn't double-release it.
-                if let Err(e) = model.compact_sequence(&mut active[i].seq, i) {
-                    tracing::error!("compact_sequence: {e:#}");
-                }
-                // Disown the retired seq's slot (now owned by the swapped-in
-                // seq's guard): sets the reuse sentinel AND neutralizes the
-                // RAII guard so `free_sequence`/Drop won't double-release it.
-                model.detach_slot_for_reuse(&mut a.seq);
+    if model.ep_protocol_v2() {
+        // v2 EP: slots are pre-allocated and kept in place (see doc above);
+        // just drop finished seqs, no compaction.
+        let mut i = 0;
+        while i < active.len() {
+            if active[i].finished {
+                let mut a = active.swap_remove(i);
+                finish_sequence(model, &mut a);
+            } else {
+                i += 1;
             }
-            finish_sequence(model, &mut a);
+        }
+        return;
+    }
+
+    // ── Two-phase retirement (bug-2 fix) ──
+    // The old per-removal "compact swapped-in seq to position i + detach the
+    // retired seq" ASSUMED the active vec was contiguous (slot_idx == position).
+    // When co-dispatch admission left it non-contiguous, that compacted a
+    // survivor onto a slot still owned by another live seq (double-own) while
+    // leaking the retired seq's real slot — two co-dispatched seqs then shared
+    // one SSM slot → shared GDN h_state → cross-stream content bleed. The fix
+    // is order-independent and exclusivity-safe:
+    //   Phase 1: drop every finished seq, releasing ITS OWN slot to the pool.
+    //   Phase 2: compact survivors into contiguous slots [0..n), each migration
+    //            target CLAIMED exclusively from the free list (compact_sequence
+    //            → claim_specific). No two live seqs can ever share a slot.
+
+    // Phase 1.
+    let mut survivors: Vec<ActiveSeq> = Vec::with_capacity(active.len());
+    for mut a in active.drain(..) {
+        if a.finished {
+            finish_sequence(model, &mut a); // RAII guard releases a's own slot
         } else {
-            i += 1;
+            survivors.push(a);
         }
     }
+
+    // Phase 2: targets are the [0..n) slots not already held by a survivor
+    // (freed in Phase 1, or never occupied). There are exactly as many targets
+    // as survivors whose slot is out of range, so every survivor lands in
+    // [0..n) with a unique slot.
+    let n = survivors.len();
+    let occupied: std::collections::HashSet<usize> =
+        survivors.iter().map(|a| a.seq.slot_idx).collect();
+    let mut free_targets: Vec<usize> = (0..n).filter(|s| !occupied.contains(s)).collect();
+    for a in survivors.iter_mut() {
+        if a.seq.slot_idx >= n {
+            match free_targets.pop() {
+                Some(target) => {
+                    if let Err(e) = model.compact_sequence(&mut a.seq, target) {
+                        tracing::error!("compact_sequence: {e:#}");
+                    }
+                }
+                None => tracing::error!(
+                    "retire: no free target for out-of-range slot {} (n={n})",
+                    a.seq.slot_idx
+                ),
+            }
+        }
+    }
+    *active = survivors;
 }
