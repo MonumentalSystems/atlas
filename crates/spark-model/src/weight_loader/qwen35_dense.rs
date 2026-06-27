@@ -16,6 +16,8 @@ use crate::weight_map::{
     interleave_ba, load_dense_ffn, load_kv_scales, load_mtp, quantize_to_nvfp4, quantized_auto,
 };
 
+mod loaders_b;
+
 pub struct Qwen35DenseWeightLoader;
 
 impl ModelWeightLoader for Qwen35DenseWeightLoader {
@@ -419,9 +421,13 @@ impl ModelWeightLoader for Qwen35DenseWeightLoader {
         Ok(layers)
     }
 
-    fn load_embedding(&self, store: &WeightStore, config: &ModelConfig) -> Result<DenseWeight> {
-        let prefix = &config.weight_prefix;
-        dense(store, &format!("{prefix}.embed_tokens.weight"))
+    fn load_embedding(
+        &self,
+        store: &WeightStore,
+        config: &ModelConfig,
+        _gpu: &dyn GpuBackend,
+    ) -> Result<DenseWeight> {
+        loaders_b::load_embedding(store, config)
     }
 
     fn load_final_norm(
@@ -430,21 +436,11 @@ impl ModelWeightLoader for Qwen35DenseWeightLoader {
         config: &ModelConfig,
         _gpu: &dyn GpuBackend,
     ) -> Result<DenseWeight> {
-        let prefix = &config.weight_prefix;
-        dense(store, &format!("{prefix}.norm.weight"))
+        loaders_b::load_final_norm(store, config)
     }
 
     fn load_lm_head(&self, store: &WeightStore, config: &ModelConfig) -> Result<DenseWeight> {
-        for pattern in &[
-            "lm_head.weight",
-            "language_model.lm_head.weight",
-            "model.lm_head.weight",
-        ] {
-            if store.contains(pattern) {
-                return dense(store, pattern);
-            }
-        }
-        self.load_embedding(store, config)
+        loaders_b::load_lm_head(store, config)
     }
 
     fn load_mtp_weights(
@@ -476,5 +472,20 @@ impl ModelWeightLoader for Qwen35DenseWeightLoader {
             );
         }
         Ok(Some(mtp))
+    }
+
+    fn load_vision_encoder(
+        &self,
+        store: &WeightStore,
+        config: &ModelConfig,
+        gpu: &dyn GpuBackend,
+    ) -> Result<Option<crate::layers::VisionEncoder>> {
+        // Dense Qwen3.5 / Holo VL checkpoints (e.g. Holo-3.1-0.8B, Ornith-1.0-9B)
+        // ship the SAME Qwen3-VL ViT tower as their MoE siblings. The MoE
+        // loader's `load_vision_encoder` reads only `store` + `config.vision`
+        // (no MoE-specific state), so reuse it verbatim. The shared model
+        // forward (`model/trait_impl/*`, gated on `vision_encoder.is_some()`)
+        // then merges image embeddings — no dense-specific forward changes.
+        super::qwen35::Qwen35WeightLoader.load_vision_encoder(store, config, gpu)
     }
 }
