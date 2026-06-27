@@ -24,6 +24,12 @@ behind specific subsystems — see the
 
 ### Fixed
 
+- Weight-only NVFP4 (W4A16) checkpoints now load. llm-compressor
+  `nvfp4-pack-quantized` with `input_activations: None` ships no static
+  activation scale; the loader previously required `input_global_scale` and
+  failed (e.g. `AEON-7/Ornith-1.0-35B-AEON-Ultimate-Uncensored-NVFP4`). The
+  field is loaded-but-unused (activations are quantized dynamically), so it is
+  now optional. W4A4/W4A8 checkpoints are unaffected. (#203)
 - `--gpu-memory-utilization` now enforces a hard ceiling on total GPU
   memory (weights + buffers + KV cache + reserves), matching the vLLM /
   sparkrun convention.  Previously the fraction was applied only to
