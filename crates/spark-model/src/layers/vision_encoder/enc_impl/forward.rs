@@ -78,6 +78,7 @@ impl VisionEncoder {
             return self.forward_oversized_fallback(images, &p_i, &mp_i, &mp_off, sms, gpu, stream);
         }
 
+        let _sec0 = std::time::Instant::now();
         // 1. Per-image host prep, packed into the SHARED buffers at p_off[i].
         let pos_interp_on = std::env::var("ATLAS_VISION_POSINTERP")
             .map(|v| v != "0")
@@ -95,6 +96,15 @@ impl VisionEncoder {
             self.build_rope_cossin_into(*gh, *gw, cos_dst, sin_dst, gpu, stream)?;
         }
 
+        let timing = std::env::var("ATLAS_VISION_TIMING").is_ok();
+        if timing {
+            gpu.synchronize(stream).ok();
+            tracing::info!(
+                "VIT_SEC host_prep({n_img} imgs): {:.1}ms",
+                _sec0.elapsed().as_secs_f64() * 1000.0
+            );
+        }
+        let _sec1 = std::time::Instant::now();
         // 2. Patch embed over M=Σp.
         self.patch_embed_batched(images, &p_off, p_total, gpu, stream)?;
         Self::maybe_dump_buf(gpu, self.buf_h1, p_total * self.hidden_size, "patch_embed", stream)?;
@@ -129,11 +139,27 @@ impl VisionEncoder {
             }
         }
 
+        if timing {
+            gpu.synchronize(stream).ok();
+            tracing::info!(
+                "VIT_SEC patch+27blocks(M={p_total}): {:.1}ms",
+                _sec1.elapsed().as_secs_f64() * 1000.0
+            );
+        }
+        let _sec2 = std::time::Instant::now();
         // 4. Final merger per image → packed [0 .. Σmerged_p).
         for (i, (_px, gh, gw)) in images.iter().enumerate() {
             let src = self.buf_h1.offset(p_off[i] * self.hidden_size * 2);
             let out_slice = self.buf_out.offset(mp_off[i] * self.out_hidden_size * 2);
             self.apply_merger(&self.merger, p_i[i], *gh, *gw, src, out_slice, gpu, stream)?;
+        }
+        if timing {
+            gpu.synchronize(stream).ok();
+            tracing::info!(
+                "VIT_SEC mergers(final+{} ds): {:.1}ms",
+                self.deepstack_indexes.len(),
+                _sec2.elapsed().as_secs_f64() * 1000.0
+            );
         }
         // Dump the full packed region (final + deepstack) so N=1 == the old
         // `total_rows` span exactly (byte-identity validation).

@@ -24,6 +24,11 @@ pub fn start_chunked_prefill(
     // streams batch into one `run_batched_prefill_step` forward. Vision is
     // excluded upstream (PrefillInProgress carries no pixel state).
     defer: bool,
+    // Vision co-dispatch: when Some, this request's images were already encoded
+    // (batched with other requests) into the shared buf_out; skip the per-request
+    // encode and instead set the per-stream slice base around the chunk-0 splice.
+    // None ⇒ legacy self-encode. Only ever Some for single-chunk-fit image prompts.
+    vision_slice: Option<VisionSlice>,
 ) -> Result<StartPrefillResult> {
     // Merge user-supplied stop tokens with model EOS tokens.
     let stop_tokens = req.take_stop_tokens();
@@ -193,7 +198,10 @@ pub fn start_chunked_prefill(
     // Guard: free SSM slot on any error after allocation.
     let prefill_result = (|| -> Result<DevicePtr> {
         // Vision: encode images and store embeddings for chunk 0 token overwrite.
-        if !image_pixels.is_empty() {
+        // Skipped when the images were already batch-encoded by the co-dispatch
+        // pre-pass (vision_slice.is_some()) — that path runs ONE encode + fence
+        // for the whole tick; here we only set the per-stream slice base below.
+        if vision_slice.is_none() && !image_pixels.is_empty() {
             model.prepare_vision_embed(&image_pixels)?;
             // prepare_vision_embed() runs the vision encoder asynchronously on
             // the default stream, writing this request's patch embeddings into
@@ -219,14 +227,36 @@ pub fn start_chunked_prefill(
         model.ep_broadcast_cmd(prompt_tokens.len() as u32)?; // full prompt length
         model.ep_broadcast_tokens(&prompt_tokens)?;
 
-        model.prefill_chunk(
+        // Co-dispatch: point this request's chunk-0 splice/MRoPE at its slice of
+        // the shared packed buf_out. Single-chunk-fit is guaranteed upstream, so
+        // the whole prompt (and its full pad run) is consumed in THIS chunk —
+        // set before, reset after (the scheduler admit loop is single-threaded,
+        // so no other request observes the non-zero base).
+        if let Some(s) = vision_slice {
+            model.set_vision_slice_base(s.patch_row_offset, s.grid_index_offset, s.num_images);
+        }
+        let _pt0 = std::time::Instant::now();
+        let chunk_res = model.prefill_chunk(
             &prompt_tokens,
             &mut seq,
             0,
             chunk_len,
             is_last,
             prefill_stream,
-        )
+        );
+        if std::env::var("ATLAS_VISION_TIMING").is_ok() {
+            let _ = model.synchronize(prefill_stream);
+            tracing::info!(
+                "VIT_TIMING prefill_chunk {} tok (img={}): {:.1}ms",
+                chunk_len,
+                vision_slice.is_some() || !image_pixels.is_empty(),
+                _pt0.elapsed().as_secs_f64() * 1000.0
+            );
+        }
+        if vision_slice.is_some() {
+            model.set_vision_slice_base(0, 0, 0);
+        }
+        chunk_res
     })();
 
     let logits = match prefill_result {

@@ -53,9 +53,104 @@ pub(super) fn start_new_requests(
     // want_codispatch (which requires active.is_empty()). EP/vision excluded (per
     // request, below) — same constraints as the fused mixed path.
     let mixed_defer = always_mixed && chunked && !active.is_empty() && !model.is_ep();
-    for req in new_reqs {
+
+    // ── Vision co-dispatch pre-pass (ATLAS_VISION_CODISPATCH, default on) ──
+    // Batch every single-chunk-fit image request's ViT encode into ONE
+    // forward_batched call so each block's GEMM weights are read once over
+    // Σpatches instead of N× — the concurrent-image win (serialized ViT made
+    // image TTFT grow ~linearly with concurrency). Each request then reads its
+    // own slice of the shared packed buf_out via set_vision_slice_base.
+    // Default OFF: profiling showed the ViT encode is ~94% the per-image
+    // vision_attention_rope kernel (which does NOT batch across images), so
+    // co-dispatching the encode gives no TTFT win (the batchable GEMMs are
+    // only ~6% of the ViT) and adds gather/fence overhead. Kept as opt-in
+    // infrastructure — it correctly slices vision per-request, which is the
+    // prerequisite for admitting image requests into LLM-prefill co-dispatch.
+    let vision_codispatch = std::env::var("ATLAS_VISION_CODISPATCH")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    const VISION_P_MAX: usize = 6400; // VisionEncoder scratch cap (Σ pre-merge patches)
+    let mut vision_slices: Vec<VisionSlice> = vec![VisionSlice::default(); new_reqs.len()];
+    if vision_codispatch && chunked {
+        let mut batched_idx: Vec<usize> = Vec::new();
+        let mut per_request_imgs: Vec<Vec<(Vec<f32>, usize, usize)>> = Vec::new();
+        let mut running_patches = 0usize;
+        let mut overflow = false;
+        for (k, req) in new_reqs.iter().enumerate() {
+            if !req.has_image_pixels() {
+                continue;
+            }
+            // Single-chunk-fit gate: the splice + MRoPE reset img_idx per chunk,
+            // so a pad run must not straddle a chunk boundary. max_prefill_tokens
+            // is the conservative per-request budget (active grows as we admit
+            // each request, dropping the budget from max_batch_tokens), so
+            // fitting it guarantees a single chunk regardless of admit order.
+            if req.prompt_len() > max_prefill_tokens {
+                continue; // self-encodes per-request (legacy single-image path)
+            }
+            let imgs = req.image_pixels_ref();
+            let req_patches: usize = imgs.iter().map(|(_, gh, gw)| gh * gw).sum();
+            if running_patches + req_patches > VISION_P_MAX {
+                overflow = true;
+                break;
+            }
+            running_patches += req_patches;
+            batched_idx.push(k);
+            per_request_imgs.push(imgs.to_vec());
+        }
+        if overflow {
+            // Full-disable for the tick — never mix a batched encode with a
+            // per-request self-encode into the same buf_out (a later self-encode
+            // on the default stream would clobber it before earlier splices run).
+            batched_idx.clear();
+            per_request_imgs.clear();
+        }
+        if batched_idx.len() >= 2 {
+            match model.prepare_vision_embed_batched(&per_request_imgs) {
+                Ok(descs) if descs.len() == batched_idx.len() => {
+                    for (slot, (row_off, grid_off, n_img, row_cnt)) in
+                        batched_idx.iter().zip(descs.into_iter())
+                    {
+                        vision_slices[*slot] = VisionSlice {
+                            patch_row_offset: row_off,
+                            grid_index_offset: grid_off,
+                            num_images: n_img,
+                            patch_row_count: row_cnt,
+                        };
+                    }
+                    // ONE fence for the whole batch: prefill_stream waits for the
+                    // batched encode (default stream) before any chunk-0 splice.
+                    if let Err(e) = model
+                        .record_event(prefill_event, model.default_stream())
+                        .and_then(|_| model.stream_wait_event(prefill_stream, prefill_event))
+                    {
+                        tracing::error!("vision co-dispatch fence failed: {e:#}");
+                    }
+                    tracing::info!(
+                        "Vision co-dispatch: batched {} image requests this tick",
+                        batched_idx.len()
+                    );
+                }
+                Ok(_) => {
+                    tracing::warn!(
+                        "vision co-dispatch desc count mismatch; per-request fallback this tick"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "vision co-dispatch batched encode failed: {e:#}; per-request fallback"
+                    );
+                }
+            }
+        }
+    }
+
+    for (req_idx, req) in new_reqs.into_iter().enumerate() {
         if chunked {
             let defer = want_codispatch || (mixed_defer && !req.has_image_pixels());
+            // Pre-encoded by the co-dispatch pre-pass? (num_images>0 ⇒ batched)
+            let slice = vision_slices[req_idx];
+            let vision_slice = if slice.num_images > 0 { Some(slice) } else { None };
             // When no active sequences are decoding, process as much of the
             // prompt as buffers allow — avoids per-token paged decode fallback
             // in chunk 2+. Capped at max_batch_tokens (buffer capacity).
@@ -78,6 +173,7 @@ pub(super) fn start_new_requests(
                 grammar_engine,
                 spontaneous_think_budget,
                 defer,
+                vision_slice,
             ) {
                 Ok(StartPrefillResult::Active(a)) => {
                     tracing::info!(

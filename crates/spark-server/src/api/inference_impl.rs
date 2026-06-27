@@ -63,6 +63,16 @@ impl InferenceRequest {
         }
     }
 
+    /// Borrow the preprocessed image data (non-consuming) — used by the vision
+    /// co-dispatch pre-pass to batch-encode across requests before the admit
+    /// loop consumes each request.
+    pub fn image_pixels_ref(&self) -> &[(Vec<f32>, usize, usize)] {
+        match self {
+            InferenceRequest::Blocking { image_pixels, .. } => image_pixels.as_slice(),
+            InferenceRequest::Streaming { image_pixels, .. } => image_pixels.as_slice(),
+        }
+    }
+
     /// Per-request stop tokens, consumed by the scheduler.
     pub fn take_stop_tokens(&mut self) -> Vec<u32> {
         match self {

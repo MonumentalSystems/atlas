@@ -220,7 +220,13 @@ impl VisionEncoder {
         self.vit_gemm_bias(gpu, self.buf_h1, blk.qkv_w, blk.qkv_b, self.buf_wide, pt, qkv_n, h, stream)?;
         // 4. Attention PER IMAGE over its disjoint slice. buf_wide (QKV) is
         //    read-only here; each image writes a disjoint buf_h1 row range.
+        // ATLAS_VISION_NOATTN: skip the attention loop (WRONG output) to measure
+        // its share of block time vs the batched GEMMs. Diagnostic only.
+        let skip_attn = std::env::var("ATLAS_VISION_NOATTN").is_ok();
         for (i, &p) in p_i.iter().enumerate() {
+            if skip_attn {
+                break;
+            }
             let p32 = p as u32;
             let sm_bytes = ((p + self.head_dim) * std::mem::size_of::<f32>()) as u32;
             let qkv = self.buf_wide.offset(p_off[i] * qkv_n as usize * 2);
