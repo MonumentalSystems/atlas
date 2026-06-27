@@ -171,6 +171,10 @@ name = "gdn_chunk_delta_h_gateb"
 required-features = ["cuda", "gpu-examples"]
 
 [[example]]
+name = "gdn_chunk_shapetest"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
 name = "gdn_recompute_wu_gateb"
 required-features = ["cuda", "gpu-examples"]
 

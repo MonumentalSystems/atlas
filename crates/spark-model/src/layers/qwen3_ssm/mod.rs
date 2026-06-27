@@ -94,6 +94,12 @@ pub struct Qwen3SsmLayer {
     /// token-equal (cos=1.0 vs scalar). Three handles; all must be non-null.
     gdn_prefill_fla_recompute_wu_k: KernelHandle,
     gdn_prefill_fla_chunk_delta_h_k: KernelHandle,
+    /// Tensor-core / DV-block-split variant of the FLA chunk_delta_h spine
+    /// (`gated_delta_rule_chunk_delta_h_tc_vblock`). Loaded by default but not
+    /// yet wired into the prefill dispatch — the cos-gate validates it in
+    /// isolation first. `allow(dead_code)` until the launch site reads it.
+    #[allow(dead_code)]
+    gdn_prefill_fla_chunk_delta_h_tc_vblock_k: KernelHandle,
     gdn_prefill_fla_chunk_fwd_o_k: KernelHandle,
     /// WY32 chunked prefill: processes 32 tokens per WY iteration with H in
     /// shared memory. ~30x faster than per-token for 14k+ sequences.

@@ -17,6 +17,8 @@
 // GB10 sm_121: mma.sync.m16n8k16 BF16 (no wgmma/TMA, ldmatrix broken).
 
 #include <cuda_bf16.h>
+#include <mma.h>   // nvcuda::wmma fragment types (tc_vblock variant; mma_gram itself
+                   // stays raw mma.sync PTX — ldmatrix is broken on sm_121).
 
 #define K_DIM 128
 #define V_DIM 128
@@ -644,6 +646,203 @@ gated_delta_rule_chunk_delta_h_ksplit(
     cdh_ksplit_core<2>(h_state, W_in, U_in, key, gate, gc_in, S_out, uc_out, seq_len, num_chunks,
                        num_k_heads, num_v_heads, k_dim, v_dim, qk_stride, gb_stride, h_state_is_table,
                        cu_seqlens, cu_chunks, is_varlen);
+}
+
+// ── KERNEL 2-TC-VBLOCK: chunk_delta_h_tc_vblock ──────────────────────────────
+// wmma Phase-A (W·S on tensor cores via mma_gram) + DV-block split (DV 128→2×64)
+// + double-buffered cp.async. Grafts chunk_delta_h_tc's Phase A (line ~479) but the
+// DV split halves every DV-dimensioned smem buffer, so the wmma Sᵀ+ws buffers AND a
+// double buffer fit under 99KB (81KB used) — the thing the shelved TC (96KB, single-
+// buffered) couldn't. State stays f32 in registers (precision-critical). Grid adds a
+// dv-block axis folded into blockIdx.y: more CTAs on the same 48 SMs. Drop-in ABI ==
+// ksplit (SPEC C): same 21 args, same S_out/uc_out/h_state layout for chunk_fwd_o.
+//
+// DV-block factorization (the #1 correctness fact): column block [dv_off,dv_off+64)
+// of S_{c+1} depends ONLY on the same column block of S_c. The W·S contraction
+// reduces over k (never v); duc_i[v]=exp(gc_last-gc_i)·uc_i[v] is per-column; edl·S_c
+// is element-wise in v. DV is purely an OUTPUT/state axis, never a contraction axis →
+// two DV-block CTAs carry disjoint, non-interacting column-slices (no reduction, no
+// cross-block comms). Same split croll83 prepare_h uses; same reason ksplit_vblock is
+// bit-parity. (This split is on DV/output; ksplit's is on K/contraction + a shfl.)
+//
+// Thread layout (256 threads = 8 warps): a DV_BLK(64)-wide v-block × KSPLIT(4)-way
+// K-split of the state column IN REGISTERS — like ksplit SPLIT=4 but WITHOUT the
+// __shfl_xor butterfly (wmma performs the full-K W·S sum in Phase A). The other 4
+// warps idle ONLY during the Phase-A mma_gram call (which tiles M by warp*16 and
+// would overrun CHUNK=64 past 4 warps); they participate in all loads + Phases B.
+//
+// smem (DV_BLK=64): St[64*128]bf16(16K) + ws[64*64]f32(16K) + buf[2][64*128+64*64]
+// bf16(48K) + gcb[2][64]f32 + decb[2][65]f32 = 82952 B (~81KB), double-buffered AND
+// wmma. Kb aliases St (Phase A consumes St→ws; St then dead, reused to stage K for
+// Phase B), recovering the 16KB that lets the double buffer coexist with wmma.
+// NOTE: launcher MUST opt in via CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES=82952.
+#define DV_BLK 64
+#define NUM_DV_BLK (V_DIM / DV_BLK)                 // 2
+// double-buffer slot: {W[CHUNK*K_DIM], Uslice[CHUNK*DV_BLK]} bf16
+#define TCVB_SLOT (CHUNK * K_DIM + CHUNK * DV_BLK)  // 8192 + 4096 = 12288 bf16
+
+extern "C" __global__ void __launch_bounds__(256, 1)
+gated_delta_rule_chunk_delta_h_tc_vblock(
+    float* __restrict__ h_state,
+    const __nv_bfloat16* __restrict__ W_in,
+    const __nv_bfloat16* __restrict__ U_in,
+    const __nv_bfloat16* __restrict__ key,
+    const float* __restrict__ gate,
+    const float* __restrict__ gc_in,
+    __nv_bfloat16* __restrict__ S_out,
+    __nv_bfloat16* __restrict__ uc_out,
+    unsigned int batch_size, unsigned int seq_len, unsigned int num_chunks,
+    unsigned int num_k_heads, unsigned int num_v_heads, unsigned int k_dim,
+    unsigned int v_dim, unsigned int qk_stride, unsigned int gb_stride,
+    unsigned int h_state_is_table,
+    const int* __restrict__ cu_seqlens, const int* __restrict__ cu_chunks,
+    unsigned int is_varlen
+) {
+    const unsigned int vh = blockIdx.x;
+    if (vh >= num_v_heads) return;
+    const unsigned int dv_blk = blockIdx.y / batch_size;   // 0..NUM_DV_BLK-1
+    const unsigned int b      = blockIdx.y % batch_size;
+    const unsigned int dv_off = dv_blk * DV_BLK;           // 0 or 64
+    GDN_GEOM(g);
+    key += g.tokoff * qk_stride;   // per-stream token offset (b*seq_len / cu_seqlens) —
+                                   // the raw key tensor is token-major; W/U/gc fold b via
+                                   // choff but key did not → batch>1 read batch-0's tokens.
+
+    const unsigned int tid = threadIdx.x;                  // 0..255  (8 warps)
+    const unsigned int head_repeat = num_v_heads / num_k_heads;
+    const unsigned int kh = vh / head_repeat;
+
+    // ── smem (82952 B, double-buffered) ──
+    extern __shared__ char smem_raw[];
+    __nv_bfloat16* St  = (__nv_bfloat16*)smem_raw;             // [DV_BLK*K_DIM] Sᵀ snapshot   16KB
+    float*         ws  = (float*)(St + DV_BLK * K_DIM);        // [CHUNK*DV_BLK] Phase-A out   16KB
+    __nv_bfloat16* buf = (__nv_bfloat16*)(ws + CHUNK * DV_BLK);// buf[2][TCVB_SLOT]            48KB
+    float*         gcb = (float*)(buf + 2 * TCVB_SLOT);        // gcb[2][CHUNK]
+    float*         decb = gcb + 2 * CHUNK;                     // decb[2][CHUNK+1] [0]=exp(gc_last)
+    __nv_bfloat16* Kb  = St;                                   // Phase B reuses St for K (alias)
+
+    // ── resident f32 state slice: this CTA owns v-columns [dv_off, dv_off+DV_BLK).
+    //    256 threads → DV_BLK(64) v-columns × KSPLIT(4) k-strips of KH=32. Thread
+    //    holds Sreg[KH] for one v-column and one k-strip (4-way K-split in registers,
+    //    like ksplit SPLIT=4 but WITHOUT shfl — wmma does the W·S sum).
+    constexpr int KSPLIT = 256 / DV_BLK;                      // 4
+    constexpr int KH     = K_DIM / KSPLIT;                    // 32
+    const unsigned int vloc = tid / KSPLIT;                   // 0..DV_BLK-1  local v
+    const unsigned int ksub = tid % KSPLIT;                   // 0..3
+    const unsigned int k0   = ksub * KH;
+    const unsigned int v    = dv_off + vloc;                  // absolute v-column
+
+    float* H = h_state_is_table
+        ? ((float* const*)h_state)[b] + (unsigned long long)vh * K_DIM * V_DIM
+        : h_state + ((unsigned long long)(b * num_v_heads + vh) * K_DIM * V_DIM);
+    float Sreg[KH];
+    #pragma unroll
+    for (int kk = 0; kk < KH; kk++) Sreg[kk] = H[(k0 + kk) * V_DIM + v];
+
+    // ── inline DV-block-aware double-buffer prefetch (W full-K, U dv-sliced, gc/dec) ──
+    // (cdh_prefetch stages full-V U; here U is sliced to [dv_off,dv_off+DV_BLK) so the
+    //  U buffer is DV_BLK-wide — hence an inline prefetch instead of the shared helper.)
+    auto prefetch = [&](unsigned int p, unsigned int c) {
+        __nv_bfloat16* Wp = buf + (unsigned long long)p * TCVB_SLOT;
+        __nv_bfloat16* Up = Wp + CHUNK * K_DIM;
+        const unsigned int cs = c * CHUNK;
+        const unsigned int ce = (g.seqlen - cs) < CHUNK ? (g.seqlen - cs) : CHUNK;
+        const unsigned long long base = ((unsigned long long)(g.choff + c) * num_v_heads + vh);
+        // W [CHUNK][K_DIM] full (DV-independent): cp.async 16B = 8 bf16.
+        for (unsigned int idx = tid * 8; idx < CHUNK * K_DIM; idx += 256 * 8) {
+            unsigned int i = idx / K_DIM, k = idx % K_DIM;
+            if (i < ce) cp_async16(&Wp[i * K_DIM + k], &W_in[base * CHUNK * K_DIM + i * k_dim + k]);
+        }
+        // U [CHUNK][DV_BLK] dv-sliced.
+        for (unsigned int idx = tid * 8; idx < CHUNK * DV_BLK; idx += 256 * 8) {
+            unsigned int i = idx / DV_BLK, vv = idx % DV_BLK;
+            if (i < ce) cp_async16(&Up[i * DV_BLK + vv],
+                                   &U_in[base * CHUNK * V_DIM + i * v_dim + (dv_off + vv)]);
+        }
+        cp_commit();
+        if (tid == 0) {            // gc / decay computed scalar (cheap, no cp.async).
+            float* gcp = gcb + p * CHUNK; float* dp = decb + p * (CHUNK + 1);
+            float gl = gc_in[base * CHUNK + (ce - 1)];
+            dp[0] = expf(gl);
+            for (unsigned int i = 0; i < ce; i++) {
+                float gi = gc_in[base * CHUNK + i];
+                gcp[i] = gi; dp[1 + i] = expf(gl - gi);
+            }
+        }
+    };
+
+    prefetch(0, 0);
+
+    for (unsigned int c = 0; c < g.nchunks; c++) {
+        const unsigned int cur = c & 1u;
+        const unsigned int cs  = c * CHUNK;
+        const unsigned int ce  = (g.seqlen - cs) < CHUNK ? (g.seqlen - cs) : CHUNK;
+        const unsigned long long base = ((unsigned long long)(g.choff + c) * num_v_heads + vh);
+
+        if (c + 1 < g.nchunks) { prefetch((c + 1) & 1u, c + 1); cp_wait<1>(); }
+        else                   { cp_wait<0>(); }
+        __syncthreads();
+
+        __nv_bfloat16* Wp = buf + (unsigned long long)cur * TCVB_SLOT;
+        __nv_bfloat16* Up = Wp + CHUNK * K_DIM;
+        const float*   dec = decb + cur * (CHUNK + 1);
+        const float    edl = dec[0];
+
+        // (1) entry state bf16(S_c) → S_out  [(choff+c)*nv+vh][K_DIM][V_DIM].
+        #pragma unroll
+        for (int kk = 0; kk < KH; kk++)
+            S_out[base * K_DIM * V_DIM + (k0 + kk) * V_DIM + v] = __float2bfloat16(Sreg[kk]);
+
+        // (2) stage Sᵀ snapshot for this dv-block: St[vloc][k] = bf16(S[k][v]). The 4
+        //     ksub lanes of a v-column together fill its full 128-wide K row.
+        #pragma unroll
+        for (int kk = 0; kk < KH; kk++)
+            St[vloc * K_DIM + (k0 + kk)] = __float2bfloat16(Sreg[kk]);
+        __syncthreads();
+
+        // (3) PHASE A (TENSOR CORE): ws[i][vloc] = Σ_k W[i][k]·Sᵀ[vloc][k] = <W_i,S[:,v]>.
+        //     mma_gram M=CHUNK(64) over 4 warps, K=K_DIM(128), N=DV_BLK(64)=NTC*8 → NTC=8,
+        //     NSTRIDE=DV_BLK. Guard to first 4 warps: mma_gram tiles M by warp*16 and
+        //     warps 4–7 would address M-rows 64–127 (past CHUNK). Each warp writes disjoint
+        //     ws rows (no internal __syncthreads) → the warp guard is safe.
+        if ((tid >> 5) < 4)
+            mma_gram<DV_BLK / 8, DV_BLK, false>(Wp, St, ws);   // NTC = 64/8 = 8
+        __syncthreads();
+
+        // (4) uc = U - ws ; duc = exp(gc_last-gc_i)·uc   (scalar; ksub==0 writes uc_out).
+        float duc[CHUNK];
+        for (unsigned int i = 0; i < ce; i++) {
+            float uci = (float)Up[i * DV_BLK + vloc] - ws[i * DV_BLK + vloc];
+            if (ksub == 0)
+                uc_out[base * CHUNK * V_DIM + i * v_dim + v] = __float2bfloat16(uci);
+            duc[i] = dec[1 + i] * uci;
+        }
+        __syncthreads();   // before St region reused for K
+
+        // (5) load K into the freed St region (Kb=St), full K_DIM (DV-independent).
+        for (unsigned int idx = tid * 8; idx < CHUNK * K_DIM; idx += 256 * 8) {
+            unsigned int i = idx / K_DIM, k = idx % K_DIM;
+            #pragma unroll
+            for (int j = 0; j < 8; j++)
+                Kb[i * K_DIM + k + j] = (i < ce)
+                    ? key[(unsigned long long)(cs + i) * qk_stride + kh * k_dim + (k + j)]
+                    : __float2bfloat16(0.0f);
+        }
+        __syncthreads();
+
+        // (6) PHASE B (SCALAR, f32 register-S): S_{c+1}[k][v]=edl·S+Σ_i duc_i·K_i[k].
+        #pragma unroll
+        for (int kk = 0; kk < KH; kk++) {
+            float hv = edl * Sreg[kk];
+            for (unsigned int i = 0; i < ce; i++)
+                hv += duc[i] * (float)Kb[i * K_DIM + (k0 + kk)];
+            Sreg[kk] = hv;
+        }
+        __syncthreads();   // before St/ws/buf reused next chunk
+    }
+
+    #pragma unroll
+    for (int kk = 0; kk < KH; kk++) H[(k0 + kk) * V_DIM + v] = Sreg[kk];
 }
 
 // ── KERNEL 2-KSPLIT-VBLOCK: chunk_delta_h_ksplit_vblock<SPLIT,VTILES> ─────
