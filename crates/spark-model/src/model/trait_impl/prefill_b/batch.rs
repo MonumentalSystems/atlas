@@ -196,7 +196,16 @@ impl TransformerModel {
 
         let mut logits_out: Vec<DevicePtr> = Vec::with_capacity(n);
 
-        for slice in streams.iter_mut() {
+        for (stream_idx, slice) in streams.iter_mut().enumerate() {
+            // Fault isolation (scheduler-hardening): a single stream's prefill
+            // error must fail ONLY that stream, not the whole co-dispatched
+            // batch. Wrap the per-stream body so an Err pushes NULL logits (the
+            // caller marks just that stream failed in `completed_indices`) and
+            // the loop continues with the others. Each stream is independent
+            // here — own seq, own KV/SSM-pool slot; the shared hidden buffer at
+            // offset 0 is re-embedded fresh by the next stream — so a mid-stream
+            // failure cannot corrupt its peers.
+            let stream_res: Result<DevicePtr> = (|| {
             let tokens = slice.prompt_tokens;
             let chunk_start = slice.chunk_start;
             let chunk_len = slice.chunk_len;
@@ -205,11 +214,13 @@ impl TransformerModel {
             let seq = &mut *slice.seq;
 
             // EP=2 zeroes ALL buffers per chunk for NCCL defence-in-depth.
-            // EP=1 zeroes essentials only at chunk_start==0 (stale data).
+            // EP=1 zeroes only prefill essentials at chunk_start==0; layer
+            // forward overwrites the remaining scratch buffers before read.
             if self.comm.is_some() {
                 self.buffers.zero_all(self.gpu.as_ref(), stream)?;
             } else if chunk_start == 0 {
-                self.buffers.zero_all(self.gpu.as_ref(), stream)?;
+                self.buffers
+                    .zero_prefill_essentials(self.gpu.as_ref(), stream)?;
             }
 
             // Phase 1+1b: embed at the shared hidden-buffer offset 0.
@@ -253,6 +264,8 @@ impl TransformerModel {
                     is_last_chunk,
                     kv_write_start,
                     marconi_skip,
+                    // Per-stream fallback: hidden at offset 0 ⇒ base (byte-identical).
+                    self.buffers.hidden_states(),
                     stream,
                 )? {
                 ProcRange::Compute {
@@ -268,8 +281,7 @@ impl TransformerModel {
                         .extend_from_slice(&tokens[chunk_start..chunk_start + chunk_len]);
                     seq.seq_len = chunk_start + chunk_len;
                     seq.last_decode_ckpt_block = seq.tokens.len() / bs;
-                    logits_out.push(ptr);
-                    continue;
+                    return Ok(ptr);
                 }
             };
 
@@ -337,13 +349,26 @@ impl TransformerModel {
             seq.last_decode_ckpt_block = seq.tokens.len() / bs;
 
             let logits = if is_last_chunk {
-                self.prefill_b_finalize_last(
+                // Per-stream logits row (bug-1 class fix for THIS per-stream
+                // fallback loop — the kernel-batched PHASE C was already fixed
+                // in e86d68c). Each iteration writes the shared hidden buffer at
+                // offset 0 and is consumed before the next overwrites it, BUT
+                // logits are sampled by the caller AFTER the whole loop, so
+                // every stream must land in its OWN logits row — otherwise
+                // logits_out is N copies of offset 0 and all streams sample the
+                // LAST stream's logits (concurrent-prefill cross-request bleed,
+                // exposed by short prefix-cache-hit prefills bailing here).
+                // hidden offset stays 0 (per-stream hidden is at base in this
+                // loop); only the logits destination is per-stream.
+                self.prefill_b_finalize_last_at(
                     tokens,
                     seq,
                     &mut kv_cache,
                     chunk_start,
                     chunk_len,
                     proc_count,
+                    0,
+                    stream_idx,
                     stream,
                 )?
             } else {
@@ -357,7 +382,18 @@ impl TransformerModel {
                 )?;
                 DevicePtr::NULL
             };
-            logits_out.push(logits);
+            Ok(logits)
+            })();
+            match stream_res {
+                Ok(l) => logits_out.push(l),
+                Err(e) => {
+                    tracing::error!(
+                        "Batched prefill fallback: stream {stream_idx} failed: {e:#} \
+                         — isolating (NULL logits; only this stream fails, batch continues)"
+                    );
+                    logits_out.push(DevicePtr::NULL);
+                }
+            }
         }
 
         Ok(logits_out)

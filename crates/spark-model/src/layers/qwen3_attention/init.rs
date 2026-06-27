@@ -185,6 +185,11 @@ impl Qwen3AttentionLayer {
                 "rope_mrope_interleaved",
                 "rope_forward_mrope_interleaved",
             ),
+            rope_mrope_interleaved_k_only_k: super::super::try_kernel(
+                gpu,
+                "rope_mrope_interleaved",
+                "rope_forward_mrope_interleaved_k_only",
+            ),
             rope_yarn_k: super::super::try_kernel(gpu, "rope", "rope_forward_yarn"),
             // Interleaved (GPT-J / is_neox_style=False) YaRN RoPE — DeepSeek-V4 MLA.
             rope_yarn_interleaved_k: super::super::try_kernel(
@@ -407,6 +412,11 @@ impl Qwen3AttentionLayer {
                 "w4a16_gemm_t_m128_v3",
             ),
             dense_gemm_k: gpu.kernel("gemm", "dense_gemm_bf16")?,
+            dense_gemm_pipelined_k: super::super::try_kernel(
+                gpu,
+                "gemm",
+                "dense_gemm_bf16_pipelined",
+            ),
             prefill_attn_k: gpu.kernel("inferspark_prefill", "inferspark_prefill")?,
             prefill_attn_512_k: super::super::try_kernel(
                 gpu,
@@ -552,6 +562,11 @@ impl Qwen3AttentionLayer {
             deinterleave_qg_split_k: gpu.kernel("ssm_preprocess", "deinterleave_qg_split")?,
             deinterleave_qg_split_qnorm_k: gpu
                 .kernel("ssm_preprocess", "deinterleave_qg_split_qnorm")?,
+            deinterleave_qg_split_qnorm_mrope_k: super::super::try_kernel(
+                gpu,
+                "ssm_preprocess",
+                "deinterleave_qg_split_qnorm_mrope",
+            ),
             sigmoid_gate_mul_batched_k: gpu.kernel("residual_add", "sigmoid_gate_mul_batched")?,
             q_fp8: None,
             k_fp8: None,

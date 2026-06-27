@@ -232,7 +232,7 @@ pub(crate) fn quantized_any(
             // Raw BF16/FP16 fine-tune: load the dense weight then runtime-quantize.
             let w = store.get(&format!("{prefix}.weight"))?;
             let bf16 = DenseWeight { weight: w.ptr };
-            quantize_to_nvfp4(
+            let q = quantize_to_nvfp4(
                 &bf16,
                 n,
                 k,
@@ -240,7 +240,15 @@ pub(crate) fn quantized_any(
                 qctx.absmax_k,
                 qctx.quantize_k,
                 qctx.stream,
-            )
+            )?;
+            // Free the BF16 source: the NVFP4 buffer is a fresh allocation, so the
+            // on-disk BF16 weight is now redundant. Without this a 35B BF16 MoE
+            // (Bf16Raw, SEPARATE per-expert layout routed through here by #200's
+            // `quantized_any`) holds BOTH the ~60GB BF16 experts AND the ~22GB
+            // NVFP4 copies → ~109GB pre-KV, no room for KV. Safe + mirrors
+            // `quantized_from_fp8` which frees its BF16 intermediate the same way.
+            gpu.free(w.ptr)?;
+            Ok(q)
         }
     }
 }

@@ -133,4 +133,38 @@ impl FfnComponent {
             }
         }
     }
+
+    pub fn forward_token_major_decode(
+        &self,
+        input: DevicePtr,
+        num_tokens: usize,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        match self {
+            Self::Moe(m) => m.forward_token_major_decode(input, num_tokens, ctx, stream),
+            Self::Dense(d) => d.forward_batched(input, num_tokens, ctx, stream),
+            Self::None => {
+                let _ = (input, num_tokens);
+                Ok(())
+            }
+        }
+    }
+
+    pub fn forward_atomic_c4_decode(
+        &self,
+        input: DevicePtr,
+        num_tokens: usize,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        match self {
+            Self::Moe(m) => m.forward_atomic_c4_decode(input, num_tokens, ctx, stream),
+            Self::Dense(d) => d.forward_batched(input, num_tokens, ctx, stream),
+            Self::None => {
+                let _ = (input, num_tokens);
+                Ok(())
+            }
+        }
+    }
 }
