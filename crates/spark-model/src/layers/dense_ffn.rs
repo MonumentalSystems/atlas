@@ -43,6 +43,28 @@ pub enum FfnActivation {
     GeLU,
 }
 
+/// A per-projection int8 W4A8 weight, built lazily from the NVFP4 weight on the
+/// first `ATLAS_INT8_PREFILL` prefill (see `DenseFfnLayer::ensure_int8_weight`).
+/// `w_i8` is `[N, K]` signed int8; `w_scale` is `[N, K/32]` F32. Cached for the
+/// process lifetime in a `OnceLock`, so the requant kernel runs once per weight.
+#[derive(Debug, Clone, Copy)]
+struct Int8Weight {
+    w_i8: DevicePtr,
+    w_scale: DevicePtr,
+}
+
+/// Caller-owned activation-requant scratch for the int8 prefill path. Sized to
+/// the largest `(M, K)` seen so far (`M*K` int8 bytes + `M*(K/32)*4` F32 bytes)
+/// and reused across calls. Grown (with a stream sync before freeing the old
+/// buffers) only when a larger prefill arrives.
+#[derive(Debug, Clone, Copy)]
+struct Int8Scratch {
+    a_i8: DevicePtr,
+    a_scale: DevicePtr,
+    i8_bytes: usize,
+    scale_bytes: usize,
+}
+
 pub struct DenseFfnLayer {
     pub weights: DenseFfnWeights,
     activation: FfnActivation,
@@ -82,6 +104,31 @@ pub struct DenseFfnLayer {
     // warps), giving a measured ~3-8% faster prefill GEMM on this latency-bound
     // kernel. Preferred over bf16_k when present. KernelHandle(0) on miss → bf16_k.
     w4a16_gemm_t_m128_bf16_v2_k: KernelHandle,
+    // FP8 M64 prefill (w4a16_gemm_t): m16n8k32 e4m3 MMA + M_TILE=64. Packed 1-byte
+    // operands cut shared-memory load instructions ~4x (the v2 BF16 path is
+    // smem-bandwidth-bound, L1/TEX 90% per ncu), and M64's lower register pressure
+    // lifts occupancy → measured ~44 TFLOP/s vs ~30 for v2 (~1.47x prefill) on dgx1.
+    // LOSSY (FP8 E4M3, cosine ~0.9997) — OPT-IN via ATLAS_FP8_M64_PREFILL, gated on
+    // quality. KernelHandle(0) on miss → dispatch unchanged.
+    w4a16_gemm_t_k: KernelHandle,
+    // int8 W4A8 prefill (ATLAS_INT8_PREFILL): the validated requant→faith2
+    // pipeline (cosine 0.999978). `int8_gemm_faith2` is an int8×int8 MMA with
+    // per-32 block scales, so BOTH operands must be int8 — unlike the FP8 path
+    // (mixed BF16×FP8). At first int8 prefill we requant the NVFP4 gate/up/down
+    // weights to int8 once (`requant_w_nvfp4_int8`, cached in the OnceLocks
+    // below) and requant the BF16 activations every call (`requant_a_bf16_int8`,
+    // into `int8_a_scratch`). KernelHandle(0) on miss → arm never taken.
+    int8_faith2_k: KernelHandle,
+    requant_w_int8_k: KernelHandle,
+    requant_a_int8_k: KernelHandle,
+    // Lazily-built, process-lifetime int8 weight copies (one per projection),
+    // requanted from `self.weights.{gate,up,down}_proj`. Only ever touched when
+    // ATLAS_INT8_PREFILL is set → default-off path is byte-identical.
+    int8_gate: std::sync::OnceLock<Int8Weight>,
+    int8_up: std::sync::OnceLock<Int8Weight>,
+    int8_down: std::sync::OnceLock<Int8Weight>,
+    // Grow-on-demand activation requant scratch, shared by all three int8 GEMMs.
+    int8_a_scratch: std::sync::Mutex<Option<Int8Scratch>>,
     /// SiLU(gate)*up or GELU(gate)*up depending on activation.
     act_mul: KernelHandle,
     /// BF16 dense MLP weights — when `Some`, all forward paths use the
@@ -151,6 +198,14 @@ impl DenseFfnLayer {
                 "w4a16",
                 "w4a16_gemm_t_m128_bf16_v2",
             ),
+            w4a16_gemm_t_k: super::try_kernel(gpu, "w4a16", "w4a16_gemm_t"),
+            int8_faith2_k: super::try_kernel(gpu, "w4a16", "int8_gemm_faith2"),
+            requant_w_int8_k: super::try_kernel(gpu, "w4a16", "requant_w_nvfp4_int8"),
+            requant_a_int8_k: super::try_kernel(gpu, "w4a16", "requant_a_bf16_int8"),
+            int8_gate: std::sync::OnceLock::new(),
+            int8_up: std::sync::OnceLock::new(),
+            int8_down: std::sync::OnceLock::new(),
+            int8_a_scratch: std::sync::Mutex::new(None),
             act_mul,
             bf16_weights: None,
             dense_gemv_bf16_k,
@@ -171,6 +226,91 @@ impl DenseFfnLayer {
             up_proj: up,
             down_proj: down,
         });
+    }
+
+    /// Ensure the int8 W4A8 copy of one NVFP4 projection weight exists, building
+    /// it once via `requant_w_nvfp4_int8` and caching it in `cell`. Reads the
+    /// NON-transposed NVFP4 layout (`weight` = packed E2M1 `[N, K/2]`,
+    /// `weight_scale` = per-16 E4M3 `[N, K/16]`, `weight_scale_2` = per-tensor
+    /// F32) — so it is independent of the `*_proj_t` transposed copies. The
+    /// requant launches on `stream`; the subsequent faith2 read is stream-ordered
+    /// after it, so no host sync is needed.
+    fn ensure_int8_weight(
+        &self,
+        cell: &std::sync::OnceLock<Int8Weight>,
+        gpu: &dyn GpuBackend,
+        src: &QuantizedWeight,
+        n: u32,
+        k: u32,
+        stream: u64,
+    ) -> Result<Int8Weight> {
+        if let Some(w) = cell.get() {
+            return Ok(*w);
+        }
+        let (nn, kk) = (n as usize, k as usize);
+        let w_i8 = gpu.alloc(nn * kk)?; // [N, K] int8
+        let w_scale = gpu.alloc(nn * (kk / 32) * 4)?; // [N, K/32] F32
+        ops::requant_w_nvfp4_int8(
+            gpu,
+            self.requant_w_int8_k,
+            src.weight,
+            src.weight_scale,
+            src.weight_scale_2,
+            w_i8,
+            w_scale,
+            n,
+            k,
+            stream,
+        )?;
+        let built = Int8Weight { w_i8, w_scale };
+        // Lost a race (another thread built first): free our duplicate buffers.
+        if let Err(dup) = cell.set(built) {
+            let _ = gpu.free(dup.w_i8);
+            let _ = gpu.free(dup.w_scale);
+        }
+        Ok(*cell.get().expect("int8 weight cell set above"))
+    }
+
+    /// Ensure the shared activation-requant scratch holds at least `M*K` int8
+    /// bytes + `M*(K/32)*4` F32 bytes, growing (and stream-syncing before freeing
+    /// the old buffers) only when a larger prefill arrives. Returns
+    /// `(a_i8, a_scale)` device pointers reused across all three int8 GEMMs.
+    fn ensure_int8_scratch(
+        &self,
+        gpu: &dyn GpuBackend,
+        m: u32,
+        k: u32,
+        stream: u64,
+    ) -> Result<(DevicePtr, DevicePtr)> {
+        let need_i8 = (m as usize) * (k as usize);
+        let need_scale = (m as usize) * ((k as usize) / 32) * 4;
+        let mut guard = self
+            .int8_a_scratch
+            .lock()
+            .expect("int8 scratch mutex poisoned");
+        let grow = match guard.as_ref() {
+            Some(s) => s.i8_bytes < need_i8 || s.scale_bytes < need_scale,
+            None => true,
+        };
+        if grow {
+            if let Some(old) = guard.take() {
+                // Old buffers may still be referenced by in-flight kernels on
+                // this stream; sync before freeing to avoid a use-after-free.
+                gpu.synchronize(stream)?;
+                let _ = gpu.free(old.a_i8);
+                let _ = gpu.free(old.a_scale);
+            }
+            let a_i8 = gpu.alloc(need_i8.max(1))?;
+            let a_scale = gpu.alloc(need_scale.max(1))?;
+            *guard = Some(Int8Scratch {
+                a_i8,
+                a_scale,
+                i8_bytes: need_i8,
+                scale_bytes: need_scale,
+            });
+        }
+        let s = guard.as_ref().expect("int8 scratch set above");
+        Ok((s.a_i8, s.a_scale))
     }
 
     /// Single-token decode: 2-3 kernel launches depending on activation.
@@ -506,6 +646,40 @@ impl DenseFfnLayer {
         // (PCND: explicit opt-in, no silent default change). Read once per call.
         let bf16_tc_prefill = self.w4a16_gemm_t_m128_bf16_k.0 != 0
             && std::env::var_os("ATLAS_BF16_TC_PREFILL").is_some();
+        // FP8 M64 fast-prefill opt-in: route prefill GEMMs through the m16n8k32
+        // e4m3 M64 kernel (~1.47x vs v2 BF16, smem-relieved). Lossy (cosine 0.9997)
+        // → highest priority when set, so it overrides the BF16/FP8 t_m128 arms.
+        // PCND: explicit opt-in, default off = byte-for-byte prior behavior.
+        let fp8_m64_prefill = self.w4a16_gemm_t_k.0 != 0
+            && std::env::var_os("ATLAS_FP8_M64_PREFILL").is_some();
+        // int8 W4A8 fast-prefill opt-in (ATLAS_INT8_PREFILL): route prefill GEMMs
+        // through the validated requant→`int8_gemm_faith2` pipeline (cosine
+        // 0.999978 vs the host full-precision dequant GEMM). HIGHEST priority when
+        // set, so it overrides every other prefill arm. Needs both operands int8:
+        // the NVFP4 weights are requanted to int8 once (cached, see
+        // `ensure_int8_weight`) and the BF16 activations are requanted every call
+        // into the shared scratch (`ensure_int8_scratch`). LOSSY (perf gate, not
+        // bit-identical) — the _2.5h IoU gate is the final arbiter.
+        // PCND: explicit opt-in, default off = byte-for-byte prior behavior; the
+        // arm is a no-op (and no buffers are built) unless the kernels are loaded.
+        let int8_prefill =
+            self.int8_faith2_k.0 != 0 && std::env::var_os("ATLAS_INT8_PREFILL").is_some();
+        if int8_prefill {
+            static INT8_LOG: std::sync::Once = std::sync::Once::new();
+            INT8_LOG.call_once(|| {
+                eprintln!(
+                    "[atlas] ATLAS_INT8_PREFILL=1: dense-FFN prefill via int8_gemm_faith2 (W4A8 requant→int8 MMA, lossy ~0.99998 cosine)"
+                );
+            });
+        }
+        // Pre-allocate (or reuse) the activation-requant scratch once per call,
+        // sized to the largest projection K (= max(h, inter)) so the per-GEMM
+        // arms never trigger a mid-call grow/sync. NULL when the int8 path is off.
+        let (int8_a_i8, int8_a_scale) = if int8_prefill {
+            self.ensure_int8_scratch(ctx.gpu, m, h.max(inter), stream)?
+        } else {
+            (DevicePtr::NULL, DevicePtr::NULL)
+        };
         // A/B escape hatch (benchmark only): force the proven v1 BF16 kernel even
         // when v2 is loaded, so v1-vs-v2 prefill TTFT can be compared in one
         // binary. Default unset → prefer v2 (the faster, bit-identical variant).
@@ -518,14 +692,52 @@ impl DenseFfnLayer {
         };
 
         macro_rules! w4_gemm {
-            ($w:expr, $wt:expr, $in:expr, $out:expr, $n:expr, $k:expr) => {
+            ($w:expr, $wt:expr, $cell:expr, $in:expr, $out:expr, $n:expr, $k:expr) => {
                 match $wt {
+                    // int8 W4A8 fast prefill (ATLAS_INT8_PREFILL) — HIGHEST priority.
+                    // Independent of `$wt`/the transposed copies: requant reads the
+                    // non-transposed NVFP4 `$w` directly. Builds (once) + caches the
+                    // int8 weight in `$cell`, then requant_a + faith2 via the shared
+                    // scratch. Lossy (cosine ~0.99998).
+                    _ if int8_prefill => {
+                        let iw = self.ensure_int8_weight(
+                            $cell, ctx.gpu, $w, $n, $k, stream,
+                        )?;
+                        ops::int8_gemm_faith2_prefill(
+                            ctx.gpu,
+                            self.int8_faith2_k,
+                            self.requant_a_int8_k,
+                            $in,
+                            iw.w_i8,
+                            iw.w_scale,
+                            int8_a_i8,
+                            int8_a_scale,
+                            $out,
+                            m,
+                            $n,
+                            $k,
+                            stream,
+                        )?;
+                    }
                     // Lossless opt-in: BF16 128x128 tensor-core prefill (bit-equivalent
                     // to base `w4a16_gemm`). Preferred over the FP8 t_m128/v2 paths only
                     // when ATLAS_BF16_TC_PREFILL is set and the kernel is loaded. Within
                     // the lossless path, prefer the higher-occupancy v2 kernel (3 CTAs/SM,
                     // bit-identical to v1) when it is loaded; else the proven v1 kernel.
                     // Both go through the same launch helper (identical grid/block/args).
+                    // FP8 M64 fast prefill (ATLAS_FP8_M64_PREFILL) — highest priority,
+                    // M64 grid via the w4a16_gemm_n128 launcher.
+                    Some(wt) if fp8_m64_prefill => ops::w4a16_gemm_n128(
+                        ctx.gpu,
+                        self.w4a16_gemm_t_k,
+                        $in,
+                        &wt,
+                        $out,
+                        m,
+                        $n,
+                        $k,
+                        stream,
+                    )?,
                     Some(wt) if bf16_tc_prefill => ops::w4a16_gemm_n128_m128_bf16(
                         ctx.gpu,
                         bf16_kernel,
@@ -571,6 +783,7 @@ impl DenseFfnLayer {
         w4_gemm!(
             &self.weights.gate_proj,
             self.weights.gate_proj_t,
+            &self.int8_gate,
             input,
             gate_out,
             inter,
@@ -580,6 +793,7 @@ impl DenseFfnLayer {
         w4_gemm!(
             &self.weights.up_proj,
             self.weights.up_proj_t,
+            &self.int8_up,
             input,
             up_out,
             inter,
@@ -602,6 +816,7 @@ impl DenseFfnLayer {
         w4_gemm!(
             &self.weights.down_proj,
             self.weights.down_proj_t,
+            &self.int8_down,
             gate_out,
             output,
             h,
