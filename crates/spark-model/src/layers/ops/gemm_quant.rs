@@ -324,6 +324,7 @@ pub fn fp8_gemm_t_blockscaled(
     k: u32,
     stream: u64,
 ) -> Result<()> {
+    super::log_gemm_shape("fp8_gemm_t_blockscaled", m, n, k);
     KernelLaunch::new(gpu, kernel)
         .grid([div_ceil(n, 128), div_ceil(m, 64), 1])
         .block([128, 1, 1])
@@ -609,6 +610,7 @@ pub fn w8a16_gemm_t_pipelined(
     k: u32,
     stream: u64,
 ) -> Result<()> {
+    super::log_gemm_shape("w8a16_gemm_t_pipelined", m, n, k);
     KernelLaunch::new(gpu, kernel)
         .grid([div_ceil(n, 32), div_ceil(m, 128), 1])
         .block([256, 1, 1])
