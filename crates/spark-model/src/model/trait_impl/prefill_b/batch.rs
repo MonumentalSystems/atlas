@@ -196,7 +196,7 @@ impl TransformerModel {
 
         let mut logits_out: Vec<DevicePtr> = Vec::with_capacity(n);
 
-        for slice in streams.iter_mut() {
+        for (stream_idx, slice) in streams.iter_mut().enumerate() {
             let tokens = slice.prompt_tokens;
             let chunk_start = slice.chunk_start;
             let chunk_len = slice.chunk_len;
@@ -339,13 +339,26 @@ impl TransformerModel {
             seq.last_decode_ckpt_block = seq.tokens.len() / bs;
 
             let logits = if is_last_chunk {
-                self.prefill_b_finalize_last(
+                // Per-stream logits row (bug-1 class fix for THIS per-stream
+                // fallback loop — the kernel-batched PHASE C was already fixed
+                // in e86d68c). Each iteration writes the shared hidden buffer at
+                // offset 0 and is consumed before the next overwrites it, BUT
+                // logits are sampled by the caller AFTER the whole loop, so
+                // every stream must land in its OWN logits row — otherwise
+                // logits_out is N copies of offset 0 and all streams sample the
+                // LAST stream's logits (concurrent-prefill cross-request bleed,
+                // exposed by short prefix-cache-hit prefills bailing here).
+                // hidden offset stays 0 (per-stream hidden is at base in this
+                // loop); only the logits destination is per-stream.
+                self.prefill_b_finalize_last_at(
                     tokens,
                     seq,
                     &mut kv_cache,
                     chunk_start,
                     chunk_len,
                     proc_count,
+                    0,
+                    stream_idx,
                     stream,
                 )?
             } else {
