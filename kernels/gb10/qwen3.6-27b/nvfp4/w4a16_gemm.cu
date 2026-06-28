@@ -4306,6 +4306,139 @@ void int8_gemm_mmq2(
 #undef M2_SB
 #undef M2W
 
+// int8 W4A8 FAITH5 — faith2 with the MMQ interleaved-q8_1 activation B-load.
+// HYPOTHESIS (from llama-MMQ source A/B): faith2's #1 ncu stall is
+// SHORT_SCOREBOARD from the activation(B) fragment load — two SCALAR int32 smem
+// reads `abase[lane%4]` and `abase[lane%4+4]` (4 int32 apart) serialized 1:1
+// with the MMA; MMQ stores activations q8_1-INTERLEAVED so the two B-fragment
+// int32 are ADJACENT and load via one vectorized fetch. faith5 reads the B
+// fragment as a single 8-byte `int2` from activations re-quantized K-interleaved
+// [0,4,1,5,2,6,3,7] per 32-block (requant_a_bf16_int8_il). Everything else is
+// faith2 verbatim; output is bit-identical (cosine 0.999978 == faith2).
+// RESULT 2026-06-28: NEUTRAL — 44.67/48.86 vs faith2 44.62/49.08 TFLOP/s
+// (gate-up/down M=4096). The B-load is NOT faith2's bottleneck (same conclusion
+// as faith3 B-ILP + faith4 occupancy). faith2 is a hard ~44.7/49 plateau; the
+// warm FFN-bucket gap vs llama lives elsewhere (NVFP4 w4a16_gemm / requant /
+// stream-k), not the int8 GEMM activation load. Kept as a documented experiment.
+#define F2_TILE 128
+#define F2_SB   (F2_TILE/32)
+#define F2W     36
+#define ATLAS_MMA_S8(d, a0,a1,a2,a3, b0,b1) \
+    asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 " \
+        "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};" \
+        : "=r"((d)[0]), "=r"((d)[1]), "=r"((d)[2]), "=r"((d)[3]) \
+        : "r"(a0),"r"(a1),"r"(a2),"r"(a3),"r"(b0),"r"(b1), \
+          "r"((d)[0]),"r"((d)[1]),"r"((d)[2]),"r"((d)[3]))
+extern "C" __global__
+__launch_bounds__(256, 1)
+void int8_gemm_faith5(
+    const signed char* __restrict__ A_i8,    // activations [M,K] K-INTERLEAVED per-32 [0,4,1,5,2,6,3,7]
+    const signed char* __restrict__ B_i8,     // weights [N,K]
+    const float* __restrict__ A_scale,        // [M, K/32]
+    const float* __restrict__ B_scale,        // [N, K/32]
+    __nv_bfloat16* __restrict__ C,            // [M, N]
+    unsigned int M, unsigned int N, unsigned int K
+) {
+    const unsigned int cta_n = blockIdx.x * 128;
+    const unsigned int cta_m = blockIdx.y * 128;
+    if (cta_m >= M || cta_n >= N) return;
+    const unsigned int t = threadIdx.x;
+    const unsigned int warp_id = t >> 5;
+    const unsigned int lane = t & 31;
+    const unsigned int ng = warp_id >> 1;
+    const unsigned int mh = warp_id & 1;
+    const unsigned int nb = K >> 5;
+
+    __shared__ int   sW[128][F2W];
+    __shared__ int   sA[128][F2W];
+    __shared__ float sWs[128][F2_SB];
+    __shared__ float sAs[128][F2_SB];
+
+    float acc[2][8][4];
+    #pragma unroll
+    for (int n=0;n<2;n++) for(int j=0;j<8;j++){acc[n][j][0]=0;acc[n][j][1]=0;acc[n][j][2]=0;acc[n][j][3]=0;}
+
+    for (unsigned int kb = 0; kb < K; kb += F2_TILE) {
+        const unsigned F2_CPR = F2_TILE/16;
+        #pragma unroll
+        for (int c = 0; c < F2_TILE/32; c++) {
+            unsigned lin = c*256 + t;
+            unsigned row = lin / F2_CPR;
+            unsigned col = (lin % F2_CPR) << 4;
+            unsigned gk = kb + col;
+            signed char* wdst = ((signed char*)&sW[row][0]) + col;
+            signed char* adst = ((signed char*)&sA[row][0]) + col;
+            cp_async_pred_16(wdst, &B_i8[(unsigned long long)(cta_n+row)*K + gk], (cta_n+row<N)&&(gk+15<K));
+            cp_async_pred_16(adst, &A_i8[(unsigned long long)(cta_m+row)*K + gk], (cta_m+row<M)&&(gk+15<K));
+        }
+        if (t < 128) {
+            unsigned blk = kb >> 5;
+            #pragma unroll
+            for (int s=0;s<F2_SB;s++){
+                sWs[t][s] = (cta_n+t<N)?B_scale[(unsigned long long)(cta_n+t)*nb + blk + s]:0.f;
+                sAs[t][s] = (cta_m+t<M)?A_scale[(unsigned long long)(cta_m+t)*nb + blk + s]:0.f;
+            }
+        }
+        cp_async_commit(); cp_async_wait_all(); __syncthreads();
+
+        #pragma unroll
+        for (int sb=0; sb<F2_SB; sb++){
+            unsigned WA[2][4];
+            float    wsc[2][2];
+            #pragma unroll
+            for (int n=0;n<2;n++){
+                unsigned wbase_row = ng*32 + n*16;
+                const int* xs = &sW[wbase_row][0] + (lane%16)*F2W + sb*8 + (lane/16)*4;
+                asm volatile("ldmatrix.sync.aligned.m8n8.x4.b16 {%0,%1,%2,%3},[%4];"
+                    : "=r"(WA[n][0]),"=r"(WA[n][1]),"=r"(WA[n][2]),"=r"(WA[n][3]) : "l"(xs));
+                wsc[n][0] = sWs[wbase_row + lane/4][sb];
+                wsc[n][1] = sWs[wbase_row + 8 + lane/4][sb];
+            }
+            #pragma unroll
+            for (int j=0;j<8;j++){
+                unsigned mcol0 = mh*64 + j*8;
+                float asc0 = sAs[mcol0 + (lane%4)*2][sb];
+                float asc1 = sAs[mcol0 + (lane%4)*2 + 1][sb];
+                // Interleaved K [0,4,1,5,2,6,3,7] => the two B-fragment int32
+                // (old indices lane%4 and lane%4+4) sit at adjacent positions
+                // (lane%4)*2 and +1 => one 8-byte int2 load instead of 2 scalars.
+                const int* abase = &sA[mcol0 + lane/4][0] + sb*8;
+                int2 bb = *(const int2*)(abase + (lane%4)*2);
+                unsigned b0 = (unsigned)bb.x;
+                unsigned b1 = (unsigned)bb.y;
+                #pragma unroll
+                for (int n=0;n<2;n++){
+                    int s[4]={0,0,0,0};
+                    ATLAS_MMA_S8(s, WA[n][0],WA[n][1],WA[n][2],WA[n][3], b0,b1);
+                    acc[n][j][0]+=(float)s[0]*wsc[n][0]*asc0;
+                    acc[n][j][1]+=(float)s[1]*wsc[n][0]*asc1;
+                    acc[n][j][2]+=(float)s[2]*wsc[n][1]*asc0;
+                    acc[n][j][3]+=(float)s[3]*wsc[n][1]*asc1;
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    #pragma unroll
+    for (int n=0;n<2;n++){
+        unsigned nrow0 = cta_n + ng*32 + n*16 + lane/4;
+        #pragma unroll
+        for (int j=0;j<8;j++){
+            unsigned mcol = cta_m + mh*64 + j*8 + (lane%4)*2;
+            unsigned cN0=nrow0, cN1=nrow0+8;
+            if (mcol<M   && cN0<N) C[(unsigned long long)mcol*N + cN0]     = __float2bfloat16(acc[n][j][0]);
+            if (mcol+1<M && cN0<N) C[(unsigned long long)(mcol+1)*N + cN0] = __float2bfloat16(acc[n][j][1]);
+            if (mcol<M   && cN1<N) C[(unsigned long long)mcol*N + cN1]     = __float2bfloat16(acc[n][j][2]);
+            if (mcol+1<M && cN1<N) C[(unsigned long long)(mcol+1)*N + cN1] = __float2bfloat16(acc[n][j][3]);
+        }
+    }
+}
+#undef ATLAS_MMA_S8
+#undef F2_TILE
+#undef F2_SB
+#undef F2W
+
 // ═══════════════════════════════════════════════════════════════════
 // REQUANT kernels feeding the int8 W4A8 prefill GEMM (faith2).
 //   requant_w_nvfp4_int8 : NVFP4 weights [N,K/2] packed E2M1 + [N,K/16] E4M3
@@ -4400,5 +4533,49 @@ void requant_a_bf16_int8(
         int q = __float2int_rn(vals[i] * inv);
         q = max(-127, min(127, q));
         A_i8[(unsigned long long)m * K + kb + i] = (signed char)q;
+    }
+}
+
+// requant_a_bf16_int8_il — same as requant_a_bf16_int8 but K-INTERLEAVED per
+// 32-block so faith5's B fragment loads as one int2. Within each 32-int8 block
+// the 8 int32 (4-int8 groups) are permuted [0,4,1,5,2,6,3,7]: int32 at block
+// position p -> position (p<4 ? 2p : 2(p-4)+1). This places the two B-fragment
+// int32 (old positions lane%4 and lane%4+4) adjacently. Scales are unchanged
+// (per-32 max is order-independent). Output GEMM is bit-identical to faith2.
+extern "C" __global__
+void requant_a_bf16_int8_il(
+    const __nv_bfloat16* __restrict__ A_bf16,    // [M, K]
+    signed char* __restrict__ A_i8,              // [M, K] out (K-interleaved per 32)
+    float* __restrict__ A_scale,                 // [M, K/32] out
+    unsigned int M, unsigned int K
+) {
+    unsigned long long blk = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned long long nblocks = (unsigned long long)M * (K >> 5);
+    if (blk >= nblocks) return;
+    unsigned int nb = K >> 5;
+    unsigned int m  = (unsigned int)(blk / nb);
+    unsigned int kb = (unsigned int)(blk % nb) * 32;
+
+    float vals[32];
+    float maxa = 0.f;
+    #pragma unroll
+    for (int i = 0; i < 32; i++) {
+        float v = __bfloat162float(A_bf16[(unsigned long long)m * K + kb + i]);
+        vals[i] = v;
+        float a = fabsf(v);
+        if (a > maxa) maxa = a;
+    }
+    float sc = (maxa > 0.f) ? (maxa / 127.0f) : 1.0f;
+    float inv = 1.0f / sc;
+    A_scale[blk] = sc;
+    #pragma unroll
+    for (int i = 0; i < 32; i++) {
+        int q = __float2int_rn(vals[i] * inv);
+        q = max(-127, min(127, q));
+        unsigned p = i >> 2;            // int32 group 0..7
+        unsigned w = i & 3;             // byte within group
+        unsigned np = (p < 4) ? (p << 1) : (((p - 4) << 1) + 1);
+        unsigned out_i = (np << 2) + w; // interleaved int8 offset within the 32-block
+        A_i8[(unsigned long long)m * K + kb + out_i] = (signed char)q;
     }
 }
