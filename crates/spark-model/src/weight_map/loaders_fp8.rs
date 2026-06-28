@@ -49,12 +49,27 @@ pub fn load_fp8_block_scaled_as_fp8weight(
     let k = w.shape[1];
     let weight_ptr = w.ptr;
 
-    // Load block scale_inv [N/BS, K/BS] — already on GPU from safetensors.
-    // ModelOpt MIXED_PRECISION checkpoints can instead ship a scalar
-    // `weight_scale`; expand that scalar to the same block-scale matrix shape
-    // so the W8A16 kernels can consume it without a separate scalar path.
-    let scale_key = format!("{prefix}.weight_scale_inv");
-    let row_scale = if store.contains(&scale_key) {
+    // Load block scale [N/BS, K/BS] — already on GPU from safetensors. The
+    // tensor name varies by producer: DeepSeek/Qwen-native FP8 ships
+    // `weight_scale_inv` (2D); compressed-tensors `float-quantized` (e.g.
+    // Hcompany/Holo-3.1-*-FP8) ships a 2D `weight_scale`; ModelOpt
+    // MIXED_PRECISION ships a *scalar* `weight_scale` (expanded to the block
+    // matrix shape below). All three are the per-block FP8 dequant multiplier
+    // the W8A16 kernels apply in FP32. Prefer whichever 2D block scale exists.
+    let scale_inv_key = format!("{prefix}.weight_scale_inv");
+    let plain_scale_key = format!("{prefix}.weight_scale");
+    let block_scale_key = if store.contains(&scale_inv_key) {
+        Some(scale_inv_key.clone())
+    } else if store
+        .get(&plain_scale_key)
+        .map(|s| s.shape.len() == 2)
+        .unwrap_or(false)
+    {
+        Some(plain_scale_key.clone())
+    } else {
+        None
+    };
+    let row_scale = if let Some(scale_key) = block_scale_key {
         let s = store.get(&scale_key)?;
         ensure!(
             s.shape.len() == 2,
@@ -94,9 +109,9 @@ pub fn load_fp8_block_scaled_as_fp8weight(
         gpu.synchronize(stream)?;
         row_scale
     } else {
-        let scalar_key = format!("{prefix}.weight_scale");
+        let scalar_key = plain_scale_key;
         let scale = scalar_f32(store, &scalar_key, gpu)
-            .with_context(|| format!("Missing {scale_key} or scalar {scalar_key}"))?;
+            .with_context(|| format!("Missing {scale_inv_key} or scalar {scalar_key}"))?;
         let n_blocks = n.div_ceil(128);
         let k_blocks = k.div_ceil(128);
         let scale_total = n_blocks * k_blocks;
