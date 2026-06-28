@@ -144,3 +144,18 @@ NOT the GEMM M-tiling. A dispatch swap can't fix it; needs a NEW bandwidth-optim
 Note: head is FIXED ~7.5ms/step (weight read once) → it DOMINATES low-concurrency decode (~most of the
 C=1 token) but AMORTIZES at high C (7.5ms/8tok). So a fast FP4 head kernel would extend Atlas's existing
 C=1 win (single-user latency), not close the concurrent gap. Real kernel R&D, modest/low-conc payoff.
+
+## (b) OVER-CONTEXT HARDENING + SOAK-CRASH ROOT CAUSE (2026-06-28)
+Over-context graceful denial: ALREADY WORKING for text. Isolated probes 40K/50K/64K-token prompts all
+return clean HTTP 400 "Prompt too long: N exceeds max_seq_len 32768", server stays ALIVE (chat/mod.rs:191
+guard + the max_tokens clamp). 8 concurrent within-limit 14K prefills (112K total KV demand) → all HTTP200,
+alive (KV pool pages/queues fine). So the user's ask (deny over-context instead of exploding) is satisfied.
+
+SOAK CUDA-700 ROOT CAUSE = a VISION BUG, not over-context:
+- A single image request CUDA-700s the server (HTTP 500) when the image is NON-SQUARE (soak uses 640x400):
+  "cuLaunchKernel CUDA_ERROR_ILLEGAL_ADDRESS (700) grid=[293,1,1] block=[256,1,1]" in the vision prefill,
+  then cascades (free_sequence zero_slot 700). Reproducible on a FRESH server, first request.
+- SQUARE images work: 448x448 → HTTP200, correct answer, 0x700.
+=> The vision encoder mishandles non-square aspect ratios (patch-grid / merge OOB). This is what kills the
+soak (it rotates in a 640x400 screenshot). Separate from over-context + from the parity POC. Needs a
+vision-encoder fix (find the grid=293 kernel's non-square bounds bug). Square-image vision is fine.
