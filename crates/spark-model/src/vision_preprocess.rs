@@ -57,8 +57,25 @@ fn target_size_with_max_pixels(
         .map(|p| ((p as f32) / ((orig_h as f32) * (orig_w as f32))).sqrt())
         .unwrap_or(1.0);
     let scale = dim_scale.min(pixel_scale).min(1.0); // never upscale
-    let target_h = ((orig_h as f32 * scale / grid_unit as f32).round() as u32).max(1) * grid_unit;
-    let target_w = ((orig_w as f32 * scale / grid_unit as f32).round() as u32).max(1) * grid_unit;
+    let gu = grid_unit as f32;
+    let sh = orig_h as f32 * scale;
+    let sw = orig_w as f32 * scale;
+    let mut target_h = ((sh / gu).round() as u32).max(1) * grid_unit;
+    let mut target_w = ((sw / gu).round() as u32).max(1) * grid_unit;
+    // Round-to-NEAREST grid_unit can push the area OVER max_pixels even when the
+    // source was under it (e.g. 400 → 416: 416×640 = 266240 > 262144). The patch
+    // buffers (buf_rope/buf_pos/…) are sized for max_pixels/patch² patches, so an
+    // over-cap target overflows them → CUDA_ERROR_ILLEGAL_ADDRESS (700) in the
+    // vision prefill on NON-SQUARE images. Mirror Qwen smart_resize: if the
+    // rounded area exceeds the cap, FLOOR each side to grid_unit instead (the
+    // floored area is ≤ the scaled source area ≤ max_pixels). Both sides stay
+    // multiples of grid_unit and ≥ 1.
+    if let Some(mp) = max_pixels.filter(|&p| p > 0) {
+        if (target_h as usize) * (target_w as usize) > mp {
+            target_h = ((sh / gu).floor() as u32).max(1) * grid_unit;
+            target_w = ((sw / gu).floor() as u32).max(1) * grid_unit;
+        }
+    }
     (target_h, target_w)
 }
 
@@ -164,6 +181,26 @@ mod tests {
     fn test_target_size_max_pixels() {
         let (h, w) = target_size_with_max_pixels(1254, 1254, 32, Some(512 * 512));
         assert_eq!((h, w), (512, 512));
+    }
+
+    #[test]
+    fn test_target_size_nonsquare_never_exceeds_max_pixels() {
+        // Regression: a NON-SQUARE source UNDER max_pixels whose round-to-nearest
+        // overshoots the cap (640×400: round 400→416 → 416×640=266240 > 262144)
+        // must NOT exceed max_pixels — else the patch buffers (sized for
+        // max_pixels/patch²) overflow → CUDA 700 in the vision prefill.
+        let mp = 262144usize; // 512×512, the deployed ATLAS_VISION_MAX_PIXELS
+        for &(oh, ow) in &[(400u32, 640u32), (640, 400), (401, 1280), (720, 480), (333, 999)] {
+            let (h, w) = target_size_with_max_pixels(oh, ow, 32, Some(mp));
+            assert_eq!(h % 32, 0, "{oh}x{ow} -> {h}x{w}: h not grid-aligned");
+            assert_eq!(w % 32, 0, "{oh}x{ow} -> {h}x{w}: w not grid-aligned");
+            assert!(h >= 32 && w >= 32, "{oh}x{ow} -> {h}x{w}: degenerate");
+            assert!(
+                (h as usize) * (w as usize) <= mp,
+                "{oh}x{ow} -> {h}x{w} = {} exceeds max_pixels {mp} (would OOB patch buffers)",
+                (h as usize) * (w as usize)
+            );
+        }
     }
 
     #[test]
