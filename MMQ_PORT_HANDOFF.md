@@ -535,3 +535,67 @@ The user's prefill/long-context gap = SSM-state recompute Atlas did but llama av
 eviction fix gives Atlas "prefix caching like llama" for the Mamba state. STRETCH (NVFP4-native MMA) = dead on
 GB10 (bandwidth-bound, 3.2× slower). Quality bar IoU>=0.63 is unreachable for ANY engine != the GT reference
 (similarity metric), so the wall win is the correct head-to-head result; tool-call quality is not regressed.
+
+## ★★★★★ TTFT DECOMPOSITION (2026-06-28, ATLAS_PROFILE on winning config, dgx1) — RE-PRIORITIZES THE GOAL
+Measured WHERE prefill TTFT actually goes, to gate the multi-day GEMM rewrite. Served winning config
+(ATLAS_INT8_PREFILL=1 int8 faith2 CONFIRMED active, interval-16, FP8-KV, util 0.80, slots 64).
+Cold 19.4k prefill = 46s (256-tok chunks ~593ms; attn layers L3,7,..63 ~18ms TOP, GDN ~6ms).
+WARM 238-tok suffix prefill (representative of TTFT-MEDIAN turns) = 738.9ms, per-component (ATLAS_PROFILE):
+  | component                     | time    | % TTFT | targeted by |
+  | ATTENTION (16 layers, 19k ctx)| ~289ms  | **39%**| (NOT in plan — inferspark_prefill.cu) |
+  | FFN GEMM moe_ffn (64 layers)  | ~245ms  | **33%**| Step1 faith2→60 (ALREADY int8, 44.7) |
+  | GDN recurrence gdn_prefill(48)| ~139ms  | **19%**| Step4 |
+  | qkvz/out_proj/conv/norms      | ~66ms   |  9%   | — |
+GDN-layer components summed directly from log; attn = remainder, confirmed by per-layer (attn ~22ms ×16
+= 352ms vs GDN ~8ms ×48). int8 faith2 ACTIVE → FFN 33% is the ALREADY-optimized path; q8_1 rewrite
+(44.7→60) = 1.34× on 33% ≈ only ~8% TTFT cut for a multi-day port. DIMINISHING.
+★ RE-PRIORITIZED LEVER ORDER (by measured TTFT impact):
+  1. ATTENTION PREFILL (39%) — inferspark_prefill.cu, the file with the over-generalized "ldmatrix broken"
+     mis-port (memory project_prefill_bubble_bound_not_mma) → SCALAR smem loads. ldmatrix PROVEN to work on
+     GB10 (ldmatrix_probe.cu cosine 1.0). Same self-inflicted slow path the FFN had pre-faith2. BIGGEST win.
+     Compare vs llama flash-attention prefill on this shape. NEEDS: ncu inferspark_prefill, then ldmatrix-ize.
+  2. FFN GEMM q8_1 interleave (33%, faith2 44.7→60) — smaller than the goal assumed (~8% TTFT). Secondary.
+  3. GDN recurrence (19%) — gdn_prefill kernel.
+  4. native NVFP4 MMA — only helps FFN's 33% AND is W4A4 coherence-risk + prefill-netneg (memory). Last.
+
+## DECODE H2H (2026-06-28) — derived from results events.jsonl (harness tpot EMPTY in ALL 15 runs)
+Harness config stream_all_chunks=false → NO per-token timestamps → tpot{}/output_sequence_lengths{} EMPTY
+for llama AND every Atlas run (not targeted; benchmark only scores Wall/TTFT/full-Latency). Reconstructed
+decode tok/s from events.jsonl (recv_first→complete window) tokenized with real Qwen3.6-27B tokenizer,
+counting BOTH natural-language text AND tool-call JSON (most agentic tokens are tool calls):
+  | run                         | agg decode | per-turn avg/median/max |
+  | llama cfff1fc               | 9.5 tok/s  | 7.6 median              |
+  | Atlas int8+MTP (evictfix)   | 14.2 tok/s | avg 12.5 / med 12.2 / max 20.5 |
+  | Atlas bf16 (no MTP)         | 14.1 tok/s | 12.3 median             |
+Atlas decode ~+49% vs llama — this (MTP 2× + tail control), NOT prefill TTFT, is why Atlas wins the WALL
+(llama actually wins TTFT median 1393 vs Atlas 1936). Reported metrics standing vs llama cfff1fc:
+  Wall 7195.68 < 8369.87 ✅ | full-Latency med 4797<4956 ✅ avg 7146<8312 ✅ | TTFT med 1936>1393 ❌
+  TTFT max 17480>9991 ❌ | IoU 0.5145<0.6326 (similarity artifact, not regression — BFCL-ST 90.79>88.60).
+The TTFT gap (the only reported metric not yet beaten) is what the re-prioritized lever order above targets.
+
+## ★★★★★★ ATTENTION PREFILL = THE LEVER (2026-06-28, gated by arithmetic from ATLAS_PROFILE)
+Config (MODEL.toml): q_heads=24, kv_heads=4, **head_dim=256**, 16 full-attn layers (interval 4).
+Warm attn ~18ms/layer (289ms/16). FLOP/layer = 4·Nq·Nk·hd·q_heads = 4·238·19000·256·24 = 111 GFLOP
+→ **~6.2 TFLOP/s** (vs GB10 BF16-TC peak ~hundreds; proper flash-attn 50-100+). KV-BW floor (FP8 K+V,
+2·19000·4·256·1B = 38.9MB) = 0.14ms → measured 18ms is **126× ABOVE the bandwidth floor**. So attention
+prefill is DEFINITIVELY compute/latency-bound (scalar-load / poor MMA util), NOT bandwidth-bound. The
+turbo-V (2/3/4-bit) variants are a DECODE/BW lever → won't fix this. ~10-15× headroom on 39% of TTFT.
+LIKELY ROOT: head_dim=256 has no specialized MMA path (inferspark_prefill_h128.cu = head_dim 128 only) →
+the 256-dim attn falls to a generic scalar/low-util path. THE FIX = tensor-core (ldmatrix+MMA) flash-attn
+prefill for head_dim=256 on GB10 (ldmatrix proven cosine 1.0). This dwarfs the FFN q8_1 rewrite (~8%).
+NEXT: ncu the active kernel (inferspark_prefill_paged_fp8_batched, FP8-KV config) to confirm scalar/low-util
++ identify the head_dim=256 codepath, then port/author an MMA flash-attn-256. Gate cosine + per-layer ms + agentic TTFT.
+
+## int8_gemm_mmq2 (faith2 + 2-stage double-buffered cp.async) — BUILT+GATED 2026-06-28: REGRESSED, dead end
+Added int8_gemm_mmq2 (w4a16_gemm.cu): faith2 + double-buffered sW/sA[2][128][36] + wait_group<1> so tile k+1
+loads during tile k compute. Hypothesis: faith2's cp.async.wait_all+sync stalls compute on the full load.
+MEASURED (int8_gemm_test.rs, dgx1): **cosine 0.999999 PASS** but gate/up **37.39 < faith2 44.02**, down
+**41.13 < 48.42**. REFUTED: the wait_all is NOT the bottleneck. Root = per-warp MMA→scale dependency latency
+at 1 CTA/SM (launch_bounds 256,1); double-buffering the global→smem load adds 80KB smem + bookkeeping without
+adding per-warp ILP, so it's net-negative. Consistent with faith3 (ILP neutral) + faith4 (occupancy neutral).
+CONCLUSION (3rd independent confirmation): 44.7 is the HARD ceiling for the int8 m16n8k32 software-dequant
+skeleton. Only structural levers left for the FFN GEMM: (a) q8_1 INTERLEAVED weight so the activation B-frag
+loads via ldmatrix (memory note: plain ldmab=0 speedup, so needs the INTERLEAVE not just ldmatrix), or
+(b) native NVFP4 block-scale MMA m16n8k64 (W4A4 coherence-risk). BUT FFN GEMM is only 33% of TTFT and already
+at faith2 → q8_1 (44.7→~60) = ~8% TTFT for a multi-day port. DECISION: pivot to the bigger lever = ATTENTION
+prefill (39%). Kernel kept in-tree as documented negative (like faith3/4), NOT committed as a win.
