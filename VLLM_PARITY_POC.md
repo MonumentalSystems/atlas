@@ -133,3 +133,14 @@ EFFICIENCY / framework overhead, NOT a structural amortization Atlas lacks. Fusi
 are dead ends for the concurrent gap. Atlas ALREADY wins single-stream (C1 90 vs 45).
 => The only real decode wins are per-kernel bandwidth efficiency. Fattest: lm_head w4a16 GEMV @ ~32 GB/s (8x
 headroom, 20% of step). Realistic decode ceiling ~+15-20%, not concurrent-parity. lm_head GEMV is THE target.
+
+## lm_head GEMV — NEGATIVE (2026-06-28): dispatch swap doesn't help, FP4-read-bandwidth bound
+Routed the decode lm_head (decode_a2.rs + lm_head_batched) through w4a16_gemv_batch16 (the small-M
+weight-once GEMV out_proj uses) instead of w4a16_gemm. MS_PROFILE head us IDENTICAL: GEMV 7566us vs
+GEMM 7549us (both ~34 GB/s reading the 254MB NVFP4 head weight once). Needle 3/3 (numerics fine).
+=> The head bottleneck is the FP4 weight-READ access pattern (8x below GB10 peak) shared by BOTH kernels,
+NOT the GEMM M-tiling. A dispatch swap can't fix it; needs a NEW bandwidth-optimized NVFP4 GEMV kernel
+(vectorized 128-bit loads, coalesced nibble+scale). Reverted the no-op swap.
+Note: head is FIXED ~7.5ms/step (weight read once) → it DOMINATES low-concurrency decode (~most of the
+C=1 token) but AMORTIZES at high C (7.5ms/8tok). So a fast FP4 head kernel would extend Atlas's existing
+C=1 win (single-user latency), not close the concurrent gap. Real kernel R&D, modest/low-conc payoff.
