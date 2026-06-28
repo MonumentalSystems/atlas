@@ -81,7 +81,16 @@ impl TransformerModel {
         // refs. Trade: cold requests under active caching lose kernel-batched
         // co-dispatch, but with caching on most requests hit and a hit's
         // processed suffix is tiny, so the co-dispatch scaling is moot.
-        if self.prefix_cache.is_active() {
+        // The Fix #4 guard above disabled kernel-batched co-dispatch whenever a
+        // radix cache holds refs (the mixed cache-hit-depth partial-mutation
+        // bug). Much of that path has since been hardened; relax behind an env
+        // flag so the 2x-TTFT kernel-batched path can be A/B'd for correctness
+        // under active caching before becoming default. ATLAS_Q12_BATCHED_WITH_CACHE=1
+        // allows it; default (unset) preserves the conservative per-stream gate.
+        let allow_with_cache = std::env::var("ATLAS_Q12_BATCHED_WITH_CACHE")
+            .map(|v| v != "0" && v.to_lowercase() != "false")
+            .unwrap_or(false);
+        if self.prefix_cache.is_active() && !allow_with_cache {
             return false;
         }
         let varlen = varlen_prefill_enabled();

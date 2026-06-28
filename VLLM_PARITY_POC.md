@@ -61,3 +61,17 @@ ACTUAL cache hits. Pre-compute all co-dispatched streams' cache-hit depth (read-
 any state mutation; allow the kernel-batched path when all streams are cold / uniform depth, else fall
 through cleanly (no partial mutation). Unlocks the 2x TTFT win with prefix caching ON.
 Residual gap to vLLM (524 vs ~190ms) = follow-on (packed forward still partly per-layer-overhead bound + admission).
+
+## PREFILL FIX VALIDATED (2026-06-28) — guard relaxation is correct + 2x TTFT
+The Fix #4 mixed-cache-depth bug appears already fixed elsewhere. Relaxed the guard behind
+ATLAS_Q12_BATCHED_WITH_CACHE=1 (batch_kernel.rs kernel_batched_eligible).
+Correctness: warmed cache S (Roman-aqueduct prefix), then co-dispatched n=6 with MIXED hit depths
+(full-hit S, partial-hit S+suffix, cold unique) — q12: "kernel-batched dispatch attempt n=6 → succeeded".
+All 6 outputs coherent, on-topic, semantically == per-stream reference; NO cross-stream bleed / gibberish
+(only ULP-level wording diffs from batched-vs-GEMV accumulation).
+Perf (prefix caching ON + flag): TTFT C2 258→178, C4 547→289 (1.9x), C8 1066→495ms (2.15x); agg C8 103→108.
+Decode unchanged (per-stream still ~13.8 — that's the SSM-fusion lever, separate).
+
+REMAINING before default-on: my test exercised the SUCCESS path (no mid-batch bail). The original bug was
+partial-mutation on BAIL under cache. Validate the bail path + longctx_needle + soak with the flag before
+removing the guard / defaulting it on. Then it's a ~free 2x TTFT win with caching on.
