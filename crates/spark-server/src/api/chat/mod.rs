@@ -231,6 +231,28 @@ pub(crate) async fn chat_completions_inner(
         Err(resp) => return resp,
     };
 
+    // Context-budget cap: prompt + generated output must fit max_seq_len. The
+    // prompt-only guard above rejects oversized prompts, but a SMALL prompt with
+    // a huge `max_tokens` (e.g. max_tokens=128000 against max_seq_len=32768)
+    // would decode past the KV cache and fault the GPU (CUDA 700, taking down
+    // the whole server) instead of stopping cleanly. Clamp generation to the
+    // remaining context so the request finishes with finish_reason="length"
+    // rather than exploding. (room >= 1: prompt_len < max_seq_len is guaranteed
+    // by the guard above.)
+    let max_tokens = {
+        let room = state.max_seq_len.saturating_sub(prompt_len);
+        if max_tokens > room {
+            tracing::warn!(
+                "Clamping max_tokens {max_tokens} -> {room}: prompt {prompt_len} + output \
+                 must fit max_seq_len {}",
+                state.max_seq_len
+            );
+            room
+        } else {
+            max_tokens
+        }
+    };
+
     // ── Phase 7: dispatch streaming or blocking ─────────────────
     if req.stream {
         return super::chat_stream_dispatch::dispatch_streaming(
