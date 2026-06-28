@@ -396,10 +396,17 @@ pub fn gdn_prefill_fla(
     const DV_BLK: u32 = 64; // matches the kernel's compile-time DV_BLK
     let num_dv_blk = (vd / DV_BLK).max(1); // 2 for Holo (vd=128)
     // tc_vblock smem: St[DV_BLK*kd] + ws[C*DV_BLK]f32 + buf[2][C*kd + C*DV_BLK] + gcb + decb
-    let smem_tcvb =
-        DV_BLK * kd * 2 + C * DV_BLK * 4 + 2 * (C * kd + C * DV_BLK) * 2 + 2 * C * 4 + 2 * (C + 1) * 4;
+    let smem_tcvb = DV_BLK * kd * 2
+        + C * DV_BLK * 4
+        + 2 * (C * kd + C * DV_BLK) * 2
+        + 2 * C * 4
+        + 2 * (C + 1) * 4;
     let (k_cdh, cdh_grid_y, cdh_smem) = if use_tcvb {
-        (k_chunk_delta_h_tc_vblock, batch_size * num_dv_blk, smem_tcvb)
+        (
+            k_chunk_delta_h_tc_vblock,
+            batch_size * num_dv_blk,
+            smem_tcvb,
+        )
     } else {
         (k_chunk_delta_h, batch_size, smem_dh)
     };

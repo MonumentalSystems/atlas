@@ -382,8 +382,10 @@ pub fn build_model(
         // warning: the scheduler admits up to max_batch_size and the pool fills on
         // demand (a genuinely over-long burst gets back-pressured by the block
         // allocator, not a boot-time refusal).
-        let overcommit =
-            matches!(std::env::var("ATLAS_KV_OVERCOMMIT").as_deref(), Ok("1") | Ok("true"));
+        let overcommit = matches!(
+            std::env::var("ATLAS_KV_OVERCOMMIT").as_deref(),
+            Ok("1") | Ok("true")
+        );
         if overcommit {
             tracing::warn!(
                 "KV OVERCOMMIT: pool fits {} seq(s) at full --max-seq-len={} but \

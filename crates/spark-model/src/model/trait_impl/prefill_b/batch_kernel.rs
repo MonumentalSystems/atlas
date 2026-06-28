@@ -41,8 +41,8 @@ mod eligible;
 // Re-exports so `batch_kernel::check_kernel_batched_eligible` (used by
 // `batch_kernel_tests.rs`) and the env-flag predicates resolve unchanged
 // after the eligibility cluster moved into the `eligible` submodule.
-pub(in crate::model) use eligible::{check_kernel_batched_eligible, varlen_prefill_enabled};
 use eligible::first_chunk_batched_enabled;
+pub(in crate::model) use eligible::{check_kernel_batched_eligible, varlen_prefill_enabled};
 
 use crate::layer::{
     BatchedAttnMetadata, ForwardContext, GdnPrefillBuffers, LayerState, TransformerLayer,
@@ -81,7 +81,11 @@ impl TransformerModel {
         // Largest per-stream chunk (VARLEN). All per-stream scratch slots must be
         // sized for this, not streams[0].chunk_len, or a longer stream's meta /
         // MoE topk staging overruns its slot (CUDA 700).
-        let max_chunk_len = streams.iter().map(|s| s.chunk_len).max().unwrap_or(chunk_len);
+        let max_chunk_len = streams
+            .iter()
+            .map(|s| s.chunk_len)
+            .max()
+            .unwrap_or(chunk_len);
 
         // EP active → NCCL needs the default stream.
         let stream = if self.comm.is_some() && self.config.ep_world_size > 1 {
@@ -366,7 +370,11 @@ impl TransformerModel {
             // PHASE-A loop) — the cu_seqlens SSOT. Was Σ chunk_len (total_tokens),
             // which over-counts on a partial cache hit and makes the GDN scan
             // walk phantom tokens past the packed data. Legacy uniform: proc_count*n.
-            total_len: if varlen { running_proc_off } else { proc_count * n },
+            total_len: if varlen {
+                running_proc_off
+            } else {
+                proc_count * n
+            },
         };
 
         // ForwardContext for batched layer calls. attn_metadata is

@@ -158,7 +158,14 @@ pub trait TransformerLayer: Send + Sync {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
-        let _ = (hidden_stacked, residual_stacked, total_tokens, gdn_bufs, ctx, stream);
+        let _ = (
+            hidden_stacked,
+            residual_stacked,
+            total_tokens,
+            gdn_bufs,
+            ctx,
+            stream,
+        );
         anyhow::bail!("prefill_phase1_proj_batched: only implemented for SSM layers")
     }
 
@@ -467,7 +474,16 @@ pub trait TransformerLayer: Send + Sync {
         stream: u64,
     ) -> Result<()> {
         default_loops::decode_multi_seq_default(
-            self, hidden, residual, num_seqs, states, kv_cache, seq_lens, block_tables, ctx, stream,
+            self,
+            hidden,
+            residual,
+            num_seqs,
+            states,
+            kv_cache,
+            seq_lens,
+            block_tables,
+            ctx,
+            stream,
         )
     }
 

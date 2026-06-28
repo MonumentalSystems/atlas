@@ -18,6 +18,7 @@ mod merger;
 mod patch_embed;
 mod pos_embed;
 mod utils;
+mod vit_attention;
 mod vit_block;
 
 /// Convert an f32 to BF16 bits using round-to-nearest-even. The input

@@ -199,15 +199,33 @@ fn main() -> Result<()> {
     println!();
     println!("hand-rolled MMA  vs  CUTLASS collective  cosine = {cos:.6}");
     // sample a few values
-    println!("sample [0][0..4]: mma={:?} oracle={:?}",
-        &c_mma[0..4].iter().map(|&b| bf16_bits_to_f32(b)).collect::<Vec<_>>(),
-        &c_oracle[0..4].iter().map(|&b| bf16_bits_to_f32(b)).collect::<Vec<_>>());
-    println!("sample [1][0..4]: mma={:?} oracle={:?}",
-        &c_mma[n..n+4].iter().map(|&b| bf16_bits_to_f32(b)).collect::<Vec<_>>(),
-        &c_oracle[n..n+4].iter().map(|&b| bf16_bits_to_f32(b)).collect::<Vec<_>>());
+    println!(
+        "sample [0][0..4]: mma={:?} oracle={:?}",
+        &c_mma[0..4]
+            .iter()
+            .map(|&b| bf16_bits_to_f32(b))
+            .collect::<Vec<_>>(),
+        &c_oracle[0..4]
+            .iter()
+            .map(|&b| bf16_bits_to_f32(b))
+            .collect::<Vec<_>>()
+    );
+    println!(
+        "sample [1][0..4]: mma={:?} oracle={:?}",
+        &c_mma[n..n + 4]
+            .iter()
+            .map(|&b| bf16_bits_to_f32(b))
+            .collect::<Vec<_>>(),
+        &c_oracle[n..n + 4]
+            .iter()
+            .map(|&b| bf16_bits_to_f32(b))
+            .collect::<Vec<_>>()
+    );
 
-    for p in [a_ptr, b_ptr, packed_ptr, scale_ptr, out_oracle,
-              a_packed, a_scales, b_packed, b_scales, out_mma] {
+    for p in [
+        a_ptr, b_ptr, packed_ptr, scale_ptr, out_oracle, a_packed, a_scales, b_packed, b_scales,
+        out_mma,
+    ] {
         gpu.free(p).ok();
     }
 
