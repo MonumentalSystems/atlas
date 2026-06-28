@@ -291,10 +291,22 @@ extern "C" __global__ void KERNEL_NAME(
                 unsigned int kb = ks*16;
                 unsigned int ar0=qk_warp_m+group_id, ar1=ar0+8;
                 unsigned int ac0=kb+tid_in_group*2, ac1=ac0+8;
-                unsigned int a0=*(const unsigned int*)&sQ[ar0*HDIM_PAD+ac0];
-                unsigned int a1=*(const unsigned int*)&sQ[ar1*HDIM_PAD+ac0];
-                unsigned int a2=*(const unsigned int*)&sQ[ar0*HDIM_PAD+ac1];
-                unsigned int a3=*(const unsigned int*)&sQ[ar1*HDIM_PAD+ac1];
+                unsigned int a0,a1,a2,a3;
+#ifdef ATLAS_ATTN_LDMATRIX
+                // SM121 ldmatrix.x4 NON-trans for the Q A-fragment (v47-proven on
+                // GB10): one instr replaces 4 manual smem loads, shortening the
+                // load->MMA dependency chain this latency-bound kernel is gated on.
+                // sQ-relative addressing so the same code serves BR32/BR64.
+                { unsigned int qb=__cvta_generic_to_shared(&sQ[(qk_warp_m+(lane_id&15))*HDIM_PAD+(lane_id>>4)*8+kb]);
+                  asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3},[%4];"
+                    :"=r"(a0),"=r"(a1),"=r"(a2),"=r"(a3):"r"(qb)); }
+                (void)ar0;(void)ar1;(void)ac0;(void)ac1;
+#else
+                a0=*(const unsigned int*)&sQ[ar0*HDIM_PAD+ac0];
+                a1=*(const unsigned int*)&sQ[ar1*HDIM_PAD+ac0];
+                a2=*(const unsigned int*)&sQ[ar0*HDIM_PAD+ac1];
+                a3=*(const unsigned int*)&sQ[ar1*HDIM_PAD+ac1];
+#endif
 
                 #pragma unroll
                 for (int nt=0; nt<4; nt++) {
@@ -438,10 +450,19 @@ extern "C" __global__ void KERNEL_NAME(
                 unsigned int ko=ks*16;
                 unsigned int ar0=pv_warp_m+group_id, ar1=ar0+8;
                 unsigned int ac0=ko+tid_in_group*2, ac1=ac0+8;
-                unsigned int a0=*(const unsigned int*)&sP[ar0*p_smem_stride+ac0];
-                unsigned int a1=*(const unsigned int*)&sP[ar1*p_smem_stride+ac0];
-                unsigned int a2=*(const unsigned int*)&sP[ar0*p_smem_stride+ac1];
-                unsigned int a3=*(const unsigned int*)&sP[ar1*p_smem_stride+ac1];
+                unsigned int a0,a1,a2,a3;
+#ifdef ATLAS_ATTN_LDMATRIX
+                // ldmatrix.x4 for the P (softmax-prob) A-fragment — same lever as QK.
+                { unsigned int pb=__cvta_generic_to_shared(&sP[(pv_warp_m+(lane_id&15))*p_smem_stride+(lane_id>>4)*8+ko]);
+                  asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3},[%4];"
+                    :"=r"(a0),"=r"(a1),"=r"(a2),"=r"(a3):"r"(pb)); }
+                (void)ar0;(void)ar1;(void)ac0;(void)ac1;
+#else
+                a0=*(const unsigned int*)&sP[ar0*p_smem_stride+ac0];
+                a1=*(const unsigned int*)&sP[ar1*p_smem_stride+ac0];
+                a2=*(const unsigned int*)&sP[ar0*p_smem_stride+ac1];
+                a3=*(const unsigned int*)&sP[ar1*p_smem_stride+ac1];
+#endif
                 #pragma unroll
                 for(int nt=0;nt<N_TILES_PER_WARP;nt++){
                     unsigned int nc=(pv_n_start+nt)*8+group_id, k0=ko+tid_in_group*2, k1=k0+8;
@@ -685,10 +706,22 @@ extern "C" __global__ void PAGED_CONCAT(KERNEL_NAME, _64)(
                 unsigned int kb = ks*16;
                 unsigned int ar0=qk_warp_m+group_id, ar1=ar0+8;
                 unsigned int ac0=kb+tid_in_group*2, ac1=ac0+8;
-                unsigned int a0=*(const unsigned int*)&sQ[ar0*HDIM_PAD+ac0];
-                unsigned int a1=*(const unsigned int*)&sQ[ar1*HDIM_PAD+ac0];
-                unsigned int a2=*(const unsigned int*)&sQ[ar0*HDIM_PAD+ac1];
-                unsigned int a3=*(const unsigned int*)&sQ[ar1*HDIM_PAD+ac1];
+                unsigned int a0,a1,a2,a3;
+#ifdef ATLAS_ATTN_LDMATRIX
+                // SM121 ldmatrix.x4 NON-trans for the Q A-fragment (v47-proven on
+                // GB10): one instr replaces 4 manual smem loads, shortening the
+                // load->MMA dependency chain this latency-bound kernel is gated on.
+                // sQ-relative addressing so the same code serves BR32/BR64.
+                { unsigned int qb=__cvta_generic_to_shared(&sQ[(qk_warp_m+(lane_id&15))*HDIM_PAD+(lane_id>>4)*8+kb]);
+                  asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3},[%4];"
+                    :"=r"(a0),"=r"(a1),"=r"(a2),"=r"(a3):"r"(qb)); }
+                (void)ar0;(void)ar1;(void)ac0;(void)ac1;
+#else
+                a0=*(const unsigned int*)&sQ[ar0*HDIM_PAD+ac0];
+                a1=*(const unsigned int*)&sQ[ar1*HDIM_PAD+ac0];
+                a2=*(const unsigned int*)&sQ[ar0*HDIM_PAD+ac1];
+                a3=*(const unsigned int*)&sQ[ar1*HDIM_PAD+ac1];
+#endif
 
                 #pragma unroll
                 for (int nt=0; nt<4; nt++) {
@@ -829,10 +862,19 @@ extern "C" __global__ void PAGED_CONCAT(KERNEL_NAME, _64)(
                 unsigned int ko=ks*16;
                 unsigned int ar0=pv_warp_m+group_id, ar1=ar0+8;
                 unsigned int ac0=ko+tid_in_group*2, ac1=ac0+8;
-                unsigned int a0=*(const unsigned int*)&sP[ar0*p_smem_stride64+ac0];
-                unsigned int a1=*(const unsigned int*)&sP[ar1*p_smem_stride64+ac0];
-                unsigned int a2=*(const unsigned int*)&sP[ar0*p_smem_stride64+ac1];
-                unsigned int a3=*(const unsigned int*)&sP[ar1*p_smem_stride64+ac1];
+                unsigned int a0,a1,a2,a3;
+#ifdef ATLAS_ATTN_LDMATRIX
+                // ldmatrix.x4 for the P (softmax-prob) A-fragment — same lever as QK.
+                { unsigned int pb=__cvta_generic_to_shared(&sP[(pv_warp_m+(lane_id&15))*p_smem_stride64+(lane_id>>4)*8+ko]);
+                  asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3},[%4];"
+                    :"=r"(a0),"=r"(a1),"=r"(a2),"=r"(a3):"r"(pb)); }
+                (void)ar0;(void)ar1;(void)ac0;(void)ac1;
+#else
+                a0=*(const unsigned int*)&sP[ar0*p_smem_stride64+ac0];
+                a1=*(const unsigned int*)&sP[ar1*p_smem_stride64+ac0];
+                a2=*(const unsigned int*)&sP[ar0*p_smem_stride64+ac1];
+                a3=*(const unsigned int*)&sP[ar1*p_smem_stride64+ac1];
+#endif
                 #pragma unroll
                 for(int nt=0;nt<N_TILES_PER_WARP;nt++){
                     unsigned int nc=(pv_n_start+nt)*8+group_id, k0=ko+tid_in_group*2, k1=k0+8;

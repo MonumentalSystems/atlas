@@ -93,23 +93,31 @@ fn main() -> Result<()> {
     let seed: u64 = a.get(4).map_or(0x51A7, |s| {
         u64::from_str_radix(s.trim_start_matches("0x"), 16).unwrap_or(0x51A7)
     });
+    // Warm-shape override (the real agentic case: small q suffix, large paged KV).
+    // ATLAS_QLEN/ATLAS_KVLEN/ATLAS_QOFF default to self-attention (qlen=kvlen=seq,
+    // qoff=0). When set, q attends causally over [0, qoff+i].
+    let env_usize = |k: &str, d: usize| std::env::var(k).ok().and_then(|s| s.parse().ok()).unwrap_or(d);
+    let qlen = env_usize("ATLAS_QLEN", seq);
+    let kvlen = env_usize("ATLAS_KVLEN", seq);
+    let qoff = env_usize("ATLAS_QOFF", 0);
     let hd = HDIM;
     let inv_sqrt_d = 1.0f32 / (hd as f32).sqrt();
     let k_scale = 0.25f32;
     let v_scale = 0.25f32;
     println!(
         "=== inferspark_prefill_paged_fp8 (FP8-smem) microtest: \
-         seq={seq} nq={nq} nkv={nkv} hd={hd} k_scale={k_scale} v_scale={v_scale} seed=0x{seed:X} ==="
+         qlen={qlen} kvlen={kvlen} qoff={qoff} nq={nq} nkv={nkv} hd={hd} \
+         k_scale={k_scale} v_scale={v_scale} seed=0x{seed:X} ==="
     );
 
     let mut rng = Rng(seed);
-    // Q: BF16, contiguous [seq, nq, hd].
-    let q: Vec<u16> = (0..seq * nq * hd)
+    // Q: BF16, contiguous [qlen, nq, hd].
+    let q: Vec<u16> = (0..qlen * nq * hd)
         .map(|_| f32_to_bf16_bits(rng.uniform(-1.0, 1.0)))
         .collect();
-    // K/V: raw E4M3 bytes for a single paged block [seq, nkv, hd].
-    let k_fp8: Vec<u8> = (0..seq * nkv * hd).map(|_| rng.e4m3_byte()).collect();
-    let v_fp8: Vec<u8> = (0..seq * nkv * hd).map(|_| rng.e4m3_byte()).collect();
+    // K/V: raw E4M3 bytes for a single paged block [kvlen, nkv, hd].
+    let k_fp8: Vec<u8> = (0..kvlen * nkv * hd).map(|_| rng.e4m3_byte()).collect();
+    let v_fp8: Vec<u8> = (0..kvlen * nkv * hd).map(|_| rng.e4m3_byte()).collect();
 
     let backend = AtlasCudaBackend::new(0, &atlas_kernels::ptx_modules())?;
     let gpu: &dyn GpuBackend = &backend;
@@ -118,27 +126,27 @@ fn main() -> Result<()> {
     let qp = upload(gpu, &u16s_to_le(&q))?;
     let kp = upload(gpu, &k_fp8)?;
     let vp = upload(gpu, &v_fp8)?;
-    let op = gpu.alloc(seq * nq * hd * 2)?;
+    let op = gpu.alloc(qlen * nq * hd * 2)?;
     // Single paged block: block_table = [0].
     let btp = upload(gpu, &0i32.to_le_bytes())?;
 
-    let cache_block_size = seq as u32; // all positions in block 0
-    let cache_stride = (seq * nkv * hd) as u64; // FP8 elements per block
+    let cache_block_size = kvlen as u32; // all positions in block 0
+    let cache_stride = (kvlen * nkv * hd) as u64; // FP8 elements per block
 
     // Kernel contract mirrors ops::prefill_attention_paged_fp8 (BR=32, block 128).
     let br = 32u32;
     let handle = gpu.kernel("prefill_paged_fp8", "inferspark_prefill_paged_fp8")?;
     KernelLaunch::new(gpu, handle)
-        .grid([nq as u32, div_ceil(seq as u32, br), 1])
+        .grid([nq as u32, div_ceil(qlen as u32, br), 1])
         .block([128, 1, 1])
         .arg_ptr(qp)
         .arg_ptr(kp)
         .arg_ptr(vp)
         .arg_ptr(op)
         .arg_ptr(btp)
-        .arg_u32(seq as u32) // q_len
-        .arg_u32(seq as u32) // kv_len
-        .arg_u32(0) // q_offset
+        .arg_u32(qlen as u32) // q_len
+        .arg_u32(kvlen as u32) // kv_len
+        .arg_u32(qoff as u32) // q_offset
         .arg_u32(nq as u32)
         .arg_u32(nkv as u32)
         .arg_u32(hd as u32)
@@ -152,21 +160,62 @@ fn main() -> Result<()> {
         .launch(stream)?;
     gpu.synchronize(stream)?;
 
-    let mut raw = vec![0u8; seq * nq * hd * 2];
+    // Optional timing loop (A/B harness for the ldmatrix lever). Gated by
+    // ATLAS_BENCH_ITERS so the correctness gate stays the default behaviour.
+    // Re-launches the SAME kernel path (SSOT) — warmup then N timed launches
+    // with a single trailing sync; reports avg per-launch GPU time.
+    if let Ok(iters_s) = std::env::var("ATLAS_BENCH_ITERS") {
+        let iters: usize = iters_s.parse().unwrap_or(50);
+        let relaunch = || -> Result<()> {
+            KernelLaunch::new(gpu, handle)
+                .grid([nq as u32, div_ceil(qlen as u32, br), 1])
+                .block([128, 1, 1])
+                .arg_ptr(qp).arg_ptr(kp).arg_ptr(vp).arg_ptr(op).arg_ptr(btp)
+                .arg_u32(qlen as u32).arg_u32(kvlen as u32).arg_u32(qoff as u32)
+                .arg_u32(nq as u32).arg_u32(nkv as u32).arg_u32(hd as u32)
+                .arg_u32(cache_block_size).arg_u32(0).arg_u32(1)
+                .arg_f32(inv_sqrt_d).arg_f32(k_scale).arg_f32(v_scale)
+                .arg_u64(cache_stride)
+                .launch(stream)?;
+            Ok(())
+        };
+        for _ in 0..10 { relaunch()?; }
+        gpu.synchronize(stream)?;
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters { relaunch()?; }
+        gpu.synchronize(stream)?;
+        let us = t0.elapsed().as_secs_f64() * 1e6 / iters as f64;
+        println!("BENCH: {us:.2} us/launch  (iters={iters}, grid_y={})", div_ceil(qlen as u32, br));
+    }
+
+    let mut raw = vec![0u8; qlen * nq * hd * 2];
     gpu.copy_d2h(op, &mut raw)?;
     let o_gpu: Vec<u16> = raw
         .chunks_exact(2)
         .map(|c| u16::from_le_bytes([c[0], c[1]]))
         .collect();
 
+    // The FP32 CPU reference is O(qlen * kvlen * hd * nq); skip it for large warm
+    // shapes (timing-only runs) — correctness is gated by the small self-attention
+    // cases, and the kernel path is identical regardless of shape.
+    if qlen * kvlen > 4_000_000 {
+        println!("cosine skipped (warm shape qlen*kvlen={} > 4M; timing-only)", qlen * kvlen);
+        for p in [qp, kp, vp, op, btp] {
+            gpu.free(p).ok();
+        }
+        return Ok(());
+    }
+
     // CPU reference: causal GQA softmax attention in FP32 over the dequantized
-    // (same-byte) K/V. Measures attention correctness, not FP8 input error.
+    // (same-byte) K/V. Query i sits at absolute position qoff+i and attends to
+    // KV [0, qoff+i] (bounded by kvlen). Measures attention correctness.
     let gqa = nq / nkv;
-    let mut o_cpu = vec![0u16; seq * nq * hd];
+    let mut o_cpu = vec![0u16; qlen * nq * hd];
     for h in 0..nq {
         let kvh = h / gqa;
-        for i in 0..seq {
-            let mut scores = vec![0f32; i + 1];
+        for i in 0..qlen {
+            let nkeys = (qoff + i + 1).min(kvlen);
+            let mut scores = vec![0f32; nkeys];
             let mut mx = -1e30f32;
             for (j, sj) in scores.iter_mut().enumerate() {
                 let mut s = 0f32;
@@ -196,7 +245,7 @@ fn main() -> Result<()> {
         }
     }
 
-    let cosall = cos(&o_gpu, &o_cpu, 0, seq * nq * hd);
+    let cosall = cos(&o_gpu, &o_cpu, 0, qlen * nq * hd);
     println!("cosine(all)={cosall:.6}");
     for p in [qp, kp, vp, op, btp] {
         gpu.free(p).ok();
