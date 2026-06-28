@@ -102,8 +102,7 @@ pub(super) fn load_layers(
     // regardless of source quant format; the mixed-precision-specific handling
     // (fp8 experts, native-modelopt SSM/attn) stays gated on
     // `modelopt_mixed_precision` and simply doesn't fire for the uniform case.
-    let holo_nvfp4_moe =
-        config.model_type == "holo3_1_moe" && quant_format == QuantFormat::Nvfp4;
+    let holo_nvfp4_moe = config.model_type == "holo3_1_moe" && quant_format == QuantFormat::Nvfp4;
     let low_memory_modelopt_moe = (modelopt_mixed_precision || holo_nvfp4_moe)
         && std::env::var("ATLAS_HOLO_LOW_MEMORY_MOE").ok().as_deref() == Some("1");
     let holo_fast_moe_mode = if low_memory_modelopt_moe {
@@ -290,9 +289,7 @@ pub(super) fn load_layers(
         // engages under ATLAS_HOLO_FAST_MOE_MODE=full; with the shared tables
         // absent the dispatch falls back to FP8. Warn once if the flags are set
         // without the tables so the opt-in isn't silently ignored.
-        if i == 0
-            && (holo_moe_gateup_fp4() || holo_moe_down_fp4())
-            && holo_fast_moe_mode.is_none()
+        if i == 0 && (holo_moe_gateup_fp4() || holo_moe_down_fp4()) && holo_fast_moe_mode.is_none()
         {
             tracing::warn!(
                 "ATLAS_HOLO_MOE_GATEUP_FP4/_DOWN_FP4 set but ATLAS_HOLO_FAST_MOE_MODE \
@@ -337,7 +334,10 @@ pub(super) fn load_layers(
         // load (the grouped kernel pairs them with gate_ptrs [N,K/2] + real scale2).
         // Needs the shared gate_ptrs_t/up_ptrs_t scales (FAST_MOE=full).
         if fast_holo_moe_layer
-            && std::env::var("ATLAS_HOLO_MOE_GROUPED_CUTLASS").ok().as_deref() == Some("1")
+            && std::env::var("ATLAS_HOLO_MOE_GROUPED_CUTLASS")
+                .ok()
+                .as_deref()
+                == Some("1")
         {
             moe_layer.build_cutlass_grouped_sfb(gpu, config, stream)?;
         }
@@ -534,9 +534,7 @@ pub(super) fn load_layers(
                     && dequant_attn_to_bf16
                     && !(force_nvfp4_all || fp4_proj_decode)
                     && proj_is_native_fp8(store, &format!("{lp}.self_attn.q_proj")))
-                    || (modelopt_mixed_precision
-                        && !native_modelopt_attn
-                        && !fp4_proj_decode) =>
+                    || (modelopt_mixed_precision && !native_modelopt_attn && !fp4_proj_decode) =>
             {
                 // ── BF16-dequant attention (diagnostic, TP=1) ──
                 // Dequant FP8 Q/K/V/O → BF16 on GPU, store as dense weights,

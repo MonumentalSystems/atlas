@@ -123,102 +123,52 @@ impl MoeLayer {
         }
         if max_m_tiles > 0 {
             if let (Some(gp), Some(up)) = (&self.gate_ptrs_t, &self.up_ptrs_t) {
-              if grouped_cutlass_gate_up_enabled()
-                  && self.gate_sfb_cutlass.is_some()
-                  && self.up_sfb_cutlass.is_some()
-              {
-                // ── SINGLE-LAUNCH CUTLASS grouped NVFP4 gate_up
-                // (ATLAS_HOLO_MOE_GROUPED_CUTLASS=1) ── one
-                // GemmUniversalMode::kGrouped launch over all active experts in
-                // place of the per-expert collective loop. Weights: the decode
-                // `gate_ptrs`/`up_ptrs` packed `[N,K/2]` (CUTLASS ColumnMajor B) +
-                // the load-built swizzled SFB tables (`gate_sfb_cutlass`) + the real
-                // per-expert scale2 (epilogue alpha). The token gather is FUSED into
-                // the kernel's per-group A-pack (lever 2): pass token-major
-                // expert_input + sorted_token_ids directly, no separate permute pass.
-                // Writes C_gate/C_up in the sorted layout so silu+down+unpermute are
-                // unchanged.
-                ops::moe_grouped_gate_up_cutlass(
-                    ctx.gpu,
-                    expert_input,
-                    sorted_token_ids,
-                    self.gate_ptrs.packed_ptrs,
-                    self.gate_sfb_cutlass.expect("gate sfb checked above"),
-                    self.gate_ptrs.scale2_vals,
-                    self.up_ptrs.packed_ptrs,
-                    self.up_sfb_cutlass.expect("up sfb checked above"),
-                    self.up_ptrs.scale2_vals,
-                    expert_gate_out,
-                    expert_up_out,
-                    expert_offsets,
-                    num_experts as usize,
-                    inter,
-                    h,
-                    stream,
-                )?;
-              } else if self.gateup_fp4 && self.moe_fused_gate_up_t_k64_fp4.0 != 0 {
-                // ── FUSED FP4 gate_up (ATLAS_HOLO_MOE_GATEUP_FP4) ──
-                // Block-scaled FP4 over the SHARED FAST_MOE=full [K/2,N] tables
-                // (gate_ptrs_t/up_ptrs_t — the SAME bytes the FP8 fused path
-                // reads, selected here only by kernel handle, so NO extra MoE
-                // memory). The kernel loads them coalesced K-major and re-gathers
-                // N-major on-chip (FP4_TRANSPOSE). gp/up carry the REAL per-expert
-                // scale2 (applied at writeback) — not the legacy hardcoded 1.0.
-                // Single launch, grid z = num_experts; writes C_gate/C_up in the
-                // same sorted layout as FP8 so silu+down+unpermute are unchanged.
-                ops::moe_w4a16_fused_gate_up_k64_n128(
-                    ctx.gpu,
-                    self.moe_fused_gate_up_t_k64_fp4,
-                    expert_input,
-                    gp.packed_ptrs,
-                    gp.scale_ptrs,
-                    gp.scale2_vals,
-                    up.packed_ptrs,
-                    up.scale_ptrs,
-                    up.scale2_vals,
-                    expert_gate_out,
-                    expert_up_out,
-                    expert_offsets,
-                    sorted_token_ids,
-                    num_experts,
-                    inter,
-                    h,
-                    max_m_tiles,
-                    stream,
-                )?;
-              } else {
-                // Block D #3 dispatch: M=128 path needs the env var on AND
-                // the kernel actually loaded (try_kernel returns 0 on
-                // models that don't ship it). max_m_tiles_m128 = ceil(...
-                // /128) instead of /64; reuse the same upper bound by
-                // halving (each m128 tile covers 2 m64 tiles).
-                let use_m128 = self.nvfp4_gate_up_m128 && self.moe_fused_gate_up_t_k64_m128.0 != 0;
-                if use_m128 {
-                    let max_m_tiles_m128 = max_m_tiles.div_ceil(2).max(1);
-                    ops::moe_w4a16_fused_gate_up_k64_m128(
+                if grouped_cutlass_gate_up_enabled()
+                    && self.gate_sfb_cutlass.is_some()
+                    && self.up_sfb_cutlass.is_some()
+                {
+                    // ── SINGLE-LAUNCH CUTLASS grouped NVFP4 gate_up
+                    // (ATLAS_HOLO_MOE_GROUPED_CUTLASS=1) ── one
+                    // GemmUniversalMode::kGrouped launch over all active experts in
+                    // place of the per-expert collective loop. Weights: the decode
+                    // `gate_ptrs`/`up_ptrs` packed `[N,K/2]` (CUTLASS ColumnMajor B) +
+                    // the load-built swizzled SFB tables (`gate_sfb_cutlass`) + the real
+                    // per-expert scale2 (epilogue alpha). The token gather is FUSED into
+                    // the kernel's per-group A-pack (lever 2): pass token-major
+                    // expert_input + sorted_token_ids directly, no separate permute pass.
+                    // Writes C_gate/C_up in the sorted layout so silu+down+unpermute are
+                    // unchanged.
+                    ops::moe_grouped_gate_up_cutlass(
                         ctx.gpu,
-                        self.moe_fused_gate_up_t_k64_m128,
                         expert_input,
-                        gp.packed_ptrs,
-                        gp.scale_ptrs,
-                        gp.scale2_vals,
-                        up.packed_ptrs,
-                        up.scale_ptrs,
-                        up.scale2_vals,
+                        sorted_token_ids,
+                        self.gate_ptrs.packed_ptrs,
+                        self.gate_sfb_cutlass.expect("gate sfb checked above"),
+                        self.gate_ptrs.scale2_vals,
+                        self.up_ptrs.packed_ptrs,
+                        self.up_sfb_cutlass.expect("up sfb checked above"),
+                        self.up_ptrs.scale2_vals,
                         expert_gate_out,
                         expert_up_out,
                         expert_offsets,
-                        sorted_token_ids,
-                        num_experts,
+                        num_experts as usize,
                         inter,
                         h,
-                        max_m_tiles_m128,
                         stream,
                     )?;
-                } else {
+                } else if self.gateup_fp4 && self.moe_fused_gate_up_t_k64_fp4.0 != 0 {
+                    // ── FUSED FP4 gate_up (ATLAS_HOLO_MOE_GATEUP_FP4) ──
+                    // Block-scaled FP4 over the SHARED FAST_MOE=full [K/2,N] tables
+                    // (gate_ptrs_t/up_ptrs_t — the SAME bytes the FP8 fused path
+                    // reads, selected here only by kernel handle, so NO extra MoE
+                    // memory). The kernel loads them coalesced K-major and re-gathers
+                    // N-major on-chip (FP4_TRANSPOSE). gp/up carry the REAL per-expert
+                    // scale2 (applied at writeback) — not the legacy hardcoded 1.0.
+                    // Single launch, grid z = num_experts; writes C_gate/C_up in the
+                    // same sorted layout as FP8 so silu+down+unpermute are unchanged.
                     ops::moe_w4a16_fused_gate_up_k64_n128(
                         ctx.gpu,
-                        self.moe_fused_gate_up_t_k64,
+                        self.moe_fused_gate_up_t_k64_fp4,
                         expert_input,
                         gp.packed_ptrs,
                         gp.scale_ptrs,
@@ -236,8 +186,59 @@ impl MoeLayer {
                         max_m_tiles,
                         stream,
                     )?;
+                } else {
+                    // Block D #3 dispatch: M=128 path needs the env var on AND
+                    // the kernel actually loaded (try_kernel returns 0 on
+                    // models that don't ship it). max_m_tiles_m128 = ceil(...
+                    // /128) instead of /64; reuse the same upper bound by
+                    // halving (each m128 tile covers 2 m64 tiles).
+                    let use_m128 =
+                        self.nvfp4_gate_up_m128 && self.moe_fused_gate_up_t_k64_m128.0 != 0;
+                    if use_m128 {
+                        let max_m_tiles_m128 = max_m_tiles.div_ceil(2).max(1);
+                        ops::moe_w4a16_fused_gate_up_k64_m128(
+                            ctx.gpu,
+                            self.moe_fused_gate_up_t_k64_m128,
+                            expert_input,
+                            gp.packed_ptrs,
+                            gp.scale_ptrs,
+                            gp.scale2_vals,
+                            up.packed_ptrs,
+                            up.scale_ptrs,
+                            up.scale2_vals,
+                            expert_gate_out,
+                            expert_up_out,
+                            expert_offsets,
+                            sorted_token_ids,
+                            num_experts,
+                            inter,
+                            h,
+                            max_m_tiles_m128,
+                            stream,
+                        )?;
+                    } else {
+                        ops::moe_w4a16_fused_gate_up_k64_n128(
+                            ctx.gpu,
+                            self.moe_fused_gate_up_t_k64,
+                            expert_input,
+                            gp.packed_ptrs,
+                            gp.scale_ptrs,
+                            gp.scale2_vals,
+                            up.packed_ptrs,
+                            up.scale_ptrs,
+                            up.scale2_vals,
+                            expert_gate_out,
+                            expert_up_out,
+                            expert_offsets,
+                            sorted_token_ids,
+                            num_experts,
+                            inter,
+                            h,
+                            max_m_tiles,
+                            stream,
+                        )?;
+                    }
                 }
-              }
             } else {
                 let (gp, up) = (&self.gate_ptrs, &self.up_ptrs);
                 ops::moe_w4a16_grouped_gemm_ptrtable(
@@ -295,69 +296,39 @@ impl MoeLayer {
             // FP8/w4a16 down kernels, so unpermute downstream is unchanged.
             // Compounds with the FP4 gate_up path to run the whole FFN at FP4.
             if let Some(dp) = &self.down_ptrs_t {
-              if grouped_cutlass_gate_up_enabled()
-                  && self.down_sfb_cutlass.is_some()
-                  && std::env::var("ATLAS_HOLO_MOE_GROUPED_DOWN").ok().as_deref() == Some("1")
-              {
-                // ── CUTLASS grouped NVFP4 down (ATLAS_HOLO_MOE_GROUPED_CUTLASS
-                //    + ATLAS_HOLO_MOE_GROUPED_DOWN) ──
-                // A = post-SiLU expert_gate_out, already expert-contiguous (the grouped
-                // gate_up wrote it sorted), so NO gather. Weights = decode down_ptrs
-                // packed [N=hidden,K/2] + load-built swizzled SFB + real scale2. Writes
-                // expert_down_out in the sorted layout (unpermute downstream unchanged).
-                ops::moe_grouped_down_cutlass(
-                    ctx.gpu,
-                    expert_gate_out,
-                    self.down_ptrs.packed_ptrs,
-                    self.down_sfb_cutlass.expect("down sfb checked above"),
-                    self.down_ptrs.scale2_vals,
-                    expert_down_out,
-                    expert_offsets,
-                    num_experts as usize,
-                    h,
-                    inter,
-                    stream,
-                )?;
-              } else if self.down_fp4 && self.moe_down_t_k64_fp4.0 != 0 {
-                // ── FP4 down (ATLAS_HOLO_MOE_DOWN_FP4) over the SHARED down_ptrs_t
-                // [K/2,N] table (real per-expert scale2; coalesced K-major load +
-                // on-chip DN4_TRANSPOSE). Same sorted layout + null
-                // sorted_token_ids as the FP8/w4a16 down kernels, so unpermute is
-                // unchanged. No extra MoE memory (shared table).
-                ops::moe_w4a16_grouped_gemm_ptrtable_n128(
-                    ctx.gpu,
-                    self.moe_down_t_k64_fp4,
-                    expert_gate_out,
-                    dp.packed_ptrs,
-                    dp.scale_ptrs,
-                    dp.scale2_vals,
-                    expert_down_out,
-                    expert_offsets,
-                    DevicePtr(0),
-                    num_experts,
-                    h,
-                    inter,
-                    max_m_tiles,
-                    stream,
-                )?;
-              } else {
-                let fp8_down = std::env::var("ATLAS_MOE_PREFILL_FP8_DOWN").ok().as_deref()
-                    == Some("1")
-                    && self.moe_fp8_grouped_gemm_t.0 != 0
-                    && self.bf16_to_fp8_k.0 != 0;
-                if fp8_down {
-                    ops::bf16_to_fp8(
+                if grouped_cutlass_gate_up_enabled()
+                    && self.down_sfb_cutlass.is_some()
+                    && std::env::var("ATLAS_HOLO_MOE_GROUPED_DOWN").ok().as_deref() == Some("1")
+                {
+                    // ── CUTLASS grouped NVFP4 down (ATLAS_HOLO_MOE_GROUPED_CUTLASS
+                    //    + ATLAS_HOLO_MOE_GROUPED_DOWN) ──
+                    // A = post-SiLU expert_gate_out, already expert-contiguous (the grouped
+                    // gate_up wrote it sorted), so NO gather. Weights = decode down_ptrs
+                    // packed [N=hidden,K/2] + load-built swizzled SFB + real scale2. Writes
+                    // expert_down_out in the sorted layout (unpermute downstream unchanged).
+                    ops::moe_grouped_down_cutlass(
                         ctx.gpu,
-                        self.bf16_to_fp8_k,
                         expert_gate_out,
-                        expert_up_out,
-                        total_expanded * inter,
+                        self.down_ptrs.packed_ptrs,
+                        self.down_sfb_cutlass.expect("down sfb checked above"),
+                        self.down_ptrs.scale2_vals,
+                        expert_down_out,
+                        expert_offsets,
+                        num_experts as usize,
+                        h,
+                        inter,
                         stream,
                     )?;
-                    ops::moe_fp8_grouped_gemm_ptrtable_n128(
+                } else if self.down_fp4 && self.moe_down_t_k64_fp4.0 != 0 {
+                    // ── FP4 down (ATLAS_HOLO_MOE_DOWN_FP4) over the SHARED down_ptrs_t
+                    // [K/2,N] table (real per-expert scale2; coalesced K-major load +
+                    // on-chip DN4_TRANSPOSE). Same sorted layout + null
+                    // sorted_token_ids as the FP8/w4a16 down kernels, so unpermute is
+                    // unchanged. No extra MoE memory (shared table).
+                    ops::moe_w4a16_grouped_gemm_ptrtable_n128(
                         ctx.gpu,
-                        self.moe_fp8_grouped_gemm_t,
-                        expert_up_out,
+                        self.moe_down_t_k64_fp4,
+                        expert_gate_out,
                         dp.packed_ptrs,
                         dp.scale_ptrs,
                         dp.scale2_vals,
@@ -371,24 +342,54 @@ impl MoeLayer {
                         stream,
                     )?;
                 } else {
-                    ops::moe_w4a16_grouped_gemm_ptrtable_n128(
-                        ctx.gpu,
-                        self.moe_grouped_gemm_t_k64,
-                        expert_gate_out,
-                        dp.packed_ptrs,
-                        dp.scale_ptrs,
-                        dp.scale2_vals,
-                        expert_down_out,
-                        expert_offsets,
-                        DevicePtr(0),
-                        num_experts,
-                        h,
-                        inter,
-                        max_m_tiles,
-                        stream,
-                    )?;
+                    let fp8_down = std::env::var("ATLAS_MOE_PREFILL_FP8_DOWN").ok().as_deref()
+                        == Some("1")
+                        && self.moe_fp8_grouped_gemm_t.0 != 0
+                        && self.bf16_to_fp8_k.0 != 0;
+                    if fp8_down {
+                        ops::bf16_to_fp8(
+                            ctx.gpu,
+                            self.bf16_to_fp8_k,
+                            expert_gate_out,
+                            expert_up_out,
+                            total_expanded * inter,
+                            stream,
+                        )?;
+                        ops::moe_fp8_grouped_gemm_ptrtable_n128(
+                            ctx.gpu,
+                            self.moe_fp8_grouped_gemm_t,
+                            expert_up_out,
+                            dp.packed_ptrs,
+                            dp.scale_ptrs,
+                            dp.scale2_vals,
+                            expert_down_out,
+                            expert_offsets,
+                            DevicePtr(0),
+                            num_experts,
+                            h,
+                            inter,
+                            max_m_tiles,
+                            stream,
+                        )?;
+                    } else {
+                        ops::moe_w4a16_grouped_gemm_ptrtable_n128(
+                            ctx.gpu,
+                            self.moe_grouped_gemm_t_k64,
+                            expert_gate_out,
+                            dp.packed_ptrs,
+                            dp.scale_ptrs,
+                            dp.scale2_vals,
+                            expert_down_out,
+                            expert_offsets,
+                            DevicePtr(0),
+                            num_experts,
+                            h,
+                            inter,
+                            max_m_tiles,
+                            stream,
+                        )?;
+                    }
                 }
-              }
             } else {
                 ops::moe_w4a16_grouped_gemm_ptrtable(
                     ctx.gpu,

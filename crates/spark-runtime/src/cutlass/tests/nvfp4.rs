@@ -266,6 +266,12 @@ fn cutlass_nvfp4_transpose_is_bit_exact() {
         cuda_check(cudaFree(dst_dev), "free dst");
     }
 
-    assert_eq!(got, golden, "device transpose must reproduce the golden [N,K/2] pack");
-    eprintln!("NVFP4_TRANSPOSE bit-exact over N={N} K={K} ({} bytes) OK", N * half);
+    assert_eq!(
+        got, golden,
+        "device transpose must reproduce the golden [N,K/2] pack"
+    );
+    eprintln!(
+        "NVFP4_TRANSPOSE bit-exact over N={N} K={K} ({} bytes) OK",
+        N * half
+    );
 }

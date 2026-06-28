@@ -188,9 +188,7 @@ fn main() -> Result<()> {
     let norm_k = g.kernel("norm", "gated_rms_norm_f32_input")?;
 
     let mut rng = Lcg(0x5155_4d5f_c4f0_0001);
-    let h0: Vec<f32> = (0..B * NV * KD * VD)
-        .map(|_| rng.r(-0.05, 0.05))
-        .collect();
+    let h0: Vec<f32> = (0..B * NV * KD * VD).map(|_| rng.r(-0.05, 0.05)).collect();
     let conv: Vec<f32> = (0..B * CONV_DIM).map(|_| rng.r(-0.5, 0.5)).collect();
     let mut gates = Vec::with_capacity(B * GB_STRIDE);
     for _ in 0..B {
@@ -204,9 +202,7 @@ fn main() -> Result<()> {
     let z: Vec<bf16> = (0..B * QKVZ_SIZE)
         .map(|_| bf16::from_f32(rng.r(-0.5, 0.5)))
         .collect();
-    let norm_w: Vec<bf16> = (0..VD)
-        .map(|_| bf16::from_f32(rng.r(0.5, 1.5)))
-        .collect();
+    let norm_w: Vec<bf16> = (0..VD).map(|_| bf16::from_f32(rng.r(0.5, 1.5))).collect();
 
     let h_ref = up_f32(g, &h0)?;
     let h_fused = up_f32(g, &h0)?;

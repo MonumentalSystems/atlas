@@ -298,8 +298,12 @@ impl Qwen3SsmLayer {
             vpg as u32,
             stream,
         )?;
-        ctx.gpu
-            .copy_d2d_async(gates_buf, gdn_bufs.gate_beta, total_tokens * gate_stride * fp32, stream)?;
+        ctx.gpu.copy_d2d_async(
+            gates_buf,
+            gdn_bufs.gate_beta,
+            total_tokens * gate_stride * fp32,
+            stream,
+        )?;
 
         // Z gate: strided copy from deinterleaved (stride qkvz_size) → gdn_bufs.z
         // (stride value_dim) over all tokens.

@@ -350,4 +350,3 @@ fn test_layer_prefix() {
     cfg35.weight_prefix = "model.language_model".to_string();
     assert_eq!(cfg35.layer_prefix(3), "model.language_model.layers.3");
 }
-

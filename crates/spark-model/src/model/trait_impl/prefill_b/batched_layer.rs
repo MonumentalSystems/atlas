@@ -248,7 +248,15 @@ impl TransformerModel {
         // stacked hidden/residual/gdn buffers are packed contiguously, so
         // token_offset=0 over total_tokens covers every request's slice.
         let total = meta.total_tokens as usize;
-        layer.prefill_phase3(hidden_stacked, residual_stacked, total, gdn_bufs, 0, ctx, stream)?;
+        layer.prefill_phase3(
+            hidden_stacked,
+            residual_stacked,
+            total,
+            gdn_bufs,
+            0,
+            ctx,
+            stream,
+        )?;
 
         // meta is consumed for chunk_len/batch_size above.
         let _ = meta;

@@ -13,9 +13,9 @@
 use anyhow::Result;
 
 use super::super::super::types::TransformerModel;
-use atlas_core::config::LayerType;
 use crate::layer::{LayerState, SsmLayerState};
 use crate::traits::SequenceState;
+use atlas_core::config::LayerType;
 
 impl TransformerModel {
     /// Build the decode portion's `(seq_lens, block_tables, all_layer_states)`

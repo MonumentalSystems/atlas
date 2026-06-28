@@ -161,13 +161,7 @@ impl GpuBackend for MockGpuBackend {
         Ok(())
     }
 
-    fn memset_async(
-        &self,
-        ptr: DevicePtr,
-        value: u8,
-        bytes: usize,
-        _stream: u64,
-    ) -> Result<()> {
+    fn memset_async(&self, ptr: DevicePtr, value: u8, bytes: usize, _stream: u64) -> Result<()> {
         self.memset(ptr, value, bytes)
     }
 
