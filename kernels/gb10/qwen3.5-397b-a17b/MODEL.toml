@@ -124,3 +124,12 @@ hidden_size = 4096
 [[model_types]]
 model_type = "qwen3_6_moe"
 hidden_size = 4096
+
+# Multimodal hybrid 397B checkpoints (vision tower + image_token_id 248056, e.g.
+# deepreinforce-ai/Ornith-1.0-397B) are rewritten qwen3_5_moe -> holo3_1_moe by
+# parse_config (config/dispatch.rs, the same path that enables Holo-3.1-35B /
+# AgentWorld). They share this 397B target's exact dims (60L = 45 SSM + 15 full,
+# 512 experts, hidden 4096, head_dim 256), so accept holo3_1_moe at hidden 4096.
+[[model_types]]
+model_type = "holo3_1_moe"
+hidden_size = 4096
