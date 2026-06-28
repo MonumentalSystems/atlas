@@ -599,3 +599,15 @@ loads via ldmatrix (memory note: plain ldmab=0 speedup, so needs the INTERLEAVE 
 (b) native NVFP4 block-scale MMA m16n8k64 (W4A4 coherence-risk). BUT FFN GEMM is only 33% of TTFT and already
 at faith2 → q8_1 (44.7→~60) = ~8% TTFT for a multi-day port. DECISION: pivot to the bigger lever = ATTENTION
 prefill (39%). Kernel kept in-tree as documented negative (like faith3/4), NOT committed as a win.
+
+## ★★★ ATTENTION PREFILL ncu (2026-06-28) — ROOT CAUSE = SMEM-OCCUPANCY-BOUND (the #1 TTFT lever)
+ncu on inferspark_prefill (attn compute core, microtest, sm_121): **Theoretical Occupancy 16.67%**,
+**Block Limit Shared Mem = 1** (Registers=2, Warps=6) → SMEM is the binding constraint → only 1 CTA/SM,
+2 warps/scheduler vs hw max 12. Confirms the header note: at HDIM=256 double-buffered smem_K (33,792B)
+exceeds 64KB → single-buffered K (no prefetch overlap) AND can't fit a 2nd CTA. This is WHY attention runs
+at ~6.5 TFLOP/s effective and is 39% of TTFT. ATTACKABLE: smem_K/smem_V are stored BF16 (dequanted from the
+FP8 KV cache on load). Keeping smem K/V in FP8 (1 byte) and dequant-in-register at MMA time HALVES attn smem
+→ fits 2 CTAs/SM → ~2× occupancy → hides the QK/PV latency. THE concrete attention lever (vs the dead FFN GEMM).
+NEXT: retile inferspark_prefill HDIM=256 with FP8 smem K/V (or smaller BC tile) for 2 CTAs/SM; gate cosine
+(microtest) + per-attn-layer ms (ATLAS_PROFILE) + agentic TTFT. This targets the 39% — the real path to
+TTFT-median 1936→<1393 and TTFT-max 17480→<9991. FFN GEMM (33%, faith2) and SSM interval (GDN 19%) secondary.
