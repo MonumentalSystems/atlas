@@ -43,3 +43,21 @@ Two REAL levers, both kernel/structural — no free flag closes them:
  (B) TTFT: prefill latency-bound + co-dispatch serializes internally. Lever = truly batched prefill forward
      (kernel-level, not per-stream loop) + GDN-prefill throughput. NOT ALWAYS_MIXED (stall_ratio=0).
 Dead ends proven: A1 batched CUDA graphs (shipped, neutral), POC-1 batched-recurrent GDN (no-op), POC-2 ALWAYS_MIXED (neutral here).
+
+## PREFILL LEVER PROVEN (2026-06-28) — kernel-batched prefill gated off under prefix cache
+The truly-batched packed prefill forward EXISTS and WORKS: `prefill_batch_chunk_kernel_batched`
+(crates/spark-model/src/model/trait_impl/prefill_b/batch.rs), gated by `kernel_batched_eligible`.
+BUG/GATE: `kernel_batched_eligible` returns false whenever `self.prefix_cache.is_active()` ("Fix #4" —
+defensive guard against partial-mutation when co-dispatched streams have MIXED cache-hit depths).
+Production serves `--enable-prefix-caching true` → gate always fires → per-stream serialization
+(verified: 4 concurrent prompts → 4 separate 27-tok forwards @ ~72ms each).
+
+Disabling prefix cache engages it (q12 trace: "kernel-batched dispatch attempt n=4 → succeeded"):
+  TTFT  C4 547→294ms,  C8 1066→524ms  (~2x), decode unchanged. Bench uses unique prompts (0 cache hits)
+  so prefix caching buys nothing here anyway.
+
+FIX (next, scoped — not new kernel work): the gate is too broad. The mixed-depth bug only occurs with
+ACTUAL cache hits. Pre-compute all co-dispatched streams' cache-hit depth (read-only radix lookup) BEFORE
+any state mutation; allow the kernel-batched path when all streams are cold / uniform depth, else fall
+through cleanly (no partial mutation). Unlocks the 2x TTFT win with prefix caching ON.
+Residual gap to vLLM (524 vs ~190ms) = follow-on (packed forward still partly per-layer-overhead bound + admission).
