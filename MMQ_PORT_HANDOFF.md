@@ -611,3 +611,30 @@ FP8 KV cache on load). Keeping smem K/V in FP8 (1 byte) and dequant-in-register 
 NEXT: retile inferspark_prefill HDIM=256 with FP8 smem K/V (or smaller BC tile) for 2 CTAs/SM; gate cosine
 (microtest) + per-attn-layer ms (ATLAS_PROFILE) + agentic TTFT. This targets the 39% — the real path to
 TTFT-median 1936→<1393 and TTFT-max 17480→<9991. FFN GEMM (33%, faith2) and SSM interval (GDN 19%) secondary.
+
+## ★★★ ATTENTION FP8-smem retile — BUILT+GATED 2026-06-28: bit-identical, occupancy 2× — but SPEED-NEUTRAL
+Implemented FP8-smem K/V (store raw E4M3 in smem, dequant-in-register at MMA) behind ATLAS_ATTN_FP8_SMEM
+(prefill_paged_compute.cuh + fp8/fp8_batched wrappers + new inferspark_attn_fp8_microtest). GATED on dgx1:
+- Correctness: microtest cosine **1.000000** (bit-identical — same fp8→bf16 + scales, only smem storage moved).
+  Server coherence PASS ("capital of France is Paris...", batched path).
+- Occupancy: ncu **smem 70.4→45.1 KB/CTA, Block Limit Shared Mem 1→2, theoretical occ 8.3→16.7% (2×)**. ✓
+- SPEED (the gate that matters): **NO improvement.** Cold attn-layers ~18ms (unchanged); warm prefill 752 vs
+  baseline 738.9ms, attention 360.6 vs 350ms (noise/slightly worse). Doubling occupancy did NOT speed attention.
+=> CONCLUSION: attention prefill is **per-warp dependency-latency bound** (QK→softmax→PV serial chain), NOT
+  occupancy bound — exactly like the GEMM faith4 result. Occupancy is NOT the attention lever. DISABLED the
+  macro on the serving path (reverted to proven baseline; no win to ship); kept the validated code + microtest
+  in-tree (it frees ~25KB attn smem) for a possible future LARGER-BR retile (more queries/block → arithmetic
+  intensity) — the one remaining untested attention angle.
+
+## ★★★★ PREFILL TTFT IMPASSE (2026-06-28) — both biggest levers empirically hard-bound
+Gated this session: (1) FFN GEMM (33% of TTFT) — faith2 44.7 plateau, mmq2 double-buffer regressed (37<44),
+3rd confirmation capped. (2) Attention (39%) — FP8-smem 2× occupancy = speed-neutral (dependency-latency bound).
+TTFT-median 1936>1393 (gap 543ms) and TTFT-max 17480>9991 remain unbeaten; the two components that dominate
+TTFT are both hard-bound on the current kernel structures. Remaining options (all hard/uncertain or a decision):
+  (A) larger-BR attention retile using the freed FP8-smem (arithmetic intensity; uncertain, occupancy was neutral)
+  (B) software-pipeline QK/softmax/PV across k-tiles to break the per-warp dependency chain (research-grade)
+  (C) native NVFP4 MMA for the FFN 33% (W4A4 coherence-risk, prefill-netneg per [[project_fp4_mma_gb10]])
+  (D) finer SSM checkpoint interval (item 4) — cuts GDN replay ~75ms, partial (~14% of the 543ms gap)
+  (E) ACCEPT the TTFT position: Atlas already BEATS llama on wall (7196<8369), full-latency (4797<4956 med,
+      7146<8312 avg), decode (+49%), and accuracy (BFCL-ST 90.79>88.60). TTFT-median/max are the lone
+      unbeaten REPORTED metrics and are now shown hard-bound.
