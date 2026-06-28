@@ -94,3 +94,24 @@ and WITH_CACHE=1 (control-confirmed: NOT the relaxation). Causes are over-contex
 RELAXATION STATUS: WITH_CACHE=1 validated correct WITHIN context (needle 3/3, mixed-cache correctness,
 120s sustained stress 0×700 + 0 cross-stream-bleed, corrupt-rate == baseline). 2x TTFT win stands for
 in-context serving. Soak 700 is orthogonal.
+
+## DECODE LEVER (c) — design + A/B findings (2026-06-28, workflow wf_04635cc4)
+Profile (nsys C=4 GPU-time share, prod kernels): SSM out_proj GEMM (w8a16_pipelined) ~31%, lm_head w4a16_gemm ~16%
+(~32 GB/s — ~8x below GB10 peak, "no fast swap"), attn dense_gemv ~12%, MoE ~20%, conv1d ~0%.
+Per-step C=4: SSM 24.8ms(65%), head 7.5ms(20%), attn 5.9ms(15%). C=8: ssm 73%.
+
+A/B RESULTS (live, gx10:8890, vs FUSED_NORM baseline 88/82/93/104 @ C1/2/4/8):
+- ATLAS_SSM_BATCHED_RECURRENT=1 → 89.5/81.9/93.0/104.6 = NO-OP (confirmed; horizontal batching is chain-depth-bound, GPU ~93% idle).
+- FUSED_NORM (already on) = the one proven fusion (+18%@C4). FUSED_CONV = neutral (per-k-head grid halves CTAs 32→16).
+- conv1d fusion is pointless (conv ~0% of decode).
+
+DESIGN candidates (occupancy-preserving fusion, NOT horizontal batching):
+- C1 BA-into-QKVZ concat GEMV (hoist per-seq ba_gates into the batched qkvz pass): low risk, +3-8% (review down-rated from +8-15%).
+- C2 FUSED_CONV v2 (per-V-head grid remap, restore 32 CTAs): +10-18% possible, medium-high risk (conv_state race / recompute).
+- Head/vocab GEMM (lm_head w4a16_gemv @ ~32 GB/s, 20% of step): FATTEST lower-risk single-kernel target — ~8x bandwidth
+  headroom; amortizes across batch. Review's pick over the 30-layer fusion.
+
+HONEST CEILING: decode is fundamentally chain-depth bound (30 serial layers, GPU 93% idle). Realistic cumulative decode
+gain ~+12-20% (head-GEMV + a fusion), NOT the ~1.8x needed for full concurrent-decode parity — that needs whole-layer
+vertical fusion (architectural). Atlas ALREADY WINS single-stream (C1 90 vs vLLM 45); the gap is purely concurrent decode.
+NEXT (best gain/risk): optimize the lm_head w4a16_gemv bandwidth (20%/8x headroom), then C1.
