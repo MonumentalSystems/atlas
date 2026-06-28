@@ -83,11 +83,13 @@ and WITH_CACHE=1 (control-confirmed: NOT the relaxation). Causes are over-contex
      FIXED: chat/mod.rs clamps max_tokens to (max_seq_len - prompt_len), logs warn, finishes length.
      Verified: 128000→32733, HTTP 200, no 700.
   2. REMAINING (pre-existing, separate hardening): soak still 700s on first batch — heterogeneous
-     vision(<|image_pad|>)+text+tools co-dispatch and/or the 190K big_ctx compaction path. 0 "prompt too long"
-     rejects because oversized prompts are auto-COMPACTED (template.rs >70% max_seq_len), not rejected.
-     The 64k/190k soak is built for a larger-context + vision-image server; it is not a valid test on the
-     32K text config. Fixing all over-context vectors (vision token budget, compaction-then-overflow,
-     decode-time hard KV stop) is a separate robustness task.
+     vision(<|image_pad|>)+text+tools co-dispatch and/or the 190K big_ctx path. CORRECTION: auto-compaction
+     is NOT the cause — it is OPT-IN via `--auto-compact [THRESHOLD]` (Option<f32>, OFF when omitted; our
+     serve omits it) AND only fires for messages.len()>4, while big_ctx is a single message. So the 0
+     "prompt too long" rejects is unexplained (big_ctx likely never produced >=max_seq_len tokens at the
+     guard, or failed pre-guard). The 64k/190k soak targets a larger-context + vision-image server; not a
+     valid test on the 32K text config. Fixing all over-context vectors (vision token budget, decode-time
+     hard KV stop, reject-not-truncate oversized single prompts) is a separate robustness task (deferred).
 
 RELAXATION STATUS: WITH_CACHE=1 validated correct WITHIN context (needle 3/3, mixed-cache correctness,
 120s sustained stress 0×700 + 0 cross-stream-bleed, corrupt-rate == baseline). 2x TTFT win stands for
