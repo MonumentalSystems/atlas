@@ -742,8 +742,16 @@ fn canonicalize_model_quant(config: &atlas_core::config::ModelConfig) -> String 
     if algo == "nvfp4" || algo == "mixed_precision" || fmt.contains("nvfp4") {
         return "nvfp4".into();
     }
-    // FP8 detection — explicit algo OR method/format containing "fp8".
-    if algo == "fp8" || method.contains("fp8") || fmt.contains("fp8") {
+    // FP8 detection — explicit algo OR method/format containing "fp8", OR
+    // compressed-tensors' `float-quantized` block-FP8 (e.g.
+    // Hcompany/Holo-3.1-*-FP8: `quant_method="compressed-tensors"`,
+    // `format="float-quantized"`, num_bits=8). That format string contains no
+    // literal "fp8", so match it explicitly. Canonicalizing to "fp8" lets the
+    // nvfp4 kernel bundle accept it (quant_pair_compatible: nvfp4↔fp8) — the
+    // loader detects the FP8E4M3 weight dtype as Fp8Dequanted and requants
+    // FP8→BF16→NVFP4 from the 2D `.weight_scale` (nvfp4_detect.rs).
+    if algo == "fp8" || method.contains("fp8") || fmt.contains("fp8") || fmt.contains("float-quant")
+    {
         return "fp8".into();
     }
     // compressed-tensors with no FP8/NVFP4 marker is usually GPTQ/AWQ —
