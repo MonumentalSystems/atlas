@@ -83,7 +83,10 @@ impl VisionEncoder {
         seq: u32,
         stream: u64,
     ) -> Result<()> {
-        debug_assert!(seq <= 1024, "ViT SDPA seq {seq} exceeds buf_scores cap (1024)");
+        debug_assert!(
+            seq <= 1024,
+            "ViT SDPA seq {seq} exceeds buf_scores cap (1024)"
+        );
         let h_n = self.num_heads as u32;
         let d = self.head_dim as u32; // 72
         let hd = self.hidden_size as u32; // H*D = 1152
@@ -198,7 +201,17 @@ impl VisionEncoder {
             .arg_f32(1e-6)
             .launch(stream)?;
         // 3. QKV GEMM → buf_wide
-        self.vit_gemm_bias(gpu, self.buf_h1, blk.qkv_w, blk.qkv_b, self.buf_wide, p32, qkv_n, h, stream)?;
+        self.vit_gemm_bias(
+            gpu,
+            self.buf_h1,
+            blk.qkv_w,
+            blk.qkv_b,
+            self.buf_wide,
+            p32,
+            qkv_n,
+            h,
+            stream,
+        )?;
         // 4. Attention. GEMM-based SDPA by default; ATLAS_VISION_ATTN_LEGACY=1
         //    restores the warp-per-query kernel for A/B / fallback.
         if std::env::var("ATLAS_VISION_ATTN_LEGACY").is_ok() {
@@ -226,7 +239,17 @@ impl VisionEncoder {
             )?;
         }
         // 5. proj GEMM → buf_wide (reuse)
-        self.vit_gemm_bias(gpu, self.buf_h1, blk.proj_w, blk.proj_b, self.buf_wide, p32, h, h, stream)?;
+        self.vit_gemm_bias(
+            gpu,
+            self.buf_h1,
+            blk.proj_w,
+            blk.proj_b,
+            self.buf_wide,
+            p32,
+            h,
+            h,
+            stream,
+        )?;
         // 6. residual add: buf_wide += buf_h2
         KernelLaunch::new(gpu, self.k_add)
             .grid([div_ceil(n_h as u32, 256), 1, 1])
@@ -265,7 +288,17 @@ impl VisionEncoder {
             .arg_f32(1e-6)
             .launch(stream)?;
         // 10. fc1 GEMM → buf_wide
-        self.vit_gemm_bias(gpu, self.buf_h1, blk.fc1_w, blk.fc1_b, self.buf_wide, p32, inter, h, stream)?;
+        self.vit_gemm_bias(
+            gpu,
+            self.buf_h1,
+            blk.fc1_w,
+            blk.fc1_b,
+            self.buf_wide,
+            p32,
+            inter,
+            h,
+            stream,
+        )?;
         // 11. GELU in-place on buf_wide
         KernelLaunch::new(gpu, self.k_gelu)
             .grid([div_ceil(p32 * inter, 256), 1, 1])
@@ -274,7 +307,17 @@ impl VisionEncoder {
             .arg_u32(p32 * inter)
             .launch(stream)?;
         // 12. fc2 GEMM → buf_h1 (overwrites normed hidden, OK — normed already consumed by fc1)
-        self.vit_gemm_bias(gpu, self.buf_wide, blk.fc2_w, blk.fc2_b, self.buf_h1, p32, h, inter, stream)?;
+        self.vit_gemm_bias(
+            gpu,
+            self.buf_wide,
+            blk.fc2_w,
+            blk.fc2_b,
+            self.buf_h1,
+            p32,
+            h,
+            inter,
+            stream,
+        )?;
         // 13. residual add: buf_h1 += buf_h2
         KernelLaunch::new(gpu, self.k_add)
             .grid([div_ceil(n_h as u32, 256), 1, 1])
@@ -327,7 +370,17 @@ impl VisionEncoder {
             .arg_f32(1e-6)
             .launch(stream)?;
         // 3. QKV GEMM over M=p_total → buf_wide
-        self.vit_gemm_bias(gpu, self.buf_h1, blk.qkv_w, blk.qkv_b, self.buf_wide, pt, qkv_n, h, stream)?;
+        self.vit_gemm_bias(
+            gpu,
+            self.buf_h1,
+            blk.qkv_w,
+            blk.qkv_b,
+            self.buf_wide,
+            pt,
+            qkv_n,
+            h,
+            stream,
+        )?;
         // 4. Attention PER IMAGE over its disjoint slice. buf_wide (QKV) is
         //    read-only here; each image writes a disjoint buf_h1 row range.
         // ATLAS_VISION_NOATTN: skip the attention loop (WRONG output) to measure
@@ -362,7 +415,17 @@ impl VisionEncoder {
             }
         }
         // 5. proj GEMM over M=p_total → buf_wide (reuse)
-        self.vit_gemm_bias(gpu, self.buf_h1, blk.proj_w, blk.proj_b, self.buf_wide, pt, h, h, stream)?;
+        self.vit_gemm_bias(
+            gpu,
+            self.buf_h1,
+            blk.proj_w,
+            blk.proj_b,
+            self.buf_wide,
+            pt,
+            h,
+            h,
+            stream,
+        )?;
         // 6. residual add: buf_wide += buf_h2
         KernelLaunch::new(gpu, self.k_add)
             .grid([div_ceil(n_h as u32, 256), 1, 1])
@@ -401,7 +464,17 @@ impl VisionEncoder {
             .arg_f32(1e-6)
             .launch(stream)?;
         // 10. fc1 GEMM → buf_wide
-        self.vit_gemm_bias(gpu, self.buf_h1, blk.fc1_w, blk.fc1_b, self.buf_wide, pt, inter, h, stream)?;
+        self.vit_gemm_bias(
+            gpu,
+            self.buf_h1,
+            blk.fc1_w,
+            blk.fc1_b,
+            self.buf_wide,
+            pt,
+            inter,
+            h,
+            stream,
+        )?;
         // 11. GELU in-place on buf_wide
         KernelLaunch::new(gpu, self.k_gelu)
             .grid([div_ceil(pt * inter, 256), 1, 1])
@@ -410,7 +483,17 @@ impl VisionEncoder {
             .arg_u32(pt * inter)
             .launch(stream)?;
         // 12. fc2 GEMM → buf_h1
-        self.vit_gemm_bias(gpu, self.buf_wide, blk.fc2_w, blk.fc2_b, self.buf_h1, pt, h, inter, stream)?;
+        self.vit_gemm_bias(
+            gpu,
+            self.buf_wide,
+            blk.fc2_w,
+            blk.fc2_b,
+            self.buf_h1,
+            pt,
+            h,
+            inter,
+            stream,
+        )?;
         // 13. residual add: buf_h1 += buf_h2
         KernelLaunch::new(gpu, self.k_add)
             .grid([div_ceil(n_h as u32, 256), 1, 1])

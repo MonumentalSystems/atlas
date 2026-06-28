@@ -85,11 +85,19 @@ impl VisionEncoder {
             .unwrap_or(true);
         for (i, (_px, gh, gw)) in images.iter().enumerate() {
             let p = p_i[i];
-            let pos_dst = self.buf_pos_resampled.offset(p_off[i] * self.hidden_size * 2);
+            let pos_dst = self
+                .buf_pos_resampled
+                .offset(p_off[i] * self.hidden_size * 2);
             if pos_interp_on {
                 self.resample_pos_embed_into(*gh, *gw, pos_dst, gpu, stream)?;
             } else {
-                self.gpu_copy_bf16(gpu, self.pos_embed, pos_dst, p * self.hidden_size * 2, stream)?;
+                self.gpu_copy_bf16(
+                    gpu,
+                    self.pos_embed,
+                    pos_dst,
+                    p * self.hidden_size * 2,
+                    stream,
+                )?;
             }
             let cos_dst = self.buf_rope_cos.offset(p_off[i] * self.head_dim * 2);
             let sin_dst = self.buf_rope_sin.offset(p_off[i] * self.head_dim * 2);
@@ -107,7 +115,13 @@ impl VisionEncoder {
         let _sec1 = std::time::Instant::now();
         // 2. Patch embed over M=Σp.
         self.patch_embed_batched(images, &p_off, p_total, gpu, stream)?;
-        Self::maybe_dump_buf(gpu, self.buf_h1, p_total * self.hidden_size, "patch_embed", stream)?;
+        Self::maybe_dump_buf(
+            gpu,
+            self.buf_h1,
+            p_total * self.hidden_size,
+            "patch_embed",
+            stream,
+        )?;
 
         // 3. 27 blocks: M-agnostic ops once, attention per image, deepstack per image.
         let n_h_bytes = p_total * self.hidden_size * 2;
@@ -133,7 +147,16 @@ impl VisionEncoder {
                     let src = self.buf_h2.offset(p_off[i] * self.hidden_size * 2);
                     let out_rows = ds_region_base + mp_off[i];
                     let out_slice = self.buf_out.offset(out_rows * self.out_hidden_size * 2);
-                    self.apply_merger(&self.deepstack[ds_idx], p_i[i], *gh, *gw, src, out_slice, gpu, stream)?;
+                    self.apply_merger(
+                        &self.deepstack[ds_idx],
+                        p_i[i],
+                        *gh,
+                        *gw,
+                        src,
+                        out_slice,
+                        gpu,
+                        stream,
+                    )?;
                 }
                 next_ds = deepstack_iter.next();
             }
@@ -164,7 +187,13 @@ impl VisionEncoder {
         // Dump the full packed region (final + deepstack) so N=1 == the old
         // `total_rows` span exactly (byte-identity validation).
         let dump_rows = (1 + self.deepstack_indexes.len()) * mp_total;
-        Self::maybe_dump_buf(gpu, self.buf_out, dump_rows * self.out_hidden_size, "final", stream)?;
+        Self::maybe_dump_buf(
+            gpu,
+            self.buf_out,
+            dump_rows * self.out_hidden_size,
+            "final",
+            stream,
+        )?;
 
         Ok(images
             .iter()
@@ -214,7 +243,16 @@ impl VisionEncoder {
                 self.vit_block(blk, p, gpu, stream)?;
             }
             let out_slice = self.buf_out.offset(mp_off[i] * self.out_hidden_size * 2);
-            self.apply_merger(&self.merger, p, *gh, *gw, self.buf_h1, out_slice, gpu, stream)?;
+            self.apply_merger(
+                &self.merger,
+                p,
+                *gh,
+                *gw,
+                self.buf_h1,
+                out_slice,
+                gpu,
+                stream,
+            )?;
         }
         Ok(images
             .iter()

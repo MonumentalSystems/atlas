@@ -65,7 +65,17 @@ impl VisionEncoder {
             .arg_u32(ms)
             .launch(stream)?;
         // fc1 GEMM → buf_merge_fc1
-        self.vit_gemm_bias(gpu, self.buf_merge_in, m.fc1_w, m.fc1_b, self.buf_merge_fc1, merged_p, merged_in, merged_in, stream)?;
+        self.vit_gemm_bias(
+            gpu,
+            self.buf_merge_in,
+            m.fc1_w,
+            m.fc1_b,
+            self.buf_merge_fc1,
+            merged_p,
+            merged_in,
+            merged_in,
+            stream,
+        )?;
         // GELU in-place
         KernelLaunch::new(gpu, self.k_gelu)
             .grid([div_ceil(merged_p * merged_in, 256), 1, 1])
@@ -74,6 +84,16 @@ impl VisionEncoder {
             .arg_u32(merged_p * merged_in)
             .launch(stream)?;
         // fc2 GEMM → out_slice
-        self.vit_gemm_bias(gpu, self.buf_merge_fc1, m.fc2_w, m.fc2_b, out_slice, merged_p, out_h_size, merged_in, stream)
+        self.vit_gemm_bias(
+            gpu,
+            self.buf_merge_fc1,
+            m.fc2_w,
+            m.fc2_b,
+            out_slice,
+            merged_p,
+            out_h_size,
+            merged_in,
+            stream,
+        )
     }
 }

@@ -103,7 +103,14 @@ impl VisionEncoder {
         gpu: &dyn GpuBackend,
         stream: u64,
     ) -> Result<()> {
-        self.build_rope_cossin_into(grid_h, grid_w, self.buf_rope_cos, self.buf_rope_sin, gpu, stream)
+        self.build_rope_cossin_into(
+            grid_h,
+            grid_w,
+            self.buf_rope_cos,
+            self.buf_rope_sin,
+            gpu,
+            stream,
+        )
     }
 
     /// Build per-patch 2D rotary cos/sin in row-major patch order
