@@ -103,14 +103,21 @@ impl VisionEncoder {
             k_norm: gpu.kernel("vision_encoder", "vision_layer_norm")?,
             k_add: gpu.kernel("vision_encoder", "vision_add_inplace")?,
             k_gelu: gpu.kernel("vision_encoder", "vision_gelu")?,
+            // Legacy warp-per-query ViT attention — present in EVERY vision
+            // kernel tree, the universal fallback (hard-required).
             k_attn: gpu.kernel("vision_encoder", "vision_attention_rope")?,
-            k_rope_deint: gpu.kernel("vision_encoder", "vit_rope_deinterleave")?,
-            k_softmax: gpu.kernel("vision_encoder", "vit_softmax_rows")?,
-            k_scatter_head: gpu.kernel("vision_encoder", "vit_scatter_head")?,
-            // f32-out dense GEMM for raw QKᵀ scores. Module "gemm" (same as
-            // k_gemm_pipelined). Hard-required — a null handle would silently
-            // launch nothing and corrupt every attention.
-            k_gemm_f32: gpu.kernel("gemm", "dense_gemm_bf16_f32out")?,
+            // GEMM-based ViT SDPA kernels (the ~2× image-TTFT path). SOFT: only
+            // the qwen3.6 / Holo vision tree ships them. Vision models on an
+            // older tree (qwen3-vl-30b, gemma-4) leave these null and
+            // `vit_block` auto-falls back to `k_attn` — see `vit_attention_gemm`
+            // gate. Hard-requiring them here would break every such model at
+            // init with `vit_rope_deinterleave: named symbol not found`.
+            k_rope_deint: crate::layers::try_kernel(gpu, "vision_encoder", "vit_rope_deinterleave"),
+            k_softmax: crate::layers::try_kernel(gpu, "vision_encoder", "vit_softmax_rows"),
+            k_scatter_head: crate::layers::try_kernel(gpu, "vision_encoder", "vit_scatter_head"),
+            // f32-out dense GEMM for raw QKᵀ scores (GEMM-ViT path only). SOFT,
+            // paired with the kernels above.
+            k_gemm_f32: crate::layers::try_kernel(gpu, "gemm", "dense_gemm_bf16_f32out"),
             k_merge: gpu.kernel("vision_encoder", "vision_spatial_merge")?,
             k_f32_bf16: gpu.kernel("vision_encoder", "vision_f32_to_bf16")?,
             k_copy: gpu.kernel("vision_encoder", "vision_bf16_copy")?,
