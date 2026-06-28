@@ -73,6 +73,7 @@ fn main() -> Result<()> {
     let hfaith4 = gpu.kernel("w4a16", "int8_gemm_faith4")?;
     let hfaith5 = gpu.kernel("w4a16", "int8_gemm_faith5")?;
     let hfaith6 = gpu.kernel("w4a16", "int8_gemm_faith6")?;
+    let hfaith7 = gpu.kernel("w4a16", "int8_gemm_faith7")?;
     let hreqa_il = gpu.kernel("w4a16", "requant_a_bf16_int8_il")?;
     let hmmq = gpu.kernel("w4a16", "int8_gemm_mmq")?;
     let hmmq2 = gpu.kernel("w4a16", "int8_gemm_mmq2")?;
@@ -421,7 +422,24 @@ fn main() -> Result<()> {
         println!("REQUANT e2e faith6 (WAR-break 3-phase schedule) vs host dequant: cosine={cos6:.6}  RESULT: {}",
             if cos6>0.999 {"PASS"} else {"FAIL"});
 
-        for p in [packed_p,e4m3_p,abf_p,wi8_p,wsc_p,ai8_p,asc_p,ce,ai8_il_p,asc5_p,ce5,ce6] { let _ = gpu.free(p); }
+        // faith7 path: same non-interleaved int8 inputs as faith2 (64Nx32M reuse
+        // reshape), MUST be bit-identical to faith2 vs host.
+        let ce7 = gpu.alloc(m2*n2*2)?;
+        KernelLaunch::new(gpu, hfaith7)
+            .grid([(n2 as u32).div_ceil(128), (m2 as u32).div_ceil(128), 1]).block([256,1,1])
+            .arg_ptr(ai8_p).arg_ptr(wi8_p).arg_ptr(asc_p).arg_ptr(wsc_p).arg_ptr(ce7)
+            .arg_u32(m2 as u32).arg_u32(n2 as u32).arg_u32(k2 as u32).launch(stream)?;
+        gpu.synchronize(stream)?;
+        let mut re7 = vec![0u8; m2*n2*2];
+        gpu.copy_d2h(ce7, &mut re7)?;
+        let cg7: Vec<f32> = re7.chunks_exact(2).map(|c| bf16_bits_to_f32(u16::from_le_bytes([c[0],c[1]]))).collect();
+        let (mut d7, mut nr7, mut ng7) = (0f64,0f64,0f64);
+        for i in 0..m2*n2 { let (x,y)=(cref[i] as f64, cg7[i] as f64); d7+=x*y; nr7+=x*x; ng7+=y*y; }
+        let cos7 = d7/(nr7.sqrt()*ng7.sqrt());
+        println!("REQUANT e2e faith7 (64Nx32M 4:1-reuse reshape) vs host dequant: cosine={cos7:.6}  RESULT: {}",
+            if cos7>0.999 {"PASS"} else {"FAIL"});
+
+        for p in [packed_p,e4m3_p,abf_p,wi8_p,wsc_p,ai8_p,asc_p,ce,ai8_il_p,asc5_p,ce5,ce6,ce7] { let _ = gpu.free(p); }
     }
 
     // ---- speed: prefill shapes ----
@@ -649,6 +667,18 @@ fn main() -> Result<()> {
         for _ in 0..iters { launchfaith6()?; }
         gpu.synchronize(stream)?;
         let tffaith6 = flops / (tf6.elapsed().as_secs_f64() / iters as f64) / 1e12;
+        let launchfaith7 = || -> Result<()> {
+            KernelLaunch::new(gpu, hfaith7)
+                .grid([n.div_ceil(128) as u32, m.div_ceil(128) as u32, 1]).block([256, 1, 1])
+                .arg_ptr(a_p).arg_ptr(b_p).arg_ptr(as_p).arg_ptr(bs_p).arg_ptr(c_p)
+                .arg_u32(m as u32).arg_u32(n as u32).arg_u32(k as u32).launch(stream)
+        };
+        for _ in 0..3 { launchfaith7()?; }
+        gpu.synchronize(stream)?;
+        let tf7 = Instant::now();
+        for _ in 0..iters { launchfaith7()?; }
+        gpu.synchronize(stream)?;
+        let tffaith7 = flops / (tf7.elapsed().as_secs_f64() / iters as f64) / 1e12;
         let launchmmq2 = || -> Result<()> {
             KernelLaunch::new(gpu, hmmq2)
                 .grid([n.div_ceil(128) as u32, m.div_ceil(128) as u32, 1]).block([256, 1, 1])
@@ -662,7 +692,7 @@ fn main() -> Result<()> {
         gpu.synchronize(stream)?;
         let tfmmq2 = flops / (tm2.elapsed().as_secs_f64() / iters as f64) / 1e12;
         let _ = (tf64, tfk64, tf8w3, tf8w, tf8wl, tf8wi, tfpipe, tfpada, tf8wab);
-        print!("{label}: M128 {tf128:.2} | padA {tfpada:.2} | FAITH {tffaith:.2} | FAITH2 {tffaith2:.2} | FAITH3 {tffaith3:.2} | FAITH4 {tffaith4:.2} | FAITH5 {tffaith5:.2} | FAITH6 {tffaith6:.2} | MMQ {tfmmq:.2} | MMQ2 {tfmmq2:.2}  (bf16=30, llama=60)");
+        print!("{label}: M128 {tf128:.2} | padA {tfpada:.2} | FAITH {tffaith:.2} | FAITH2 {tffaith2:.2} | FAITH3 {tffaith3:.2} | FAITH4 {tffaith4:.2} | FAITH5 {tffaith5:.2} | FAITH6 {tffaith6:.2} | FAITH7 {tffaith7:.2} | MMQ {tfmmq:.2} | MMQ2 {tfmmq2:.2}  (bf16=30, llama Q4K=65/Q6K=41)");
         // split-K sweep (partial + reduce)
         for &ks in &[2u32, 4, 8, 16] {
             let cp = gpu.alloc(ks as usize * m * n * 4)?;

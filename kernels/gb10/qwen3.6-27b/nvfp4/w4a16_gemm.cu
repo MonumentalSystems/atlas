@@ -4594,6 +4594,139 @@ void int8_gemm_faith6(
 #undef F2_SB
 #undef F2W
 
+// int8 W4A8 FAITH7 — STRUCTURAL: raise the MMA-to-load REUSE ratio (the llama edge).
+// DEFINITIVE measurement (test-backend-ops, GB10): on gate/up (M4096 N17408 K5120)
+// llama MMQ = 65.3 TFLOP/s vs faith2 44.5 (+46% real gap); on down (K17408) Atlas
+// wins (49 vs 41). faith6 proved 44.7 is the *scheduling* ceiling, but llama proves
+// 65 is reachable on this exact shape — so the gap is the MMA-to-load reuse ratio,
+// not the scale-fold. faith2's per-warp tile is 32N×64M: each activation B-fragment
+// (token-chunk) feeds only 2 MMAs (n=0,1) = 2:1 reuse; llama gets ~4:1. faith7
+// TRANSPOSES the warp tile to 64N×32M = 4 N-minitiles × 4 token-chunks, so each B
+// load feeds 4 MMAs and each weight feeds 4 tokens (4:1 reuse both) — HALVING the
+// smem-load traffic per MMA that drives the SHORT_SCOREBOARD latency stall. acc[4][4]
+// [4] = 64 fp32 regs (REGISTER-NEUTRAL vs faith2). Output bit-identical to faith2
+// (same per-K accumulation order; only the warp→tile mapping changes). BET: 4:1 reuse
+// closes gate/up 44.5→~65. (Leave down alone — faith2 already beats llama there.)
+#define F2_TILE 128
+#define F2_SB   (F2_TILE/32)
+#define F2W     36
+#define ATLAS_MMA_S8(d, a0,a1,a2,a3, b0,b1) \
+    asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 " \
+        "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};" \
+        : "=r"((d)[0]), "=r"((d)[1]), "=r"((d)[2]), "=r"((d)[3]) \
+        : "r"(a0),"r"(a1),"r"(a2),"r"(a3),"r"(b0),"r"(b1), \
+          "r"((d)[0]),"r"((d)[1]),"r"((d)[2]),"r"((d)[3]))
+extern "C" __global__
+__launch_bounds__(256, 1)
+void int8_gemm_faith7(
+    const signed char* __restrict__ A_i8,    // activations [M,K]
+    const signed char* __restrict__ B_i8,     // weights [N,K]
+    const float* __restrict__ A_scale,        // [M, K/32]
+    const float* __restrict__ B_scale,        // [N, K/32]
+    __nv_bfloat16* __restrict__ C,            // [M, N]
+    unsigned int M, unsigned int N, unsigned int K
+) {
+    const unsigned int cta_n = blockIdx.x * 128;
+    const unsigned int cta_m = blockIdx.y * 128;
+    if (cta_m >= M || cta_n >= N) return;
+    const unsigned int t = threadIdx.x;
+    const unsigned int warp_id = t >> 5;
+    const unsigned int lane = t & 31;
+    const unsigned int ng = warp_id >> 2;          // N group 0..1 (64 N-rows each)
+    const unsigned int mq = warp_id & 3;           // M quarter 0..3 (32 tokens each)
+    const unsigned int nb = K >> 5;
+
+    __shared__ int   sW[128][F2W];
+    __shared__ int   sA[128][F2W];
+    __shared__ float sWs[128][F2_SB];
+    __shared__ float sAs[128][F2_SB];
+
+    float acc[4][4][4];   // [N-minitile][token-chunk][4]
+    #pragma unroll
+    for (int i=0;i<4;i++) for(int j=0;j<4;j++){acc[i][j][0]=0;acc[i][j][1]=0;acc[i][j][2]=0;acc[i][j][3]=0;}
+
+    for (unsigned int kb = 0; kb < K; kb += F2_TILE) {
+        const unsigned F2_CPR = F2_TILE/16;
+        #pragma unroll
+        for (int c = 0; c < F2_TILE/32; c++) {
+            unsigned lin = c*256 + t;
+            unsigned row = lin / F2_CPR;
+            unsigned col = (lin % F2_CPR) << 4;
+            unsigned gk = kb + col;
+            signed char* wdst = ((signed char*)&sW[row][0]) + col;
+            signed char* adst = ((signed char*)&sA[row][0]) + col;
+            cp_async_pred_16(wdst, &B_i8[(unsigned long long)(cta_n+row)*K + gk], (cta_n+row<N)&&(gk+15<K));
+            cp_async_pred_16(adst, &A_i8[(unsigned long long)(cta_m+row)*K + gk], (cta_m+row<M)&&(gk+15<K));
+        }
+        if (t < 128) {
+            unsigned blk = kb >> 5;
+            #pragma unroll
+            for (int s=0;s<F2_SB;s++){
+                sWs[t][s] = (cta_n+t<N)?B_scale[(unsigned long long)(cta_n+t)*nb + blk + s]:0.f;
+                sAs[t][s] = (cta_m+t<M)?A_scale[(unsigned long long)(cta_m+t)*nb + blk + s]:0.f;
+            }
+        }
+        cp_async_commit(); cp_async_wait_all(); __syncthreads();
+
+        #pragma unroll
+        for (int sb=0; sb<F2_SB; sb++){
+            unsigned WA[4][4];
+            float    wsc[4][2];
+            #pragma unroll
+            for (int nm=0;nm<4;nm++){
+                unsigned wbase_row = ng*64 + nm*16;
+                const int* xs = &sW[wbase_row][0] + (lane%16)*F2W + sb*8 + (lane/16)*4;
+                asm volatile("ldmatrix.sync.aligned.m8n8.x4.b16 {%0,%1,%2,%3},[%4];"
+                    : "=r"(WA[nm][0]),"=r"(WA[nm][1]),"=r"(WA[nm][2]),"=r"(WA[nm][3]) : "l"(xs));
+                wsc[nm][0] = sWs[wbase_row + lane/4][sb];
+                wsc[nm][1] = sWs[wbase_row + 8 + lane/4][sb];
+            }
+            unsigned bb[4][2];
+            float    asc[4][2];
+            #pragma unroll
+            for (int tc=0;tc<4;tc++){
+                unsigned mcol0 = mq*32 + tc*8;
+                asc[tc][0] = sAs[mcol0 + (lane%4)*2][sb];
+                asc[tc][1] = sAs[mcol0 + (lane%4)*2 + 1][sb];
+                const int* abase = &sA[mcol0 + lane/4][0] + sb*8;
+                bb[tc][0] = abase[lane%4];
+                bb[tc][1] = abase[lane%4 + 4];
+            }
+            #pragma unroll
+            for (int nm=0;nm<4;nm++){
+                #pragma unroll
+                for (int tc=0;tc<4;tc++){
+                    int s[4]={0,0,0,0};
+                    ATLAS_MMA_S8(s, WA[nm][0],WA[nm][1],WA[nm][2],WA[nm][3], bb[tc][0],bb[tc][1]);
+                    acc[nm][tc][0]+=(float)s[0]*wsc[nm][0]*asc[tc][0];
+                    acc[nm][tc][1]+=(float)s[1]*wsc[nm][0]*asc[tc][1];
+                    acc[nm][tc][2]+=(float)s[2]*wsc[nm][1]*asc[tc][0];
+                    acc[nm][tc][3]+=(float)s[3]*wsc[nm][1]*asc[tc][1];
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    #pragma unroll
+    for (int nm=0;nm<4;nm++){
+        unsigned nrow0 = cta_n + ng*64 + nm*16 + lane/4;
+        #pragma unroll
+        for (int tc=0;tc<4;tc++){
+            unsigned mcol = cta_m + mq*32 + tc*8 + (lane%4)*2;
+            unsigned cN0=nrow0, cN1=nrow0+8;
+            if (mcol<M   && cN0<N) C[(unsigned long long)mcol*N + cN0]     = __float2bfloat16(acc[nm][tc][0]);
+            if (mcol+1<M && cN0<N) C[(unsigned long long)(mcol+1)*N + cN0] = __float2bfloat16(acc[nm][tc][1]);
+            if (mcol<M   && cN1<N) C[(unsigned long long)mcol*N + cN1]     = __float2bfloat16(acc[nm][tc][2]);
+            if (mcol+1<M && cN1<N) C[(unsigned long long)(mcol+1)*N + cN1] = __float2bfloat16(acc[nm][tc][3]);
+        }
+    }
+}
+#undef ATLAS_MMA_S8
+#undef F2_TILE
+#undef F2_SB
+#undef F2W
+
 // ═══════════════════════════════════════════════════════════════════
 // REQUANT kernels feeding the int8 W4A8 prefill GEMM (faith2).
 //   requant_w_nvfp4_int8 : NVFP4 weights [N,K/2] packed E2M1 + [N,K/16] E4M3
