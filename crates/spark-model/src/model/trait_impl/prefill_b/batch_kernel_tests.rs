@@ -253,3 +253,79 @@ fn rejects_scratch_footprint_overflow() {
         "footprint must fit once scratch is sized to it"
     );
 }
+
+// ── varlen=true path (ATLAS_PREFILL_VARLEN=1, the deployed default) ──
+// varlen relaxes ONLY the chunk_len-match (ragged batched prefill via
+// cu_seqlens); chunk_start and is_last must still match across streams.
+
+#[test]
+fn accepts_mismatched_chunk_len_when_varlen() {
+    // Same input as rejects_mismatched_chunk_len, but varlen=true → ELIGIBLE.
+    // This is the production behaviour: streams of DIFFERENT lengths batch
+    // together (ragged), which the non-varlen path rejects.
+    assert!(check_kernel_batched_eligible(
+        vec![s(4096, 4096, false), s(2048, 4096, false)],
+        2,
+        8192,
+        "qwen3_next",
+        256,
+        BIG_SCRATCH,
+        TOP_K,
+        MROPE,
+        false,
+        true, // varlen
+    ));
+}
+
+#[test]
+fn varlen_still_rejects_mismatched_chunk_start() {
+    // varlen relaxes chunk_len, NOT chunk_start (different chunk_start →
+    // different effective_seq_len_start → still ineligible even under varlen).
+    assert!(!check_kernel_batched_eligible(
+        vec![s(4096, 12288, false), s(4096, 4096, false)],
+        2,
+        16384,
+        "qwen3_next",
+        256,
+        BIG_SCRATCH,
+        TOP_K,
+        MROPE,
+        false,
+        true, // varlen
+    ));
+}
+
+#[test]
+fn varlen_still_rejects_mismatched_is_last() {
+    // is_last must match across streams even under varlen (can't co-dispatch
+    // finalize_last + non-final chunks).
+    assert!(!check_kernel_batched_eligible(
+        vec![s(4096, 4096, false), s(4096, 4096, true)],
+        2,
+        8192,
+        "qwen3_next",
+        256,
+        BIG_SCRATCH,
+        TOP_K,
+        MROPE,
+        false,
+        true, // varlen
+    ));
+}
+
+#[test]
+fn accepts_uniform_when_varlen() {
+    // Uniform streams are eligible under varlen too (varlen is a superset).
+    assert!(check_kernel_batched_eligible(
+        vec![s(4096, 4096, false); 4],
+        4,
+        16384,
+        "qwen3_next",
+        256,
+        BIG_SCRATCH,
+        TOP_K,
+        MROPE,
+        false,
+        true, // varlen
+    ));
+}
