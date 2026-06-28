@@ -115,3 +115,21 @@ HONEST CEILING: decode is fundamentally chain-depth bound (30 serial layers, GPU
 gain ~+12-20% (head-GEMV + a fusion), NOT the ~1.8x needed for full concurrent-decode parity — that needs whole-layer
 vertical fusion (architectural). Atlas ALREADY WINS single-stream (C1 90 vs vLLM 45); the gap is purely concurrent decode.
 NEXT (best gain/risk): optimize the lm_head w4a16_gemv bandwidth (20%/8x headroom), then C1.
+
+## DECODE AMORTIZATION — FINAL VERDICT (2026-06-28, FLA bench + code audit)
+FLA/FlashInfer gated_delta_rule_decode (the kernel vLLM uses), GB10, 1 GDN layer:
+  B=1 27us, B=4 87us (3.24x), B=8 155us (5.74x) — does NOT amortize. At B=8: 32MB state traffic/155us
+  = ~206 GB/s (~75% of GB10 peak) → STATE-BANDWIDTH bound (state = 2MB/seq, scales with batch).
+  => Swapping in NVIDIA's GDN decode kernel will NOT close the concurrent gap. vLLM hits the same physics.
+
+Code audit of Atlas decode SSM (trait_decode_multi_seq.rs):
+- out_proj: ALREADY batched (line 827 "ONE GEMM, weights ×1", w8a16_gemm_pipelined / w4a16_gemv_batchm). amortizes.
+- qkvz: ALREADY batched. ba_gates: per-seq GEMV but weight tiny [64,2048] → batching = launch saving only (~C1).
+- MoE decode: sparse; n tokens hit up to n*top_k distinct experts → expert-weight reads scale with batch (no amortize).
+
+CONCLUSION: concurrent decode of this GDN+sparse-MoE hybrid is PHYSICALLY un-amortizable — both dominant costs
+(GDN state I/O + MoE distinct-expert reads) scale with batch. vLLM's ~2x per-stream edge at C8 is per-kernel
+EFFICIENCY / framework overhead, NOT a structural amortization Atlas lacks. Fusion (C1/C2) and GDN-kernel swap
+are dead ends for the concurrent gap. Atlas ALREADY wins single-stream (C1 90 vs 45).
+=> The only real decode wins are per-kernel bandwidth efficiency. Fattest: lm_head w4a16 GEMV @ ~32 GB/s (8x
+headroom, 20% of step). Realistic decode ceiling ~+15-20%, not concurrent-parity. lm_head GEMV is THE target.
