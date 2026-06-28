@@ -724,6 +724,16 @@ fn canonicalize_model_quant(config: &atlas_core::config::ModelConfig) -> String 
     if algo == "fp8" || method.contains("fp8") || fmt.contains("fp8") {
         return "fp8".into();
     }
+    // compressed-tensors "float-quantized" == FP8 (E4M3): deepreinforce-ai
+    // Ornith-1.0-397B-FP8 labels its FP8 this way (quant_method
+    // "compressed-tensors", format "float-quantized", empty quant_algo, no
+    // "fp8" literal anywhere). Distinct from "pack-quantized" (int GPTQ/AWQ)
+    // and "nvfp4-pack-quantized" (handled above). Per-module dispatch stays
+    // tensor-aware in the loader, so this only selects the nvfp4↔fp8-compatible
+    // bundle; an unexpected module faults at load rather than corrupting.
+    if fmt == "float-quantized" {
+        return "fp8".into();
+    }
     // compressed-tensors with no FP8/NVFP4 marker is usually GPTQ/AWQ —
     // we don't currently dispatch those on Atlas; report verbatim so
     // the bail message is precise.
