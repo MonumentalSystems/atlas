@@ -19,6 +19,7 @@ mod decode_logits_seq;
 mod decode_logits_step;
 mod decode_step;
 mod emit_step;
+mod gap_timing;
 mod helpers;
 mod lifecycle;
 mod logit_dump;
@@ -189,7 +190,9 @@ pub fn run(
     std::thread::spawn(move || {
         let mut rx = request_rx;
         while let Some(req) = rx.blocking_recv() {
-            p.0.lock().requests.push(req);
+            // Stamp enqueue time for GAP-TIMING queue-wait (read only when
+            // ATLAS_GAP_TIMING=1; the Instant::now() is otherwise harmless).
+            p.0.lock().requests.push((Instant::now(), req));
             p.1.notify_one();
         }
         p.0.lock().closed = true;
@@ -313,6 +316,13 @@ pub fn run(
             tool_call_end_token,
             adaptive_sampling,
         );
+
+        // GAP-TIMING (ATLAS_GAP_TIMING=1): a tick where a prefill is in
+        // progress while active decode lanes exist is a prefill-stall signal
+        // (decode is waiting on prefill). Zero-cost when disabled.
+        if gap_timing::enabled() && !prefilling.is_empty() && !active.is_empty() {
+            gap_timing::note_stall_tick();
+        }
 
         if active.is_empty() {
             continue;

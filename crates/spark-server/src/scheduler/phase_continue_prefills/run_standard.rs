@@ -163,6 +163,17 @@ pub(super) fn run_standard_chunk_loop(
                     tool_call_end_token,
                     adaptive_sampling,
                 );
+                // GAP-TIMING (ATLAS_GAP_TIMING=1): a fused mixed step is ONE
+                // forward that does both a prefill chunk AND decode for the
+                // active lanes. Attribute its wall to BOTH buckets (one decode
+                // contribution sized by the decode batch, one prefill
+                // contribution) using the same `t0_mixed` Instant — no new GPU
+                // sync. The shared wall is intentionally counted in each bucket
+                // (it is genuinely both); aggregate prefill/decode wall is thus
+                // an upper bound for mixed-heavy runs, by design. Zero-cost off.
+                let mixed_us = t0_mixed.elapsed().as_micros() as u64;
+                super::super::gap_timing::record_decode(active.len(), mixed_us);
+                super::super::gap_timing::record_prefill(mixed_us);
                 *did_mixed_step = true;
             }
             Err(e) => {
@@ -189,14 +200,19 @@ pub(super) fn run_standard_chunk_loop(
         return;
     }
 
-    match model.prefill_chunk(
+    // GAP-TIMING (ATLAS_GAP_TIMING=1): time the standard (non-mixed) prefill
+    // chunk. Zero-cost when disabled.
+    let _t = Instant::now();
+    let chunk_res = model.prefill_chunk(
         &p.prompt_tokens,
         &mut p.seq,
         p.chunk_offset,
         chunk_len,
         is_last,
         prefill_stream,
-    ) {
+    );
+    super::super::gap_timing::record_prefill(_t.elapsed().as_micros() as u64);
+    match chunk_res {
         Ok(logits) => {
             p.chunk_offset += chunk_len;
             tracing::info!(

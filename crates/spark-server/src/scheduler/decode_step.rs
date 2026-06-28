@@ -77,4 +77,9 @@ pub fn step_decode_only(
         tool_call_end_token,
         adaptive_sampling,
     );
+
+    // GAP-TIMING (ATLAS_GAP_TIMING=1): record this decode tick (batch=n,
+    // wall = forward + logits processing). Reuses the existing `t0` Instant —
+    // no new GPU sync. Zero-cost when disabled.
+    super::gap_timing::record_decode(n, t0.elapsed().as_micros() as u64);
 }

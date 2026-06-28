@@ -141,7 +141,7 @@ pub(super) fn drain_pending_requests(
         .requests
         .iter()
         .enumerate()
-        .map(|(i, req)| PendingRequestInfo {
+        .map(|(i, (_enq, req))| PendingRequestInfo {
             prompt_len: req.prompt_len(),
             index: i,
         })
@@ -153,7 +153,11 @@ pub(super) fn drain_pending_requests(
     remove_indices.sort_unstable_by(|a, b| b.cmp(a));
     let mut taken: Vec<(usize, InferenceRequest)> = Vec::with_capacity(selected.len());
     for idx in remove_indices {
-        taken.push((idx, g.requests.remove(idx)));
+        let (enq, req) = g.requests.remove(idx);
+        // GAP-TIMING (ATLAS_GAP_TIMING=1): queue-wait = enqueue→dequeue.
+        // Zero-cost when disabled.
+        super::gap_timing::record_queue_wait(enq.elapsed().as_micros() as u64);
+        taken.push((idx, req));
     }
 
     // Re-sort into policy-selected order.

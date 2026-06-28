@@ -170,6 +170,9 @@ pub(super) fn run_batched_prefill_step(
     }
 
     let elapsed = t0_batch.elapsed().as_micros();
+    // GAP-TIMING (ATLAS_GAP_TIMING=1): record the batched-prefill wall. Reuses
+    // the existing `t0_batch` Instant — no new GPU sync. Zero-cost when off.
+    super::super::gap_timing::record_prefill(elapsed as u64);
     if elapsed > 1000 {
         tracing::debug!("Batched prefill step: {n} streams, {elapsed}µs total");
     }

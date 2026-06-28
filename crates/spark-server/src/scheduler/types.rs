@@ -18,8 +18,13 @@ use crate::grammar::GrammarState;
 use crate::openai::RepetitionDetectionParams;
 
 /// Shared queue between receiver thread and scheduler.
+///
+/// Each entry is stamped with the `Instant` it was pushed by the receiver
+/// thread so the scheduler can measure queue-wait at dequeue time
+/// (GAP-TIMING, ATLAS_GAP_TIMING=1). The stamp is always recorded (one cheap
+/// `Instant::now()` per enqueue); it is only *read* when gap-timing is on.
 pub(super) struct PendingQueue {
-    pub requests: Vec<InferenceRequest>,
+    pub requests: Vec<(Instant, InferenceRequest)>,
     pub closed: bool,
 }
 

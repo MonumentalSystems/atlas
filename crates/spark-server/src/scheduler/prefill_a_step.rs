@@ -244,6 +244,9 @@ pub fn start_chunked_prefill(
             is_last,
             prefill_stream,
         );
+        // GAP-TIMING (ATLAS_GAP_TIMING=1): time chunk-0 prefill. Reuses the
+        // existing `_pt0` Instant — no new GPU sync. Zero-cost when disabled.
+        crate::scheduler::gap_timing::record_prefill(_pt0.elapsed().as_micros() as u64);
         if std::env::var("ATLAS_VISION_TIMING").is_ok() {
             let _ = model.synchronize(prefill_stream);
             tracing::info!(
