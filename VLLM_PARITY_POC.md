@@ -159,3 +159,12 @@ SOAK CUDA-700 ROOT CAUSE = a VISION BUG, not over-context:
 => The vision encoder mishandles non-square aspect ratios (patch-grid / merge OOB). This is what kills the
 soak (it rotates in a 640x400 screenshot). Separate from over-context + from the parity POC. Needs a
 vision-encoder fix (find the grid=293 kernel's non-square bounds bug). Square-image vision is fine.
+
+## VISION FIX VALIDATED via soak (2026-06-28)
+After the non-square over-max-pixels fix: SOAK faults 12378 → 12, server STAYS ALIVE (served ~969 reqs/60s,
+15 image encodes, 33 completions) vs total context-death before. The catastrophic crash is RESOLVED.
+- Reproducible non-square 640×400 → CUDA 700: FIXED (now encodes 240 patches, answers correctly).
+- Residual: 12× status 716 (MISALIGNED) on vision requests under CONCURRENT load (~1.2%), now ISOLATED
+  (server survives, no cascade). Could NOT reproduce in isolation (vision_probe + 6 varied/odd sizes
+  sequentially = 0 faults); only surfaces under the 6-client concurrent soak. Separate, intermittent
+  vision-encoder buffer-alignment bug (grid=278 kernel) — deeper, concurrency-dependent, non-catastrophic.
