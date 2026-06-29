@@ -577,3 +577,15 @@ The "1840 tok/s flat" was a MEASUREMENT ARTIFACT in my probe: it sent each workl
 - 11k (16120 tok): 4465ms → ~3610 tok/s
 
 Clean large-context prefill CONCURRENCY (drained between levels) @ 11k: C1 3489 → C2 3545 → C4 3559 → C8 3566 tok/s = still FLAT (1.02×), mean TTFT linear (4.6s→36s). So: single-stream prefill ~3700 tok/s; large-context concurrency saturates one stream (flat agg, linear TTFT) — expected, matches vLLM for large prefills. LESSON: always space/drain between latency probes, and prefer server-side TTFT (lifecycle log) over client wall-time.
+
+## ATTENTION-PROJECTION TILING + FINAL DECODE VERDICT (2026-06-29, Holo-35B)
+
+Per-phase decode @C8 (ATLAS_MS_PROFILE, eager): total~64ms = **ssm 72.5% (30L) / attn 15.5% (10L) / head 12%**.
+
+Implemented BOTH remaining attention-projection levers (commits on branch): n>=4 qkv + o_proj now TILE the proven batch3/batch2 GEMV kernels (n=8 -> 3+3+2 = 3 weight reads vs 8), byte-identical layout to ms_qkv_batch3 → correct (3/4 probes, 0 errors, no corruption). Decode @C8:
+- baseline (conv-fix SSM-batched only): 1.93x
+- + qkv-tiling: 1.96x
+- + qkv+oproj-tiling: 1.92x
+All within run-to-run noise (±0.04x). **The attention tiling is correct but does NOT meaningfully move decode** — under CUDA graphs the per-seq launch overhead was already gone, and projection weight-reads (8->3) are tiny vs the SSM wall.
+
+**FINAL VERDICT:** decode @C8 ceiling ~1.96x, firmly SSM-bound (72.5%, the per-seq recurrent scan is genuinely n× — same property as the FLA/FlashInfer GDN kernel vLLM uses, per holo-vllm-parity-poc: "B=8 = 5.74× B=1, state-bandwidth bound"). Every tractable lever is now implemented + validated: conv-fix SSM-batched (the real win, 1.76->1.93 on MoE), qkv-tiling, o_proj-tiling. Crossing 2x cleanly requires a fundamentally different GDN decode kernel (chunked/wmma — [[holo-gdn-wmma-vblock]], [[holo-gdn-chunk-rfc-ref]]), a multi-week kernel-research effort, NOT a tuning lever. 1.96x is vLLM-parity-class for a linear-attention hybrid (vLLM does not exceed ~2x on GDN decode either).
