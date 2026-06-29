@@ -528,3 +528,14 @@ Conclusions:
 **The real lever for vLLM-like scaling:** batch the *projection GEMMs* (read weights once per step) the way the committed FFN fix does — extend to (a) attention q/k/v/o on the 8 full-attn layers, and (b) the SSM in_proj_qkvz/ba + out_proj on the 24 linear-attn layers — while leaving the cheap per-seq recurrent scan alone. The SSM-projection batching is the dominant remaining bandwidth win and the largest restructure (ssm_forward splits into batched-in_proj → per-seq scan → batched-out_proj). The broken batched-recurrent scan fusion is a separate, lower-value concern.
 
 Honest magnitude: each projection-batching increment is M (~50-150 LoC, mirrors the FFN pattern); the SSM restructure is the bulk. Full vLLM-parity scaling on this GDN-heavy model is a multi-step kernel/dispatch effort, not a single flag.
+
+## PREFILL vs DECODE split (2026-06-29, graphs+FFN-batched, varlen+large-prefill probes)
+
+| C | prefill tok/s | pf speedup | decode tok/s | dec speedup | TTFT ms | correct |
+|---|---|---|---|---|---|---|
+| 1 | 63  | 1.00x | 63.7 | 1.00x | 350  | 1/1 |
+| 2 | 120 | 1.91x | 72.7 | 1.14x | 400  | 2/2 |
+| 4 | 137 | 2.18x | 47.1 | 0.74x | 674  | 3/3 |
+| 8 | 607 | 9.67x | 52.7 | 0.83x | 1376 | 4/4 |
+
+**PREFILL ALREADY SCALES (~9.7x @C8)** — the batched prefill GEMMs + ATLAS_PREFILL_VARLEN path work; this is much of vLLM's concurrency win and we have it. **DECODE does NOT scale (0.74–0.83x, regressing)** — the per-seq projection-GEMV bandwidth ceiling: each added sequence re-reads ~1.6B SSM + 0.56B attn weights. Graphs+FFN-batching can't break it (SSM 65% + attn still per-seq GEMV). The goal reduces to: **batch the DECODE-path projection GEMMs (SSM in_proj_qkvz/ba + out_proj, attn qkv/o) into M=n GEMMs**, the same pattern the committed dense-FFN fix uses. Decode metric is noisy under varlen (wall ≈ longest request) but direction is unambiguous and matches the architecture.
