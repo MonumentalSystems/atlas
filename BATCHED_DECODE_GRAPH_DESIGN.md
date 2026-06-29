@@ -568,3 +568,12 @@ C=1 by workload: text-7k (9916 tok) 1836 tok/s / 5.4s TTFT; text-11k (16125 tok)
 Prefill concurrency @ 11k: C1 1840 → C2 1852 → C4 1852 → C8 1845 tok/s = **FLAT (1.00–1.01×)**; mean TTFT grows LINEARLY 8.8s→17.4s→34.8s→69.9s.
 
 **At realistic contexts prefill is COMPUTE-saturated by a single stream — concurrency gives zero throughput gain and linear TTFT growth (expected; vLLM is the same for large prefills).** The prefill lever is SINGLE-STREAM throughput (~1840 tok/s in-container), NOT concurrency: i.e. the cuda13.2 container ~6× penalty ([[holo-container-perf-gap]]) + prefill GEMM/GDN efficiency ([[holo-cuda132-container-plan]]). Image prefill is token-cheap (vision encoder) and adds negligible cost atop text.
+
+## PREFILL RE-CORRECTION (2026-06-29) — the 1840 was a HARNESS bug, real is ~3700 tok/s
+
+The "1840 tok/s flat" was a MEASUREMENT ARTIFACT in my probe: it sent each workload probe back-to-back with NO gap, so a large prefill QUEUED behind the previous request's still-running decode → client TTFT ~doubled. Binary/flags/container were NOT the cause (GPU 0% idle between reqs, no contention). Authoritative server-side TTFT (lifecycle.rs "Done: ... TTFT=") with SPACED single requests (image's own cutlass/flashinfer binary, full prod flags, prefix-cache on):
+- 3k (4389 tok): server TTFT 1161ms → ~3780 tok/s
+- 7k (9909 tok): 2581ms → ~3840 tok/s
+- 11k (16120 tok): 4465ms → ~3610 tok/s
+
+Clean large-context prefill CONCURRENCY (drained between levels) @ 11k: C1 3489 → C2 3545 → C4 3559 → C8 3566 tok/s = still FLAT (1.02×), mean TTFT linear (4.6s→36s). So: single-stream prefill ~3700 tok/s; large-context concurrency saturates one stream (flat agg, linear TTFT) — expected, matches vLLM for large prefills. LESSON: always space/drain between latency probes, and prefer server-side TTFT (lifecycle log) over client wall-time.
