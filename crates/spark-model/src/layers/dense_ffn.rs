@@ -10,7 +10,7 @@ use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 
 use crate::layer::ForwardContext;
 use crate::layers::ops;
-use crate::weight_map::{DenseWeight, QuantizedWeight};
+use crate::weight_map::{DenseWeight, Fp8Weight, QuantizedWeight};
 
 pub struct DenseFfnWeights {
     pub gate_proj: QuantizedWeight,
@@ -34,6 +34,16 @@ pub struct DenseFfnWeightsBf16 {
     pub gate_proj: DenseWeight,
     pub up_proj: DenseWeight,
     pub down_proj: DenseWeight,
+}
+
+/// Native block-scaled FP8 dense MLP weights — loaded directly from an FP8
+/// checkpoint (no NVFP4 requant). When installed via `set_fp8_weights`, decode
+/// dispatches `w8a16_gemv` and prefill `w8a16_gemm` per projection (BF16 act ×
+/// FP8 E4M3 weight with 2D block scales), mirroring the SSM/attention FP8 path.
+pub struct DenseFfnWeightsFp8 {
+    pub gate_proj: Fp8Weight,
+    pub up_proj: Fp8Weight,
+    pub down_proj: Fp8Weight,
 }
 
 /// Activation function for gated FFN (SiLU for Qwen/Llama, GELU for Gemma-4).
@@ -79,6 +89,14 @@ pub struct DenseFfnLayer {
     // KernelHandle(0) on miss → forward_prefill falls back to the scalar path.
     // Decode (gemv, M=1) is untouched, so TPOT is unaffected.
     dense_gemm_tc_k: KernelHandle,
+    /// Native FP8 dense MLP weights — when `Some`, decode/prefill dispatch the
+    /// block-scaled FP8 kernels (`w8a16_gemv` / `w8a16_gemm`) instead of w4a16
+    /// NVFP4. Set via `set_fp8_weights` for native FP8 checkpoints (Qwythos /
+    /// Ornith-FP8). Spec-decode batched paths fall back to dequant — dense
+    /// qwen3_5 has no MTP, so they're never reached.
+    fp8_weights: Option<DenseFfnWeightsFp8>,
+    w8a16_gemv_k: KernelHandle,
+    w8a16_gemm_k: KernelHandle,
 }
 
 impl DenseFfnLayer {
@@ -123,7 +141,22 @@ impl DenseFfnLayer {
             dense_gemv_bf16_k,
             dense_gemm_bf16_k,
             dense_gemm_tc_k,
+            fp8_weights: None,
+            w8a16_gemv_k: super::try_kernel(gpu, "w8a16_gemv", "w8a16_gemv"),
+            w8a16_gemm_k: super::try_kernel(gpu, "w8a16_gemm", "w8a16_gemm"),
         })
+    }
+
+    /// Install native block-scaled FP8 dense MLP weights. After this call the
+    /// forward paths dispatch `w8a16_gemv` (decode) / `w8a16_gemm` (prefill)
+    /// instead of w4a16 NVFP4. Caller must ensure those kernels are present in
+    /// the target (they are for the qwen3_5/ornith nvfp4 bundle).
+    pub fn set_fp8_weights(&mut self, gate: Fp8Weight, up: Fp8Weight, down: Fp8Weight) {
+        self.fp8_weights = Some(DenseFfnWeightsFp8 {
+            gate_proj: gate,
+            up_proj: up,
+            down_proj: down,
+        });
     }
 
     /// Install BF16 dense MLP weights. After this call, the forward paths
@@ -154,6 +187,55 @@ impl DenseFfnLayer {
 
         let gate_out = ctx.buffers.expert_gate_out();
         let up_out = ctx.buffers.expert_up_out();
+
+        // FP8 dispatch: per-projection `w8a16_gemv` (block-scaled E4M3 weight ×
+        // BF16 activation). No fused FP8 dual-GEMV yet → 3 launches like BF16.
+        if let Some(ref fp8w) = self.fp8_weights {
+            ops::w8a16_gemv(
+                ctx.gpu,
+                self.w8a16_gemv_k,
+                input,
+                fp8w.gate_proj.weight,
+                fp8w.gate_proj.row_scale,
+                gate_out,
+                inter,
+                h,
+                stream,
+            )?;
+            ops::w8a16_gemv(
+                ctx.gpu,
+                self.w8a16_gemv_k,
+                input,
+                fp8w.up_proj.weight,
+                fp8w.up_proj.row_scale,
+                up_out,
+                inter,
+                h,
+                stream,
+            )?;
+            ops::silu_mul(
+                ctx.gpu,
+                self.act_mul,
+                gate_out,
+                up_out,
+                gate_out,
+                inter,
+                stream,
+            )?;
+            let output = ctx.buffers.moe_output();
+            ops::w8a16_gemv(
+                ctx.gpu,
+                self.w8a16_gemv_k,
+                gate_out,
+                fp8w.down_proj.weight,
+                fp8w.down_proj.row_scale,
+                output,
+                h,
+                inter,
+                stream,
+            )?;
+            return Ok(output);
+        }
 
         // BF16 dispatch: per-projection GEMV via `dense_gemv_bf16`. We
         // don't have a fused dual-BF16-GEMV kernel today; two sequential
@@ -367,6 +449,60 @@ impl DenseFfnLayer {
 
         let gate_out = ctx.buffers.expert_gate_out();
         let up_out = ctx.buffers.expert_up_out();
+
+        // FP8 prefill dispatch: per-projection `w8a16_gemm` (block-scaled E4M3
+        // weight × BF16 act). Non-transposed (correctness-first; the transposed
+        // `w8a16_gemm_t` is a later perf step). Mirrors the SSM/attention FP8
+        // prefill fallback.
+        if let Some(ref fp8w) = self.fp8_weights {
+            ops::w8a16_gemm(
+                ctx.gpu,
+                self.w8a16_gemm_k,
+                input,
+                fp8w.gate_proj.weight,
+                fp8w.gate_proj.row_scale,
+                gate_out,
+                m,
+                inter,
+                h,
+                stream,
+            )?;
+            ops::w8a16_gemm(
+                ctx.gpu,
+                self.w8a16_gemm_k,
+                input,
+                fp8w.up_proj.weight,
+                fp8w.up_proj.row_scale,
+                up_out,
+                m,
+                inter,
+                h,
+                stream,
+            )?;
+            ops::silu_mul(
+                ctx.gpu,
+                self.act_mul,
+                gate_out,
+                up_out,
+                gate_out,
+                m * inter,
+                stream,
+            )?;
+            let output = ctx.buffers.moe_output();
+            ops::w8a16_gemm(
+                ctx.gpu,
+                self.w8a16_gemm_k,
+                gate_out,
+                fp8w.down_proj.weight,
+                fp8w.down_proj.row_scale,
+                output,
+                m,
+                h,
+                inter,
+                stream,
+            )?;
+            return Ok(());
+        }
 
         // BF16 prefill dispatch. Prefer the tensor-core m16n8k16 MMA kernel
         // (`dense_gemm_tc`, 3-5x+ over scalar) — the scalar `dense_gemm_bf16`
