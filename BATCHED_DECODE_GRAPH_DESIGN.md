@@ -558,3 +558,13 @@ Uniform 200-tok generations + uniform prefill so all C sequences decode concurre
 4. **vLLM-like concurrency for this model therefore lives in PREFILL (already ~9.7x), not decode.** Decode is architecturally capped near ~1.5x with all batch levers correct.
 
 **Remaining decode lever** (per holo-vllm-parity-poc): SSM *vertical fusion* — fuse the per-token SSM op chain (ba/gates→conv→gdn→norm→out_proj) to cut launch + intermediate-memory overhead. That lowers per-token latency (helps C=1 AND aggregate), but it is latency work, not batch-scaling. It is the honest next step if decode tok/s is the target.
+
+## PREFILL CORRECTION — large-context probe (2026-06-29, Holo-35B NVFP4, in cuda13.2 container)
+
+The earlier "prefill scales 9.7–13×" was a METHODOLOGY ARTIFACT (heterogeneous tiny prompts 16–320 tok; latency-bound; slow tiny-prompt C=1 baseline). Re-measured at REAL contexts:
+
+C=1 by workload: text-7k (9916 tok) 1836 tok/s / 5.4s TTFT; text-11k (16125 tok) 1839 tok/s / 8.77s; image (268 tok) 438 tok/s / 611ms; image+text (10174 tok) 1807 tok/s / 5.63s.
+
+Prefill concurrency @ 11k: C1 1840 → C2 1852 → C4 1852 → C8 1845 tok/s = **FLAT (1.00–1.01×)**; mean TTFT grows LINEARLY 8.8s→17.4s→34.8s→69.9s.
+
+**At realistic contexts prefill is COMPUTE-saturated by a single stream — concurrency gives zero throughput gain and linear TTFT growth (expected; vLLM is the same for large prefills).** The prefill lever is SINGLE-STREAM throughput (~1840 tok/s in-container), NOT concurrency: i.e. the cuda13.2 container ~6× penalty ([[holo-container-perf-gap]]) + prefill GEMM/GDN efficiency ([[holo-cuda132-container-plan]]). Image prefill is token-cheap (vision encoder) and adds negligible cost atop text.
