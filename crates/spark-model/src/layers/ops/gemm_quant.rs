@@ -596,7 +596,7 @@ pub fn w8a16_gemm_t(
 /// W8A16 transposed M128 GEMM (kernel `w8a16_gemm_t_m128`): FP8 E4M3 analog of
 /// `w4a16_gemm_n128_m128_v2`. 128×128 (M×N) tile, two 64-row chunks, 8 warps,
 /// parallel-chunk `m16n8k16.bf16.bf16` MMA + two-level FP32 block-scale fold.
-/// Same transposed contract as `w8a16_gemm_t` (B_t[K,N] + block_scale_t[K/128,
+/// Same transposed contract as `w8a16_gemm_t` (`B_t[K,N]` + block_scale_t[K/128,
 /// N/128]); reuses the transpose_fp8 / transpose_block_scale output as-is.
 /// Grid: (ceil(N/128), ceil(M/128), 1)  Block: (256, 1, 1)
 #[allow(clippy::too_many_arguments)]
