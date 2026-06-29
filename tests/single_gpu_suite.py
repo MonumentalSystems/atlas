@@ -6,7 +6,9 @@ Usage: python3 single_gpu_suite.py --base-url http://localhost:8888/v1 --model M
 """
 
 import argparse
+import base64
 import json
+import os
 import time
 import sys
 import urllib.request
@@ -737,11 +739,192 @@ def run_long_context_tests(base_url, model):
 
 # ── Main ─────────────────────────────────────────────────────────
 
+# ── Vision (multimodal image) test ──────────────────────────────────────
+# The image test runs ONLY for models EXPLICITLY MARKED vision-capable —
+# `--vision` on the CLI, or a `TestSpec(vision=True)` row in run_all_models
+# (which passes `--vision`). It is never auto-detected from the model name and
+# never sent to a text-only model, so it can't false-FAIL a non-vision model.
+
+
+def _vision_sample_data_uri():
+    """Load the committed sample image as an OpenAI data URI. Override the
+    sample with ATLAS_VISION_TEST_IMAGE=<path>. Default:
+    tests/fixtures/mona_lisa.jpeg (alongside this script)."""
+    path = os.environ.get("ATLAS_VISION_TEST_IMAGE") or os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "fixtures", "mona_lisa.jpeg"
+    )
+    with open(path, "rb") as f:
+        b64 = base64.b64encode(f.read()).decode()
+    ext = os.path.splitext(path)[1].lstrip(".").lower() or "jpeg"
+    mime = "jpeg" if ext in ("jpg", "jpeg") else ext
+    return f"data:image/{mime};base64,{b64}", path
+
+
+def run_vision_test(base_url, model):
+    """Multimodal image test: send a sample image + a describe prompt and check
+    for a coherent, on-topic description (non-empty, no error, no repetition,
+    contains an image-relevant keyword). Only invoked for models explicitly
+    marked vision-capable (see `--vision` in `main` / TestSpec.vision), so a
+    non-description here is a genuine FAIL, never a false alarm on a text model."""
+    print("\n" + "=" * 60)
+    print("VISION TEST")
+    print("=" * 60)
+
+    try:
+        data_uri, path = _vision_sample_data_uri()
+    except Exception as e:
+        print(f"  [FAIL] could not load sample image: {e}")
+        return [{"name": "Image", "status": "FAIL (sample image missing)", "preview": str(e)[:160]}]
+    print(f"  Image: {path}")
+
+    # Sample is the Mona Lisa → expect portrait/painting/woman vocabulary.
+    # Override the sample via ATLAS_VISION_TEST_IMAGE; if you do, adjust the
+    # keyword set or set ATLAS_VISION_TEST_KEYWORDS (comma-separated).
+    kw_env = os.environ.get("ATLAS_VISION_TEST_KEYWORDS")
+    keywords = (
+        [k.strip().lower() for k in kw_env.split(",") if k.strip()]
+        if kw_env
+        else ["woman", "portrait", "painting", "mona", "lisa", "person", "lady", "smil"]
+    )
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image_url", "image_url": {"url": data_uri}},
+                {"type": "text", "text": "Describe this image in one sentence."},
+            ],
+        }
+    ]
+    try:
+        result, elapsed = chat(
+            base_url, model, messages, max_tokens=128, temperature=0.0, timeout=180
+        )
+    except Exception as e:
+        print(f"  [FAIL] request error: {e}")
+        return [{"name": "Image", "status": "FAIL (api error)", "preview": str(e)[:160]}]
+
+    text = extract_text(result)
+    visible = _strip_thinking(text)
+    ok = ("error" not in text.lower()) and len(visible.strip()) > 0
+    status = "PASS" if ok else "FAIL (empty or error)"
+    if ok and _has_repetition_loop(visible):
+        status = "FAIL (repetition loop)"
+    if "PASS" in status and not any(k in visible.lower() for k in keywords):
+        status = f"FAIL (no image-relevant keyword in: {visible[:80]!r})"
+
+    print(f"  [{status.split()[0]}] Describe image")
+    print(f"    Preview: {visible[:200]}")
+    return [{"name": "Image", "status": status, "preview": visible[:200], "elapsed": elapsed}]
+
+
+def _scrape_spec_accept(base_url):
+    """Read the DFlash/MTP verify counters from the server's /metrics endpoint.
+    Returns (accepts, rejects) summed across all K-paths, or (0, 0) if absent.
+
+    The metric is `atlas_spec_decode_verify_total{k="...",outcome="accept|reject"}`
+    (server-root /metrics, NOT under /v1)."""
+    import re
+
+    metrics_url = base_url.rstrip("/")
+    if metrics_url.endswith("/v1"):
+        metrics_url = metrics_url[: -len("/v1")]
+    metrics_url = metrics_url + "/metrics"
+    accepts = rejects = 0
+    try:
+        with urllib.request.urlopen(metrics_url, timeout=10) as resp:
+            body = resp.read().decode()
+    except Exception:
+        return (0, 0)
+    pat = re.compile(
+        r'atlas_spec_decode_verify_total\{[^}]*outcome="(accept|reject)"[^}]*\}\s+([0-9.]+)'
+    )
+    for outcome, val in pat.findall(body):
+        n = int(float(val))
+        if outcome == "accept":
+            accepts += n
+        else:
+            rejects += n
+    return (accepts, rejects)
+
+
+def run_dflash_test(base_url, model):
+    """DFlash speculative-decode acceptance check. Drives a decode workload, then
+    reads the `atlas_spec_decode_verify_total` counters to compute the draft
+    accept-rate. PASS = the drafter is actually accepting (rate above a floor),
+    proving spec-decode is wired and not in the 0%/garbage-output state. Reports
+    accept-rate + decode tok/s. Only invoked when the server runs with `--dflash`
+    (see `--dflash-check` / TestSpec.dflash). Floor overridable via
+    ATLAS_DFLASH_MIN_ACCEPT (default 5.0 %)."""
+    print("\n" + "=" * 60)
+    print("DFLASH ACCEPTANCE TEST")
+    print("=" * 60)
+
+    min_accept = float(os.environ.get("ATLAS_DFLASH_MIN_ACCEPT", "5.0"))
+    prompts = [
+        "Explain how a CPU pipeline works, step by step, in detail.",
+        "Write a short story about a lighthouse keeper who discovers a hidden door.",
+        "Summarize the causes and consequences of the Industrial Revolution.",
+    ]
+    a0, r0 = _scrape_spec_accept(base_url)
+    decode_tps_vals = []
+    preview = ""
+    for p in prompts:
+        try:
+            result, elapsed = chat(
+                base_url, model, [{"role": "user", "content": p}],
+                max_tokens=256, temperature=0.0, timeout=180,
+            )
+            decode_tps_vals.append(calc_decode_tps(result, elapsed))
+            if not preview:
+                preview = _strip_thinking(extract_text(result))[:160]
+        except Exception as e:
+            print(f"  [FAIL] request error: {e}")
+            return [{"name": "DFlash", "status": "FAIL (api error)", "preview": str(e)[:160]}]
+    a1, r1 = _scrape_spec_accept(base_url)
+
+    accepts = a1 - a0
+    rejects = r1 - r0
+    total = accepts + rejects
+    accept_rate = (100.0 * accepts / total) if total else 0.0
+    decode_tps = sum(decode_tps_vals) / max(1, len(decode_tps_vals))
+
+    if total == 0:
+        status = "FAIL (no verify events — spec-decode not active)"
+    elif not preview:
+        status = "FAIL (empty output)"
+    elif accept_rate < min_accept:
+        status = f"FAIL (accept {accept_rate:.1f}% < {min_accept:.1f}% floor)"
+    else:
+        status = "PASS"
+
+    print(f"  [{status.split()[0]}] DFlash spec-decode")
+    print(f"    Verify events: {total} (accept {accepts} / reject {rejects})")
+    print(f"    Accept rate:   {accept_rate:.1f}%   (floor {min_accept:.1f}%)")
+    print(f"    Decode TPS:    {decode_tps:.1f} tok/s")
+    print(f"    Preview: {preview[:160]}")
+    return [{
+        "name": "DFlash", "status": status, "accept_rate": accept_rate,
+        "accepts": accepts, "rejects": rejects, "decode_tps": decode_tps,
+        "preview": preview[:160],
+    }]
+
+
 def main():
     parser = argparse.ArgumentParser(description="Atlas Single-GPU Model Test Suite")
     parser.add_argument("--base-url", default="http://localhost:8888/v1", help="API base URL")
     parser.add_argument("--model", required=True, help="Model ID")
     parser.add_argument("--skip-longctx", action="store_true", help="Skip long context tests")
+    parser.add_argument(
+        "--vision",
+        action="store_true",
+        help="Run the multimodal image test (opt-in; only for vision-capable models)",
+    )
+    parser.add_argument(
+        "--dflash-check",
+        action="store_true",
+        help="Run the DFlash spec-decode acceptance check (opt-in; only when the "
+             "server runs with --dflash)",
+    )
     parser.add_argument("--output", help="Save JSON results to file")
     args = parser.parse_args()
 
@@ -770,6 +953,12 @@ def main():
     all_results["tool_calls"] = run_tool_call_tests(args.base_url, args.model)
     all_results["tps"] = run_tps_benchmark(args.base_url, args.model)
 
+    if args.vision:
+        all_results["vision"] = run_vision_test(args.base_url, args.model)
+
+    if args.dflash_check:
+        all_results["dflash"] = run_dflash_test(args.base_url, args.model)
+
     if not args.skip_longctx:
         all_results["long_context"] = run_long_context_tests(args.base_url, args.model)
 
@@ -787,6 +976,17 @@ def main():
     print(f"  Fibonacci:    {fib_pass}/1 PASS")
     print(f"  Tool Calls:   {tool_pass}/{len(all_results['tool_calls'])} PASS")
     print(f"  Avg TPS:      {avg_tps:.1f} tok/s")
+
+    if "vision" in all_results:
+        v_pass = sum(1 for r in all_results["vision"] if "PASS" in r["status"])
+        print(f"  Vision:       {v_pass}/{len(all_results['vision'])} PASS")
+
+    if "dflash" in all_results:
+        d = all_results["dflash"][0]
+        d_pass = 1 if "PASS" in d["status"] else 0
+        print(f"  DFlash:       {d_pass}/1 PASS "
+              f"(accept {d.get('accept_rate', 0):.1f}%, "
+              f"{d.get('decode_tps', 0):.1f} tok/s)")
 
     if "long_context" in all_results:
         lc_pass = sum(1 for r in all_results["long_context"] if "PASS" in r["status"])
