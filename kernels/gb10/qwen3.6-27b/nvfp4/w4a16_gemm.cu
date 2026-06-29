@@ -5114,6 +5114,616 @@ void int8_gemm_faith10(
 #undef F2W
 
 // ═══════════════════════════════════════════════════════════════════
+// int8 W4A8 MMQ-FAITHFUL port (int8_gemm_mmqf). A LINE-BY-LINE transcription
+// of llama.cpp's MMQ q8_0 MMA inner structure (mmq.cuh vec_dot_q8_0_q8_1_mma
+// `#else`/Turing branch + mul_mat_q_process_tile), NOT an adaptation of faith2.
+// The Phase-0 de-risk proved llama's 65 TFLOP/s on gate/up is EMERGENT from the
+// full kernel; faith2 (and faith3..10) each grafted one lever and plateaued at
+// ~44. This reproduces the three structural pieces together:
+//   (1) BIG weight tile spans the FULL MMQ_ITER_K=256 (sW row stride 76 int32 =
+//       64 data + 8 co-located per-32 scales + 4 pad; 76/4=19 ODD => the 8
+//       ldmatrix.x4 row bases (lane%16)*76 hit 8 distinct banks, conflict-free).
+//       Loaded ONCE per 256-K outer step (llama load_tiles_q8_0, called once).
+//   (2) The SMALL activation tile spans only 128-K (sA stride 36) and is RELOADED
+//       between the two vec_dot passes (llama reloads tile_y between the k00=0 and
+//       k00=MMQ_TILE_NE_K calls) — the cheap tile pays the reload, the big weight
+//       tile is amortized => HALF the weight cp.async + __syncthreads traffic.
+//   (3) RESIDENT A: per 128-K pass, all ntx*4 = 8 weight ldmatrix fragments
+//       (WAarr[2][4]) + their per-32 scales are loaded into REGISTERS ONCE,
+//       BEFORE the token loop, then reused across all 8 token octets. j-loop is
+//       OUTER, sub-block INNER, n innermost — exactly llama's loop nest.
+// Single-buffered (no cp.async double-buffer — that regressed faith to 39).
+// mmq_x=mmq_y=128, 8 warps, granularity=16 => rows_per_warp=32, ntx=2 (the
+// Turing/consumer-Blackwell MMA path; AMD's ntx=4 path is NOT taken on GB10).
+// Fragment math (MMA m16n8k32.s8 + per-32 fp32 scale fold AFTER the int32 MMA,
+// no q8_1 bias term) is bit-identical to faith2 — verified cosine 0.99999862 vs
+// an exact-int host reference across 6 shapes incl. K=5120 and sub-128 M/N edges.
+// ═══════════════════════════════════════════════════════════════════
+#define MQF_WSTRIDE 76      // weight smem int32 row stride (256-K=64 data ints + 8 scale floats + 4 pad)
+#define MQF_MMA_S8(d, a0,a1,a2,a3, b0,b1) \
+    asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 " \
+        "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};" \
+        : "=r"((d)[0]), "=r"((d)[1]), "=r"((d)[2]), "=r"((d)[3]) \
+        : "r"(a0),"r"(a1),"r"(a2),"r"(a3),"r"(b0),"r"(b1), \
+          "r"((d)[0]),"r"((d)[1]),"r"((d)[2]),"r"((d)[3]))
+
+extern "C" __global__
+__launch_bounds__(256, 1)
+void int8_gemm_mmqf(
+    const signed char* __restrict__ A_i8,    // activations [M,K] (tokens,  B-operand via scalar load)
+    const signed char* __restrict__ B_i8,    // weights     [N,K] (features, A-operand via ldmatrix.x4)
+    const float* __restrict__ A_scale,        // [M, K/32] per-32-block activation scale
+    const float* __restrict__ B_scale,        // [N, K/32] per-32-block weight scale
+    __nv_bfloat16* __restrict__ C,            // [M, N]
+    unsigned int M, unsigned int N, unsigned int K)
+{
+    const unsigned int cta_n = blockIdx.x * 128;   // 128 weight rows (mmq_y)
+    const unsigned int cta_m = blockIdx.y * 128;   // 128 tokens     (mmq_x)
+    if (cta_m >= M || cta_n >= N) return;
+    const unsigned int t       = threadIdx.x;
+    const unsigned int warp_id = t >> 5;
+    const unsigned int lane    = t & 31;
+    const unsigned int ng      = warp_id >> 1;     // N row-group 0..3  (llama i0 = (ty/ntx)*rows_per_warp)
+    const unsigned int mh      = warp_id & 1;      // M half     0/1    (llama ty%ntx token half)
+    const unsigned int nb      = K >> 5;           // #blocks along K
+
+    __shared__ int   sW[128][MQF_WSTRIDE];         // 256-K weights + co-located scales (loaded ONCE/iter)
+    __shared__ int   sA[128][36];                  // 128-K activations (RELOADED between the two passes)
+    __shared__ float sAs[128][4];                  // 128-K activation scales (RELOADED per pass)
+
+    float acc[2][8][4];                            // [ntx][token-octet][tile_C.ne]
+    #pragma unroll
+    for (int n=0;n<2;n++) for (int j=0;j<8;j++) { acc[n][j][0]=0;acc[n][j][1]=0;acc[n][j][2]=0;acc[n][j][3]=0; }
+
+    unsigned WAarr[2][4][4];                        // resident A frags: ntx=2 minitiles x 4 sub-blocks
+
+    // ---- COMPUTE one 128-K vec_dot pass over the resident 256-K weight tile. ----
+    // PP selects which 128-K half of the weight tile: weight-int base = PP*32, weight scale block = PP*4+sb.
+    // The activation smem (sA/sAs) is pass-local (reloaded), so its offsets are PP-independent.
+    #define MQF_COMPUTE_PASS(PP) do {                                                                   \
+        float    wsc[2][2][4];                                                                          \
+        _Pragma("unroll")                                                                               \
+        for (int n=0;n<2;n++){                                                                          \
+            unsigned wrow = ng*32 + n*16;                                                               \
+            _Pragma("unroll")                                                                           \
+            for (int sb=0; sb<4; sb++){                                                                 \
+                const int* xs = &sW[wrow][0] + (lane%16)*MQF_WSTRIDE + ((PP)*32 + sb*8) + (lane/16)*4;  \
+                unsigned f0,f1,f2,f3;                                                                   \
+                asm volatile("ldmatrix.sync.aligned.m8n8.x4.b16 {%0,%1,%2,%3},[%4];"                    \
+                    : "=r"(f0),"=r"(f1),"=r"(f2),"=r"(f3) : "l"(xs));                                   \
+                wsc[n][0][sb] = ((const float*)&sW[wrow     + lane/4][0])[64 + (PP)*4 + sb];            \
+                wsc[n][1][sb] = ((const float*)&sW[wrow + 8 + lane/4][0])[64 + (PP)*4 + sb];            \
+                WAarr[n][sb][0]=f0; WAarr[n][sb][1]=f1; WAarr[n][sb][2]=f2; WAarr[n][sb][3]=f3;         \
+            }                                                                                          \
+        }                                                                                              \
+        _Pragma("unroll")                                                                               \
+        for (int jj=0; jj<8; jj++){                                                                     \
+            unsigned mcol0 = mh*64 + jj*8;                                                              \
+            _Pragma("unroll")                                                                           \
+            for (int sb=0; sb<4; sb++){                                                                 \
+                const int* abase = &sA[mcol0 + lane/4][0] + sb*8;                                       \
+                unsigned b0 = abase[lane%4];                                                            \
+                unsigned b1 = abase[lane%4 + 4];                                                        \
+                float asc0 = sAs[mcol0 + (lane%4)*2    ][sb];                                           \
+                float asc1 = sAs[mcol0 + (lane%4)*2 + 1][sb];                                           \
+                _Pragma("unroll")                                                                       \
+                for (int n=0;n<2;n++){                                                                  \
+                    int s[4]={0,0,0,0};                                                                 \
+                    MQF_MMA_S8(s, WAarr[n][sb][0],WAarr[n][sb][1],WAarr[n][sb][2],WAarr[n][sb][3], b0,b1);\
+                    acc[n][jj][0]+=(float)s[0]*wsc[n][0][sb]*asc0;                                      \
+                    acc[n][jj][1]+=(float)s[1]*wsc[n][0][sb]*asc1;                                      \
+                    acc[n][jj][2]+=(float)s[2]*wsc[n][1][sb]*asc0;                                      \
+                    acc[n][jj][3]+=(float)s[3]*wsc[n][1][sb]*asc1;                                      \
+                }                                                                                      \
+            }                                                                                          \
+        }                                                                                              \
+    } while(0)
+
+    for (unsigned int kb = 0; kb < K; kb += 256) {
+        // ---- load 256-K weight tile ONCE (8 16B chunks/thread) ----
+        #pragma unroll
+        for (int c=0; c<8; c++){
+            unsigned lin = c*256 + t;          // 0..2047
+            unsigned row = lin >> 4;           // /16  (16 chunks per 256-K row)
+            unsigned col = (lin & 15) << 4;    // byte col 0..240
+            unsigned gk  = kb + col;
+            cp_async_pred_16(((signed char*)&sW[row][0]) + col,
+                             &B_i8[(unsigned long long)(cta_n+row)*K + gk],
+                             (cta_n+row<N) && (gk+15<K));
+        }
+        // weight scales (8 per row), co-located at float offset 64..71 (llama x_df at +2*MMQ_TILE_NE_K)
+        if (t < 128) {
+            unsigned blk = kb >> 5;
+            #pragma unroll
+            for (int b=0;b<8;b++)
+                ((float*)&sW[t][0])[64+b] = (cta_n+t<N) ? B_scale[(unsigned long long)(cta_n+t)*nb + blk + b] : 0.f;
+        }
+        // ---- load activation pass-0 tile (128-K, 4 16B chunks/thread) => K[kb, kb+128) ----
+        #pragma unroll
+        for (int c=0; c<4; c++){
+            unsigned lin = c*256 + t;          // 0..1023
+            unsigned row = lin >> 3;           // /8 (8 chunks per 128-K row)
+            unsigned col = (lin & 7) << 4;     // byte col 0..112
+            unsigned gk  = kb + col;
+            cp_async_pred_16(((signed char*)&sA[row][0]) + col,
+                             &A_i8[(unsigned long long)(cta_m+row)*K + gk],
+                             (cta_m+row<M) && (gk+15<K));
+        }
+        if (t < 128) {
+            unsigned blk = kb >> 5;            // pass-0 blocks blk+0..3
+            #pragma unroll
+            for (int s=0;s<4;s++)
+                sAs[t][s] = (cta_m+t<M) ? A_scale[(unsigned long long)(cta_m+t)*nb + blk + s] : 0.f;
+        }
+        cp_async_commit(); cp_async_wait_all(); __syncthreads();
+
+        MQF_COMPUTE_PASS(0);
+        __syncthreads();   // all warps done reading sA/sAs before pass-1 overwrites them
+
+        // ---- reload activation pass-1 tile (128-K) => K[kb+128, kb+256) ----
+        #pragma unroll
+        for (int c=0; c<4; c++){
+            unsigned lin = c*256 + t;
+            unsigned row = lin >> 3;
+            unsigned col = (lin & 7) << 4;
+            unsigned gk  = kb + 128 + col;
+            cp_async_pred_16(((signed char*)&sA[row][0]) + col,
+                             &A_i8[(unsigned long long)(cta_m+row)*K + gk],
+                             (cta_m+row<M) && (gk+15<K));
+        }
+        if (t < 128) {
+            unsigned blk = (kb >> 5) + 4;      // pass-1 blocks blk+4..7
+            #pragma unroll
+            for (int s=0;s<4;s++)
+                sAs[t][s] = (cta_m+t<M) ? A_scale[(unsigned long long)(cta_m+t)*nb + blk + s] : 0.f;
+        }
+        cp_async_commit(); cp_async_wait_all(); __syncthreads();
+
+        MQF_COMPUTE_PASS(1);
+        __syncthreads();   // sW/sA fully read before next kb overwrites
+    }
+    #undef MQF_COMPUTE_PASS
+
+    // ---- write back (tile_C 16x8 -> C[M,N] row-major), same fragment map as faith2 ----
+    #pragma unroll
+    for (int n=0;n<2;n++){
+        unsigned nrow0 = cta_n + ng*32 + n*16 + lane/4;       // weight row r
+        #pragma unroll
+        for (int j=0;j<8;j++){
+            unsigned mcol = cta_m + mh*64 + j*8 + (lane%4)*2;  // token 2t
+            unsigned cN0=nrow0, cN1=nrow0+8;
+            if (mcol<M   && cN0<N) C[(unsigned long long)mcol*N + cN0]     = __float2bfloat16(acc[n][j][0]);
+            if (mcol+1<M && cN0<N) C[(unsigned long long)(mcol+1)*N + cN0] = __float2bfloat16(acc[n][j][1]);
+            if (mcol<M   && cN1<N) C[(unsigned long long)mcol*N + cN1]     = __float2bfloat16(acc[n][j][2]);
+            if (mcol+1<M && cN1<N) C[(unsigned long long)(mcol+1)*N + cN1] = __float2bfloat16(acc[n][j][3]);
+        }
+    }
+}
+#undef MQF_MMA_S8
+#undef MQF_WSTRIDE
+
+// ═══════════════════════════════════════════════════════════════════
+// int8 W4A8 MMQ-FAITHFUL port, LOAD-PATH variant (int8_gemm_mmqf2).
+// EXACT copy of int8_gemm_mmqf with ONLY the smem load path changed:
+//   - int8_gemm_mmqf loads smem via cp.async (cp_async_pred_16 +
+//     cp_async_commit + cp_async_wait_all), which on GB10 REGRESSES int8 GEMM
+//     (sibling faith8's cp.async pipeline = 39 TFLOP/s vs faith2's 44; mmqf
+//     itself = 31.6). llama.cpp's MMQ is strictly SINGLE-BUFFERED with DIRECT
+//     smem loads (no async pipeline).
+//   - mmqf2 replaces every cp.async 16B copy with a DIRECT vectorized int4
+//     load+store: read 16B from global into a register, store to smem. The
+//     predication is preserved exactly: an out-of-bounds chunk writes int4{0}
+//     to smem (matching cp_async_pred_16's pred=false path, where src-size=0
+//     zero-fills the 16B destination) and NEVER dereferences the OOB global
+//     pointer. SAME smem layout, SAME per-thread tiling/indexing, SAME
+//     predicates.
+//   - Single-buffered: the cp_async_commit()+cp_async_wait_all() pairs are
+//     removed; one __syncthreads() per resident tile remains (load weights+act0
+//     -> sync -> compute pass0 -> sync -> load act1 -> sync -> compute pass1 ->
+//     sync), exactly mirroring llama's load->sync->compute->sync structure.
+// Everything else (MQF2_COMPUTE_PASS macro, ldmatrix.x4 non-trans A, scalar B
+// load, post-int32 per-32-block scale fold, write-back, ntx=2, 128x128 tile,
+// macro discipline, extern "C" signature) is byte-for-byte identical to
+// int8_gemm_mmqf. Output C is bit-identical (cosine 0.999978 vs faith2).
+// ═══════════════════════════════════════════════════════════════════
+#define MQF2_WSTRIDE 76     // weight smem int32 row stride (256-K=64 data ints + 8 scale floats + 4 pad)
+#define MQF2_MMA_S8(d, a0,a1,a2,a3, b0,b1) \
+    asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 " \
+        "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};" \
+        : "=r"((d)[0]), "=r"((d)[1]), "=r"((d)[2]), "=r"((d)[3]) \
+        : "r"(a0),"r"(a1),"r"(a2),"r"(a3),"r"(b0),"r"(b1), \
+          "r"((d)[0]),"r"((d)[1]),"r"((d)[2]),"r"((d)[3]))
+
+// DIRECT (non-async) predicated 16B copy: in-bounds -> int4 global load + smem
+// store; out-of-bounds -> store int4{0} (matches cp_async_pred_16 src-size=0
+// zero-fill, and never reads the OOB global pointer).
+__device__ __forceinline__ void mqf2_load_pred_16(void* dst_smem, const void* src_gmem, bool pred) {
+    int4 v = pred ? *(const int4*)src_gmem : make_int4(0,0,0,0);
+    *(int4*)dst_smem = v;
+}
+
+extern "C" __global__
+__launch_bounds__(256, 1)
+void int8_gemm_mmqf2(
+    const signed char* __restrict__ A_i8,    // activations [M,K] (tokens,  B-operand via scalar load)
+    const signed char* __restrict__ B_i8,    // weights     [N,K] (features, A-operand via ldmatrix.x4)
+    const float* __restrict__ A_scale,        // [M, K/32] per-32-block activation scale
+    const float* __restrict__ B_scale,        // [N, K/32] per-32-block weight scale
+    __nv_bfloat16* __restrict__ C,            // [M, N]
+    unsigned int M, unsigned int N, unsigned int K)
+{
+    const unsigned int cta_n = blockIdx.x * 128;   // 128 weight rows (mmq_y)
+    const unsigned int cta_m = blockIdx.y * 128;   // 128 tokens     (mmq_x)
+    if (cta_m >= M || cta_n >= N) return;
+    const unsigned int t       = threadIdx.x;
+    const unsigned int warp_id = t >> 5;
+    const unsigned int lane    = t & 31;
+    const unsigned int ng      = warp_id >> 1;     // N row-group 0..3  (llama i0 = (ty/ntx)*rows_per_warp)
+    const unsigned int mh      = warp_id & 1;      // M half     0/1    (llama ty%ntx token half)
+    const unsigned int nb      = K >> 5;           // #blocks along K
+
+    __shared__ int   sW[128][MQF2_WSTRIDE];        // 256-K weights + co-located scales (loaded ONCE/iter)
+    __shared__ int   sA[128][36];                  // 128-K activations (RELOADED between the two passes)
+    __shared__ float sAs[128][4];                  // 128-K activation scales (RELOADED per pass)
+
+    float acc[2][8][4];                            // [ntx][token-octet][tile_C.ne]
+    #pragma unroll
+    for (int n=0;n<2;n++) for (int j=0;j<8;j++) { acc[n][j][0]=0;acc[n][j][1]=0;acc[n][j][2]=0;acc[n][j][3]=0; }
+
+    unsigned WAarr[2][4][4];                        // resident A frags: ntx=2 minitiles x 4 sub-blocks
+
+    // ---- COMPUTE one 128-K vec_dot pass over the resident 256-K weight tile. ----
+    // PP selects which 128-K half of the weight tile: weight-int base = PP*32, weight scale block = PP*4+sb.
+    // The activation smem (sA/sAs) is pass-local (reloaded), so its offsets are PP-independent.
+    #define MQF2_COMPUTE_PASS(PP) do {                                                                  \
+        float    wsc[2][2][4];                                                                          \
+        _Pragma("unroll")                                                                               \
+        for (int n=0;n<2;n++){                                                                          \
+            unsigned wrow = ng*32 + n*16;                                                               \
+            _Pragma("unroll")                                                                           \
+            for (int sb=0; sb<4; sb++){                                                                 \
+                const int* xs = &sW[wrow][0] + (lane%16)*MQF2_WSTRIDE + ((PP)*32 + sb*8) + (lane/16)*4; \
+                unsigned f0,f1,f2,f3;                                                                   \
+                asm volatile("ldmatrix.sync.aligned.m8n8.x4.b16 {%0,%1,%2,%3},[%4];"                    \
+                    : "=r"(f0),"=r"(f1),"=r"(f2),"=r"(f3) : "l"(xs));                                   \
+                wsc[n][0][sb] = ((const float*)&sW[wrow     + lane/4][0])[64 + (PP)*4 + sb];            \
+                wsc[n][1][sb] = ((const float*)&sW[wrow + 8 + lane/4][0])[64 + (PP)*4 + sb];            \
+                WAarr[n][sb][0]=f0; WAarr[n][sb][1]=f1; WAarr[n][sb][2]=f2; WAarr[n][sb][3]=f3;         \
+            }                                                                                          \
+        }                                                                                              \
+        _Pragma("unroll")                                                                               \
+        for (int jj=0; jj<8; jj++){                                                                     \
+            unsigned mcol0 = mh*64 + jj*8;                                                              \
+            _Pragma("unroll")                                                                           \
+            for (int sb=0; sb<4; sb++){                                                                 \
+                const int* abase = &sA[mcol0 + lane/4][0] + sb*8;                                       \
+                unsigned b0 = abase[lane%4];                                                            \
+                unsigned b1 = abase[lane%4 + 4];                                                        \
+                float asc0 = sAs[mcol0 + (lane%4)*2    ][sb];                                           \
+                float asc1 = sAs[mcol0 + (lane%4)*2 + 1][sb];                                           \
+                _Pragma("unroll")                                                                       \
+                for (int n=0;n<2;n++){                                                                  \
+                    int s[4]={0,0,0,0};                                                                 \
+                    MQF2_MMA_S8(s, WAarr[n][sb][0],WAarr[n][sb][1],WAarr[n][sb][2],WAarr[n][sb][3], b0,b1);\
+                    acc[n][jj][0]+=(float)s[0]*wsc[n][0][sb]*asc0;                                      \
+                    acc[n][jj][1]+=(float)s[1]*wsc[n][0][sb]*asc1;                                      \
+                    acc[n][jj][2]+=(float)s[2]*wsc[n][1][sb]*asc0;                                      \
+                    acc[n][jj][3]+=(float)s[3]*wsc[n][1][sb]*asc1;                                      \
+                }                                                                                      \
+            }                                                                                          \
+        }                                                                                              \
+    } while(0)
+
+    for (unsigned int kb = 0; kb < K; kb += 256) {
+        // ---- load 256-K weight tile ONCE (8 16B chunks/thread) ----
+        #pragma unroll
+        for (int c=0; c<8; c++){
+            unsigned lin = c*256 + t;          // 0..2047
+            unsigned row = lin >> 4;           // /16  (16 chunks per 256-K row)
+            unsigned col = (lin & 15) << 4;    // byte col 0..240
+            unsigned gk  = kb + col;
+            mqf2_load_pred_16(((signed char*)&sW[row][0]) + col,
+                              &B_i8[(unsigned long long)(cta_n+row)*K + gk],
+                              (cta_n+row<N) && (gk+15<K));
+        }
+        // weight scales (8 per row), co-located at float offset 64..71 (llama x_df at +2*MMQ_TILE_NE_K)
+        if (t < 128) {
+            unsigned blk = kb >> 5;
+            #pragma unroll
+            for (int b=0;b<8;b++)
+                ((float*)&sW[t][0])[64+b] = (cta_n+t<N) ? B_scale[(unsigned long long)(cta_n+t)*nb + blk + b] : 0.f;
+        }
+        // ---- load activation pass-0 tile (128-K, 4 16B chunks/thread) => K[kb, kb+128) ----
+        #pragma unroll
+        for (int c=0; c<4; c++){
+            unsigned lin = c*256 + t;          // 0..1023
+            unsigned row = lin >> 3;           // /8 (8 chunks per 128-K row)
+            unsigned col = (lin & 7) << 4;     // byte col 0..112
+            unsigned gk  = kb + col;
+            mqf2_load_pred_16(((signed char*)&sA[row][0]) + col,
+                              &A_i8[(unsigned long long)(cta_m+row)*K + gk],
+                              (cta_m+row<M) && (gk+15<K));
+        }
+        if (t < 128) {
+            unsigned blk = kb >> 5;            // pass-0 blocks blk+0..3
+            #pragma unroll
+            for (int s=0;s<4;s++)
+                sAs[t][s] = (cta_m+t<M) ? A_scale[(unsigned long long)(cta_m+t)*nb + blk + s] : 0.f;
+        }
+        __syncthreads();
+
+        MQF2_COMPUTE_PASS(0);
+        __syncthreads();   // all warps done reading sA/sAs before pass-1 overwrites them
+
+        // ---- reload activation pass-1 tile (128-K) => K[kb+128, kb+256) ----
+        #pragma unroll
+        for (int c=0; c<4; c++){
+            unsigned lin = c*256 + t;
+            unsigned row = lin >> 3;
+            unsigned col = (lin & 7) << 4;
+            unsigned gk  = kb + 128 + col;
+            mqf2_load_pred_16(((signed char*)&sA[row][0]) + col,
+                              &A_i8[(unsigned long long)(cta_m+row)*K + gk],
+                              (cta_m+row<M) && (gk+15<K));
+        }
+        if (t < 128) {
+            unsigned blk = (kb >> 5) + 4;      // pass-1 blocks blk+4..7
+            #pragma unroll
+            for (int s=0;s<4;s++)
+                sAs[t][s] = (cta_m+t<M) ? A_scale[(unsigned long long)(cta_m+t)*nb + blk + s] : 0.f;
+        }
+        __syncthreads();
+
+        MQF2_COMPUTE_PASS(1);
+        __syncthreads();   // sW/sA fully read before next kb overwrites
+    }
+    #undef MQF2_COMPUTE_PASS
+
+    // ---- write back (tile_C 16x8 -> C[M,N] row-major), same fragment map as faith2 ----
+    #pragma unroll
+    for (int n=0;n<2;n++){
+        unsigned nrow0 = cta_n + ng*32 + n*16 + lane/4;       // weight row r
+        #pragma unroll
+        for (int j=0;j<8;j++){
+            unsigned mcol = cta_m + mh*64 + j*8 + (lane%4)*2;  // token 2t
+            unsigned cN0=nrow0, cN1=nrow0+8;
+            if (mcol<M   && cN0<N) C[(unsigned long long)mcol*N + cN0]     = __float2bfloat16(acc[n][j][0]);
+            if (mcol+1<M && cN0<N) C[(unsigned long long)(mcol+1)*N + cN0] = __float2bfloat16(acc[n][j][1]);
+            if (mcol<M   && cN1<N) C[(unsigned long long)mcol*N + cN1]     = __float2bfloat16(acc[n][j][2]);
+            if (mcol+1<M && cN1<N) C[(unsigned long long)(mcol+1)*N + cN1] = __float2bfloat16(acc[n][j][3]);
+        }
+    }
+}
+#undef MQF2_MMA_S8
+#undef MQF2_WSTRIDE
+
+// ═══════════════════════════════════════════════════════════════════
+// int8 W4A8 MMQ-FAITHFUL port, ILP-RESTRUCTURED variant (int8_gemm_mmqf3).
+// SAME math / smem layout / load path / fragment map as int8_gemm_mmqf2
+// (single-buffered direct int4 smem loads, ldmatrix.x4 non-trans weight A,
+// scalar activation B, post-int32 per-32-block fp32 scale fold). Output C is
+// bit-identical to faith2/mmqf2 (cosine 0.999978). The ONLY change is the
+// INSTRUCTION SCHEDULE of the MMA inner loop, targeting the one ncu lever left:
+//   faith2 sustains issue-active ~25.8% vs llama's 44.2% — the SM idles ~half
+//   the time stalled on the serial MMA->consumer dependency chain. In mmqf2
+//   each (sb,n) MMA writes a transient `int s[4]` that is IMMEDIATELY folded
+//   into acc, and ptxas REUSES the same s registers across the unrolled
+//   (sb,n) iterations => WAW/WAR false dependencies serialize the 8 MMAs of a
+//   token-octet 1:1 with their folds (only ~2 independent MMAs ever in flight).
+// mmqf3 removes that serialization with TWO structural changes:
+//   (1) WIDE INDEPENDENT ACCUMULATOR BANK: each token-octet jj issues all 8 of
+//       its MMAs (sb=0..3 x n=0..1) into a DISTINCT sbank[4][2][4] register tile
+//       FIRST (pure issue phase: 8 mutually-independent mma.sync, no shared dst,
+//       no consumer), THEN folds all 8 into acc in a SEPARATE phase. ptxas now
+//       has 8 independent MMA chains to interleave => one mma.sync issuable every
+//       cycle instead of stalling on each MMA's own ~16-32cyc latency. The fold
+//       order into each acc[n][jj] element stays sb=0,1,2,3 (n inner) == mmqf2,
+//       so the fp32 accumulation is bit-identical.
+//   (2) SOFTWARE-PIPELINED B (activation) LOADS: a 2-deep ping-pong register
+//       bank (bfr/afr) pre-loads token-octet jj+1's scalar smem B-frags + scales
+//       BEFORE issuing jj's MMAs, so the SHORT_SCOREBOARD smem-read latency (the
+//       #1 stall in faith2) overlaps the current octet's MMA issue instead of
+//       gating it. Weight A-frags are already resident (8 ldmatrix once/pass).
+// Tile/occupancy reuse mmqf's proven layout (128x128x256, 8 warps, ntx=2,
+// 1 CTA/SM) — occupancy is exhausted per faith4; this kernel spends the win on
+// raising issue-active via ILP, the hypothesis under test. Register tradeoff:
+// the distinct sbank (+32 int regs live within an octet) and the ping-pong B
+// bank (+16 regs vs single) are what buy the independence; kept the token-octet
+// processed ONE-at-a-time (sbank holds a single jj's 8 MMAs, not all 8 octets)
+// so peak live regs stay bounded (acc64 + WAarr32 + wsc16 + sbank32 + bfr/afr32)
+// at 1 CTA/SM. If ptxas spills, the lever to shed is the ping-pong depth (drop
+// to single-buffered B) before the sbank width.
+// ═══════════════════════════════════════════════════════════════════
+#define MQF3_WSTRIDE 76     // weight smem int32 row stride (256-K=64 data ints + 8 scale floats + 4 pad)
+#define MQF3_MMA_S8(d, a0,a1,a2,a3, b0,b1) \
+    asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 " \
+        "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};" \
+        : "=r"((d)[0]), "=r"((d)[1]), "=r"((d)[2]), "=r"((d)[3]) \
+        : "r"(a0),"r"(a1),"r"(a2),"r"(a3),"r"(b0),"r"(b1), \
+          "r"((d)[0]),"r"((d)[1]),"r"((d)[2]),"r"((d)[3]))
+
+extern "C" __global__
+__launch_bounds__(256, 1)
+void int8_gemm_mmqf3(
+    const signed char* __restrict__ A_i8,    // activations [M,K] (tokens,  B-operand via scalar load)
+    const signed char* __restrict__ B_i8,    // weights     [N,K] (features, A-operand via ldmatrix.x4)
+    const float* __restrict__ A_scale,        // [M, K/32] per-32-block activation scale
+    const float* __restrict__ B_scale,        // [N, K/32] per-32-block weight scale
+    __nv_bfloat16* __restrict__ C,            // [M, N]
+    unsigned int M, unsigned int N, unsigned int K)
+{
+    const unsigned int cta_n = blockIdx.x * 128;   // 128 weight rows (mmq_y)
+    const unsigned int cta_m = blockIdx.y * 128;   // 128 tokens     (mmq_x)
+    if (cta_m >= M || cta_n >= N) return;
+    const unsigned int t       = threadIdx.x;
+    const unsigned int warp_id = t >> 5;
+    const unsigned int lane    = t & 31;
+    const unsigned int ng      = warp_id >> 1;     // N row-group 0..3
+    const unsigned int mh      = warp_id & 1;      // M half     0/1
+    const unsigned int nb      = K >> 5;           // #blocks along K
+
+    __shared__ int   sW[128][MQF3_WSTRIDE];        // 256-K weights + co-located scales (loaded ONCE/iter)
+    __shared__ int   sA[128][36];                  // 128-K activations (RELOADED between the two passes)
+    __shared__ float sAs[128][4];                  // 128-K activation scales (RELOADED per pass)
+
+    float acc[2][8][4];                            // [ntx][token-octet][tile_C.ne]
+    #pragma unroll
+    for (int n=0;n<2;n++) for (int j=0;j<8;j++) { acc[n][j][0]=0;acc[n][j][1]=0;acc[n][j][2]=0;acc[n][j][3]=0; }
+
+    unsigned WAarr[2][4][4];                        // resident A frags: ntx=2 minitiles x 4 sub-blocks
+
+    // Pre-load token-octet JJ's scalar activation B-frags + per-32 scales into
+    // ping-pong slot P (technique #2: hoist the SHORT_SCOREBOARD smem read off
+    // the MMA issue path). sA/sAs are pass-local & stable during the pass.
+    #define MQF3_LOAD_B(P, JJ) do {                                              \
+        unsigned mcol0 = mh*64 + (JJ)*8;                                         \
+        _Pragma("unroll")                                                        \
+        for (int sb=0; sb<4; sb++){                                             \
+            const int* abase = &sA[mcol0 + lane/4][0] + sb*8;                    \
+            bfr[P][sb][0] = abase[lane%4];                                       \
+            bfr[P][sb][1] = abase[lane%4 + 4];                                   \
+            afr[P][sb][0] = sAs[mcol0 + (lane%4)*2    ][sb];                     \
+            afr[P][sb][1] = sAs[mcol0 + (lane%4)*2 + 1][sb];                     \
+        }                                                                        \
+    } while(0)
+
+    // ---- COMPUTE one 128-K vec_dot pass over the resident 256-K weight tile. ----
+    // PP selects which 128-K half of the weight tile (weight-int base = PP*32,
+    // weight scale block = PP*4+sb). Activation smem is pass-local => PP-independent.
+    #define MQF3_COMPUTE_PASS(PP) do {                                                                  \
+        float    wsc[2][2][4];                                                                          \
+        /* resident weight A-frags + per-32 scales: 8 ldmatrix.x4 ONCE per pass, reused all 8 octets */\
+        _Pragma("unroll")                                                                               \
+        for (int n=0;n<2;n++){                                                                          \
+            unsigned wrow = ng*32 + n*16;                                                               \
+            _Pragma("unroll")                                                                           \
+            for (int sb=0; sb<4; sb++){                                                                 \
+                const int* xs = &sW[wrow][0] + (lane%16)*MQF3_WSTRIDE + ((PP)*32 + sb*8) + (lane/16)*4; \
+                unsigned f0,f1,f2,f3;                                                                   \
+                asm volatile("ldmatrix.sync.aligned.m8n8.x4.b16 {%0,%1,%2,%3},[%4];"                    \
+                    : "=r"(f0),"=r"(f1),"=r"(f2),"=r"(f3) : "l"(xs));                                   \
+                wsc[n][0][sb] = ((const float*)&sW[wrow     + lane/4][0])[64 + (PP)*4 + sb];            \
+                wsc[n][1][sb] = ((const float*)&sW[wrow + 8 + lane/4][0])[64 + (PP)*4 + sb];            \
+                WAarr[n][sb][0]=f0; WAarr[n][sb][1]=f1; WAarr[n][sb][2]=f2; WAarr[n][sb][3]=f3;         \
+            }                                                                                          \
+        }                                                                                              \
+        unsigned bfr[2][4][2];   /* ping-pong activation B-frags  [pipe][sb][0..1] */                  \
+        float    afr[2][4][2];   /* ping-pong activation scales   [pipe][sb][0..1] */                  \
+        MQF3_LOAD_B(0, 0);       /* prime octet 0 */                                                   \
+        _Pragma("unroll")                                                                               \
+        for (int jj=0; jj<8; jj++){                                                                     \
+            const int p = jj & 1;                                                                       \
+            if (jj < 7) { MQF3_LOAD_B(p^1, jj+1); }   /* pipeline next octet's B off the MMA path */    \
+            /* --- PHASE A: issue all 8 INDEPENDENT MMAs into a distinct register bank --- */          \
+            int sbank[4][2][4];                                                                         \
+            _Pragma("unroll")                                                                           \
+            for (int sb=0; sb<4; sb++){                                                                 \
+                _Pragma("unroll")                                                                       \
+                for (int n=0; n<2; n++){                                                                \
+                    sbank[sb][n][0]=0; sbank[sb][n][1]=0; sbank[sb][n][2]=0; sbank[sb][n][3]=0;         \
+                    MQF3_MMA_S8(sbank[sb][n], WAarr[n][sb][0],WAarr[n][sb][1],WAarr[n][sb][2],WAarr[n][sb][3], \
+                                bfr[p][sb][0], bfr[p][sb][1]);                                          \
+                }                                                                                      \
+            }                                                                                          \
+            /* --- PHASE B: fold all 8 into acc (sb outer, n inner == mmqf2 order => bit-identical) ---*/\
+            _Pragma("unroll")                                                                           \
+            for (int sb=0; sb<4; sb++){                                                                 \
+                _Pragma("unroll")                                                                       \
+                for (int n=0; n<2; n++){                                                                \
+                    acc[n][jj][0]+=(float)sbank[sb][n][0]*wsc[n][0][sb]*afr[p][sb][0];                  \
+                    acc[n][jj][1]+=(float)sbank[sb][n][1]*wsc[n][0][sb]*afr[p][sb][1];                  \
+                    acc[n][jj][2]+=(float)sbank[sb][n][2]*wsc[n][1][sb]*afr[p][sb][0];                  \
+                    acc[n][jj][3]+=(float)sbank[sb][n][3]*wsc[n][1][sb]*afr[p][sb][1];                  \
+                }                                                                                      \
+            }                                                                                          \
+        }                                                                                              \
+    } while(0)
+
+    for (unsigned int kb = 0; kb < K; kb += 256) {
+        // ---- load 256-K weight tile ONCE (8 16B chunks/thread) ----
+        #pragma unroll
+        for (int c=0; c<8; c++){
+            unsigned lin = c*256 + t;          // 0..2047
+            unsigned row = lin >> 4;           // /16  (16 chunks per 256-K row)
+            unsigned col = (lin & 15) << 4;    // byte col 0..240
+            unsigned gk  = kb + col;
+            mqf2_load_pred_16(((signed char*)&sW[row][0]) + col,
+                              &B_i8[(unsigned long long)(cta_n+row)*K + gk],
+                              (cta_n+row<N) && (gk+15<K));
+        }
+        // weight scales (8 per row), co-located at float offset 64..71 (llama x_df at +2*MMQ_TILE_NE_K)
+        if (t < 128) {
+            unsigned blk = kb >> 5;
+            #pragma unroll
+            for (int b=0;b<8;b++)
+                ((float*)&sW[t][0])[64+b] = (cta_n+t<N) ? B_scale[(unsigned long long)(cta_n+t)*nb + blk + b] : 0.f;
+        }
+        // ---- load activation pass-0 tile (128-K, 4 16B chunks/thread) => K[kb, kb+128) ----
+        #pragma unroll
+        for (int c=0; c<4; c++){
+            unsigned lin = c*256 + t;          // 0..1023
+            unsigned row = lin >> 3;           // /8 (8 chunks per 128-K row)
+            unsigned col = (lin & 7) << 4;     // byte col 0..112
+            unsigned gk  = kb + col;
+            mqf2_load_pred_16(((signed char*)&sA[row][0]) + col,
+                              &A_i8[(unsigned long long)(cta_m+row)*K + gk],
+                              (cta_m+row<M) && (gk+15<K));
+        }
+        if (t < 128) {
+            unsigned blk = kb >> 5;            // pass-0 blocks blk+0..3
+            #pragma unroll
+            for (int s=0;s<4;s++)
+                sAs[t][s] = (cta_m+t<M) ? A_scale[(unsigned long long)(cta_m+t)*nb + blk + s] : 0.f;
+        }
+        __syncthreads();
+
+        MQF3_COMPUTE_PASS(0);
+        __syncthreads();   // all warps done reading sA/sAs before pass-1 overwrites them
+
+        // ---- reload activation pass-1 tile (128-K) => K[kb+128, kb+256) ----
+        #pragma unroll
+        for (int c=0; c<4; c++){
+            unsigned lin = c*256 + t;
+            unsigned row = lin >> 3;
+            unsigned col = (lin & 7) << 4;
+            unsigned gk  = kb + 128 + col;
+            mqf2_load_pred_16(((signed char*)&sA[row][0]) + col,
+                              &A_i8[(unsigned long long)(cta_m+row)*K + gk],
+                              (cta_m+row<M) && (gk+15<K));
+        }
+        if (t < 128) {
+            unsigned blk = (kb >> 5) + 4;      // pass-1 blocks blk+4..7
+            #pragma unroll
+            for (int s=0;s<4;s++)
+                sAs[t][s] = (cta_m+t<M) ? A_scale[(unsigned long long)(cta_m+t)*nb + blk + s] : 0.f;
+        }
+        __syncthreads();
+
+        MQF3_COMPUTE_PASS(1);
+        __syncthreads();   // sW/sA fully read before next kb overwrites
+    }
+    #undef MQF3_COMPUTE_PASS
+    #undef MQF3_LOAD_B
+
+    // ---- write back (tile_C 16x8 -> C[M,N] row-major), same fragment map as faith2/mmqf2 ----
+    #pragma unroll
+    for (int n=0;n<2;n++){
+        unsigned nrow0 = cta_n + ng*32 + n*16 + lane/4;       // weight row r
+        #pragma unroll
+        for (int j=0;j<8;j++){
+            unsigned mcol = cta_m + mh*64 + j*8 + (lane%4)*2;  // token 2t
+            unsigned cN0=nrow0, cN1=nrow0+8;
+            if (mcol<M   && cN0<N) C[(unsigned long long)mcol*N + cN0]     = __float2bfloat16(acc[n][j][0]);
+            if (mcol+1<M && cN0<N) C[(unsigned long long)(mcol+1)*N + cN0] = __float2bfloat16(acc[n][j][1]);
+            if (mcol<M   && cN1<N) C[(unsigned long long)mcol*N + cN1]     = __float2bfloat16(acc[n][j][2]);
+            if (mcol+1<M && cN1<N) C[(unsigned long long)(mcol+1)*N + cN1] = __float2bfloat16(acc[n][j][3]);
+        }
+    }
+}
+#undef MQF3_MMA_S8
+#undef MQF3_WSTRIDE
+
+// ═══════════════════════════════════════════════════════════════════
 // REQUANT kernels feeding the int8 W4A8 prefill GEMM (faith2).
 //   requant_w_nvfp4_int8 : NVFP4 weights [N,K/2] packed E2M1 + [N,K/16] E4M3
 //     scales + per-tensor scale2  ->  int8 [N,K] + per-32 float scale [N,K/32].

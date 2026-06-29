@@ -77,6 +77,9 @@ fn main() -> Result<()> {
     let hfaith8 = gpu.kernel("w4a16", "int8_gemm_faith8")?;
     let hfaith9 = gpu.kernel("w4a16", "int8_gemm_faith9")?;
     let hfaith10 = gpu.kernel("w4a16", "int8_gemm_faith10")?;
+    let hmmqf = gpu.kernel("w4a16", "int8_gemm_mmqf")?;
+    let hmmqf2 = gpu.kernel("w4a16", "int8_gemm_mmqf2")?;
+    let hmmqf3 = gpu.kernel("w4a16", "int8_gemm_mmqf3")?;
     let hreqa_il = gpu.kernel("w4a16", "requant_a_bf16_int8_il")?;
     let hmmq = gpu.kernel("w4a16", "int8_gemm_mmq")?;
     let hmmq2 = gpu.kernel("w4a16", "int8_gemm_mmq2")?;
@@ -490,7 +493,39 @@ fn main() -> Result<()> {
         println!("REQUANT e2e faith10 (128-token weight reuse) vs host dequant: cosine={cos10:.6}  RESULT: {}",
             if cos10>0.999 {"PASS"} else {"FAIL"});
 
-        for p in [packed_p,e4m3_p,abf_p,wi8_p,wsc_p,ai8_p,asc_p,ce,ai8_il_p,asc5_p,ce5,ce6,ce7,ce8,ce9,ce10] { let _ = gpu.free(p); }
+        // mmqf path: faithful llama-MMQ port (ITER_K=256 + resident A reused across full 128-token tile + co-resident scales). MUST be bit-identical.
+        let cemf = gpu.alloc(m2*n2*2)?;
+        KernelLaunch::new(gpu, hmmqf)
+            .grid([(n2 as u32).div_ceil(128), (m2 as u32).div_ceil(128), 1]).block([256,1,1])
+            .arg_ptr(ai8_p).arg_ptr(wi8_p).arg_ptr(asc_p).arg_ptr(wsc_p).arg_ptr(cemf)
+            .arg_u32(m2 as u32).arg_u32(n2 as u32).arg_u32(k2 as u32).launch(stream)?;
+        gpu.synchronize(stream)?;
+        let mut remf = vec![0u8; m2*n2*2];
+        gpu.copy_d2h(cemf, &mut remf)?;
+        let cgmf: Vec<f32> = remf.chunks_exact(2).map(|c| bf16_bits_to_f32(u16::from_le_bytes([c[0],c[1]]))).collect();
+        let (mut dmf, mut nrmf, mut ngmf) = (0f64,0f64,0f64);
+        for i in 0..m2*n2 { let (x,y)=(cref[i] as f64, cgmf[i] as f64); dmf+=x*y; nrmf+=x*x; ngmf+=y*y; }
+        let cosmf = dmf/(nrmf.sqrt()*ngmf.sqrt());
+        println!("REQUANT e2e mmqf (faithful llama-MMQ port) vs host dequant: cosine={cosmf:.6}  RESULT: {}",
+            if cosmf>0.999 {"PASS"} else {"FAIL"});
+
+        // mmqf3 path: ILP-max MMA schedule (independent acc banks + pipelined B). MUST be bit-identical.
+        let cemf3 = gpu.alloc(m2*n2*2)?;
+        KernelLaunch::new(gpu, hmmqf3)
+            .grid([(n2 as u32).div_ceil(128), (m2 as u32).div_ceil(128), 1]).block([256,1,1])
+            .arg_ptr(ai8_p).arg_ptr(wi8_p).arg_ptr(asc_p).arg_ptr(wsc_p).arg_ptr(cemf3)
+            .arg_u32(m2 as u32).arg_u32(n2 as u32).arg_u32(k2 as u32).launch(stream)?;
+        gpu.synchronize(stream)?;
+        let mut remf3 = vec![0u8; m2*n2*2];
+        gpu.copy_d2h(cemf3, &mut remf3)?;
+        let cgmf3: Vec<f32> = remf3.chunks_exact(2).map(|c| bf16_bits_to_f32(u16::from_le_bytes([c[0],c[1]]))).collect();
+        let (mut dmf3, mut nrmf3, mut ngmf3) = (0f64,0f64,0f64);
+        for i in 0..m2*n2 { let (x,y)=(cref[i] as f64, cgmf3[i] as f64); dmf3+=x*y; nrmf3+=x*x; ngmf3+=y*y; }
+        let cosmf3 = dmf3/(nrmf3.sqrt()*ngmf3.sqrt());
+        println!("REQUANT e2e mmqf3 (ILP-max MMA schedule) vs host dequant: cosine={cosmf3:.6}  RESULT: {}",
+            if cosmf3>0.999 {"PASS"} else {"FAIL"});
+
+        for p in [packed_p,e4m3_p,abf_p,wi8_p,wsc_p,ai8_p,asc_p,ce,ai8_il_p,asc5_p,ce5,ce6,ce7,ce8,ce9,ce10,cemf,cemf3] { let _ = gpu.free(p); }
     }
 
     // ---- speed: prefill shapes ----
@@ -766,6 +801,42 @@ fn main() -> Result<()> {
         for _ in 0..iters { launchfaith10()?; }
         gpu.synchronize(stream)?;
         let tffaith10 = flops / (tf10.elapsed().as_secs_f64() / iters as f64) / 1e12;
+        let launchmmqf = || -> Result<()> {
+            KernelLaunch::new(gpu, hmmqf)
+                .grid([n.div_ceil(128) as u32, m.div_ceil(128) as u32, 1]).block([256, 1, 1])
+                .arg_ptr(a_p).arg_ptr(b_p).arg_ptr(as_p).arg_ptr(bs_p).arg_ptr(c_p)
+                .arg_u32(m as u32).arg_u32(n as u32).arg_u32(k as u32).launch(stream)
+        };
+        for _ in 0..3 { launchmmqf()?; }
+        gpu.synchronize(stream)?;
+        let tfmf = Instant::now();
+        for _ in 0..iters { launchmmqf()?; }
+        gpu.synchronize(stream)?;
+        let tfmmqf = flops / (tfmf.elapsed().as_secs_f64() / iters as f64) / 1e12;
+        let launchmmqf2 = || -> Result<()> {
+            KernelLaunch::new(gpu, hmmqf2)
+                .grid([n.div_ceil(128) as u32, m.div_ceil(128) as u32, 1]).block([256, 1, 1])
+                .arg_ptr(a_p).arg_ptr(b_p).arg_ptr(as_p).arg_ptr(bs_p).arg_ptr(c_p)
+                .arg_u32(m as u32).arg_u32(n as u32).arg_u32(k as u32).launch(stream)
+        };
+        for _ in 0..3 { launchmmqf2()?; }
+        gpu.synchronize(stream)?;
+        let tfmf2 = Instant::now();
+        for _ in 0..iters { launchmmqf2()?; }
+        gpu.synchronize(stream)?;
+        let tfmmqf2 = flops / (tfmf2.elapsed().as_secs_f64() / iters as f64) / 1e12;
+        let launchmmqf3 = || -> Result<()> {
+            KernelLaunch::new(gpu, hmmqf3)
+                .grid([n.div_ceil(128) as u32, m.div_ceil(128) as u32, 1]).block([256, 1, 1])
+                .arg_ptr(a_p).arg_ptr(b_p).arg_ptr(as_p).arg_ptr(bs_p).arg_ptr(c_p)
+                .arg_u32(m as u32).arg_u32(n as u32).arg_u32(k as u32).launch(stream)
+        };
+        for _ in 0..3 { launchmmqf3()?; }
+        gpu.synchronize(stream)?;
+        let tfmf3 = Instant::now();
+        for _ in 0..iters { launchmmqf3()?; }
+        gpu.synchronize(stream)?;
+        let tfmmqf3 = flops / (tfmf3.elapsed().as_secs_f64() / iters as f64) / 1e12;
         let launchmmq2 = || -> Result<()> {
             KernelLaunch::new(gpu, hmmq2)
                 .grid([n.div_ceil(128) as u32, m.div_ceil(128) as u32, 1]).block([256, 1, 1])
@@ -779,7 +850,7 @@ fn main() -> Result<()> {
         gpu.synchronize(stream)?;
         let tfmmq2 = flops / (tm2.elapsed().as_secs_f64() / iters as f64) / 1e12;
         let _ = (tf64, tfk64, tf8w3, tf8w, tf8wl, tf8wi, tfpipe, tfpada, tf8wab);
-        print!("{label}: M128 {tf128:.2} | padA {tfpada:.2} | FAITH {tffaith:.2} | FAITH2 {tffaith2:.2} | FAITH3 {tffaith3:.2} | FAITH4 {tffaith4:.2} | FAITH5 {tffaith5:.2} | FAITH6 {tffaith6:.2} | FAITH7 {tffaith7:.2} | FAITH8 {tffaith8:.2} | FAITH9 {tffaith9:.2} | FAITH10 {tffaith10:.2} | MMQ {tfmmq:.2} | MMQ2 {tfmmq2:.2}  (bf16=30, llama Q4K=65/Q6K=41)");
+        print!("{label}: M128 {tf128:.2} | padA {tfpada:.2} | FAITH {tffaith:.2} | FAITH2 {tffaith2:.2} | FAITH3 {tffaith3:.2} | FAITH4 {tffaith4:.2} | FAITH5 {tffaith5:.2} | FAITH6 {tffaith6:.2} | FAITH7 {tffaith7:.2} | FAITH8 {tffaith8:.2} | FAITH9 {tffaith9:.2} | FAITH10 {tffaith10:.2} | MMQF {tfmmqf:.2} | MMQF2 {tfmmqf2:.2} | MMQF3 {tfmmqf3:.2} | MMQ {tfmmq:.2} | MMQ2 {tfmmq2:.2}  (bf16=30, llama Q4K=65/Q6K=41)");
         // split-K sweep (partial + reduce)
         for &ks in &[2u32, 4, 8, 16] {
             let cp = gpu.alloc(ks as usize * m * n * 4)?;
