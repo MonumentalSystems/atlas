@@ -30,6 +30,7 @@ fn rejects_under_two_streams() {
         TOP_K,
         MROPE,
         false,
+        false,
     ));
     assert!(!check_kernel_batched_eligible(
         vec![s(4096, 0, false)],
@@ -40,6 +41,7 @@ fn rejects_under_two_streams() {
         BIG_SCRATCH,
         TOP_K,
         MROPE,
+        false,
         false,
     ));
 }
@@ -56,6 +58,7 @@ fn rejects_chunk_zero() {
         TOP_K,
         MROPE,
         false,
+        false,
     ));
 }
 
@@ -71,6 +74,7 @@ fn accepts_chunk_zero_when_explicitly_allowed() {
         TOP_K,
         MROPE,
         true,
+        false,
     ));
 }
 
@@ -86,6 +90,7 @@ fn accepts_uniform_paged_n_2() {
         TOP_K,
         MROPE,
         false,
+        false,
     ));
 }
 
@@ -100,6 +105,7 @@ fn rejects_mismatched_chunk_len() {
         BIG_SCRATCH,
         TOP_K,
         MROPE,
+        false,
         false,
     ));
 }
@@ -118,6 +124,7 @@ fn rejects_mismatched_chunk_start() {
         TOP_K,
         MROPE,
         false,
+        false,
     ));
 }
 
@@ -132,6 +139,7 @@ fn rejects_mismatched_is_last() {
         BIG_SCRATCH,
         TOP_K,
         MROPE,
+        false,
         false,
     ));
 }
@@ -149,6 +157,7 @@ fn rejects_arena_overflow() {
         TOP_K,
         MROPE,
         false,
+        false,
     ));
 }
 
@@ -163,6 +172,7 @@ fn rejects_mla_model() {
         BIG_SCRATCH,
         TOP_K,
         MROPE,
+        false,
         false,
     ));
 }
@@ -180,6 +190,7 @@ fn rejects_large_head_dim() {
         TOP_K,
         MROPE,
         false,
+        false,
     ));
 }
 
@@ -194,6 +205,7 @@ fn accepts_n_4_uniform() {
         BIG_SCRATCH,
         TOP_K,
         MROPE,
+        false,
         false,
     ));
 }
@@ -221,6 +233,7 @@ fn rejects_scratch_footprint_overflow() {
             8,
             true,
             false,
+            false,
         ),
         "footprint must NOT fit in the old 348_840 B scratch"
     );
@@ -234,6 +247,7 @@ fn rejects_scratch_footprint_overflow() {
             enlarged,
             8,
             true,
+            false,
             false,
         ),
         "footprint must fit once scratch is sized to it"

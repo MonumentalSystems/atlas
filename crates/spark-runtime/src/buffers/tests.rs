@@ -41,10 +41,10 @@ fn test_buffer_arena_alloc() {
     assert!(!arena.hidden_states().is_null());
     assert!(!arena.logits().is_null());
     assert_eq!(arena.max_batch_tokens(), 128);
-    // 21 allocations: the prior 19 (12 data + 1 scratch + 3 expert + 2 splitk
-    // + 1 gdn_fla_scratch) plus the 2 FP32-routing buffers (gate_logits_f32 +
-    // moe_router_in_f32) added for the ATLAS_FP32_GATE/ROUTING path.
-    assert_eq!(gpu.alloc_count(), 21);
+    // 23 allocations: the prior 21 (12 data + 1 scratch + 3 expert + 2 splitk
+    // + 1 gdn_fla_scratch + 2 FP32-routing) plus the 2 buffers added by the
+    // Holo-3.1/Ornith GB10 enablement (see buffers.rs).
+    assert_eq!(gpu.alloc_count(), 23);
 }
 
 #[test]

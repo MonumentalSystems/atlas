@@ -27,7 +27,7 @@ impl MoeLayer {
     /// Writes the routed expert outputs into `ctx.buffers.expert_down_out()`.
     /// `t0` carries the running profile timer so per-step timing output
     /// matches the original inline pipeline exactly.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, clippy::unnecessary_unwrap)]
     pub(super) fn run_routed_grouped_gemm(
         &self,
         expert_input: DevicePtr,
