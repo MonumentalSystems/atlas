@@ -38,6 +38,15 @@ fn proj_is_native_fp8(store: &WeightStore, prefix: &str) -> bool {
     is_fp8_weight && has_block_scale
 }
 
+/// Opt-in gate for native dense-FP8 attention + FFN dispatch (Qwythos / dense
+/// Ornith-FP8). Default OFF: the path is correct for text but still has open
+/// issues (attention FP8 prefill transpose not engaging, a residual NVFP4
+/// requant, and a vision-prefill CUDA-700) and is not yet a perf win over the
+/// NVFP4 fallback. Enable with `ATLAS_DENSE_FP8=1` to exercise/finish it.
+fn dense_fp8_enabled() -> bool {
+    std::env::var("ATLAS_DENSE_FP8").as_deref() == Ok("1")
+}
+
 mod loaders_b;
 
 pub struct Qwen35DenseWeightLoader;
@@ -131,7 +140,8 @@ impl ModelWeightLoader for Qwen35DenseWeightLoader {
             // load gate/up/down directly as block-scaled `Fp8Weight` and
             // dispatch w8a16 — no NVFP4 requant. TP>1 still uses the NVFP4
             // path (FP8 FFN sharding is a follow-up).
-            let ffn_fp8 = config.tp_world_size.max(1) == 1
+            let ffn_fp8 = dense_fp8_enabled()
+                && config.tp_world_size.max(1) == 1
                 && matches!(variant, Nvfp4Variant::Fp8Dequanted)
                 && proj_is_native_fp8(store, &format!("{lp}.mlp.gate_proj"));
             let ffn = if ffn_fp8 {
@@ -162,7 +172,8 @@ impl ModelWeightLoader for Qwen35DenseWeightLoader {
 
             match lt {
                 LayerType::FullAttention
-                    if matches!(variant, Nvfp4Variant::Fp8Dequanted)
+                    if dense_fp8_enabled()
+                        && matches!(variant, Nvfp4Variant::Fp8Dequanted)
                         && proj_is_native_fp8(store, &format!("{lp}.self_attn.q_proj")) =>
                 {
                     // ── Native dense FP8 attention (zero-copy, no NVFP4 requant) ──
