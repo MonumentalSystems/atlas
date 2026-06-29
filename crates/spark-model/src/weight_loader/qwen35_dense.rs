@@ -39,10 +39,19 @@ fn proj_is_native_fp8(store: &WeightStore, prefix: &str) -> bool {
 }
 
 /// Opt-in gate for native dense-FP8 attention + FFN dispatch (Qwythos / dense
-/// Ornith-FP8). Default OFF: the path is correct for text but still has open
-/// issues (attention FP8 prefill transpose not engaging, a residual NVFP4
-/// requant, and a vision-prefill CUDA-700) and is not yet a perf win over the
-/// NVFP4 fallback. Enable with `ATLAS_DENSE_FP8=1` to exercise/finish it.
+/// Ornith-FP8). Default OFF.
+///
+/// VERIFIED 2026-06-29 on Qwythos-9B-FP8 (gb10/ornith-1.0-9b): with the flag
+/// on, the FP8 arms fire for all 32 FFN + 8 full-attn layers and text is
+/// correct (coherence/fib/tools 3/3). BUT it is NOT a perf win — ~30 tok/s vs
+/// ~40 for the NVFP4 fallback — because this target's NVFP4 W4A16 kernels
+/// (fused dual-GEMV decode, transposed m128 prefill) are more optimized than
+/// its FP8 W8A16 kernels (unfused per-projection GEMV, non-transposed
+/// `w8a16_gemm` prefill; the attention FP8 prefill transpose also does not
+/// engage). Vision prefill additionally hits a CUDA-700. Making FP8 pay off
+/// here needs dedicated dense-FP8 kernels (fused FP8 dual-GEMV + fast
+/// transposed FP8 prefill GEMM), not loader wiring. Until then NVFP4 autoquant
+/// is the better dense runtime. `ATLAS_DENSE_FP8=1` opts in for that kernel work.
 fn dense_fp8_enabled() -> bool {
     std::env::var("ATLAS_DENSE_FP8").as_deref() == Ok("1")
 }
@@ -235,9 +244,7 @@ impl ModelWeightLoader for Qwen35DenseWeightLoader {
                     )?;
                     layer.set_fp8_weights(Some(q_fp8), Some(k_fp8), Some(v_fp8), Some(o_fp8));
                     if let Err(e) = layer.transpose_fp8_for_prefill(gpu, stream) {
-                        tracing::warn!(
-                            "Layer {i}: dense FP8 transpose failed, non-transposed prefill: {e}"
-                        );
+                        tracing::warn!("Layer {i}: dense FP8 transpose failed: {e}");
                     }
                     layers.push(Box::new(layer));
                     attn_idx += 1;
