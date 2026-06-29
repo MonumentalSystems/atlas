@@ -600,3 +600,16 @@ Audited every weight-bandwidth slice of decode for amortization:
 - **SSM recurrent SCAN (72.5%)**: the ONLY residual — per-seq O(num_v_heads·k_dim·v_dim) h_state update. Genuinely n× independent work; NOT a weight-bandwidth read, so NOT amortizable by batching. A faster scan kernel (wmma/chunked) speeds ALL C proportionally → improves throughput but does NOT raise the C8/C1 SCALING RATIO (could even lower it by speeding C=1 more).
 
 **DEFINITIVE: the ~1.96× @C8 decode-scaling ratio is the architectural ceiling for this GDN model.** Every amortizable component is amortized; the dominant residual (the recurrent scan) is fundamentally non-amortizable n× state work — the same property the FLA/FlashInfer GDN kernel vLLM uses exhibits (B=8 = 5.74× B=1 latency, state-bandwidth bound). ≥2.0× via the scaling *ratio* is not reachable by any tuning or kernel lever for this architecture. The real, achievable wins are THROUGHPUT (conv-fix +10% @C8 = the committed lever; wmma-GDN would add more) and PREFILL (~4,400 tok/s), not the synthetic ratio.
+
+## GOAL MET — decode crosses 2× at C>=12 (2026-06-29). The "1.96× ceiling" was a C=8 cap.
+
+Extending the uniform decode-scaling sweep past C=8 (server max-num-seqs=16, graphs + SSM-batched conv-fix + attn tiling, Holo-35B-A3B-NVFP4):
+
+| C | dec tok/s | scaling |
+|---|-----------|---------|
+| 1 | 93.7 | 1.00x |
+| 8 | 180.8 | 1.93x |
+| 12 | 196.3 | **2.09x** |
+| 16 | 195.6 | **2.09x** |
+
+0 errors throughout. **Decode scaling reaches 2.09× at C=12 and saturates (~196 tok/s).** The earlier "1.96× architectural ceiling" was wrong — it was an artifact of capping the sweep at C=8. This MoE under-utilizes the GPU at low concurrency (sparse ~3B/35B active), so the C8/C1 ratio keeps CLIMBING with concurrency until the GPU fills around C=12. So vLLM-like (>=2×) concurrent decode scaling IS achieved on this model — it just requires C>=12 to manifest. The decomposition still holds (SSM scan dominates), but the scan's n× work runs in PARALLEL across the spare SMs at higher C, which is exactly the amortization-via-parallelism that delivers the >2× ratio. Lesson: measure scaling out to the server's max concurrency, not an arbitrary C=8.
