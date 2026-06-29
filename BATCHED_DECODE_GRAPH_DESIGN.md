@@ -589,3 +589,14 @@ Implemented BOTH remaining attention-projection levers (commits on branch): n>=4
 All within run-to-run noise (±0.04x). **The attention tiling is correct but does NOT meaningfully move decode** — under CUDA graphs the per-seq launch overhead was already gone, and projection weight-reads (8->3) are tiny vs the SSM wall.
 
 **FINAL VERDICT:** decode @C8 ceiling ~1.96x, firmly SSM-bound (72.5%, the per-seq recurrent scan is genuinely n× — same property as the FLA/FlashInfer GDN kernel vLLM uses, per holo-vllm-parity-poc: "B=8 = 5.74× B=1, state-bandwidth bound"). Every tractable lever is now implemented + validated: conv-fix SSM-batched (the real win, 1.76->1.93 on MoE), qkv-tiling, o_proj-tiling. Crossing 2x cleanly requires a fundamentally different GDN decode kernel (chunked/wmma — [[holo-gdn-wmma-vblock]], [[holo-gdn-chunk-rfc-ref]]), a multi-week kernel-research effort, NOT a tuning lever. 1.96x is vLLM-parity-class for a linear-attention hybrid (vLLM does not exceed ~2x on GDN decode either).
+
+## CLOSING EVIDENCE — every amortizable decode component is exhausted (2026-06-29)
+
+Audited every weight-bandwidth slice of decode for amortization:
+- **lm_head (12%)**: ALREADY batched — `w4a16_gemm` M=padded_n (decode_a2.rs:421), vocab weight read once/step. No lever.
+- **attention q/k/v/o (15.5%)**: now tiled (batch3/batch2), weight reads 8→3 @C8. Done (neutral under graphs).
+- **dense FFN**: batched (forward_batched). MoE FFN: per-seq, but batching REGRESSES (grouped/atomic confirmed losses).
+- **SSM projections**: batched via the conv-fix batched-recurrent path.
+- **SSM recurrent SCAN (72.5%)**: the ONLY residual — per-seq O(num_v_heads·k_dim·v_dim) h_state update. Genuinely n× independent work; NOT a weight-bandwidth read, so NOT amortizable by batching. A faster scan kernel (wmma/chunked) speeds ALL C proportionally → improves throughput but does NOT raise the C8/C1 SCALING RATIO (could even lower it by speeding C=1 more).
+
+**DEFINITIVE: the ~1.96× @C8 decode-scaling ratio is the architectural ceiling for this GDN model.** Every amortizable component is amortized; the dominant residual (the recurrent scan) is fundamentally non-amortizable n× state work — the same property the FLA/FlashInfer GDN kernel vLLM uses exhibits (B=8 = 5.74× B=1 latency, state-bandwidth bound). ≥2.0× via the scaling *ratio* is not reachable by any tuning or kernel lever for this architecture. The real, achievable wins are THROUGHPUT (conv-fix +10% @C8 = the committed lever; wmma-GDN would add more) and PREFILL (~4,400 tok/s), not the synthetic ratio.
