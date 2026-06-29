@@ -27,6 +27,9 @@ impl MoeLayer {
     /// Writes the routed expert outputs into `ctx.buffers.expert_down_out()`.
     /// `t0` carries the running profile timer so per-step timing output
     /// matches the original inline pipeline exactly.
+    // unnecessary_unwrap: gate/up/down SFB Options are checked together via
+    // is_some() at the top of the cutlass branch, then .expect()'d at their use
+    // sites; binding all three up front would fragment the launch sequence.
     #[allow(clippy::too_many_arguments, clippy::unnecessary_unwrap)]
     pub(super) fn run_routed_grouped_gemm(
         &self,
