@@ -93,7 +93,7 @@ def build_request(rng, kinds, prefix_hit_rate, model, img_urls):
 
 
 def stream_chat(url, body, timeout):
-    t0 = time.time(); ttft = None; pt = ct = cached = rtok = 0; toolcall = False
+    t0 = time.time(); ttft = None; pt = ct = cached = rtok = 0; toolcall = False; txt = []
     try:
         req = urllib.request.Request(url, data=json.dumps(body).encode(),
                                      headers={"Content-Type": "application/json"})
@@ -118,9 +118,11 @@ def stream_chat(url, body, timeout):
                     d = ch[0].get("delta", {})
                     if (d.get("content") or d.get("reasoning_content") or d.get("tool_calls")) and ttft is None:
                         ttft = time.time() - t0
+                    if d.get("content"):
+                        txt.append(d["content"])
                     if d.get("tool_calls"):
                         toolcall = True
-        return {"ok": True, "ct": ct, "pt": pt, "cached": cached, "rtok": rtok,
+        return {"ok": True, "ct": ct, "pt": pt, "cached": cached, "rtok": rtok, "txt": "".join(txt),
                 "toolcall": toolcall, "el": time.time() - t0, "ttft": ttft or (time.time() - t0)}
     except Exception as e:
         return {"ok": False, "err": str(e)[:140], "el": time.time() - t0}
@@ -138,6 +140,10 @@ def main():
     ap.add_argument("--prefix-hit-rate", type=float, default=0.0,
                     help="target fraction (0..1) of each prompt that is a shared cacheable prefix")
     ap.add_argument("--think-rate", type=float, default=0.5, help="fraction of requests with thinking ON")
+    ap.add_argument("--conv-rate", type=float, default=0.5,
+                    help="fraction of clients that run GROWING multi-turn conversations (rest do one-shot mix)")
+    ap.add_argument("--rolling-context", type=int, default=64000,
+                    help="grow each conversation thread until ~this many tokens, then reset (adjustable)")
     ap.add_argument("--timeout", type=int, default=600)
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--max-error-rate", type=float, default=2.0, help="fail (exit 1) above this %% errors")
@@ -170,29 +176,69 @@ def main():
             print(f"--vision set but image dir unavailable ({e}); text-only", file=sys.stderr)
 
     st = {"req": 0, "err": 0, "ct": 0, "pt": 0, "cached": 0, "rtok": 0, "tc": 0, "think": 0,
-          "fact": 0, "tool": 0, "img": 0}
+          "fact": 0, "tool": 0, "img": 0, "conv": 0, "conv_turns": 0, "max_thread_tok": 0}
     lat, lock, stop = [], threading.Lock(), time.time() + args.duration
+    FOLLOWUPS = ["Continue your analysis.", "Elaborate on the most important point.",
+                 "What did you miss? Add detail.", "Now consider the edge cases.",
+                 "Summarize so far, then go deeper.", "Cross-check that against the context above."]
+
+    def record(r, kind, think):
+        with lock:
+            st["req"] += 1; st[kind] += 1
+            if think:
+                st["think"] += 1
+            if r["ok"]:
+                st["ct"] += r["ct"]; st["pt"] += r["pt"]; st["cached"] += r["cached"]
+                st["rtok"] += r["rtok"]; st["tc"] += int(r["toolcall"]); lat.append(r["el"])
+        return r["ok"]
+
+    def oneshot_client(cid, rng):
+        consec = 0
+        while time.time() < stop:
+            body, kind, think = build_request(rng, kinds, args.prefix_hit_rate, args.model, img_urls)
+            ok = record(stream_chat(chat_url, body, args.timeout), kind, think)
+            consec = 0 if ok else consec + 1
+            if consec:
+                time.sleep(min(2.0, 0.2 * consec))
+
+    def conversation_client(cid, rng):
+        """A GROWING multi-turn thread: resend the whole conversation each turn so
+        the prefix (all prior turns) is reused/cached, until it hits
+        --rolling-context tokens, then reset. Models a real chat session."""
+        consec = 0
+        while time.time() < stop:
+            # seed the thread with a shared cacheable preamble + opening question
+            body, _, think = build_request(rng, ["fact"], args.prefix_hit_rate, args.model, img_urls)
+            msgs = body["messages"]
+            thread_tok = 0; turns = 0
+            with lock:
+                st["conv"] += 1
+            while time.time() < stop and thread_tok < args.rolling_context:
+                turn_think = rng.random() < args.think_rate
+                tb = {"model": args.model, "messages": msgs, "max_tokens": rng.choice(DECODE_LENS),
+                      "temperature": 0.0, "stream": True, "stream_options": {"include_usage": True},
+                      "chat_template_kwargs": {"enable_thinking": turn_think}}
+                r = stream_chat(chat_url, tb, args.timeout)
+                ok = record(r, "fact", turn_think)
+                if not ok:
+                    consec += 1; time.sleep(min(2.0, 0.2 * consec)); break
+                consec = 0; turns += 1
+                thread_tok = r["pt"] + r["ct"]                       # thread size after this turn
+                msgs = msgs + [{"role": "assistant", "content": r["txt"] or "(no content)"},
+                               {"role": "user", "content": rng.choice(FOLLOWUPS)}]
+            with lock:
+                st["conv_turns"] += turns
+                st["max_thread_tok"] = max(st["max_thread_tok"], thread_tok)
+
+    n_conv = int(round(args.clients * max(0.0, min(1.0, args.conv_rate))))
 
     def client(cid):
         rng = random.Random(cid * 7919 + args.seed)
-        consec_err = 0
-        while time.time() < stop:
-            body, kind, think = build_request(rng, kinds, args.prefix_hit_rate, args.model, img_urls)
-            r = stream_chat(chat_url, body, args.timeout)
-            with lock:
-                st["req"] += 1; st[kind] += 1
-                if think:
-                    st["think"] += 1
-                if r["ok"]:
-                    consec_err = 0
-                    st["ct"] += r["ct"]; st["pt"] += r["pt"]; st["cached"] += r["cached"]
-                    st["rtok"] += r["rtok"]; st["tc"] += int(r["toolcall"]); lat.append(r["el"])
-                else:
-                    st["err"] += 1; consec_err += 1
-            if consec_err:                       # back off on errors so a server hiccup
-                time.sleep(min(2.0, 0.2 * consec_err))   # doesn't spin into a tight fail-loop
+        (conversation_client if cid < n_conv else oneshot_client)(cid, rng)
 
     t0 = time.time()
+    print(f"clients: {n_conv} conversation (roll to {args.rolling_context} tok) + "
+          f"{args.clients - n_conv} one-shot; think-rate {args.think_rate}", flush=True)
     ths = [threading.Thread(target=client, args=(c,)) for c in range(args.clients)]
     for t in ths:
         t.start()
@@ -216,6 +262,8 @@ def main():
           f"kinds fact={st['fact']} tool={st['tool']} img={st['img']} | "
           f"thinking {st['think']}/{st['req']} ({100*st['think']/max(1,st['req']):.0f}%) | "
           f"tool_calls emitted={st['tc']}", flush=True)
+    print(f"  CONVERSATIONS: {st['conv']} threads, {st['conv_turns']} total turns, "
+          f"deepest thread {st['max_thread_tok']} tok (roll @ {args.rolling_context})", flush=True)
     print(f"  PREFILL: {fresh} fresh tok ({st['cached']} cached, {hit:.0f}% hit vs "
           f"{100*args.prefix_hit_rate:.0f}% target) = {fresh/el:.0f} tok/s", flush=True)
     print(f"  DECODE:  {st['ct']} gen tok = {st['ct']/el:.0f} tok/s (reasoning {st['rtok']} tok, "
