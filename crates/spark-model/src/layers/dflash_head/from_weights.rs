@@ -191,17 +191,65 @@ impl BlockDiffusionDraftHead {
             position_ids: gpu.alloc(n_attn * 4)?,
         };
 
-        // Pre-compute standard RoPE inv_freq table for drafter.
-        // Drafter config.json has `rope_scaling: null` — no interpolation.
-        // Previous code incorrectly applied YaRN (factor=64) which corrupted
-        // all positional encodings and caused 0% accept rate.
-        let rope_theta = 10_000_000.0f32; // drafter rope_theta from config
-        let rotary_dim = head_dim;
+        // Pre-compute the drafter RoPE inv_freq table, CONFIG-DRIVEN from the
+        // drafter's `config.json` (rope_theta + rope_scaling). The drafter must
+        // use exactly the RoPE it was trained with: the Qwen3.5 / gemma-4
+        // drafters ship `rope_scaling: null` → standard RoPE; the Qwen3.6
+        // drafter ships `rope_type: "yarn"` (factor=64) → YaRN-interpolated.
+        // Hardcoding either one corrupts the other's attention rotations and
+        // collapses acceptance to ~0%.
+        let rope_theta = weights.config.rope_theta as f32;
+        let rotary_dim = head_dim; // DFlash drafters apply RoPE to the full head_dim
         let dim_f = rotary_dim as f32;
         let n_pairs = rotary_dim / 2;
         let mut inv_freq_table = vec![0.0f32; n_pairs];
-        for j in 0..n_pairs {
-            inv_freq_table[j] = 1.0 / rope_theta.powf((2 * j) as f32 / dim_f);
+        let yarn = weights.config.rope_scaling.as_ref().filter(|r| r.is_yarn());
+        match yarn {
+            Some(r) => {
+                // YaRN: NTK-by-parts interpolation between extrapolated and
+                // interpolated inv_freq, ramped over [low, high] correction dims.
+                // Mirrors mistral_loader.rs and the pre-fix drafter path.
+                let factor = r.factor.unwrap_or(64.0);
+                let beta_fast = r.beta_fast.unwrap_or(32.0);
+                let beta_slow = r.beta_slow.unwrap_or(1.0);
+                let orig_max_pos = r.original_max_position_embeddings.unwrap_or(4096.0);
+                let find_correction_dim = |num_rot: f32| -> f32 {
+                    (dim_f * (orig_max_pos / (num_rot * 2.0 * std::f32::consts::PI)).ln())
+                        / (2.0 * rope_theta.ln())
+                };
+                let low = find_correction_dim(beta_fast).floor().max(0.0);
+                let high = find_correction_dim(beta_slow)
+                    .ceil()
+                    .min((rotary_dim - 1) as f32);
+                let ramp_denom = if (high - low).abs() < 1e-6 {
+                    high - low + 0.001
+                } else {
+                    high - low
+                };
+                for j in 0..n_pairs {
+                    let pos_freq = rope_theta.powf((2 * j) as f32 / dim_f);
+                    let inv_freq_extrap = 1.0 / pos_freq;
+                    let inv_freq_interp = 1.0 / (factor * pos_freq);
+                    let ramp = ((j as f32 - low) / ramp_denom).clamp(0.0, 1.0);
+                    let extrap_factor = 1.0 - ramp;
+                    inv_freq_table[j] =
+                        inv_freq_interp * (1.0 - extrap_factor) + inv_freq_extrap * extrap_factor;
+                }
+                tracing::info!(
+                    "DFlash RoPE inv_freq: {n_pairs} pairs, theta={rope_theta}, YaRN \
+                     (factor={factor}, beta_fast={beta_fast}, beta_slow={beta_slow}, \
+                     max_pos={orig_max_pos}, low_dim={low:.1}, high_dim={high:.1})",
+                );
+            }
+            None => {
+                for j in 0..n_pairs {
+                    inv_freq_table[j] = 1.0 / rope_theta.powf((2 * j) as f32 / dim_f);
+                }
+                tracing::info!(
+                    "DFlash RoPE inv_freq: {n_pairs} pairs, theta={rope_theta} \
+                     (standard, no interpolation)",
+                );
+            }
         }
         let inv_freq_bytes: Vec<u8> = inv_freq_table
             .iter()
@@ -209,10 +257,6 @@ impl BlockDiffusionDraftHead {
             .collect();
         let yarn_inv_freq = gpu.alloc(inv_freq_bytes.len())?;
         gpu.copy_h2d(&inv_freq_bytes, yarn_inv_freq)?;
-        tracing::info!(
-            "DFlash RoPE inv_freq: {} pairs, theta={rope_theta} (standard, no interpolation)",
-            n_pairs,
-        );
 
         let head = Self {
             num_layers,

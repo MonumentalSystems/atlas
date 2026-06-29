@@ -51,6 +51,15 @@ pub struct DflashConfig {
     /// Block size γ. Qwen3.6-DFlash ships `block_size: 16`.
     #[serde(default = "default_block_size")]
     pub block_size: usize,
+    /// RoPE base frequency. Qwen3.5/3.6-DFlash ship `1e7`; gemma-4-DFlash `1e6`.
+    #[serde(default = "default_drafter_rope_theta")]
+    pub rope_theta: f64,
+    /// RoPE scaling block. `null` on the Qwen3.5 / gemma-4 drafters (→ standard
+    /// RoPE); `{rope_type: "yarn", factor, ...}` on the Qwen3.6 drafter. Drives
+    /// whether `from_weights` builds a standard or YaRN-interpolated inv_freq
+    /// table — getting this wrong corrupts every drafter attention rotation.
+    #[serde(default)]
+    pub rope_scaling: Option<DflashRopeScaling>,
     /// DFlash-specific nested config object.
     #[serde(default)]
     pub dflash_config: Option<DflashSubConfig>,
@@ -58,6 +67,38 @@ pub struct DflashConfig {
 
 fn default_block_size() -> usize {
     16
+}
+
+fn default_drafter_rope_theta() -> f64 {
+    10_000_000.0
+}
+
+/// `rope_scaling` block from the drafter's `config.json`. HF writes both
+/// `rope_type` and a legacy `type` alias; we read either. All numeric fields
+/// are optional so a partial/standard block still deserializes.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DflashRopeScaling {
+    #[serde(default)]
+    pub rope_type: Option<String>,
+    #[serde(rename = "type", default)]
+    pub type_alias: Option<String>,
+    #[serde(default)]
+    pub factor: Option<f32>,
+    #[serde(default)]
+    pub beta_fast: Option<f32>,
+    #[serde(default)]
+    pub beta_slow: Option<f32>,
+    #[serde(default)]
+    pub original_max_position_embeddings: Option<f32>,
+}
+
+impl DflashRopeScaling {
+    /// True when this block requests YaRN interpolation (`rope_type` or the
+    /// legacy `type` alias == "yarn").
+    pub fn is_yarn(&self) -> bool {
+        let ty = self.rope_type.as_deref().or(self.type_alias.as_deref());
+        matches!(ty, Some(t) if t.eq_ignore_ascii_case("yarn"))
+    }
 }
 
 /// Nested `dflash_config` block in the drafter's `config.json`.
