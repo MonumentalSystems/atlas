@@ -65,7 +65,19 @@ pub fn finish_sequence(model: &dyn Model, a: &mut ActiveSeq) {
         0.0
     };
     let ttft_ms = a.decode_start.duration_since(a.request_start).as_secs_f64() * 1000.0;
-    tracing::info!("Done: {n} tokens ({reason}) {tps:.1} tok/s, TTFT={ttft_ms:.1}ms");
+    // Prefill throughput: prompt tokens actually computed (excluding prefix-cache
+    // hits) over the time-to-first-token (≈ prefill time; includes queue wait
+    // under concurrency). Logged so prefill tok/s is readable straight from the
+    // server, no client-side derivation.
+    let prefill_computed = (a.seq.prompt_len as u32).saturating_sub(a.cached_prompt_tokens);
+    let prefill_tps = if ttft_ms > 0.0 {
+        prefill_computed as f64 / (ttft_ms / 1000.0)
+    } else {
+        0.0
+    };
+    tracing::info!(
+        "Done: {n} tokens ({reason}) {tps:.1} tok/s, TTFT={ttft_ms:.1}ms, prefill {prefill_computed} tok @ {prefill_tps:.0} tok/s"
+    );
     // Cache the full sequence (prompt + generated) in the prefix cache.
     // Must happen BEFORE free_sequence() so block indices are still valid.
     // Enables multi-turn sessions to reuse KV cache for prior assistant responses.
