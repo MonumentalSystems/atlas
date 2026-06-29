@@ -341,16 +341,24 @@ pub fn build_model(
                     "--target-kv-tokens {} needs {:.1} GB for KV ({} blocks × {} tok/block) but only \
                      {:.1} GB is free after weights+buffers+reserve ({:.1} GB reserve). Lower \
                      --target-kv-tokens or free GPU memory.",
-                    target_kv_tokens, gb(want_bytes), want_blocks, kv_block_size,
-                    gb(avail), gb(inference_reserve),
+                    target_kv_tokens,
+                    gb(want_bytes),
+                    want_blocks,
+                    kv_block_size,
+                    gb(avail),
+                    gb(inference_reserve),
                 );
             }
             tracing::info!(
                 "KV cache: --target-kv-tokens {} → {} blocks × {} tok/block = {} max KV tokens \
                  ({:.1} GB), auto-provisioned ({:.1} GB free after reserve; --gpu-memory-utilization \
                  ignored for KV sizing)",
-                target_kv_tokens, want_blocks, kv_block_size, want_blocks * kv_block_size,
-                gb(want_bytes), gb(avail),
+                target_kv_tokens,
+                want_blocks,
+                kv_block_size,
+                want_blocks * kv_block_size,
+                gb(want_bytes),
+                gb(avail),
             );
             want_blocks
         }

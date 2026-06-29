@@ -169,6 +169,14 @@ jobs:
             # files above and splitting fragments it. Clean split tracked as
             # follow-up.
             "crates/spark-model/src/weight_loader/qwen35_dense.rs"
+            # ── batched-decode-scaling carry-over ──
+            # 523 LoC — the KV-budget computation in `build_model` (was 494;
+            # `--target-kv-tokens` auto-provision added a `None if target>0`
+            # arm to the num_kv_blocks match). The match reads ~13 coupled
+            # local bindings (total_mem/used_so_far/kv_budget/actual_free/
+            # inference_reserve/kv_config/...); extracting it would mean a
+            # 13-arg helper. Same rationale as the kernel-dispatch files above.
+            "crates/spark-model/src/factory/build.rs"
           )
 
           violations=0

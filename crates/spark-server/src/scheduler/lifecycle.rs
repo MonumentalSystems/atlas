@@ -87,7 +87,9 @@ pub fn finish_sequence(model: &dyn Model, a: &mut ActiveSeq) {
             format!("prefill {prefill_computed} tok @ {prefill_tps:.0} tok/s")
         }
     };
-    tracing::info!("Done: {n} tokens ({reason}) {tps:.1} tok/s, TTFT={ttft_ms:.1}ms, {prefill_str}");
+    tracing::info!(
+        "Done: {n} tokens ({reason}) {tps:.1} tok/s, TTFT={ttft_ms:.1}ms, {prefill_str}"
+    );
     // Cache the full sequence (prompt + generated) in the prefix cache.
     // Must happen BEFORE free_sequence() so block indices are still valid.
     // Enables multi-turn sessions to reuse KV cache for prior assistant responses.
