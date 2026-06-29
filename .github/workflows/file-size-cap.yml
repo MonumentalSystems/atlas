@@ -177,6 +177,11 @@ jobs:
             # inference_reserve/kv_config/...); extracting it would mean a
             # 13-arg helper. Same rationale as the kernel-dispatch files above.
             "crates/spark-model/src/factory/build.rs"
+            # 508 LoC — serve CLI arg definitions (was <500; `--target-kv-tokens`
+            # auto-provision added the flag + its clap wiring + validation). A
+            # flat list of clap field declarations; splitting the arg struct
+            # fragments the single source-of-truth for the CLI surface.
+            "crates/spark-server/src/cli/serve_args.rs"
           )
 
           violations=0
