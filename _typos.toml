@@ -82,6 +82,9 @@ unparseable = "unparseable"
 wht_bf16 = "wht_bf16"
 wht_dim = "wht_dim"
 wht_stride = "wht_stride"
+# NVFP4 hardware scale-factor format (cutlass `float_ue4m3_t`); the checker
+# splits the identifier and reads the leading "ue" as a typo for "use"/"due".
+ue4m3 = "ue4m3"
 
 [files]
 extend-exclude = [
