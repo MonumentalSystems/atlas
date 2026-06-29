@@ -504,3 +504,27 @@ graph-capture hazards above), not to numerics — making failures diagnosable.
 | `crates/spark-runtime/src/cuda_backend/gpu_impl.rs:294-344` | begin/end/launch/destroy graph API |
 | `crates/spark-runtime/src/buffers.rs:84-160` | persistent fixed-address activation buffers |
 | `crates/spark-server/src/scheduler/mod_helpers.rs:169-216` | contiguous-slot compaction invariant |
+
+---
+
+## EMPIRICAL FINDINGS (2026-06-29, NVFP4 Qwythos-9B, GB10, varlen+correctness bench)
+
+Systematic A/B of the batching levers (C=1/2/4/8, agg tok/s, speedup vs C=1, correctness probes):
+
+| Config | C=2 | C=4 | C=8 | correct@C8 |
+|---|---|---|---|---|
+| eager (no levers) | 1.38x | 1.29x | 1.39x | — |
+| graphs only (`DECODE_GRAPHS_MULTISEQ`) | 1.38x | 1.28x | 1.40x | 4/4 ✓ |
+| graphs + FFN-batched (dense n≥4, committed) | 1.40x | 1.30x | 1.47x | 4/4 ✓ |
+| graphs + `SSM_BATCHED_RECURRENT` | 1.39x | 1.30x | 1.36x | **0/3 @C4** ✗ |
+
+Conclusions:
+1. **The slot-sort fix (committed) was a prerequisite** — without it the active list is reverse-slot-order, contiguity fails, and the batched paths silently fall back to per-seq.
+2. **FFN-batched decode (committed) is correct but a small win** (1.40→1.47x). The FFN is ~half the weights but NOT the decode-time bottleneck.
+3. **The SSM/GDN per-seq loop is the dominant ceiling (~65% of decode cost).** It re-reads the ~1.6B SSM projection weights (in_proj_qkvz/ba, out_proj across 24 layers) n times per step.
+4. **The existing `ssm_batched_recurrent` is a dead end**: it CORRUPTS at n≥4 (0/3 correct) AND gives ZERO scaling even when correct at n=2 (1.39x = per-seq). It is not the path.
+5. CUDA graphs alone only remove launch overhead; they cannot break a per-seq *bandwidth* ceiling.
+
+**The real lever for vLLM-like scaling:** batch the *projection GEMMs* (read weights once per step) the way the committed FFN fix does — extend to (a) attention q/k/v/o on the 8 full-attn layers, and (b) the SSM in_proj_qkvz/ba + out_proj on the 24 linear-attn layers — while leaving the cheap per-seq recurrent scan alone. The SSM-projection batching is the dominant remaining bandwidth win and the largest restructure (ssm_forward splits into batched-in_proj → per-seq scan → batched-out_proj). The broken batched-recurrent scan fusion is a separate, lower-value concern.
+
+Honest magnitude: each projection-batching increment is M (~50-150 LoC, mirrors the FFN pattern); the SSM restructure is the bulk. Full vLLM-parity scaling on this GDN-heavy model is a multi-step kernel/dispatch effort, not a single flag.
