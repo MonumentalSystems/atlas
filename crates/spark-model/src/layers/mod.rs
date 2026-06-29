@@ -14,7 +14,7 @@ pub mod qwen3_attention;
 pub mod qwen3_ssm;
 pub mod vision_encoder;
 
-pub use dense_ffn::{DenseFfnLayer, FfnActivation};
+pub use dense_ffn::{DenseFfnLayer, DenseFfnWeights, FfnActivation};
 pub use dflash_head::{
     BlockDiffusionDraftHead, DflashLayer, DflashProposerState, DflashQuantization,
 };

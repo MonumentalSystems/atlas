@@ -4,17 +4,39 @@ use anyhow::Result;
 use atlas_core::config::{LayerType, ModelConfig};
 use spark_runtime::gpu::GpuBackend;
 use spark_runtime::kv_cache::KvCacheDtype;
-use spark_runtime::weights::WeightStore;
+use spark_runtime::weights::{WeightDtype, WeightStore};
 
 use super::{ModelWeightLoader, WeightFormat};
 use crate::layer::TransformerLayer;
-use crate::layers::{DenseFfnLayer, FfnComponent, Qwen3AttentionLayer, Qwen3SsmLayer};
-use crate::tp_shard::{TpShardKind, load_qkvo_tp, shard_dense_bf16, shard_quantized_nvfp4};
-use crate::weight_map::{
-    AttentionWeights, DenseWeight, MtpWeights, Nvfp4Variant, SsmWeights, dense, dense_auto,
-    dense_f32_safe, dense_keep_f32, dequant_nvfp4_to_bf16, detect_nvfp4_variant, gpu_concat_rows,
-    interleave_ba, load_dense_ffn, load_kv_scales, load_mtp, quantize_to_nvfp4, quantized_auto,
+use crate::layers::{
+    DenseFfnLayer, DenseFfnWeights, FfnComponent, Qwen3AttentionLayer, Qwen3SsmLayer,
 };
+use crate::tp_shard::{
+    TpShardKind, load_qkvo_tp, shard_dense_bf16, shard_fp8_block_scaled, shard_quantized_nvfp4,
+};
+use crate::weight_map::{
+    AttentionWeights, DenseWeight, Fp8Weight, MtpWeights, Nvfp4Variant, SsmWeights, dense,
+    dense_auto, dense_f32_safe, dense_keep_f32, dequant_nvfp4_to_bf16, detect_nvfp4_variant,
+    gpu_concat_rows, interleave_ba, load_dense_ffn, load_fp8_block_scaled_as_fp8weight,
+    load_kv_scales, load_mtp, quantize_to_nvfp4, quantized_auto,
+};
+
+/// True when `{prefix}.weight` is FP8 E4M3 on disk with a 2D block scale
+/// (`weight_scale_inv` or 2D `weight_scale`) — i.e. a native FP8 checkpoint
+/// projection that should load as `Fp8Weight` rather than be requantized to
+/// NVFP4. Mirrors `qwen35::load_layers::proj_is_native_fp8`.
+fn proj_is_native_fp8(store: &WeightStore, prefix: &str) -> bool {
+    let is_fp8_weight = store
+        .get(&format!("{prefix}.weight"))
+        .map(|w| w.dtype == WeightDtype::FP8E4M3)
+        .unwrap_or(false);
+    let has_block_scale = store.contains(&format!("{prefix}.weight_scale_inv"))
+        || store
+            .get(&format!("{prefix}.weight_scale"))
+            .map(|s| s.shape.len() == 2)
+            .unwrap_or(false);
+    is_fp8_weight && has_block_scale
+}
 
 mod loaders_b;
 
@@ -105,13 +127,110 @@ impl ModelWeightLoader for Qwen35DenseWeightLoader {
             let input_norm = dense(store, &format!("{lp}.input_layernorm.weight"))?;
             let post_attn_norm = dense(store, &format!("{lp}.post_attention_layernorm.weight"))?;
 
-            // Dense FFN instead of MoE
-            let ffn_weights = load_dense_ffn(
-                store, &lp, gpu, variant, absmax_k, quantize_k, stream, config,
-            )?;
-            let ffn = FfnComponent::Dense(DenseFfnLayer::new(ffn_weights, gpu)?);
+            // Dense FFN instead of MoE. Native FP8 checkpoints (single-GPU)
+            // load gate/up/down directly as block-scaled `Fp8Weight` and
+            // dispatch w8a16 — no NVFP4 requant. TP>1 still uses the NVFP4
+            // path (FP8 FFN sharding is a follow-up).
+            let ffn_fp8 = config.tp_world_size.max(1) == 1
+                && matches!(variant, Nvfp4Variant::Fp8Dequanted)
+                && proj_is_native_fp8(store, &format!("{lp}.mlp.gate_proj"));
+            let ffn = if ffn_fp8 {
+                let null_ffn = DenseFfnWeights {
+                    gate_proj: crate::weight_map::QuantizedWeight::null(),
+                    up_proj: crate::weight_map::QuantizedWeight::null(),
+                    down_proj: crate::weight_map::QuantizedWeight::null(),
+                    gate_proj_t: None,
+                    up_proj_t: None,
+                    down_proj_t: None,
+                };
+                let mut ffn_layer = DenseFfnLayer::new(null_ffn, gpu)?;
+                let load_ffn_fp8 = |name: &str| {
+                    load_fp8_block_scaled_as_fp8weight(store, &format!("{lp}.mlp.{name}"), gpu)
+                };
+                ffn_layer.set_fp8_weights(
+                    load_ffn_fp8("gate_proj")?,
+                    load_ffn_fp8("up_proj")?,
+                    load_ffn_fp8("down_proj")?,
+                );
+                FfnComponent::Dense(ffn_layer)
+            } else {
+                let ffn_weights = load_dense_ffn(
+                    store, &lp, gpu, variant, absmax_k, quantize_k, stream, config,
+                )?;
+                FfnComponent::Dense(DenseFfnLayer::new(ffn_weights, gpu)?)
+            };
 
             match lt {
+                LayerType::FullAttention
+                    if matches!(variant, Nvfp4Variant::Fp8Dequanted)
+                        && proj_is_native_fp8(store, &format!("{lp}.self_attn.q_proj")) =>
+                {
+                    // ── Native dense FP8 attention (zero-copy, no NVFP4 requant) ──
+                    // q/k/v/o load as block-scaled `Fp8Weight`; decode dispatches
+                    // `w8a16_gemv`, prefill `w8a16_gemm`/`w8a16_gemm_t`. The forward
+                    // FP8 paths already exist (paged + cache-skip + decode) — this
+                    // arm just populates them instead of requantizing to NVFP4.
+                    // Mirrors the A3B FullAttention FP8 arm in qwen35/load_layers.rs.
+                    let p = format!("{lp}.self_attn");
+                    let tp_rank = config.tp_rank;
+                    let tp_size = config.tp_world_size.max(1);
+                    let block_size = 128usize;
+                    let load_fp8_proj = |name: &str,
+                                         _full_n: usize,
+                                         _full_k: usize,
+                                         kind: TpShardKind|
+                     -> Result<Fp8Weight> {
+                        let src =
+                            load_fp8_block_scaled_as_fp8weight(store, &format!("{p}.{name}"), gpu)?;
+                        if tp_size == 1 {
+                            return Ok(src);
+                        }
+                        let sharded =
+                            shard_fp8_block_scaled(&src, kind, tp_rank, tp_size, block_size, gpu)?;
+                        gpu.free(src.weight)?;
+                        gpu.free(src.row_scale)?;
+                        Ok(sharded)
+                    };
+                    let [q_fp8, k_fp8, v_fp8, o_fp8] = load_qkvo_tp(config, load_fp8_proj)?;
+                    let (k_scale, v_scale) = load_kv_scales(store, &p, gpu);
+                    let dummy = DenseWeight {
+                        weight: spark_runtime::gpu::DevicePtr::NULL,
+                    };
+                    let attn = AttentionWeights {
+                        q_proj: dummy,
+                        k_proj: dummy,
+                        v_proj: dummy,
+                        o_proj: crate::weight_map::QuantizedWeight::null(),
+                        q_norm: dense(store, &format!("{p}.q_norm.weight"))?,
+                        k_norm: dense(store, &format!("{p}.k_norm.weight"))?,
+                        q_norm_full: None,
+                        k_norm_full: None,
+                        k_scale,
+                        v_scale,
+                    };
+                    let mut layer = Qwen3AttentionLayer::new(
+                        input_norm,
+                        attn,
+                        post_attn_norm,
+                        ffn,
+                        attn_idx,
+                        None, // no NVFP4 — w8a16_gemv (decode) / w8a16_gemm (prefill)
+                        None,
+                        None,
+                        gpu,
+                        layer_kv_dtypes[attn_idx],
+                        config.fp8_kv_calibration_tokens,
+                        config,
+                    )?;
+                    layer.set_fp8_weights(Some(q_fp8), Some(k_fp8), Some(v_fp8), Some(o_fp8));
+                    if let Err(e) = layer.transpose_fp8_for_prefill(gpu, stream) {
+                        tracing::warn!(
+                            "Layer {i}: dense FP8 transpose failed, non-transposed prefill: {e}"
+                        );
+                    }
+                    layers.push(Box::new(layer));
+                    attn_idx += 1;
+                }
                 LayerType::FullAttention => {
                     let p = format!("{lp}.self_attn");
                     let tp_rank = config.tp_rank;
