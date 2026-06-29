@@ -539,3 +539,22 @@ Honest magnitude: each projection-batching increment is M (~50-150 LoC, mirrors 
 | 8 | 607 | 9.67x | 52.7 | 0.83x | 1376 | 4/4 |
 
 **PREFILL ALREADY SCALES (~9.7x @C8)** — the batched prefill GEMMs + ATLAS_PREFILL_VARLEN path work; this is much of vLLM's concurrency win and we have it. **DECODE does NOT scale (0.74–0.83x, regressing)** — the per-seq projection-GEMV bandwidth ceiling: each added sequence re-reads ~1.6B SSM + 0.56B attn weights. Graphs+FFN-batching can't break it (SSM 65% + attn still per-seq GEMV). The goal reduces to: **batch the DECODE-path projection GEMMs (SSM in_proj_qkvz/ba + out_proj, attn qkv/o) into M=n GEMMs**, the same pattern the committed dense-FFN fix uses. Decode metric is noisy under varlen (wall ≈ longest request) but direction is unambiguous and matches the architecture.
+
+## DECODE-SCALING A/B — uniform-length probe (2026-06-29, conv-fix applied)
+
+Uniform 200-tok generations + uniform prefill so all C sequences decode concurrently for the WHOLE window (the varlen bench masks this: short requests finish early → concurrency collapses to ~1).
+
+| C | A: FFN-batched | B: FFN + SSM-batched (conv-fix) |
+|---|---|---|
+| 1 | 44.4 (1.00x) | 44.2 (1.00x) |
+| 2 | 54.3 (1.22x) | 55.7 (1.26x) |
+| 4 | 52.8 (1.19x) | 53.7 (1.22x) |
+| 8 | 63.3 (1.42x) | 65.3 (1.48x) |
+
+**Conclusion (systematic, evidence-based):**
+1. The **conv input-stride fix restores correctness** of `ATLAS_SSM_BATCHED_RECURRENT` (was 0/3 at C=4 → now 3/3 at C=4, 4/4 at C=8, 0 errors). This is a real, committed bug fix — the flag was previously unusable.
+2. But batching the dominant SSM projections lifts decode scaling only 1.42x → 1.48x at C=8. **Batched-GDN is confirmed a "dead lever" for decode scaling** (matches the prior holo-vllm-parity-poc decomposition).
+3. **Why:** transformer decode scales with batching because it's weight-bandwidth-bound (FFN/attn projections amortize across the batch as M=n GEMMs). A GDN/linear-attention model's decode is dominated by the **recurrent scan** — per-seq O(num_v_heads·k_dim·v_dim) state work that is genuinely n× at batch n and does NOT amortize. Per-seq throughput collapses 44→8 tok/s (1→8) in BOTH configs, confirming the work scales ~linearly with n regardless of projection batching.
+4. **vLLM-like concurrency for this model therefore lives in PREFILL (already ~9.7x), not decode.** Decode is architecturally capped near ~1.5x with all batch levers correct.
+
+**Remaining decode lever** (per holo-vllm-parity-poc): SSM *vertical fusion* — fuse the per-token SSM op chain (ba/gates→conv→gdn→norm→out_proj) to cut launch + intermediate-memory overhead. That lowers per-token latency (helps C=1 AND aggregate), but it is latency work, not batch-scaling. It is the honest next step if decode tok/s is the target.
