@@ -156,8 +156,9 @@ impl ModelWeightLoader for Qwen35DenseWeightLoader {
             // FP8 is enabled we overlay the block-scaled FP8 weights on top;
             // the hot forward / forward_prefill paths then use FP8, the rare
             // batched paths fall back to real NVFP4.
-            let ffn_weights =
-                load_dense_ffn(store, &lp, gpu, variant, absmax_k, quantize_k, stream, config)?;
+            let ffn_weights = load_dense_ffn(
+                store, &lp, gpu, variant, absmax_k, quantize_k, stream, config,
+            )?;
             let mut ffn_layer = DenseFfnLayer::new(ffn_weights, gpu)?;
             if ffn_fp8 {
                 let load_ffn_fp8 = |name: &str| {
@@ -306,10 +307,13 @@ impl ModelWeightLoader for Qwen35DenseWeightLoader {
                         && matches!(variant, Nvfp4Variant::Fp8Dequanted)
                         && proj_is_native_fp8(store, &format!("{p}.q_proj"))
                     {
-                        let load_fp8_proj =
-                            |name: &str, _n: usize, _k: usize, _kind: TpShardKind| -> Result<Fp8Weight> {
-                                load_fp8_block_scaled_as_fp8weight(store, &format!("{p}.{name}"), gpu)
-                            };
+                        let load_fp8_proj = |name: &str,
+                                             _n: usize,
+                                             _k: usize,
+                                             _kind: TpShardKind|
+                         -> Result<Fp8Weight> {
+                            load_fp8_block_scaled_as_fp8weight(store, &format!("{p}.{name}"), gpu)
+                        };
                         let [q_fp8, k_fp8, v_fp8, o_fp8] = load_qkvo_tp(config, load_fp8_proj)?;
                         layer.set_fp8_weights(Some(q_fp8), Some(k_fp8), Some(v_fp8), Some(o_fp8));
                         if let Err(e) = layer.transpose_fp8_for_prefill(gpu, stream) {

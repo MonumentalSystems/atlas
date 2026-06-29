@@ -161,6 +161,14 @@ jobs:
             # too many local bindings/closures to extract cleanly (same
             # rationale as prefill_c.rs above). Clean split tracked as follow-up.
             "crates/spark-server/src/scheduler/prefill_a_step.rs"
+            # ── PR #215 (dense-fp8-attn-ffn) carry-over ──
+            # 571 LoC — native dense-FP8 weight loader for Holo-3.1/Ornith.
+            # A single load path (detect compressed-tensors float-quantized FP8
+            # → build transposed w8a16 handles + block-scale tables); the
+            # per-tensor dispatch reads top-to-bottom like the other loader
+            # files above and splitting fragments it. Clean split tracked as
+            # follow-up.
+            "crates/spark-model/src/weight_loader/qwen35_dense.rs"
           )
 
           violations=0
