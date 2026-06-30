@@ -351,12 +351,7 @@ fn cutlass_nvfp4_weight_from_fp8_cached(
     let packed_t = gpu.alloc(n * k / 2)?;
     let scale_t = gpu.alloc(n * k / 16)?;
     spark_runtime::cutlass::pack_bf16_weight_to_nvfp4_t(
-        w_bf16.0,
-        packed_t.0,
-        scale_t.0,
-        fp8w.n,
-        fp8w.k,
-        stream,
+        w_bf16.0, packed_t.0, scale_t.0, fp8w.n, fp8w.k, stream,
     )?;
     gpu.synchronize(stream)?;
     gpu.free(w_bf16)?;
@@ -386,4 +381,3 @@ pub fn cutlass_nvfp4_proj_from_fp8(
         act.0, packed_t, scale_t, 1.0, out.0, m, n, k, stream,
     )
 }
-

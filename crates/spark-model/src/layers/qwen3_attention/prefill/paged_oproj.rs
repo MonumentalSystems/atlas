@@ -35,7 +35,16 @@ impl Qwen3AttentionLayer {
             && let Some(fp8w) = self.o_weight.as_ref().and_then(|w| w.as_fp8())
         {
             ops::log_cutlass_nvfp4_route("attn_o", n, h, nq * hd);
-            ops::cutlass_nvfp4_proj_from_fp8(ctx.gpu, attn_out, fp8w, o_out, n, h, nq * hd, stream)?;
+            ops::cutlass_nvfp4_proj_from_fp8(
+                ctx.gpu,
+                attn_out,
+                fp8w,
+                o_out,
+                n,
+                h,
+                nq * hd,
+                stream,
+            )?;
         } else if ops::cublas_gemm_enabled()
             && let Some(fp8w) = self.o_weight.as_ref().and_then(|w| w.as_fp8())
         {

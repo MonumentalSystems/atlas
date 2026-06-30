@@ -72,9 +72,18 @@ fn dn(g: &dyn GpuBackend, p: DevicePtr, n_bytes: usize) -> Result<Vec<u8>> {
 // VTILES → (kernel entry name, block_x = (VD/VTILES)*SPLIT, SPLIT=2).
 fn vblock_kernel(vt: u32) -> (&'static str, u32) {
     match vt {
-        2 => ("gated_delta_rule_chunk_delta_h_ksplit_vblock2", (VD as u32 / 2) * 2),
-        4 => ("gated_delta_rule_chunk_delta_h_ksplit_vblock4", (VD as u32 / 4) * 2),
-        8 => ("gated_delta_rule_chunk_delta_h_ksplit_vblock8", (VD as u32 / 8) * 2),
+        2 => (
+            "gated_delta_rule_chunk_delta_h_ksplit_vblock2",
+            (VD as u32 / 2) * 2,
+        ),
+        4 => (
+            "gated_delta_rule_chunk_delta_h_ksplit_vblock4",
+            (VD as u32 / 4) * 2,
+        ),
+        8 => (
+            "gated_delta_rule_chunk_delta_h_ksplit_vblock8",
+            (VD as u32 / 8) * 2,
+        ),
         _ => panic!("vtiles must be 2/4/8"),
     }
 }
@@ -92,8 +101,7 @@ struct Case {
 
 fn gen_case(t: usize, batch: usize) -> Case {
     let nt = t.div_ceil(C);
-    let (mut key, mut val, mut gate, mut beta, mut h0) =
-        (vec![], vec![], vec![], vec![], vec![]);
+    let (mut key, mut val, mut gate, mut beta, mut h0) = (vec![], vec![], vec![], vec![], vec![]);
     for bi in 0..batch {
         let mut r = Lcg(0xDE17A ^ ((t as u64) ^ (bi as u64).wrapping_mul(0x9E3779B9)));
         for _ in 0..t * NK * KD {
@@ -113,7 +121,16 @@ fn gen_case(t: usize, batch: usize) -> Case {
             h0.push(r.r(-0.1, 0.1) as f32);
         }
     }
-    Case { t, nt, batch, key, val, gate, beta, h0 }
+    Case {
+        t,
+        nt,
+        batch,
+        key,
+        val,
+        gate,
+        beta,
+        h0,
+    }
 }
 
 // recompute_wu → W,U (bf16) + gc_out (f32 cumulative log-gate, consumed by the
@@ -136,11 +153,26 @@ fn run_wu(
         .grid([c.nt as u32, NV as u32, c.batch as u32])
         .block([128, 1, 1])
         .shared_mem(smem1)
-        .arg_ptr(kp).arg_ptr(vp).arg_ptr(gp).arg_ptr(bp).arg_ptr(wp).arg_ptr(up).arg_ptr(gcp)
-        .arg_u32(c.batch as u32).arg_u32(c.t as u32).arg_u32(c.nt as u32)
-        .arg_u32(NK as u32).arg_u32(NV as u32).arg_u32(KD as u32).arg_u32(VD as u32)
-        .arg_u32((NK * KD) as u32).arg_u32((NV * VD) as u32).arg_u32(NV as u32)
-        .arg_ptr(DevicePtr::NULL).arg_ptr(DevicePtr::NULL).arg_u32(0)
+        .arg_ptr(kp)
+        .arg_ptr(vp)
+        .arg_ptr(gp)
+        .arg_ptr(bp)
+        .arg_ptr(wp)
+        .arg_ptr(up)
+        .arg_ptr(gcp)
+        .arg_u32(c.batch as u32)
+        .arg_u32(c.t as u32)
+        .arg_u32(c.nt as u32)
+        .arg_u32(NK as u32)
+        .arg_u32(NV as u32)
+        .arg_u32(KD as u32)
+        .arg_u32(VD as u32)
+        .arg_u32((NK * KD) as u32)
+        .arg_u32((NV * VD) as u32)
+        .arg_u32(NV as u32)
+        .arg_ptr(DevicePtr::NULL)
+        .arg_ptr(DevicePtr::NULL)
+        .arg_u32(0)
         .launch(0)?;
     Ok(())
 }
@@ -174,11 +206,23 @@ fn launch_scan(
         .grid(grid)
         .block([block_x, 1, 1])
         .shared_mem(smem)
-        .arg_ptr(hp).arg_ptr(wp).arg_ptr(up).arg_ptr(kp).arg_ptr(gp).arg_ptr(gcp)
-        .arg_ptr(scp).arg_ptr(ucp)
-        .arg_u32(c.batch as u32).arg_u32(c.t as u32).arg_u32(c.nt as u32)
-        .arg_u32(NK as u32).arg_u32(NV as u32).arg_u32(KD as u32).arg_u32(VD as u32)
-        .arg_u32((NK * KD) as u32).arg_u32(NV as u32)
+        .arg_ptr(hp)
+        .arg_ptr(wp)
+        .arg_ptr(up)
+        .arg_ptr(kp)
+        .arg_ptr(gp)
+        .arg_ptr(gcp)
+        .arg_ptr(scp)
+        .arg_ptr(ucp)
+        .arg_u32(c.batch as u32)
+        .arg_u32(c.t as u32)
+        .arg_u32(c.nt as u32)
+        .arg_u32(NK as u32)
+        .arg_u32(NV as u32)
+        .arg_u32(KD as u32)
+        .arg_u32(VD as u32)
+        .arg_u32((NK * KD) as u32)
+        .arg_u32(NV as u32)
         .arg_u32(0) // h_state_is_table
         .arg_ptr(DevicePtr::NULL) // cu_seqlens
         .arg_ptr(DevicePtr::NULL) // cu_chunks
@@ -281,7 +325,10 @@ fn main() -> Result<()> {
     let backend = AtlasCudaBackend::new(0, &atlas_kernels::ptx_modules())?;
     let g: &dyn GpuBackend = &backend;
     let k_wu = g.kernel("gated_delta_rule_fla", "gated_delta_rule_recompute_wu")?;
-    let k_ksplit = g.kernel("gated_delta_rule_fla", "gated_delta_rule_chunk_delta_h_ksplit")?;
+    let k_ksplit = g.kernel(
+        "gated_delta_rule_fla",
+        "gated_delta_rule_chunk_delta_h_ksplit",
+    )?;
 
     let iters = 50u32;
     let mut all_ok = true;
@@ -307,7 +354,14 @@ fn main() -> Result<()> {
             }
         }
     }
-    println!("\n{}", if all_ok { "ALL BIT-PARITY GATES PASS ✅" } else { "BIT-PARITY FAILED ❌" });
+    println!(
+        "\n{}",
+        if all_ok {
+            "ALL BIT-PARITY GATES PASS ✅"
+        } else {
+            "BIT-PARITY FAILED ❌"
+        }
+    );
     if !all_ok {
         std::process::exit(1);
     }

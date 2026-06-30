@@ -194,15 +194,13 @@ impl Qwen3SsmLayer {
                         stream,
                     )?;
                 } else if n == 4
-                    && std::env::var("ATLAS_MOE_ATOMIC_C4_DECODE")
-                        .ok()
-                        .as_deref()
-                        == Some("1")
+                    && std::env::var("ATLAS_MOE_ATOMIC_C4_DECODE").ok().as_deref() == Some("1")
                 {
                     // Purpose-built C=4 routed MoE decode: batched routing,
                     // token-major gate/up, FP32 atomicAdd routed down
                     // accumulation, then BF16 finalize/blend.
-                    self.ffn.forward_atomic_c4_decode(normed_base, n, ctx, stream)?;
+                    self.ffn
+                        .forward_atomic_c4_decode(normed_base, n, ctx, stream)?;
                     let moe_out = ctx.buffers.moe_output();
                     ops::residual_add(
                         ctx.gpu,

@@ -92,7 +92,17 @@ pub fn nvfp4_gemm_bf16_act_weight_t(
     }
     #[cfg(not(atlas_cutlass))]
     {
-        let _ = (act, weight_packed_t, weight_scale_t, weight_scale_2, out, m, n, k, stream);
+        let _ = (
+            act,
+            weight_packed_t,
+            weight_scale_t,
+            weight_scale_2,
+            out,
+            m,
+            n,
+            k,
+            stream,
+        );
         bail!("CUTLASS support was not built; set CUTLASS_HOME when building")
     }
 }

@@ -599,4 +599,3 @@ fn test_parse_holo31_vlm_config() {
     assert!(vision.deepstack_visual_indexes.is_empty());
     assert_eq!(vision.image_pad_token_id, 248056);
 }
-

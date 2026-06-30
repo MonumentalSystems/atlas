@@ -76,9 +76,19 @@ pub fn nvfp4_grouped_gate_up(
     #[cfg(not(atlas_cutlass))]
     {
         let _ = (
-            a, gate_packed_ptrs, gate_scale_ptrs, gate_scale2_vals,
-            up_packed_ptrs, up_scale_ptrs, up_scale2_vals, c_gate, c_up,
-            expert_offsets, n, k, stream,
+            a,
+            gate_packed_ptrs,
+            gate_scale_ptrs,
+            gate_scale2_vals,
+            up_packed_ptrs,
+            up_scale_ptrs,
+            up_scale2_vals,
+            c_gate,
+            c_up,
+            expert_offsets,
+            n,
+            k,
+            stream,
         );
         bail!("CUTLASS support was not built; set CUTLASS_HOME when building")
     }
@@ -152,9 +162,20 @@ pub fn nvfp4_grouped_gate_up_fused(
     #[cfg(not(atlas_cutlass))]
     {
         let _ = (
-            a, sorted_token_ids, gate_packed_ptrs, gate_sfb_ptrs, gate_scale2_vals,
-            up_packed_ptrs, up_sfb_ptrs, up_scale2_vals, c_gate, c_up,
-            expert_offsets_host, n, k, stream,
+            a,
+            sorted_token_ids,
+            gate_packed_ptrs,
+            gate_sfb_ptrs,
+            gate_scale2_vals,
+            up_packed_ptrs,
+            up_sfb_ptrs,
+            up_scale2_vals,
+            c_gate,
+            c_up,
+            expert_offsets_host,
+            n,
+            k,
+            stream,
         );
         bail!("CUTLASS support was not built; set CUTLASS_HOME when building")
     }
@@ -211,7 +232,17 @@ pub fn nvfp4_grouped_down(
     }
     #[cfg(not(atlas_cutlass))]
     {
-        let _ = (a, packed_ptrs, sfb_ptrs, scale2_vals, c, expert_offsets_host, n, k, stream);
+        let _ = (
+            a,
+            packed_ptrs,
+            sfb_ptrs,
+            scale2_vals,
+            c,
+            expert_offsets_host,
+            n,
+            k,
+            stream,
+        );
         bail!("CUTLASS support was not built; set CUTLASS_HOME when building")
     }
 }

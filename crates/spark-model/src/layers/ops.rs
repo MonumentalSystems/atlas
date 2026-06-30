@@ -39,12 +39,12 @@ mod kv_cache;
 mod kv_cache_fp8k;
 #[path = "ops/kv_cache_turbok.rs"]
 mod kv_cache_turbok;
+#[path = "ops/moe_atomic_c4.rs"]
+mod moe_atomic_c4;
 #[path = "ops/moe_expert.rs"]
 mod moe_expert;
 #[path = "ops/moe_expert_more.rs"]
 mod moe_expert_more;
-#[path = "ops/moe_atomic_c4.rs"]
-mod moe_atomic_c4;
 #[path = "ops/moe_gate.rs"]
 mod moe_gate;
 #[path = "ops/moe_grouped_a.rs"]
@@ -102,9 +102,9 @@ pub use hyper_connection::*;
 pub use kv_cache::*;
 pub use kv_cache_fp8k::*;
 pub use kv_cache_turbok::*;
+pub use moe_atomic_c4::*;
 pub use moe_expert::*;
 pub use moe_expert_more::*;
-pub use moe_atomic_c4::*;
 pub use moe_gate::*;
 pub use moe_grouped_a::*;
 pub use moe_grouped_a2::*;
