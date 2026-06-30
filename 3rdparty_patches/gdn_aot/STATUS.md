@@ -1,0 +1,47 @@
+# GDN FlashInfer AOT integration — artifacts + status (2026-06-30)
+
+Route A (integrate FlashInfer GDN into Atlas). The 11-13× scan is proven; this dir holds the AOT bridge.
+
+## Done
+- `gdn_holo_0.{o,h}` — AOT-exported GDN kernel (ARM aarch64 ELF + C ABI header). Via `compiled_fn.export_to_c`.
+- `gdn_holo.so` — linked shared lib (`g++ -shared` + `aot_config --ldflags --libs`). Runtime dep: libcute_dsl_runtime.so.
+- `delta_rule_sm120_aot_export.patch` — the 3-hunk vendored-kernel patch enabling export (grid_x→Int32, stream→CUstream annotation).
+- `gdn_export.py` / `gdn_dump_meta.py` — export + arg-metadata/reference-IO dump.
+- `gdn_harness.cpp` — native C++ harness. **BUILDS + RUNS: wrapper ret=0, no CUDA error → kernel loads & launches from the AOT artifact.** Mechanically proves the C-ABI path.
+
+## RESOLVED 2026-06-30 — native C++ call is BIT-EXACT ✅
+`gdn_harness.cpp` calls the C-ABI wrapper and matches the JIT reference: **max_abs_err=0.000000, cos=1.000000**, state+output fully written. Root cause of the earlier zero-output: `cu_seqlens` must be **int64** (kernel validates dtype==int64, cu_cute assumed_align=8) — the harness now builds it as int64 [0,T]. Descriptor packing (shapes[]/strides[] = the dynamic-mask dims) was correct all along.
+**=> Route A C-ABI integration path fully proven: export -> link -> native call -> bit-exact GDN. Remaining is mechanical: Rust FFI + convention adapter + wire-in.**
+
+## (historical) earlier open item
+Harness output is zero (cos=0): the `{int32 shapes[3]; int64 strides[2]}` tensor structs aren't mapping to the kernel's memref descriptor convention yet, so no correct write.
+Exact captured arg metadata (the target values):
+- g_q: shape(2048,128,16) stride(2048,1,128)   [leading_dim=1, unit-stride dim=1]
+- g_k: shape(128,2048,16)  stride(1,2048,128)   [leading_dim=0]
+- g_v: shape(128,2048,32)  stride(1,4096,128)   [leading_dim=0]
+- g_o: shape(128,2048,32)  stride(1,4096,128)   [leading_dim=0]
+- alpha/beta [65536], state/init_state [524288], tensormaps [6144], cu_seqlens [2]
+- scale=0.08838835, num_q=16 num_k=16 num_v=32 num_sab=32 num_seqs=1 total_ckpt=1 ckpt_every=0 grid_x=32
+Candidate fixes to try: which 2 of 3 strides go in strides[2] + their order (current guess: the two non-unit-stride dims); verify shapes[3] dim order; confirm o readback layout (kernel writes via the (128,2048,32) strided view).
+Reference IO saved on gx10 /tmp/gdn_ref/*.bin (q,k,v,g,beta,cu,o_ref) for numeric compare.
+
+## Run recipe (gx10, quiet GPU)
+g++ -O2 gdn_harness.cpp -o h -I. -I/usr/local/cuda/include ./gdn_holo.so -lcudart -L<cute_lib> -lcute_dsl_runtime -Wl,-rpath,<cute_lib>
+LD_LIBRARY_PATH=/usr/local/cuda-13.2/compat:<cute_lib>:/usr/local/cuda/lib64 CUTE_DSL_ARCH=sm_121a ./h
+
+## STEP 3 DONE 2026-06-30 — Rust FFI -> shim -> AOT kernel is BIT-EXACT ✅
+`gdn_shim.cpp` wraps the header's static-inline funcs into extern "C" `atlas_gdn_load` + `atlas_gdn_prefill`
+(shape-generic, head_dim D=128 fixed). Built into `libatlasgdn.so` (bundles gdn_holo_0.o + cute runtime).
+`gdn_rs.rs` is a pure-Rust harness (raw cudart + atlasgdn FFI, no cudarc) that loads ref IO, calls the kernel,
+compares: **atlas_gdn_prefill ret=0, max_abs_err=0.000000, cos=1.000000.** Full chain Rust->C shim->AOT GDN proven.
+Build/run (gx10):
+  g++ -O2 -fPIC -shared gdn_shim.cpp gdn_holo_0.o -o libatlasgdn.so -I. -I/usr/local/cuda/include -lcudart -L<cute> -lcute_dsl_runtime -Wl,-rpath,<cute>
+  rustc -O gdn_rs.rs -o gdn_rs -L. -L/usr/local/cuda/lib64 -L<cute>
+  LD_LIBRARY_PATH=/usr/local/cuda-13.2/compat:.:<cute>:/usr/local/cuda/lib64 CUTE_DSL_ARCH=sm_121a ./gdn_rs
+
+## NEXT (step 4 — wire into Atlas proper)
+- Move the shim into a real Atlas crate (build.rs links gdn_holo_0.o + cute runtime; or dlopen libatlasgdn.so).
+- Convention adapter: Atlas log-space cumulative gate gc -> FI linear per-token alpha=exp(gc per-token); qk-l2norm; state layout.
+- Replace the 3 FLA scan kernels in the prefill GDN path behind a flag (scalar fallback retained).
+- Ship libcute_dsl_runtime.so + compat driver in the cuda13.2 container.
+- e2e numerics (full Holo prefill) + the ~11x speedup measurement.

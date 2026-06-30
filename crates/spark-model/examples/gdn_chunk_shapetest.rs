@@ -432,8 +432,8 @@ fn main() -> Result<()> {
     );
     println!("{}", "-".repeat(96));
 
-    for &t in &[128usize, 256, 512] {
-        for &batch in &[1usize, 2, 4] {
+    for &t in &[2048usize, 8192, 16384] {
+        for &batch in &[1usize] {
             let case = gen_case(t, batch);
 
             // reference (scalar ksplit) + new kernel (wmma tc_vblock), fresh h0 each.
@@ -458,7 +458,7 @@ fn main() -> Result<()> {
             let speedup = if t_new > 0.0 { t_ref / t_new } else { 0.0 };
 
             println!(
-                "{t:>5} {batch:>5} | {sc_cos:>8.4} {sc_nr:>7.4} | {uc_cos:>8.4} {uc_nr:>7.4} | {sf_cos:>8.4} {sf_nr:>7.4} | {speedup:>9.2}x | {}",
+                "{t:>5} {batch:>5} | ksplit {t_ref:>8.4}ms  tc_vblock {t_new:>8.4}ms | {speedup:>6.2}x | Sf_cos {sf_cos:>7.4} | {}",
                 if pass { "PASS" } else { "FAIL" }
             );
         }
