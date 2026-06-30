@@ -13,7 +13,7 @@ dr.cached_compile = _wrap
 
 from flashinfer.gdn_prefill import chunk_gated_delta_rule
 T, Hqk, Hv, D = 2048, 16, 32, 128
-dt, dev = torch.float16, "cuda"
+dt, dev = torch.bfloat16, "cuda"
 q = torch.randn(T, Hqk, D, dtype=dt, device=dev)
 k = torch.nn.functional.normalize(torch.randn(T, Hqk, D, dtype=torch.float32, device=dev), dim=-1).to(dt)
 v = torch.randn(T, Hv, D, dtype=dt, device=dev)
