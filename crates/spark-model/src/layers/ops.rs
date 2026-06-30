@@ -73,6 +73,8 @@ mod prefill_attn_turbok;
 mod quant_dispatch;
 #[path = "ops/sampling.rs"]
 mod sampling;
+#[path = "ops/gdn_flashinfer.rs"]
+pub mod gdn_flashinfer;
 #[path = "ops/ssm_gdn_a.rs"]
 mod ssm_gdn_a;
 #[path = "ops/ssm_gdn_a2.rs"]
