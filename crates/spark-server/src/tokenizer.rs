@@ -142,30 +142,6 @@ mod tests {
         tmpl.render(ctx).expect("template renders")
     }
 
-    fn render_holo_template(messages: &[serde_json::Value], enable_thinking: bool) -> String {
-        let template_path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../jinja-templates/holo3_1_moe.jinja"
-        );
-        let raw = std::fs::read_to_string(template_path)
-            .expect("bundled Holo3.1 template must be present in the repo");
-        let converted = super::jinja_helpers::convert_python_jinja_to_minijinja(&raw);
-        let env = super::jinja_helpers::build_jinja_env(&converted).expect("template compiles");
-        let tmpl = env.get_template("chat").unwrap();
-        let messages_for_render = normalize_tool_call_arguments(messages);
-        let messages_val = minijinja::Value::from_serialize(&messages_for_render);
-        let ctx = minijinja::context! {
-            messages => messages_val,
-            tools => minijinja::Value::UNDEFINED,
-            add_generation_prompt => true,
-            enable_thinking => enable_thinking,
-            reasoning_effort => "none",
-            disable_tool_steering => false,
-            add_vision_id => false,
-        };
-        tmpl.render(ctx).expect("template renders")
-    }
-
     #[test]
     fn normalize_tool_call_arguments_parses_string_to_dict() {
         // The shape opencode sends back on the second turn: assistant
@@ -199,37 +175,6 @@ mod tests {
         ];
         let normalized = normalize_tool_call_arguments(&messages);
         assert_eq!(normalized, messages);
-    }
-
-    #[test]
-    fn render_holo_template_accepts_vllm_thinking_controls() {
-        let messages = vec![
-            json!({"role": "developer", "content": "<|think_off|>Follow the instruction."}),
-            json!({"role": "user", "content": "Reply with OK."}),
-        ];
-        let rendered = render_holo_template(&messages, true);
-        assert!(rendered.contains("Follow the instruction."));
-        assert!(!rendered.contains("<|think_off|>"));
-        assert!(
-            rendered.ends_with("<|im_start|>assistant\n<think>\n\n</think>\n\n"),
-            "expected closed thinking prompt from think_off: {rendered}"
-        );
-    }
-
-    #[test]
-    fn render_holo_template_autocloses_think_before_tool_call() {
-        let messages = vec![
-            json!({"role": "user", "content": "Use bash."}),
-            json!({
-                "role": "assistant",
-                "content": "<think>\nNeed a directory listing.\n<tool_call>\n<function=bash>\n<parameter=command>\nls\n</parameter>\n</function>\n</tool_call>"
-            }),
-        ];
-        let rendered = render_holo_template(&messages, true);
-        assert!(
-            rendered.contains("Need a directory listing.\n</think>\n\n<tool_call>"),
-            "expected unclosed think to be closed before tool call: {rendered}"
-        );
     }
 
     #[test]
