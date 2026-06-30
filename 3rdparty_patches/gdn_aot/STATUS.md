@@ -45,3 +45,27 @@ Build/run (gx10):
 - Replace the 3 FLA scan kernels in the prefill GDN path behind a flag (scalar fallback retained).
 - Ship libcute_dsl_runtime.so + compat driver in the cuda13.2 container.
 - e2e numerics (full Holo prefill) + the ~11x speedup measurement.
+
+## STEP 4a DONE 2026-06-30 — Atlas-NATIVE layout adapter is BIT-EXACT ✅
+KEY FINDING: Atlas `gate` is ALREADY linear α (kernel gated_delta_rule_fla.cu:16 "gate[] LINEAR decay
+(NO exp)"; recompute_wu applies logf itself) == FlashInfer's alpha. NO gate-space conversion needed.
+So the adapter is pure layout:
+- q/k/v: pass Atlas packed QKV ([Q(key_dim)|K|V(value_dim)] bf16, row stride conv_dim) DIRECTLY via
+  conv_dim strides (q/k strides{conv_dim,kd}, v{conv_dim,vd}) — NO copy.
+- gate/beta: deinterleave Atlas [gate(nv)|beta(nv)] fp32 (stride 2nv) -> contiguous alpha,beta[T,nv]
+  via cudaMemcpy2DAsync (in-shim).
+- output: Atlas contiguous [T,value_dim] -> o strides{nv*vd, vd}.
+New shim entry `atlas_gdn_prefill_packed(qkv,gate_beta,output,h_state,init_state,tensormaps,cu,
+  scale,total,nk,nv,kd,vd,conv_dim,gb_stride,num_seqs,stream)` takes Atlas's EXACT native pointers.
+gdn_harness_packed.cpp packs the ref IO into Atlas layout -> **bit-exact (max_abs_err=0, cos=1.0).**
+=> Atlas call site becomes trivial: hand over the pointers prefill_gdn_full_inner already has
+(q_ptr=gdn_bufs.qkv, gate_ptr=gdn_bufs.gate_beta, gdn_bufs.output, ssm_state.h_state, dims).
+
+## STEP 4 remaining
+- Atlas Rust binding: dlopen libatlasgdn.so (no build.rs link-time dep) OR build.rs link; call
+  atlas_gdn_prefill_packed from prefill_gdn_full_inner behind ATLAS_GDN_FLASHINFER=1 (FLA fallback).
+- STATE-CARRY layout: validated single-call full-sequence (init_state=0). Multi-chunk prefill carries
+  h_state across outer chunks -> verify FI state layout == Atlas h_state ([nv,kd,vd]) for the carry
+  (FI test transposes state; check before enabling chunked).
+- Ship libatlasgdn.so + libcute_dsl_runtime.so + cuda-13.2/compat in the container.
+- e2e full-Holo prefill numerics + ~11x speedup measurement (the PR-packaging gate).
