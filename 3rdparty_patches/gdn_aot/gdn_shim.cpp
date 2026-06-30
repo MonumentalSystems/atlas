@@ -76,9 +76,12 @@ extern "C" int atlas_gdn_prefill_packed(
   return ret;
 }
 
-// Managed entry: caches tensormaps + zeroed init_state + cu_seqlens internally (no per-call
-// alloc/free/sync from the caller -> no async use-after-free). Atlas passes only its native
-// pointers. Single-stream fresh prefill (init=0). cu rebuilt only when total changes.
+// Managed entry: caches tensormaps + init_state + cu_seqlens internally (no per-call
+// alloc/free/sync -> no async use-after-free). MULTI-CHUNK CORRECT: the incoming h_state
+// (Atlas layout S[k][v], = carried state across chunked-prefill steps; zero on chunk 0) is
+// copied into init and transposed to FI layout S[v][k] before the scan; FI writes the new
+// state to h_state (S[v][k]), which the post-kernel transpose returns to S[k][v]. cu rebuilt
+// only when total changes.
 static void* m_tm=nullptr; static size_t m_tm_cap=0;
 static void* m_init=nullptr; static size_t m_init_cap=0;
 static void* m_cu=nullptr; static long long m_cu_total=-1;
@@ -87,10 +90,14 @@ extern "C" int atlas_gdn_prefill_packed_managed(
     float scale, int total_seqlen, int nk, int nv, int kd, int vd,
     int conv_dim, int gb_stride, int num_seqs, void* stream)
 {
+  cudaStream_t st=(cudaStream_t)stream;
   size_t tmn=(size_t)6144*128;
   if(tmn>m_tm_cap){ if(m_tm)cudaFree(m_tm); cudaMalloc(&m_tm,tmn); m_tm_cap=tmn; }
   size_t in=(size_t)num_seqs*nv*kd*vd*4;
-  if(in>m_init_cap){ if(m_init)cudaFree(m_init); cudaMalloc(&m_init,in); cudaMemset(m_init,0,in); m_init_cap=in; }
+  if(in>m_init_cap){ if(m_init)cudaFree(m_init); cudaMalloc(&m_init,in); m_init_cap=in; }
+  // init = incoming h_state transposed Atlas S[k][v] -> FI S[v][k] (chunk 0: h_state=0 -> 0).
+  cudaMemcpyAsync(m_init, h_state, in, cudaMemcpyDeviceToDevice, st);
+  atlas_transpose_heads((float*)m_init, num_seqs*nv, vd, st);
   if((long long)total_seqlen!=m_cu_total){ if(!m_cu) cudaMalloc(&m_cu,(size_t)(num_seqs+1)*8);
     long long h[2]={0,(long long)total_seqlen}; cudaMemcpy(m_cu,h,16,cudaMemcpyHostToDevice); m_cu_total=total_seqlen; }
   return atlas_gdn_prefill_packed(qkv,gate_beta,output,h_state,m_init,m_tm,m_cu,
