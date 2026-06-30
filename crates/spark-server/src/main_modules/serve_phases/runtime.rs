@@ -192,7 +192,18 @@ pub(crate) fn log_behavior_audit(args: &cli::ServeArgs, ptx_set: &atlas_kernels:
         confidence_early_stop: b.confidence_early_stop,
         confidence_run_length: b.confidence_run_length,
         fuzzy_repeat_tolerance_div: b.fuzzy_repeat_tolerance_div as usize,
-        max_inter_tool_prose: b.max_inter_tool_prose,
+        // ATLAS_MAX_INTER_TOOL_PROSE overrides the per-model inter-tool prose
+        // budget without a rebuild. The compiled default (Holo = 384) is tuned
+        // for agentic coding (don't let the model wander into prose between
+        // tool calls); general MCP/chat writes normal-length prose answers that
+        // exceed 384 and get rolled back + re-steered into a *spurious* tool
+        // call. Raise this (e.g. 8192) to let prose answers stand. The
+        // content-loop watchdog still catches genuine runaway, so this does NOT
+        // reintroduce the degenerate-tail loop that disabling all watchdogs does.
+        max_inter_tool_prose: std::env::var("ATLAS_MAX_INTER_TOOL_PROSE")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(b.max_inter_tool_prose),
         max_post_think_content_tokens: b.max_post_think_content_tokens,
         rollback_resteer: b.rollback_resteer,
     });
