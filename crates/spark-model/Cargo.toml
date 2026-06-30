@@ -173,3 +173,7 @@ required-features = ["cuda", "gpu-examples"]
 [[example]]
 name = "gdn_batched_repro"
 required-features = ["cuda", "gpu-examples"]
+
+[[example]]
+name = "nvfp4_gemm_bench"
+required-features = ["gpu-examples"]
