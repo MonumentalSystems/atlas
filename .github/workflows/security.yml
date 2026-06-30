@@ -26,6 +26,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: EmbarkStudios/cargo-deny-action@v2
-        with:
-          command: check advisories licenses sources bans
+      # Run cargo-deny under the repo's pinned toolchain (rust-toolchain.toml,
+      # currently 1.93.1) instead of the EmbarkStudios cargo-deny-action's
+      # Docker image, whose bundled Rust (1.85) cannot honor the pin and
+      # errored out ("override toolchain '1.93.1' is not installed") before
+      # deny ever ran. `rustup show` installs + selects the pinned channel;
+      # cargo-deny then resolves the graph with the same toolchain we build
+      # with. (deny is metadata-only — it does not compile the workspace.)
+      - run: rustup show
+      - uses: taiki-e/install-action@cargo-deny
+      - run: cargo deny check advisories licenses sources bans --all-features
