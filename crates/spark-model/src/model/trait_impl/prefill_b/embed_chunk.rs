@@ -131,7 +131,9 @@ impl TransformerModel {
                 let mut img_idx = 0usize; // pad-token count within the chunk
                 for (i, &tok) in chunk_tokens.iter().enumerate() {
                     if tok == pad_id {
-                        let src = ve.buf_out.offset((row_base + img_idx) * ve.out_hidden_size * 2);
+                        let src = ve
+                            .buf_out
+                            .offset((row_base + img_idx) * ve.out_hidden_size * 2);
                         let dst = hidden_dst.offset(i * h * elem_bytes);
                         self.gpu
                             .copy_d2d_async(src, dst, ve.out_hidden_size * 2, stream)?;

@@ -67,7 +67,10 @@ fn cos(a: &[f32], b: &[f32]) -> f64 {
     dot / (na.sqrt() * nb.sqrt() + 1e-12)
 }
 fn max_abs(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0, f32::max)
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0, f32::max)
 }
 
 fn launch_m1(
@@ -99,7 +102,9 @@ fn main() -> Result<()> {
     let m1_k = g.kernel("w8a16_gemv", "w8a16_gemv")?;
 
     let mut rng = Lcg(0x5155_4d5f_b4b4_0001);
-    let a: Vec<bf16> = (0..MAXM * K).map(|_| bf16::from_f32(rng.r(-1.0, 1.0))).collect();
+    let a: Vec<bf16> = (0..MAXM * K)
+        .map(|_| bf16::from_f32(rng.r(-1.0, 1.0)))
+        .collect();
     // Random FP8 E4M3 weight bytes (NaN bytes 0x7f/0xff -> 0.0 in both kernels).
     let weight: Vec<u8> = (0..N * K).map(|_| rng.r(0.0, 256.0) as u8).collect();
     let kb = K / FP8_BLOCK;
@@ -133,7 +138,14 @@ fn main() -> Result<()> {
             .arg_u32(K as u32)
             .launch(0)?;
         for t in 0..m {
-            launch_m1(g, m1_k, a_d.offset(t * K * 2), w_d, bs_d, c_ref.offset(t * N * 2))?;
+            launch_m1(
+                g,
+                m1_k,
+                a_d.offset(t * K * 2),
+                w_d,
+                bs_d,
+                c_ref.offset(t * N * 2),
+            )?;
         }
         g.synchronize(0)?;
         let cb = dn_bf16(g, c_batch, m * N)?;

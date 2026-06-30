@@ -193,8 +193,7 @@ fn cutlass_bf16_holo_qkvz_bench_against_cublaslt() {
             }
             let t0 = std::time::Instant::now();
             for _ in 0..ITERS {
-                run_cutlass_variant(variant, f, act_dev, weight_dev, cutlass_out, m, n, k)
-                    .unwrap();
+                run_cutlass_variant(variant, f, act_dev, weight_dev, cutlass_out, m, n, k).unwrap();
             }
             unsafe {
                 cuda_check(cudaDeviceSynchronize(), "cutlass synchronize");
@@ -310,8 +309,7 @@ fn cutlass_bf16_holo_decode_route_batch_shapes() {
             }
             let t0 = std::time::Instant::now();
             for _ in 0..ITERS {
-                run_cutlass_variant(variant, f, act_dev, weight_dev, cutlass_out, m, n, k)
-                    .unwrap();
+                run_cutlass_variant(variant, f, act_dev, weight_dev, cutlass_out, m, n, k).unwrap();
             }
             unsafe {
                 cuda_check(cudaDeviceSynchronize(), "cutlass synchronize");

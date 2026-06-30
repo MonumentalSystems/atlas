@@ -56,9 +56,7 @@ pub fn cutlass_gemm_enabled() -> bool {
 pub fn cutlass_nvfp4_gemm_enabled() -> bool {
     use std::sync::OnceLock;
     static EN: OnceLock<bool> = OnceLock::new();
-    *EN.get_or_init(|| {
-        std::env::var("ATLAS_CUTLASS_NVFP4_GEMM").ok().as_deref() == Some("1")
-    })
+    *EN.get_or_init(|| std::env::var("ATLAS_CUTLASS_NVFP4_GEMM").ok().as_deref() == Some("1"))
 }
 
 fn cutlass_nvfp4_flag_enabled(name: &str) -> bool {

@@ -14,13 +14,7 @@ use super::*;
 /// grouped collective reads. M-independent (the SFB atom depends only on N,K) so
 /// this runs once per expert at load. `scale_out` must hold the swizzled SFB
 /// region the grouped kernel consumes.
-pub fn pack_weight_sfb(
-    scale_in: u64,
-    scale_out: u64,
-    n: u32,
-    k: u32,
-    stream: u64,
-) -> Result<()> {
+pub fn pack_weight_sfb(scale_in: u64, scale_out: u64, n: u32, k: u32, stream: u64) -> Result<()> {
     #[cfg(atlas_cutlass)]
     {
         let status = unsafe {

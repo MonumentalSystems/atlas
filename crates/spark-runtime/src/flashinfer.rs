@@ -120,7 +120,13 @@ fn workspaces() -> Result<&'static Workspaces> {
     if let Some(w) = WS.get() {
         return Ok(w);
     }
-    let _ = (MAX_BATCH, MAX_TOTAL_QO_ROWS, N_QO_HEADS, N_KV_HEADS, HEAD_DIM);
+    let _ = (
+        MAX_BATCH,
+        MAX_TOTAL_QO_ROWS,
+        N_QO_HEADS,
+        N_KV_HEADS,
+        HEAD_DIM,
+    );
     let (fsz, isz, psz) = (FLOAT_WS_BYTES, INT_WS_BYTES, PINNED_WS_BYTES);
     let mut float_ws = 0u64;
     let mut int_ws = 0u64;
@@ -213,15 +219,32 @@ pub fn ragged_prefill_bf16_hd256(
             )
         };
         if st != 0 {
-            bail!("FlashInfer ragged prefill failed: status {st} (batch={batch}, qo={total_qo_rows})");
+            bail!(
+                "FlashInfer ragged prefill failed: status {st} (batch={batch}, qo={total_qo_rows})"
+            );
         }
         Ok(())
     }
     #[cfg(not(atlas_flashinfer))]
     {
         let _ = (
-            q, k, v, o, qo_indptr_h, kv_indptr_h, qo_indptr_d, kv_indptr_d, batch, total_qo_rows,
-            total_kv_rows, num_qo_heads, num_kv_heads, head_dim, sm_scale, causal, stream,
+            q,
+            k,
+            v,
+            o,
+            qo_indptr_h,
+            kv_indptr_h,
+            qo_indptr_d,
+            kv_indptr_d,
+            batch,
+            total_qo_rows,
+            total_kv_rows,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim,
+            sm_scale,
+            causal,
+            stream,
         );
         bail!("FlashInfer support was not built; set FLASHINFER_HOME when building")
     }
@@ -306,8 +329,23 @@ mod tests {
         }
 
         ragged_prefill_bf16_hd256(
-            q_d, k_d, v_d, o_d, &qo_indptr, &kv_indptr, qo_d, kv_d, lens.len() as u32,
-            total as u32, total as u32, NQO as u32, NKV as u32, HD as u32, sm_scale, true, 0,
+            q_d,
+            k_d,
+            v_d,
+            o_d,
+            &qo_indptr,
+            &kv_indptr,
+            qo_d,
+            kv_d,
+            lens.len() as u32,
+            total as u32,
+            total as u32,
+            NQO as u32,
+            NKV as u32,
+            HD as u32,
+            sm_scale,
+            true,
+            0,
         )
         .unwrap();
         unsafe {

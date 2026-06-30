@@ -369,7 +369,10 @@ fn gpu_dequant_fp8_pertensor(
     );
 
     let stream = gpu.default_stream();
-    let kernel = gpu.kernel("dequant_fp8_blockscaled_bf16", "dequant_fp8_blockscaled_bf16")?;
+    let kernel = gpu.kernel(
+        "dequant_fp8_blockscaled_bf16",
+        "dequant_fp8_blockscaled_bf16",
+    )?;
     KernelLaunch::new(gpu, kernel)
         .grid([div_ceil(k as u32, 64), div_ceil(n as u32, 4), 1])
         .block([64, 4, 1])

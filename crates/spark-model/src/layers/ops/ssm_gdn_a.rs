@@ -265,7 +265,6 @@ pub fn gdn_decode_f32_strided_norm(
         .launch(stream)
 }
 
-
 /// Fused 2-token GDN decode (speculative verification).
 ///
 /// Processes exactly 2 tokens through GDN in a single kernel launch.

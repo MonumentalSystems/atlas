@@ -150,7 +150,11 @@ pub(super) fn start_new_requests(
             let defer = want_codispatch || (mixed_defer && !req.has_image_pixels());
             // Pre-encoded by the co-dispatch pre-pass? (num_images>0 ⇒ batched)
             let slice = vision_slices[req_idx];
-            let vision_slice = if slice.num_images > 0 { Some(slice) } else { None };
+            let vision_slice = if slice.num_images > 0 {
+                Some(slice)
+            } else {
+                None
+            };
             // When no active sequences are decoding, process as much of the
             // prompt as buffers allow — avoids per-token paged decode fallback
             // in chunk 2+. Capped at max_batch_tokens (buffer capacity).

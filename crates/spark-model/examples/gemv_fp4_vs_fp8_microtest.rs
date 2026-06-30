@@ -102,12 +102,19 @@ fn main() -> Result<()> {
     // Ring big enough to blow past L2 (GB10 L2 is tens of MB); 768 MB / weight.
     let ring_fp8 = (768 * 1024 * 1024 / fp8_w_bytes).max(2);
     let ring_fp4 = (768 * 1024 * 1024 / fp4_w_bytes).max(2);
-    let w_fp8: Vec<_> = (0..ring_fp8).map(|_| gpu.alloc(fp8_w_bytes)).collect::<Result<_>>()?;
+    let w_fp8: Vec<_> = (0..ring_fp8)
+        .map(|_| gpu.alloc(fp8_w_bytes))
+        .collect::<Result<_>>()?;
     let s_fp8 = gpu.alloc((n as usize) * (k as usize / 128 + 1) * 4)?;
-    let w_fp4: Vec<_> = (0..ring_fp4).map(|_| gpu.alloc(fp4_w_bytes)).collect::<Result<_>>()?;
+    let w_fp4: Vec<_> = (0..ring_fp4)
+        .map(|_| gpu.alloc(fp4_w_bytes))
+        .collect::<Result<_>>()?;
     let s_fp4 = gpu.alloc((n as usize) * (k as usize / 16 + 1))?;
-    println!("DRAM-cold: FP8 ring={ring_fp8} bufs ({} MB), FP4 ring={ring_fp4} bufs ({} MB)",
-        ring_fp8 * fp8_w_bytes / (1<<20), ring_fp4 * fp4_w_bytes / (1<<20));
+    println!(
+        "DRAM-cold: FP8 ring={ring_fp8} bufs ({} MB), FP4 ring={ring_fp4} bufs ({} MB)",
+        ring_fp8 * fp8_w_bytes / (1 << 20),
+        ring_fp4 * fp4_w_bytes / (1 << 20)
+    );
 
     let k_w8 = gpu.kernel("w8a16_gemv", "w8a16_gemv")?;
     let k_w4 = gpu.kernel("w4a16_gemv", "w4a16_gemv")?;

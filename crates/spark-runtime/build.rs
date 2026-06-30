@@ -106,7 +106,10 @@ fn build_flashinfer_object(fi_home: std::path::PathBuf) {
         .arg(&obj)
         .status()
         .expect("failed to spawn nvcc for FlashInfer wrapper");
-    assert!(status.success(), "nvcc failed while building FlashInfer wrapper");
+    assert!(
+        status.success(),
+        "nvcc failed while building FlashInfer wrapper"
+    );
 
     let status = Command::new("ar")
         .arg("crus")
@@ -114,7 +117,10 @@ fn build_flashinfer_object(fi_home: std::path::PathBuf) {
         .arg(&obj)
         .status()
         .expect("failed to spawn ar for FlashInfer wrapper");
-    assert!(status.success(), "ar failed while archiving FlashInfer wrapper");
+    assert!(
+        status.success(),
+        "ar failed while archiving FlashInfer wrapper"
+    );
 
     println!("cargo:rustc-link-search=native={}", out_dir.display());
     println!("cargo:rustc-link-lib=static=atlas_flashinfer");

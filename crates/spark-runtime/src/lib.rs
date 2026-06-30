@@ -10,10 +10,10 @@ pub mod cublaslt;
 pub mod cuda_backend;
 #[cfg(feature = "cuda")]
 pub mod cutlass;
-#[cfg(feature = "cuda")]
-pub mod flashinfer;
 #[cfg(unix)]
 pub mod fast_weights;
+#[cfg(feature = "cuda")]
+pub mod flashinfer;
 pub mod gpu;
 pub mod kernel_args;
 pub mod kernel_audit;

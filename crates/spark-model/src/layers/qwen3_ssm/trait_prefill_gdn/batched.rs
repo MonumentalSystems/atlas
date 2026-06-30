@@ -94,10 +94,10 @@ impl Qwen3SsmLayer {
                     conv_dim as u32,
                     conv_dim as u32,
                     gb_stride,
-                    true, // h_state_is_table
+                    true,                                // h_state_is_table
                     spark_runtime::gpu::DevicePtr::NULL, // cu_seqlens (uniform)
                     spark_runtime::gpu::DevicePtr::NULL, // cu_chunks (uniform)
-                    false, // uniform batched (not varlen)
+                    false,                               // uniform batched (not varlen)
                     ctx.profile,
                     stream,
                 );
