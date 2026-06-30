@@ -86,6 +86,12 @@ max_inter_tool_prose = 384
 max_post_think_content_tokens = 8192
 default_num_drafts = 0
 tool_call_parser = "qwen3_coder"
+# Tool-call grammar OFF: XGrammar-constrained decoding for tool requests makes
+# Holo-3.1 degenerate (runaway reasoning, hallucinated `Human:` turns, fin=length)
+# — verified against vLLM, which does free-generate + parse-after and stays
+# coherent. Disabling it makes Atlas match vLLM (concise, correct tools, clean
+# stops). The qwen3_coder parser still reads the model's tool calls.
+disable_tool_grammar = true
 
 [[model_types]]
 model_type = "holo3_1_moe"
