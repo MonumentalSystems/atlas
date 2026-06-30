@@ -67,6 +67,36 @@ impl Qwen3SsmLayer {
             );
         }
 
+        // FlashInfer GDN (opt-in, ATLAS_GDN_FLASHINFER=1): tensor-core chunked delta-rule
+        // scan, ~11× the scalar FLA chunk_delta_h at the Holo shape. This is the live
+        // single-stream prefill path (trait_prefill.rs -> prefill_gdn_recurrence). q_ptr is
+        // the packed-QKV base, gates_buf the gate base — handed straight to the bit-exact
+        // shim (ops::gdn_flashinfer). FLA ladder below is the fallback when flag/lib absent.
+        if !ctx.gdn_exact_replay
+            && kd == 128
+            && vd == 128
+            && ops::gdn_flashinfer::available()
+        {
+            let scale = 1.0f32 / (kd as f32).sqrt();
+            return ops::gdn_flashinfer::flashinfer_gdn_prefill(
+                ctx.gpu,
+                q_ptr,
+                gates_buf,
+                gdn_out_buf,
+                h_state,
+                scale,
+                k,
+                nk as u32,
+                nv as u32,
+                kd as u32,
+                vd as u32,
+                conv_dim as u32,
+                gb_stride,
+                1,
+                stream,
+            );
+        }
+
         // 2026-06-06: removed the concluded GDN-prefill experiment env flags
         // (ATLAS_GDN_CHUNK64 / ATLAS_FORCE_PERSISTENT / ATLAS_DISABLE_WY4) and their
         // dispatch branches. FLA is the baked default for 128-dim linear heads; the
