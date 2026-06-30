@@ -35,4 +35,7 @@ jobs:
       # with. (deny is metadata-only — it does not compile the workspace.)
       - run: rustup show
       - uses: taiki-e/install-action@cargo-deny
-      - run: cargo deny check advisories licenses sources bans --all-features
+      # Feature selection comes from deny.toml's `[graph] all-features = true`,
+      # so no --all-features flag is needed (and newer cargo-deny rejects it on
+      # the `check` subcommand).
+      - run: cargo deny check advisories licenses sources bans
