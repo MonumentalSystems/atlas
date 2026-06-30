@@ -69,3 +69,20 @@ gdn_harness_packed.cpp packs the ref IO into Atlas layout -> **bit-exact (max_ab
   (FI test transposes state; check before enabling chunked).
 - Ship libatlasgdn.so + libcute_dsl_runtime.so + cuda-13.2/compat in the container.
 - e2e full-Holo prefill numerics + ~11x speedup measurement (the PR-packaging gate).
+
+## E2E WORKING 2026-06-30 — prefill correct + ~1.3× e2e speedup; decode pending state-transpose
+DIAGNOSTIC CHAIN (all confirmed):
+1. cross-impl A/B (gdn_fla_vs_fi example): Atlas FLA vs FlashInfer on identical input -> cos=0.999993,
+   norm_ratio=1.0 => GDN MATH IS EQUIVALENT (garbage was NOT a math/convention bug).
+2. The garbage was a DTYPE mismatch: export/harness used fp16, but Atlas GDN q/k/v/o are BF16. The fp16
+   kernel read bf16 bits as fp16 -> garbage. FIX: re-export with torch.bfloat16 (gdn_export.py), relink.
+3. Also fixed an async use-after-free (binding freed tensormaps/init/cu before the async kernel ran) ->
+   managed shim entry atlas_gdn_prefill_packed_managed caches scratch internally (no per-call alloc/free/sync).
+RESULT (holo35b, same binary, A/B via ATLAS_GDN_FLASHINFER 1 vs 0):
+- PREFILL CORRECT: first token matches FLA ("The first 6 planets...").
+- PREFILL SPEEDUP: 2K 3806->4945 (1.30x), 4K 3938->5291 (1.34x), C=8 up to 1.46x. (11x is the
+  chunk_delta_h sub-kernel; e2e is Amdahl-bound by GDN's ~24-38% prefill share -> grows with context.)
+- DECODE DRIFTS: 'The' then garbage = the known state k<->v transpose (FI writes S[v][k], Atlas decode
+  reads S[k][v]). THE one remaining fix for full generation coherence.
+NEXT: add k<->v transpose of h_state after the FI call (small per-head 128x128 transpose) -> decode
+coherent -> needle/quality test; then larger-context prefill speedup; then perf-tune.

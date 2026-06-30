@@ -22,14 +22,12 @@ unsafe extern "C" {
 const RTLD_NOW: c_int = 2;
 
 type LoadFn = unsafe extern "C" fn();
+// Managed entry: shim owns tensormaps/init/cu scratch (cached) — no per-call alloc/free/sync.
 type PackedFn = unsafe extern "C" fn(
     *mut c_void, // qkv
     *mut c_void, // gate_beta
     *mut c_void, // output
     *mut c_void, // h_state (output state)
-    *mut c_void, // init_state
-    *mut c_void, // tensormaps scratch
-    *mut c_void, // cu_seqlens (int64)
     c_float,     // scale
     c_int,       // total_seqlen
     c_int,       // nk
@@ -62,7 +60,7 @@ fn lib() -> Option<&'static Lib> {
             return None;
         }
         let load = dlsym(h, c"atlas_gdn_load".as_ptr());
-        let prefill = dlsym(h, c"atlas_gdn_prefill_packed".as_ptr());
+        let prefill = dlsym(h, c"atlas_gdn_prefill_packed_managed".as_ptr());
         if load.is_null() || prefill.is_null() {
             tracing::warn!("ATLAS_GDN_FLASHINFER: symbols not found in lib — falling back to FLA");
             return None;
@@ -107,32 +105,17 @@ pub fn flashinfer_gdn_prefill(
     stream: u64,
 ) -> Result<()> {
     let l = lib().ok_or_else(|| anyhow!("FlashInfer GDN lib unavailable"))?;
+    let _ = gpu; // scratch (tensormaps/init/cu) is now owned+cached inside the shim
 
-    // Scratch the shim's contract needs but Atlas doesn't already hold:
-    //  - tensormaps: TMA-descriptor workspace (sm_count*128 bytes; over-allocate, harmless).
-    //  - init_state: zeroed (fresh prefill starts from S=0).
-    //  - cu_seqlens: int64 [0, total] for the single sequence.
-    let tm_bytes = 6144usize * 128;
-    let tm = gpu.alloc(tm_bytes)?;
-    gpu.memset(tm, 0, tm_bytes)?;
-    let st_bytes = (num_seqs * nv * kd * vd) as usize * 4;
-    let init = gpu.alloc(st_bytes)?;
-    gpu.memset(init, 0, st_bytes)?;
-    let mut cu_host = Vec::with_capacity((num_seqs as usize + 1) * 8);
-    cu_host.extend_from_slice(&0i64.to_le_bytes());
-    cu_host.extend_from_slice(&(total as i64).to_le_bytes());
-    let cu = gpu.alloc(cu_host.len())?;
-    gpu.copy_h2d(&cu_host, cu)?;
-
+    // Managed shim entry: caches scratch internally (no per-call alloc/free → no async
+    // use-after-free, no per-call sync). Async on `stream`, ordered with the rest of
+    // the layer like the FLA path it replaces.
     let ret = unsafe {
         (l.prefill)(
             qkv.0 as *mut c_void,
             gate_beta.0 as *mut c_void,
             output.0 as *mut c_void,
             h_state.0 as *mut c_void,
-            init.0 as *mut c_void,
-            tm.0 as *mut c_void,
-            cu.0 as *mut c_void,
             scale as c_float,
             total as c_int,
             nk as c_int,
@@ -146,12 +129,8 @@ pub fn flashinfer_gdn_prefill(
         )
     };
 
-    let _ = gpu.free(tm);
-    let _ = gpu.free(init);
-    let _ = gpu.free(cu);
-
     if ret != 0 {
-        bail!("atlas_gdn_prefill_packed returned {ret}");
+        bail!("atlas_gdn_prefill_packed_managed returned {ret}");
     }
     Ok(())
 }
