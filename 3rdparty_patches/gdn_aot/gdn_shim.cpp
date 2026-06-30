@@ -3,6 +3,10 @@
 #include "gdn_holo_0.h"
 #include <cuda_runtime.h>
 
+// Per-head k<->v transpose of the output state (gdn_transpose.cu): FlashInfer writes
+// S[v][k]; Atlas's decode kernel reads S[k][v]. Stream-ordered after the FI kernel.
+extern "C" void atlas_transpose_heads(float* S, int nheads, int N, void* stream);
+
 static gdn_holo_0_Kernel_Module_t g_module;
 static int g_loaded = 0;
 
@@ -64,8 +68,12 @@ extern "C" int atlas_gdn_prefill_packed(
   gdn_holo_0_Tensor_g_init_state_t g_in={init_state,{num_seqs*nv*128*128}};
   gdn_holo_0_Tensor_g_tensormaps_t g_tm={tensormaps,{6144}};
   gdn_holo_0_Tensor_cu_seqlens_t   g_cu={cu_seqlens,{num_seqs+1}};
-  return cute_dsl_gdn_holo_0_wrapper(&g_module,&g_q,&g_k,&g_v,&g_o,&g_al,&g_be,&g_st,&g_in,&g_tm,&g_cu,
+  int ret = cute_dsl_gdn_holo_0_wrapper(&g_module,&g_q,&g_k,&g_v,&g_o,&g_al,&g_be,&g_st,&g_in,&g_tm,&g_cu,
       scale, nk, nk, nv, num_sab, num_seqs, 1, 0, grid_x, st);
+  // FI wrote h_state (g_st) as S[v][k]; Atlas decode reads S[k][v]. Transpose last two
+  // dims per head (num_seqs*nv heads of vd x vd). Same stream => runs after the FI kernel.
+  atlas_transpose_heads((float*)h_state, num_seqs * nv, vd, st);
+  return ret;
 }
 
 // Managed entry: caches tensormaps + zeroed init_state + cu_seqlens internally (no per-call
