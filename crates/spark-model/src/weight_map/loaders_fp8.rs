@@ -49,22 +49,33 @@ pub fn load_fp8_block_scaled_as_fp8weight(
     let k = w.shape[1];
     let weight_ptr = w.ptr;
 
-    // Load block scale [N/BS, K/BS] — already on GPU from safetensors. Names:
-    //   * `weight_scale_inv` — DeepSeek-V3 / Qwen native-FP8 (2D block scale)
-    //   * `weight_scale` (2D)  — compressed-tensors re-quants (RedHatAI, e.g.
-    //                            DeepSeek-V4-Flash): SAME per-block dequant mult.
-    //   * `weight_scale` (scalar) — ModelOpt MIXED_PRECISION: one scalar to
-    //                            expand to a [N/BS, K/BS] block matrix.
-    // Accept all three: prefer `weight_scale_inv`, else `weight_scale`; branch on
-    // 2D-block (widen to FP32) vs scalar (expand) by the loaded tensor's shape.
-    let scale_key = if store.contains(&format!("{prefix}.weight_scale_inv")) {
-        format!("{prefix}.weight_scale_inv")
+    // Load block scale [N/BS, K/BS] — already on GPU from safetensors. The
+    // tensor name varies by producer: DeepSeek/Qwen-native FP8 ships
+    // `weight_scale_inv` (2D); compressed-tensors `float-quantized` (e.g.
+    // Hcompany/Holo-3.1-*-FP8) ships a 2D `weight_scale`; ModelOpt
+    // MIXED_PRECISION ships a *scalar* `weight_scale` (expanded to the block
+    // matrix shape below). All three are the per-block FP8 dequant multiplier
+    // the W8A16 kernels apply in FP32. Prefer whichever 2D block scale exists.
+    let scale_inv_key = format!("{prefix}.weight_scale_inv");
+    let plain_scale_key = format!("{prefix}.weight_scale");
+    let block_scale_key = if store.contains(&scale_inv_key) {
+        Some(scale_inv_key.clone())
+    } else if store
+        .get(&plain_scale_key)
+        .map(|s| s.shape.len() == 2)
+        .unwrap_or(false)
+    {
+        Some(plain_scale_key.clone())
     } else {
-        format!("{prefix}.weight_scale")
+        None
     };
-    let is_2d_block = store.contains(&scale_key) && store.get(&scale_key)?.shape.len() == 2;
-    let row_scale = if is_2d_block {
+    let row_scale = if let Some(scale_key) = block_scale_key {
         let s = store.get(&scale_key)?;
+        ensure!(
+            s.shape.len() == 2,
+            "Expected 2D shape for {scale_key}, got {:?}",
+            s.shape,
+        );
         ensure!(
             s.dtype == WeightDtype::BF16 || s.dtype == WeightDtype::FP32,
             "Expected BF16 or FP32 for {scale_key}, got {:?}",
@@ -98,9 +109,9 @@ pub fn load_fp8_block_scaled_as_fp8weight(
         gpu.synchronize(stream)?;
         row_scale
     } else {
-        let scalar_key = format!("{prefix}.weight_scale");
+        let scalar_key = plain_scale_key;
         let scale = scalar_f32(store, &scalar_key, gpu)
-            .with_context(|| format!("Missing {scale_key} or scalar {scalar_key}"))?;
+            .with_context(|| format!("Missing {scale_inv_key} or scalar {scalar_key}"))?;
         let n_blocks = n.div_ceil(128);
         let k_blocks = k.div_ceil(128);
         let scale_total = n_blocks * k_blocks;
