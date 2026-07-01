@@ -10,7 +10,7 @@ use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 
 use crate::layer::ForwardContext;
 use crate::layers::ops;
-use crate::weight_map::{DenseWeight, QuantizedWeight};
+use crate::weight_map::{DenseWeight, Fp8Weight, Fp8WeightTransposed, QuantizedWeight};
 
 pub struct DenseFfnWeights {
     pub gate_proj: QuantizedWeight,
@@ -34,6 +34,16 @@ pub struct DenseFfnWeightsBf16 {
     pub gate_proj: DenseWeight,
     pub up_proj: DenseWeight,
     pub down_proj: DenseWeight,
+}
+
+/// Native block-scaled FP8 dense MLP weights — loaded directly from an FP8
+/// checkpoint (no NVFP4 requant). When installed via `set_fp8_weights`, decode
+/// dispatches `w8a16_gemv` and prefill `w8a16_gemm` per projection (BF16 act ×
+/// FP8 E4M3 weight with 2D block scales), mirroring the SSM/attention FP8 path.
+pub struct DenseFfnWeightsFp8 {
+    pub gate_proj: Fp8Weight,
+    pub up_proj: Fp8Weight,
+    pub down_proj: Fp8Weight,
 }
 
 /// Activation function for gated FFN (SiLU for Qwen/Llama, GELU for Gemma-4).
@@ -79,6 +89,23 @@ pub struct DenseFfnLayer {
     // KernelHandle(0) on miss → forward_prefill falls back to the scalar path.
     // Decode (gemv, M=1) is untouched, so TPOT is unaffected.
     dense_gemm_tc_k: KernelHandle,
+    /// Native FP8 dense MLP weights — when `Some`, decode/prefill dispatch the
+    /// block-scaled FP8 kernels (`w8a16_gemv` / `w8a16_gemm`) instead of w4a16
+    /// NVFP4. Set via `set_fp8_weights` for native FP8 checkpoints (Qwythos /
+    /// Ornith-FP8). Spec-decode batched paths fall back to dequant — dense
+    /// qwen3_5 has no MTP, so they're never reached.
+    fp8_weights: Option<DenseFfnWeightsFp8>,
+    w8a16_gemv_k: KernelHandle,
+    w8a16_gemm_k: KernelHandle,
+    // Fused FP8 decode GEMVs (gate+up in one launch / silu+down in one launch),
+    // mirroring the NVFP4 w4a16_gemv_dual / w4a16_gemv_silu_input. KernelHandle(0)
+    // on miss → fall back to the 3-launch w8a16_gemv path. Module = .cu file stem.
+    w8a16_gemv_dual_k: KernelHandle,
+    w8a16_gemv_silu_input_k: KernelHandle,
+    // Fast transposed FP8 prefill GEMM (128x128 / 8-warp / two-level FP32 fold).
+    // Preferred over w8a16_gemm when a transposed FP8 weight copy is present.
+    // KernelHandle(0) → fall back to non-transposed w8a16_gemm.
+    w8a16_gemm_t_m128_k: KernelHandle,
 }
 
 impl DenseFfnLayer {
@@ -123,7 +150,29 @@ impl DenseFfnLayer {
             dense_gemv_bf16_k,
             dense_gemm_bf16_k,
             dense_gemm_tc_k,
+            fp8_weights: None,
+            w8a16_gemv_k: super::try_kernel(gpu, "w8a16_gemv", "w8a16_gemv"),
+            w8a16_gemm_k: super::try_kernel(gpu, "w8a16_gemm", "w8a16_gemm"),
+            w8a16_gemv_dual_k: super::try_kernel(gpu, "w8a16_gemv_fused", "w8a16_gemv_dual"),
+            w8a16_gemv_silu_input_k: super::try_kernel(
+                gpu,
+                "w8a16_gemv_fused",
+                "w8a16_gemv_silu_input",
+            ),
+            w8a16_gemm_t_m128_k: super::try_kernel(gpu, "w8a16_gemm_t_m128", "w8a16_gemm_t_m128"),
         })
+    }
+
+    /// Install native block-scaled FP8 dense MLP weights. After this call the
+    /// forward paths dispatch `w8a16_gemv` (decode) / `w8a16_gemm` (prefill)
+    /// instead of w4a16 NVFP4. Caller must ensure those kernels are present in
+    /// the target (they are for the qwen3_5/ornith nvfp4 bundle).
+    pub fn set_fp8_weights(&mut self, gate: Fp8Weight, up: Fp8Weight, down: Fp8Weight) {
+        self.fp8_weights = Some(DenseFfnWeightsFp8 {
+            gate_proj: gate,
+            up_proj: up,
+            down_proj: down,
+        });
     }
 
     /// Install BF16 dense MLP weights. After this call, the forward paths
@@ -154,6 +203,90 @@ impl DenseFfnLayer {
 
         let gate_out = ctx.buffers.expert_gate_out();
         let up_out = ctx.buffers.expert_up_out();
+
+        // FP8 dispatch: prefer the fused FP8 dual-GEMV (gate+up in one launch) +
+        // SiLU-fused down GEMV, mirroring the NVFP4 path. Collapses gate+up+
+        // silu_mul+down (4 launches) to dual+silu (2). Falls back to the
+        // 3-launch per-projection `w8a16_gemv` path when the fused kernels or a
+        // non-SiLU activation make the fast path unavailable.
+        if let Some(ref fp8w) = self.fp8_weights {
+            let output = ctx.buffers.moe_output();
+            if self.activation == FfnActivation::SiLU
+                && self.w8a16_gemv_dual_k.0 != 0
+                && self.w8a16_gemv_silu_input_k.0 != 0
+            {
+                ops::w8a16_gemv_dual(
+                    ctx.gpu,
+                    self.w8a16_gemv_dual_k,
+                    input,
+                    fp8w.gate_proj.weight,
+                    fp8w.gate_proj.row_scale,
+                    gate_out,
+                    fp8w.up_proj.weight,
+                    fp8w.up_proj.row_scale,
+                    up_out,
+                    inter,
+                    h,
+                    stream,
+                )?;
+                ops::w8a16_gemv_silu_input(
+                    ctx.gpu,
+                    self.w8a16_gemv_silu_input_k,
+                    gate_out,
+                    up_out,
+                    fp8w.down_proj.weight,
+                    fp8w.down_proj.row_scale,
+                    output,
+                    h,
+                    inter,
+                    stream,
+                )?;
+                return Ok(output);
+            }
+            ops::w8a16_gemv(
+                ctx.gpu,
+                self.w8a16_gemv_k,
+                input,
+                fp8w.gate_proj.weight,
+                fp8w.gate_proj.row_scale,
+                gate_out,
+                inter,
+                h,
+                stream,
+            )?;
+            ops::w8a16_gemv(
+                ctx.gpu,
+                self.w8a16_gemv_k,
+                input,
+                fp8w.up_proj.weight,
+                fp8w.up_proj.row_scale,
+                up_out,
+                inter,
+                h,
+                stream,
+            )?;
+            ops::silu_mul(
+                ctx.gpu,
+                self.act_mul,
+                gate_out,
+                up_out,
+                gate_out,
+                inter,
+                stream,
+            )?;
+            ops::w8a16_gemv(
+                ctx.gpu,
+                self.w8a16_gemv_k,
+                gate_out,
+                fp8w.down_proj.weight,
+                fp8w.down_proj.row_scale,
+                output,
+                h,
+                inter,
+                stream,
+            )?;
+            return Ok(output);
+        }
 
         // BF16 dispatch: per-projection GEMV via `dense_gemv_bf16`. We
         // don't have a fused dual-BF16-GEMV kernel today; two sequential
@@ -367,6 +500,68 @@ impl DenseFfnLayer {
 
         let gate_out = ctx.buffers.expert_gate_out();
         let up_out = ctx.buffers.expert_up_out();
+
+        // FP8 prefill dispatch: per-projection block-scaled E4M3 weight × BF16
+        // act. Prefer the fast transposed `w8a16_gemm_t_m128` (128x128 / 8-warp /
+        // two-level FP32 fold) when a transposed FP8 weight copy is available;
+        // fall back to the non-transposed `w8a16_gemm`. `DenseFfnWeightsFp8`
+        // currently stores only non-transposed weights, so the fallback is taken
+        // here today — the m128 preference engages once a `*_proj_t` FP8 copy is
+        // installed (the kernel + handle are wired and ship via common/).
+        if let Some(ref fp8w) = self.fp8_weights {
+            // helper: transposed m128 when a B_t copy + handle are present, else
+            // non-transposed w8a16_gemm.
+            macro_rules! w8_gemm {
+                ($w:expr, $wt:expr, $in:expr, $out:expr, $n:expr, $k:expr) => {
+                    match $wt {
+                        Some(wt) if self.w8a16_gemm_t_m128_k.0 != 0 => {
+                            let wt: Fp8WeightTransposed = wt;
+                            ops::w8a16_gemm_n128_m128(
+                                ctx.gpu,
+                                self.w8a16_gemm_t_m128_k,
+                                $in,
+                                wt.weight_t,
+                                wt.scale_t,
+                                $out,
+                                m,
+                                $n,
+                                $k,
+                                stream,
+                            )?
+                        }
+                        _ => ops::w8a16_gemm(
+                            ctx.gpu,
+                            self.w8a16_gemm_k,
+                            $in,
+                            $w.weight,
+                            $w.row_scale,
+                            $out,
+                            m,
+                            $n,
+                            $k,
+                            stream,
+                        )?,
+                    }
+                };
+            }
+            let gate_t: Option<Fp8WeightTransposed> = None;
+            let up_t: Option<Fp8WeightTransposed> = None;
+            let down_t: Option<Fp8WeightTransposed> = None;
+            w8_gemm!(fp8w.gate_proj, gate_t, input, gate_out, inter, h);
+            w8_gemm!(fp8w.up_proj, up_t, input, up_out, inter, h);
+            ops::silu_mul(
+                ctx.gpu,
+                self.act_mul,
+                gate_out,
+                up_out,
+                gate_out,
+                m * inter,
+                stream,
+            )?;
+            let output = ctx.buffers.moe_output();
+            w8_gemm!(fp8w.down_proj, down_t, gate_out, output, h, inter);
+            return Ok(());
+        }
 
         // BF16 prefill dispatch. Prefer the tensor-core m16n8k16 MMA kernel
         // (`dense_gemm_tc`, 3-5x+ over scalar) — the scalar `dense_gemm_bf16`

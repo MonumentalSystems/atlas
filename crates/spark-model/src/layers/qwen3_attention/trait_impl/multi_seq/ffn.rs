@@ -136,18 +136,40 @@ impl Qwen3AttentionLayer {
             // writes moe_output[0]; consume it immediately before the next
             // iteration overwrites it.
             let normed_base = fwd.buffers.norm_output();
-            for i in 0..n {
-                let hidden_i = hidden.offset(i * h * residual_elem);
-                let normed2_i = normed_base.offset(i * h * bf16);
-                let moe_out = self.ffn.forward(normed2_i, fwd, stream)?;
-                ops::residual_add(
-                    fwd.gpu,
-                    self.residual_add_k,
-                    hidden_i,
-                    moe_out,
-                    h as u32,
-                    stream,
-                )?;
+            if self.ffn.is_dense() {
+                // DENSE FFN, n>=4: one batched GEMM over all n tokens
+                // (forward_batched -> forward_prefill, M=n). Weights are read
+                // ONCE for the whole batch instead of n times in the per-seq
+                // loop below — this is the decode bandwidth-amortization that
+                // lets concurrency scale. (The MoE net-loss caveat above is
+                // MoE-specific; dense has no expert sort/permute.) Writes the
+                // n FFN outputs contiguously to moe_output[0..n].
+                self.ffn.forward_batched(normed_base, n, fwd, stream)?;
+                let moe_base = fwd.buffers.moe_output();
+                for i in 0..n {
+                    ops::residual_add(
+                        fwd.gpu,
+                        self.residual_add_k,
+                        hidden.offset(i * h * residual_elem),
+                        moe_base.offset(i * h * bf16),
+                        h as u32,
+                        stream,
+                    )?;
+                }
+            } else {
+                for i in 0..n {
+                    let hidden_i = hidden.offset(i * h * residual_elem);
+                    let normed2_i = normed_base.offset(i * h * bf16);
+                    let moe_out = self.ffn.forward(normed2_i, fwd, stream)?;
+                    ops::residual_add(
+                        fwd.gpu,
+                        self.residual_add_k,
+                        hidden_i,
+                        moe_out,
+                        h as u32,
+                        stream,
+                    )?;
+                }
             }
         }
         Ok(())

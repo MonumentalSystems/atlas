@@ -134,6 +134,7 @@ mod tests {
             KvCacheDtype::Fp8,
             1024 * 1024 * 1024,
             0.90,
+            0, // target_kv_tokens (0 = disabled)
             0,
             vec![],
             0,
