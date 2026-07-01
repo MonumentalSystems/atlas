@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+
 //! Cross-impl A/B: Atlas FLA gdn_prefill_fla vs FlashInfer chunk_gated_delta_rule.
 //! Loads the SAME q/k/v/g/beta the FI reference used (/tmp/gdn_ref/*.bin) + FI's output
 //! (o_ref.bin), runs Atlas's full FLA scan on identical input, diffs the two outputs.
