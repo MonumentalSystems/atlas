@@ -27,6 +27,8 @@ mod fp8_moe;
 mod fp8_moe_batch_a;
 #[path = "ops/fp8_moe_batch_b.rs"]
 mod fp8_moe_batch_b;
+#[path = "ops/gdn_flashinfer.rs"]
+pub mod gdn_flashinfer;
 #[path = "ops/gemm_dense.rs"]
 mod gemm_dense;
 #[path = "ops/gemm_quant.rs"]
@@ -75,8 +77,6 @@ mod prefill_attn_turbok;
 mod quant_dispatch;
 #[path = "ops/sampling.rs"]
 mod sampling;
-#[path = "ops/gdn_flashinfer.rs"]
-pub mod gdn_flashinfer;
 #[path = "ops/ssm_gdn_a.rs"]
 mod ssm_gdn_a;
 #[path = "ops/ssm_gdn_a2.rs"]

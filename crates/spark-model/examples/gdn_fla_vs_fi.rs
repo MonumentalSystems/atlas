@@ -54,7 +54,11 @@ fn main() -> Result<()> {
                 put(&mut qkv, tk * conv_dim + key_dim + i, k[tk * key_dim + i]);
             }
             for i in 0..value_dim {
-                put(&mut qkv, tk * conv_dim + 2 * key_dim + i, v[tk * value_dim + i]);
+                put(
+                    &mut qkv,
+                    tk * conv_dim + 2 * key_dim + i,
+                    v[tk * value_dim + i],
+                );
             }
         }
     }
@@ -91,16 +95,46 @@ fn main() -> Result<()> {
     let beta_ptr = gb_d.offset(nv * 4);
 
     let k_wu = g.kernel("gated_delta_rule_fla", "gated_delta_rule_recompute_wu")?;
-    let k_dh = g.kernel("gated_delta_rule_fla", "gated_delta_rule_chunk_delta_h_ksplit")?;
+    let k_dh = g.kernel(
+        "gated_delta_rule_fla",
+        "gated_delta_rule_chunk_delta_h_ksplit",
+    )?;
     let k_fo = g.kernel("gated_delta_rule_fla", "gated_delta_rule_chunk_fwd_o")?;
 
     ops::gdn_prefill_fla(
-        g, k_wu, k_dh, spark_runtime::gpu::KernelHandle(0), k_fo,
-        h_state, q_ptr, k_ptr, v_ptr, gate_ptr, beta_ptr, out_d,
-        w_out, u_out, s_out, uc_out, gc_out,
-        1, t as u32, nt as u32, nk as u32, nv as u32, kd as u32, vd as u32,
-        conv_dim as u32, conv_dim as u32, (nv * 2) as u32,
-        false, DevicePtr::NULL, DevicePtr::NULL, false, false, 0,
+        g,
+        k_wu,
+        k_dh,
+        spark_runtime::gpu::KernelHandle(0),
+        k_fo,
+        h_state,
+        q_ptr,
+        k_ptr,
+        v_ptr,
+        gate_ptr,
+        beta_ptr,
+        out_d,
+        w_out,
+        u_out,
+        s_out,
+        uc_out,
+        gc_out,
+        1,
+        t as u32,
+        nt as u32,
+        nk as u32,
+        nv as u32,
+        kd as u32,
+        vd as u32,
+        conv_dim as u32,
+        conv_dim as u32,
+        (nv * 2) as u32,
+        false,
+        DevicePtr::NULL,
+        DevicePtr::NULL,
+        false,
+        false,
+        0,
     )?;
     g.synchronize(0)?;
 
@@ -125,8 +159,22 @@ fn main() -> Result<()> {
     }
     let cos = dot / (nf.sqrt() * nr.sqrt() + 1e-12);
     println!("=== Atlas FLA vs FlashInfer (same input) ===");
-    println!("|o_fla|mean={:.6}  |o_fi|mean={:.6}  norm_ratio(fla/fi)={:.4}", sf / n as f64, sr / n as f64, nf.sqrt() / (nr.sqrt() + 1e-12));
+    println!(
+        "|o_fla|mean={:.6}  |o_fi|mean={:.6}  norm_ratio(fla/fi)={:.4}",
+        sf / n as f64,
+        sr / n as f64,
+        nf.sqrt() / (nr.sqrt() + 1e-12)
+    );
     println!("cos={:.6}  max_abs_err={:.6}", cos, maxe);
-    println!("VERDICT: {}", if cos > 0.99 { "SAME MATH (divergence is elsewhere — runtime/gate-range/chunking)" } else if cos > 0.5 { "PARTIAL — likely scale/gate/beta convention diff" } else { "DIFFERENT MATH — formulation mismatch" });
+    println!(
+        "VERDICT: {}",
+        if cos > 0.99 {
+            "SAME MATH (divergence is elsewhere — runtime/gate-range/chunking)"
+        } else if cos > 0.5 {
+            "PARTIAL — likely scale/gate/beta convention diff"
+        } else {
+            "DIFFERENT MATH — formulation mismatch"
+        }
+    );
     Ok(())
 }
