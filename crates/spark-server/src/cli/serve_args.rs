@@ -86,15 +86,6 @@ pub struct ServeArgs {
     #[arg(long, default_value_t = 0.90)]
     pub gpu_memory_utilization: f64,
 
-    /// Target KV-cache capacity in TOKENS. When > 0, the KV pool is sized to
-    /// hold exactly this many tokens (rounded up to whole blocks) and validated
-    /// to fit in free memory after weights/buffers/reserve — instead of being
-    /// derived from `--gpu-memory-utilization`. Lets you say "I want ~300000 KV
-    /// tokens" and have it auto-provision, skipping the gpu-mem guesswork.
-    /// 0 = disabled (use the --gpu-memory-utilization-derived budget).
-    #[arg(long, default_value_t = 0)]
-    pub target_kv_tokens: usize,
-
     /// Maximum concurrent sequences.
     #[arg(long, default_value_t = 128)]
     pub max_num_seqs: usize,
