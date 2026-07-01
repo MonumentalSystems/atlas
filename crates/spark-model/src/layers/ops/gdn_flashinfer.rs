@@ -51,8 +51,7 @@ static LIB: OnceLock<Option<Lib>> = OnceLock::new();
 
 fn lib() -> Option<&'static Lib> {
     LIB.get_or_init(|| unsafe {
-        let path =
-            std::env::var("ATLAS_GDN_LIB").unwrap_or_else(|_| "libatlasgdn.so".to_string());
+        let path = std::env::var("ATLAS_GDN_LIB").unwrap_or_else(|_| "libatlasgdn.so".to_string());
         let cpath = std::ffi::CString::new(path.clone()).ok()?;
         let h = dlopen(cpath.as_ptr(), RTLD_NOW);
         if h.is_null() {

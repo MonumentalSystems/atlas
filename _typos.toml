@@ -100,4 +100,8 @@ extend-exclude = [
     # Local dev/benchmark scripts (not shipped); abbreviated local var names
     # like `ND` (numdrift path) read as typos but aren't user-facing.
     "bench/",
+    # FlashInfer GDN AOT bridge — vendored export patch + C++/CUDA harness
+    # (`dout` = gradient-w.r.t.-output, standard kernel naming). Third-party
+    # derived material, like `vendor/`.
+    "3rdparty_patches/",
 ]

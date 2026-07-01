@@ -105,11 +105,7 @@ impl Qwen3SsmLayer {
         // scan, ~11× the scalar FLA chunk_delta_h at the Holo shape. Single-stream only;
         // takes Atlas's native packed-QKV + interleaved gate/beta directly (see
         // ops::gdn_flashinfer). FLA path below is the fallback when the flag/lib is absent.
-        if !ctx.gdn_exact_replay
-            && kd == 128
-            && vd == 128
-            && ops::gdn_flashinfer::available()
-        {
+        if !ctx.gdn_exact_replay && kd == 128 && vd == 128 && ops::gdn_flashinfer::available() {
             let scale = 1.0f32 / (kd as f32).sqrt();
             return ops::gdn_flashinfer::flashinfer_gdn_prefill(
                 ctx.gpu,
