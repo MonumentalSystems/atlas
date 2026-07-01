@@ -195,7 +195,18 @@ pub(super) fn load_layers(
         // FP8 bf16-emulation divergence. Implies force_nvfp4_moe. Default off →
         // FP8 paths byte-unchanged. `variant` is already Fp8Dequanted for an FP8
         // checkpoint, so the NVFP4 attention branch requants from FP8 directly.
-        let force_nvfp4_all = std::env::var("ATLAS_FORCE_NVFP4_ALL").ok().as_deref() == Some("1");
+        // Auto-route per-channel / mixed FP8 through the dequant/NVFP4 builders.
+        // The native FP8 fast paths assume block-scaled (BS=128) `weight_scale_inv`
+        // weights and a uniformly-FP8 checkpoint. A compressed-tensors "channel"
+        // strategy checkpoint (e.g. deepreinforce-ai/Ornith-1.0-35B-FP8) has
+        // per-channel `weight_scale` [N] and keeps some projections (linear_attn)
+        // as BF16 ignore-list modules — it has NO `weight_scale_inv` tensors and
+        // would fault in the native paths. Detect that and force the dequant path
+        // (per-tensor-aware `dense_auto`/`quantized_any`/`dequant_fp8_any`).
+        // Block-scaled FP8 keeps the native paths byte-unchanged.
+        let fp8_block_scaled = store.names().any(|k| k.ends_with(".weight_scale_inv"));
+        let force_nvfp4_all = std::env::var("ATLAS_FORCE_NVFP4_ALL").ok().as_deref() == Some("1")
+            || (native_fp8 && !fp8_block_scaled);
         // FP4 dense PROJECTIONS only: route the SSM (in_proj_qkvz + out_proj) and
         // full-attention (q/k/v/o) projection DECODE through w4a16_gemv (NVFP4,
         // 0.5 byte/weight) instead of w8a16_gemv (FP8, 1 byte/weight), while the
