@@ -294,6 +294,17 @@ default_num_drafts = 1
 model_type = "qwen3_6_moe"
 hidden_size = 2048
 
+# Same reclassification issue as qwen3.5-35b-a3b: checkpoints with vision
+# config + the shared Qwen3.5/3.6-family image_token_id (248056) get
+# relabeled "holo3_1_moe" by atlas-core/src/config/dispatch.rs's Holo-3.1
+# detection heuristic, even when they're not Holo checkpoints (e.g.
+# deepreinforce-ai/Ornith-1.0-35B-FP8). Architecturally identical to
+# holo-3.1-35b-a3b (hidden_dim=2048, layers_total=40, head_dim=256,
+# rope_theta), so accept the alias here too.
+[[model_types]]
+model_type = "holo3_1_moe"
+hidden_size = 2048
+
 [kernel]
 moe_gate_shmem_bytes = 4096   # hidden_dim(2048) * sizeof(bf16)
 
