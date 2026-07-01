@@ -12,14 +12,14 @@ use super::*;
 /// Grouped (per-expert) NVFP4 fused gate_up GEMM — Holo MoE Phase-1
 /// escape-hatch path. Dispatches the proven Sm120 NVFP4 collective once per
 /// active expert over its token slice; bit-faithful to
-/// [`nvfp4_gemm_bf16_act_weight_t`] (it IS that collective), at one launch per
+/// `nvfp4_gemm_bf16_act_weight_t` (it IS that collective), at one launch per
 /// expert. Used to validate that the FP4 math integrates correctly in grouped
 /// form before the hand-rolled block-scaled mma (Phase 2).
 ///
 /// `a` is bf16 `[M_total, K]`; expert `e` owns rows
 /// `[expert_offsets[e], expert_offsets[e+1])`. `*_packed_ptrs`/`*_scale_ptrs`
 /// are device-pointer arrays (one per expert) in the
-/// [`pack_bf16_weight_to_nvfp4_t`] layout (`[N,K/2]` + `[K/16,N]`); the
+/// `pack_bf16_weight_to_nvfp4_t` layout (`[N,K/2]` + `[K/16,N]`); the
 /// `*_scale2_vals` and `expert_offsets` slices are HOST arrays.
 #[allow(clippy::too_many_arguments)]
 pub fn nvfp4_grouped_gate_up(
@@ -103,7 +103,7 @@ pub fn nvfp4_grouped_gate_up(
 /// owns rows `[expert_offsets_host[e], expert_offsets_host[e+1])`).
 /// `*_packed_ptrs` are device-pointer arrays (one per expert) into the CUTLASS
 /// `[N,K/2]` packed weight tables; `*_sfb_ptrs` are device-pointer arrays into
-/// the swizzled SFB (ue4m3) scale tables (see [`pack_weight_sfb`]).
+/// the swizzled SFB (ue4m3) scale tables (see `pack_weight_sfb`).
 /// `*_scale2_vals` and `expert_offsets_host` are HOST arrays.
 #[allow(clippy::too_many_arguments)]
 pub fn nvfp4_grouped_gate_up_fused(
