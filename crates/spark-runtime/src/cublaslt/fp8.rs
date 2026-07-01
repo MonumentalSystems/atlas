@@ -11,7 +11,7 @@ use super::*;
 /// scaling (OUTER_VEC): per-output-row weight scale `weight_scale[N]` and
 /// per-token activation scale `act_scale[M]`. This is the fp8 path GB10/sm_121
 /// actually supports (128-block fp8 is B200-only). ~1.8× the bf16 path.
-/// cuBLAS folds `A_scale[i]·B_scale[j]` into the FP32 epilogue; with D=[N,M],
+/// cuBLAS folds `A_scale[i]·B_scale[j]` into the FP32 epilogue; with D=`[N,M]`,
 /// i indexes weight rows (N) and j indexes tokens (M) — exactly row-wise.
 #[allow(clippy::too_many_arguments)]
 pub fn fp8_gemm_act_weight_t_rowwise(
