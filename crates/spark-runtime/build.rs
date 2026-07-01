@@ -64,6 +64,13 @@ fn main() {
     // hand-written mma.sync projection/MoE GEMMs hit only ~30% of the cuBLAS
     // ceiling on GB10; cuBLASLt is a measured 2.7-4.8x lever on those shapes.
     println!("cargo:rustc-link-lib=dylib=cublasLt");
+    // cudart: copy_d2d_2d_async uses cudaMemcpy2DAsync (a runtime, not driver,
+    // symbol). Previously only emitted in the ATLAS_SKIP_BUILD stub path and
+    // the optional CUTLASS/FlashInfer object paths below, so a real GPU build
+    // without CUTLASS_HOME/FLASHINFER_HOME set fails to link with "undefined
+    // reference to cudaMemcpy2DAsync" even though CI (which builds under
+    // ATLAS_SKIP_BUILD) is green.
+    println!("cargo:rustc-link-lib=dylib=cudart");
 
     if let Ok(cuda_path) = std::env::var("CUDA_HOME") {
         println!("cargo:rustc-link-search=native={cuda_path}/lib64");
