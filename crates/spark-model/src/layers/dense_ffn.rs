@@ -53,16 +53,11 @@ struct Int8Weight {
     w_scale: DevicePtr,
 }
 
-/// Caller-owned activation-requant scratch for the int8 prefill path. Sized to
-/// the largest `(M, K)` seen so far (`M*K` int8 bytes + `M*(K/32)*4` F32 bytes)
-/// and reused across calls. Grown (with a stream sync before freeing the old
-/// buffers) only when a larger prefill arrives.
+/// Q4_K-quantized FFN weight (GGML block_q4_K layout), materialized once at first
+/// `ATLAS_FFN_MMQ` prefill and cached for process lifetime in a `OnceLock`.
 #[derive(Debug, Clone, Copy)]
-struct Int8Scratch {
-    a_i8: DevicePtr,
-    a_scale: DevicePtr,
-    i8_bytes: usize,
-    scale_bytes: usize,
+struct Q4kWeight {
+    w_q4k: DevicePtr,
 }
 
 pub struct DenseFfnLayer {
@@ -127,8 +122,25 @@ pub struct DenseFfnLayer {
     int8_gate: std::sync::OnceLock<Int8Weight>,
     int8_up: std::sync::OnceLock<Int8Weight>,
     int8_down: std::sync::OnceLock<Int8Weight>,
-    // Grow-on-demand activation requant scratch, shared by all three int8 GEMMs.
-    int8_a_scratch: std::sync::Mutex<Option<Int8Scratch>>,
+    // Activation-requant scratch for the int8/NVFP4/Q4_K prefill GEMMs is now
+    // shared, arena-owned (BufferArena::ffn_act_{q8,a,scale}), sized once for
+    // max_batch_tokens × max(h, inter) — no per-layer allocation.
+    // W4A4 native-FP4 prefill (ATLAS_FP4_PREFILL): NVFP4 weights consumed directly
+    // (no requant), BF16 activations quantized to NVFP4 each call into ffn_act_a/scale.
+    // KernelHandle(0) on miss → arm never taken (default-off byte-identical).
+    w4a4_gemm_k: KernelHandle,
+    quantize_nvfp4_k: KernelHandle,
+    // Q4_K MMQ prefill (ATLAS_FFN_MMQ): vendored llama Q4_K W4A8 GEMM. Weights
+    // materialized NVFP4→bf16→Q4_K once (lazy, cached in the OnceLocks); activations
+    // quantized to q8_1_mmq each call into ffn_act_q8. KernelHandle(0) → arm skipped.
+    q4k_mmq_nc_k: KernelHandle,
+    q4k_mmq_wc_k: KernelHandle,
+    q4k_quant_act_k: KernelHandle,
+    q4k_quant_w_k: KernelHandle,
+    dequant_nvfp4_bf16_k: KernelHandle,
+    q4k_gate: std::sync::OnceLock<Q4kWeight>,
+    q4k_up: std::sync::OnceLock<Q4kWeight>,
+    q4k_down: std::sync::OnceLock<Q4kWeight>,
     /// SiLU(gate)*up or GELU(gate)*up depending on activation.
     act_mul: KernelHandle,
     /// BF16 dense MLP weights — when `Some`, all forward paths use the
@@ -172,7 +184,7 @@ impl DenseFfnLayer {
         let dense_gemm_bf16_k = super::try_kernel(gpu, "gemm", "dense_gemm_bf16");
         let dense_gemm_tc_k = super::try_kernel(gpu, "gemm_tc", "dense_gemm_tc");
 
-        Ok(Self {
+        let layer = Self {
             weights,
             activation,
             w4a16_gemv: gpu.kernel("w4a16_gemv", "w4a16_gemv")?,
@@ -205,13 +217,88 @@ impl DenseFfnLayer {
             int8_gate: std::sync::OnceLock::new(),
             int8_up: std::sync::OnceLock::new(),
             int8_down: std::sync::OnceLock::new(),
-            int8_a_scratch: std::sync::Mutex::new(None),
+            w4a4_gemm_k: super::try_kernel(gpu, "w4a4", "w4a4_gemm"),
+            quantize_nvfp4_k: super::try_kernel(gpu, "quantize_nvfp4", "quantize_bf16_to_nvfp4"),
+            q4k_mmq_nc_k: super::try_kernel(gpu, "q4k_mmq", "atlas_q4k_mmq128_nc"),
+            q4k_mmq_wc_k: super::try_kernel(gpu, "q4k_mmq", "atlas_q4k_mmq128_wc"),
+            q4k_quant_act_k: super::try_kernel(gpu, "q4k_mmq", "atlas_q8_1_quantize_ds4_bf16"),
+            q4k_quant_w_k: super::try_kernel(gpu, "q4k_quantize", "q4k_quantize"),
+            dequant_nvfp4_bf16_k: super::try_kernel(gpu, "dequant_nvfp4_bf16", "dequant_nvfp4_to_bf16"),
+            q4k_gate: std::sync::OnceLock::new(),
+            q4k_up: std::sync::OnceLock::new(),
+            q4k_down: std::sync::OnceLock::new(),
             act_mul,
             bf16_weights: None,
             dense_gemv_bf16_k,
             dense_gemm_bf16_k,
             dense_gemm_tc_k,
-        })
+        };
+        Ok(layer)
+    }
+
+    /// Load-time finalize for the Q4_K MMQ prefill path (`ATLAS_FFN_MMQ`). MUST run at
+    /// load, BEFORE the KV cache is sized, so the net FFN footprint is correct when the KV
+    /// cache claims free memory. Order is critical: (1) eagerly materialize the Q4_K weights
+    /// (+9.63 GB) so they are accounted for now rather than lazily on first prefill (which
+    /// would over-subscribe AFTER the KV cache already grabbed the freed `_t` space → decode
+    /// OOM-throttle); (2) free the transposed `_proj_t` copies (−9.63 GB, dead under Q4_K
+    /// prefill — only the unreachable `Some(wt)` arms read them). Net FFN = baseline; decode
+    /// untouched (NVFP4 gemv on the non-`_t` copies). No-op unless Q4_K is active.
+    pub fn finalize_q4k_load(
+        &mut self,
+        gpu: &dyn GpuBackend,
+        h: u32,
+        inter: u32,
+        stream: u64,
+    ) -> Result<()> {
+        let q4k_active = self.q4k_mmq_nc_k.0 != 0
+            && self.q4k_quant_act_k.0 != 0
+            && self.q4k_quant_w_k.0 != 0
+            && self.dequant_nvfp4_bf16_k.0 != 0
+            && std::env::var_os("ATLAS_FFN_MMQ").is_some();
+        if !q4k_active {
+            return Ok(());
+        }
+        // (1) eagerly materialize the prefill weights BEFORE freeing `_t`, so the KV cache
+        // (sized after load) can't claim the freed space before the weights exist.
+        // gate/up: Q4_K (N=inter,K=h). down: HYBRID → int8 faith2 (N=h,K=inter) for accuracy,
+        // else Q4_K. ensure_int8_weight reads the non-`_t` NVFP4 down_proj (kept for decode gemv).
+        self.ensure_q4k_weight(&self.q4k_gate, gpu, &self.weights.gate_proj, inter, h, stream)?;
+        self.ensure_q4k_weight(&self.q4k_up, gpu, &self.weights.up_proj, inter, h, stream)?;
+        let down_faith2 = self.int8_faith2_k.0 != 0
+            && self.requant_a_int8_k.0 != 0
+            && std::env::var_os("ATLAS_FFN_MMQ_DOWN_Q4K").is_none();
+        if down_faith2 {
+            self.ensure_int8_weight(&self.int8_down, gpu, &self.weights.down_proj, h, inter, stream)?;
+        } else {
+            self.ensure_q4k_weight(&self.q4k_down, gpu, &self.weights.down_proj, h, inter, stream)?;
+        }
+        gpu.synchronize(stream)?;
+        // (2) free the dead transposed copies
+        let mut freed = 0usize;
+        for wt in [
+            &mut self.weights.gate_proj_t,
+            &mut self.weights.up_proj_t,
+            &mut self.weights.down_proj_t,
+        ] {
+            if let Some(w) = wt.as_ref() {
+                if !w.weight.is_null() {
+                    gpu.free(w.weight)?;
+                    gpu.free(w.weight_scale)?;
+                    freed += 1;
+                }
+            }
+            *wt = None;
+        }
+        if freed > 0 {
+            static TWIN_LOG: std::sync::Once = std::sync::Once::new();
+            TWIN_LOG.call_once(|| {
+                eprintln!(
+                    "[atlas] ATLAS_FFN_MMQ: freed transposed FFN `_t` copies (dead under Q4_K prefill) — Q4_K weights net to ~0 vs NVFP4 baseline"
+                );
+            });
+        }
+        Ok(())
     }
 
     /// Install BF16 dense MLP weights. After this call, the forward paths
@@ -271,46 +358,44 @@ impl DenseFfnLayer {
         Ok(*cell.get().expect("int8 weight cell set above"))
     }
 
-    /// Ensure the shared activation-requant scratch holds at least `M*K` int8
-    /// bytes + `M*(K/32)*4` F32 bytes, growing (and stream-syncing before freeing
-    /// the old buffers) only when a larger prefill arrives. Returns
-    /// `(a_i8, a_scale)` device pointers reused across all three int8 GEMMs.
-    fn ensure_int8_scratch(
+    /// Lazily materialize a Q4_K FFN weight from the NVFP4 source: dequant NVFP4→bf16
+    /// (transient buffer, freed) then quantize bf16→GGML block_q4_K (cached for the
+    /// process lifetime). `src` is the non-transposed NVFP4 weight `[n, k]`.
+    fn ensure_q4k_weight(
         &self,
+        cell: &std::sync::OnceLock<Q4kWeight>,
         gpu: &dyn GpuBackend,
-        m: u32,
+        src: &QuantizedWeight,
+        n: u32,
         k: u32,
         stream: u64,
-    ) -> Result<(DevicePtr, DevicePtr)> {
-        let need_i8 = (m as usize) * (k as usize);
-        let need_scale = (m as usize) * ((k as usize) / 32) * 4;
-        let mut guard = self
-            .int8_a_scratch
-            .lock()
-            .expect("int8 scratch mutex poisoned");
-        let grow = match guard.as_ref() {
-            Some(s) => s.i8_bytes < need_i8 || s.scale_bytes < need_scale,
-            None => true,
-        };
-        if grow {
-            if let Some(old) = guard.take() {
-                // Old buffers may still be referenced by in-flight kernels on
-                // this stream; sync before freeing to avoid a use-after-free.
-                gpu.synchronize(stream)?;
-                let _ = gpu.free(old.a_i8);
-                let _ = gpu.free(old.a_scale);
-            }
-            let a_i8 = gpu.alloc(need_i8.max(1))?;
-            let a_scale = gpu.alloc(need_scale.max(1))?;
-            *guard = Some(Int8Scratch {
-                a_i8,
-                a_scale,
-                i8_bytes: need_i8,
-                scale_bytes: need_scale,
-            });
+    ) -> Result<Q4kWeight> {
+        if let Some(w) = cell.get() {
+            return Ok(*w);
         }
-        let s = guard.as_ref().expect("int8 scratch set above");
-        Ok((s.a_i8, s.a_scale))
+        // transient bf16 [n, k] (freed after quantize); persistent Q4_K bytes.
+        let bf16_tmp = gpu.alloc((n as usize) * (k as usize) * 2)?;
+        ops::dequant_nvfp4_to_bf16(
+            gpu,
+            self.dequant_nvfp4_bf16_k,
+            src.weight,
+            src.weight_scale,
+            bf16_tmp,
+            src.weight_scale_2,
+            n,
+            k,
+            stream,
+        )?;
+        let w_q4k = gpu.alloc(ops::q4k_weight_bytes(n, k))?;
+        ops::quantize_weight_q4k(gpu, self.q4k_quant_w_k, bf16_tmp, w_q4k, n, k, stream)?;
+        // bf16_tmp consumed by the quantize on `stream`; sync before freeing it.
+        gpu.synchronize(stream)?;
+        let _ = gpu.free(bf16_tmp);
+        let built = Q4kWeight { w_q4k };
+        if let Err(dup) = cell.set(built) {
+            let _ = gpu.free(dup.w_q4k);
+        }
+        Ok(*cell.get().expect("q4k weight cell set above"))
     }
 
     /// Single-token decode: 2-3 kernel launches depending on activation.
@@ -672,13 +757,73 @@ impl DenseFfnLayer {
                 );
             });
         }
+        // HYBRID: route the accuracy-critical down_proj OFF Q4_K onto the near-lossless faith2
+        // NVFP4 path (W4A8 requant, cos 0.99998). down=SiLU(gate)*up is heavy-tailed; Q4_K
+        // superblock scaling clips it (BFCL `multiple` -4.0%; llama promotes only down→Q6_K for
+        // this reason). gate/up stay on Q4_K. Default ON when MMQ active; ATLAS_FFN_MMQ_DOWN_Q4K=1
+        // = lossy all-Q4_K (A/B only). Defined here (self-fields+env, no q4k_prefill var dep) so the
+        // int8 scratch below can size for the hybrid down.
+        let down_faith2 = self.q4k_mmq_nc_k.0 != 0
+            && self.q4k_quant_act_k.0 != 0
+            && self.q4k_quant_w_k.0 != 0
+            && self.dequant_nvfp4_bf16_k.0 != 0
+            && self.int8_faith2_k.0 != 0
+            && self.requant_a_int8_k.0 != 0
+            && std::env::var_os("ATLAS_FFN_MMQ").is_some()
+            && std::env::var_os("ATLAS_FFN_MMQ_DOWN_Q4K").is_none();
         // Pre-allocate (or reuse) the activation-requant scratch once per call,
         // sized to the largest projection K (= max(h, inter)) so the per-GEMM
         // arms never trigger a mid-call grow/sync. NULL when the int8 path is off.
-        let (int8_a_i8, int8_a_scale) = if int8_prefill {
-            self.ensure_int8_scratch(ctx.gpu, m, h.max(inter), stream)?
+        // Shared, arena-owned activation-requant scratch (sized once for
+        // max_batch_tokens × max(h, inter) in BufferSizes::from_config). Replaces
+        // the former per-DenseFfnLayer grow-on-demand allocator that leaked
+        // ~286MB × 64 layers on the MMQ prefill path.
+        let (int8_a_i8, int8_a_scale) = if int8_prefill || down_faith2 {
+            (ctx.buffers.ffn_act_a(), ctx.buffers.ffn_act_scale())
         } else {
             (DevicePtr::NULL, DevicePtr::NULL)
+        };
+        // W4A4 native-FP4 prefill (ATLAS_FP4_PREFILL) — HIGHEST priority. NVFP4 weights
+        // used directly (no requant); BF16 activations quantized to NVFP4 each GEMM into
+        // the shared scratch. Native FP4 tensor cores (sm_121a). Lossy (cos ~0.99 vs fp32).
+        let fp4_prefill = self.w4a4_gemm_k.0 != 0
+            && self.quantize_nvfp4_k.0 != 0
+            && std::env::var_os("ATLAS_FP4_PREFILL").is_some();
+        if fp4_prefill {
+            static FP4_LOG: std::sync::Once = std::sync::Once::new();
+            FP4_LOG.call_once(|| {
+                eprintln!(
+                    "[atlas] ATLAS_FP4_PREFILL=1: dense-FFN prefill via w4a4_gemm (native FP4 MMA sm_121a, W4A4)"
+                );
+            });
+        }
+        // NVFP4 packed [m,K/2] + scale [m,K/16] both fit within the shared int8
+        // buffers (a_i8 [m,K] ⊇ packed; a_scale [m,(K/32)*4] ⊇ scale). FP4-prefill
+        // is a standalone A/B flag, never co-active with the int8/Q4_K down path.
+        let (nvfp4_a_packed, nvfp4_a_scale) = if fp4_prefill {
+            (ctx.buffers.ffn_act_a(), ctx.buffers.ffn_act_scale())
+        } else {
+            (DevicePtr::NULL, DevicePtr::NULL)
+        };
+        // Q4_K MMQ prefill (ATLAS_FFN_MMQ) — vendored llama Q4_K W4A8 GEMM. Highest priority
+        // when enabled. Lossy (Q4_K weight format ≠ NVFP4); gate via BFCL before relying on it.
+        let q4k_prefill = self.q4k_mmq_nc_k.0 != 0
+            && self.q4k_quant_act_k.0 != 0
+            && self.q4k_quant_w_k.0 != 0
+            && self.dequant_nvfp4_bf16_k.0 != 0
+            && std::env::var_os("ATLAS_FFN_MMQ").is_some();
+        if q4k_prefill {
+            static Q4K_LOG: std::sync::Once = std::sync::Once::new();
+            Q4K_LOG.call_once(|| {
+                eprintln!(
+                    "[atlas] ATLAS_FFN_MMQ=1: dense-FFN prefill via vendored llama Q4_K MMQ (W4A8, +25%/+10% gate·down vs faith2)"
+                );
+            });
+        }
+        let q4k_a = if q4k_prefill {
+            ctx.buffers.ffn_act_q8()
+        } else {
+            DevicePtr::NULL
         };
         // A/B escape hatch (benchmark only): force the proven v1 BF16 kernel even
         // when v2 is loaded, so v1-vs-v2 prefill TTFT can be compared in one
@@ -692,14 +837,53 @@ impl DenseFfnLayer {
         };
 
         macro_rules! w4_gemm {
-            ($w:expr, $wt:expr, $cell:expr, $in:expr, $out:expr, $n:expr, $k:expr) => {
+            ($w:expr, $wt:expr, $cell:expr, $qcell:expr, $in:expr, $out:expr, $n:expr, $k:expr, $allow_q4k:expr) => {
                 match $wt {
-                    // int8 W4A8 fast prefill (ATLAS_INT8_PREFILL) — HIGHEST priority.
+                    // Q4_K MMQ prefill (ATLAS_FFN_MMQ) — HIGHEST priority, gated per-GEMM by
+                    // `$allow_q4k` (false for down in the hybrid → falls to the faith2 arm).
+                    // Activation `$in` is pre-quantized to q8_1 in `q4k_a` by the caller.
+                    _ if q4k_prefill && $allow_q4k => {
+                        let qw = self.ensure_q4k_weight($qcell, ctx.gpu, $w, $n, $k, stream)?;
+                        ops::q4k_mmq_gemm(
+                            ctx.gpu,
+                            self.q4k_mmq_nc_k,
+                            self.q4k_mmq_wc_k,
+                            q4k_a,
+                            qw.w_q4k,
+                            $out,
+                            m,
+                            $n,
+                            $k,
+                            stream,
+                        )?;
+                    }
+                    // W4A4 native-FP4 prefill (ATLAS_FP4_PREFILL) — HIGHEST priority.
+                    // The activation is PRE-quantized into the NVFP4 scratch by the caller
+                    // (`input` once for gate+up which share it; `gate_out` for down) — opt #1,
+                    // avoids the redundant re-quant. This arm just runs w4a4_gemm against the
+                    // native NVFP4 weight `$w` (no requant). sm_121a FP4 MMA.
+                    _ if fp4_prefill => {
+                        let _ = $in;
+                        ops::w4a4_gemm(
+                            ctx.gpu,
+                            self.w4a4_gemm_k,
+                            nvfp4_a_packed,
+                            nvfp4_a_scale,
+                            $w,
+                            $out,
+                            m,
+                            $n,
+                            $k,
+                            stream,
+                        )?;
+                    }
+                    // int8 W4A8 fast prefill (ATLAS_INT8_PREFILL) — next priority.
                     // Independent of `$wt`/the transposed copies: requant reads the
                     // non-transposed NVFP4 `$w` directly. Builds (once) + caches the
                     // int8 weight in `$cell`, then requant_a + faith2 via the shared
-                    // scratch. Lossy (cosine ~0.99998).
-                    _ if int8_prefill => {
+                    // scratch. Lossy (cosine ~0.99998). Also the HYBRID down path
+                    // (down_faith2 && !$allow_q4k): down falls here instead of Q4_K.
+                    _ if int8_prefill || (down_faith2 && !$allow_q4k) => {
                         let iw = self.ensure_int8_weight(
                             $cell, ctx.gpu, $w, $n, $k, stream,
                         )?;
@@ -779,25 +963,47 @@ impl DenseFfnLayer {
             };
         }
 
+        // W4A4 opt #1: quantize the gate/up SHARED input `[M, H]` to NVFP4 ONCE
+        // (gate and up both read it) instead of per-GEMM. Reused by both arms below.
+        if fp4_prefill {
+            ops::quantize_bf16_to_nvfp4(
+                ctx.gpu,
+                self.quantize_nvfp4_k,
+                input,
+                nvfp4_a_packed,
+                nvfp4_a_scale,
+                m,
+                h,
+                stream,
+            )?;
+        }
+        // Q4_K opt: quantize the gate/up SHARED input `[M, H]` to q8_1 ONCE (both read it).
+        if q4k_prefill {
+            ops::quantize_act_q8_1(ctx.gpu, self.q4k_quant_act_k, input, q4k_a, m, h, stream)?;
+        }
         // gate_proj GEMM: [M, H] → [M, inter]
         w4_gemm!(
             &self.weights.gate_proj,
             self.weights.gate_proj_t,
             &self.int8_gate,
+            &self.q4k_gate,
             input,
             gate_out,
             inter,
-            h
+            h,
+            true
         );
         // up_proj GEMM: [M, H] → [M, inter]
         w4_gemm!(
             &self.weights.up_proj,
             self.weights.up_proj_t,
             &self.int8_up,
+            &self.q4k_up,
             input,
             up_out,
             inter,
-            h
+            h,
+            true
         );
 
         // activation(gate) * up for all M tokens (SiLU or GELU)
@@ -811,16 +1017,36 @@ impl DenseFfnLayer {
             stream,
         )?;
 
+        // W4A4 opt #1: quantize the down input (SiLU(gate)*up, `[M, inter]`) to NVFP4.
+        if fp4_prefill {
+            ops::quantize_bf16_to_nvfp4(
+                ctx.gpu,
+                self.quantize_nvfp4_k,
+                gate_out,
+                nvfp4_a_packed,
+                nvfp4_a_scale,
+                m,
+                inter,
+                stream,
+            )?;
+        }
+        // Q4_K opt: quantize the down input (SiLU(gate)*up, `[M, inter]`) to q8_1.
+        // Skip when the hybrid routes down to faith2 (it does its own int8 requant).
+        if q4k_prefill && !down_faith2 {
+            ops::quantize_act_q8_1(ctx.gpu, self.q4k_quant_act_k, gate_out, q4k_a, m, inter, stream)?;
+        }
         // down_proj GEMM: [M, inter] → [M, H]
         let output = ctx.buffers.moe_output();
         w4_gemm!(
             &self.weights.down_proj,
             self.weights.down_proj_t,
             &self.int8_down,
+            &self.q4k_down,
             gate_out,
             output,
             h,
-            inter
+            inter,
+            false
         );
 
         Ok(())

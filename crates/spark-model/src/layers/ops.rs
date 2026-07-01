@@ -25,6 +25,7 @@ mod fp8_moe_batch_a;
 mod fp8_moe_batch_b;
 #[path = "ops/gemm_dense.rs"]
 mod gemm_dense;
+mod q4k_mmq;
 #[path = "ops/gemm_quant.rs"]
 mod gemm_quant;
 #[path = "ops/kv_cache.rs"]
@@ -83,6 +84,7 @@ pub use fp8_moe::*;
 pub use fp8_moe_batch_a::*;
 pub use fp8_moe_batch_b::*;
 pub use gemm_dense::*;
+pub use q4k_mmq::*;
 pub use gemm_quant::*;
 pub use kv_cache::*;
 pub use kv_cache_fp8k::*;
