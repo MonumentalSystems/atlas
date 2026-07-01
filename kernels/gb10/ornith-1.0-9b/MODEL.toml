@@ -82,11 +82,6 @@ max_inter_tool_prose = 384
 max_post_think_content_tokens = 8192
 default_num_drafts = 0
 tool_call_parser = "qwen3_coder"
-# Tool-call grammar OFF: same XGrammar degeneration as Holo-3.1 (runaway
-# reasoning / hallucinated `Human:` turns under tool-constrained decoding).
-# Matches vLLM, which free-generates + parses tool calls after. See
-# holo-3.1-35b-a3b/MODEL.toml for the full root-cause writeup.
-disable_tool_grammar = true
 
 # Dense Qwen3.5/Ornith: model_type stays "qwen3_5" (num_experts == 0). MRoPE
 # present but the qwen3_5 -> qwen3_6_moe rewrite is gated on is_moe, so dense

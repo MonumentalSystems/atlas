@@ -66,9 +66,14 @@ moe_gate_shmem_bytes = 4096   # hidden_dim(2048) * sizeof(bf16)
 # showed this MoE A3B variant finishes naturally with EOS on long-code
 # prompts. Only the dense Qwen 27B variants need the watchdog.
 enable_loop_watchdog = false
-# Thinking on by default for all Qwen reasoning-tier models (sweep 2026-05-20).
-thinking_default = true
-# 2026-05-23 sweep: project-wide default flipped to true.
-thinking_in_tools = true
+# Thinking OFF by default: the canonical checkpoint for this target is
+# Qwen3-VL-30B-A3B-**Instruct** (ig1/...-NVFP4), a non-reasoning Instruct
+# model. Forcing thinking on it (the 2026-05-20 "all Qwen reasoning-tier"
+# sweep mis-swept this VL Instruct target) makes it free-run: it never emits
+# </think>, so all output lands in reasoning_content with empty final content,
+# and the text degenerates (repetition + hallucinated turns). A Thinking VL
+# checkpoint can still opt in per-request via enable_thinking=true.
+thinking_default = false
+thinking_in_tools = false
 # 2026-05-23 sweep: explicit 2048 (was unset → 256 default).
 max_thinking_budget = 2048

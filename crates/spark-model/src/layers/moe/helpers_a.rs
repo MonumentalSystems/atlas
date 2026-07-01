@@ -326,6 +326,7 @@ impl MoeLayer {
         if let Some(ds) = down_scale_dev {
             self.down_sfb_cutlass = Some(build_one(ds, h, inter)?);
         }
+        drop(build_one);
         self._cutlass_sfb_owned = owned;
         tracing::info!(
             "CUTLASS grouped SFB: built {num} experts gate/up (N={inter} K={h}) + down (N={h} K={inter})"

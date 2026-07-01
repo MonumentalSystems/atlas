@@ -85,9 +85,6 @@ max_inter_tool_prose = 384
 max_post_think_content_tokens = 8192
 default_num_drafts = 0
 tool_call_parser = "qwen3_coder"
-# Tool-call grammar OFF: XGrammar tool-constrained decoding degenerates the
-# Holo family (see holo-3.1-35b-a3b/MODEL.toml). Matches vLLM.
-disable_tool_grammar = true
 
 # Dense Qwen3.5/Holo: model_type stays "qwen3_5" (num_experts == 0). MRoPE is
 # present but the qwen3_5 -> qwen3_6_moe rewrite is gated on is_moe, so dense
