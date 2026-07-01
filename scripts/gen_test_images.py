@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Generate the committed, copyright-free test images for vision soak/bench.
 
-Produces 8 deterministic synthetic PNGs of varied resolution + aspect ratio
+Produces 8 deterministic synthetic PNG images of varied resolution + aspect ratio
 under tests/fixtures/images/. Synthetic => no licensing concern; varied sizes
 exercise the vision preprocessor (patch counts, aspect-ratio handling, the
 max_pixels resize path) under concurrency. Each image has distinct geometry +

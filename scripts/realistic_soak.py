@@ -239,8 +239,8 @@ def main():
     t0 = time.time()
     print(f"clients: {n_conv} conversation (roll to {args.rolling_context} tok) + "
           f"{args.clients - n_conv} one-shot; think-rate {args.think_rate}", flush=True)
-    ths = [threading.Thread(target=client, args=(c,)) for c in range(args.clients)]
-    for t in ths:
+    threads = [threading.Thread(target=client, args=(c,)) for c in range(args.clients)]
+    for t in threads:
         t.start()
     while time.time() < stop:
         time.sleep(30)
@@ -249,7 +249,7 @@ def main():
             print(f"  [{int(time.time()-t0)}s] reqs={st['req']} errs={st['err']} "
                   f"(fact={st['fact']} tool={st['tool']} img={st['img']}) think={st['think']} "
                   f"tool_calls={st['tc']} fresh_prefill={fresh} cached={st['cached']} gen={st['ct']}", flush=True)
-    for t in ths:
+    for t in threads:
         t.join()
 
     el = time.time() - t0

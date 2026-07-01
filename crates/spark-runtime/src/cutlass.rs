@@ -2,7 +2,7 @@
 //! Optional CUTLASS host-wrapper FFI for de-risking GB10 GEMM replacements.
 //!
 //! Split for the ≤500 LoC cap: this root holds the shared FFI `extern` block,
-//! the workspace [`Ctx`], and module wiring; the public wrappers live in the
+//! the workspace `Ctx`, and module wiring; the public wrappers live in the
 //! `gemm` (dense BF16 + NVFP4), `grouped` (per-expert MoE), and `pack`
 //! (weight pack / SFB swizzle / transpose) siblings. The public API
 //! (`spark_runtime::cutlass::<fn>`) is preserved via the re-exports below.
