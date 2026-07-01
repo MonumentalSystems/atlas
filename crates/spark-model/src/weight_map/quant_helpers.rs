@@ -270,6 +270,102 @@ pub(crate) fn dequant_fp8_blockscaled_to_bf16(
     Ok(DenseWeight { weight: out })
 }
 
+/// Dequant FP8E4M3 → BF16, auto-detecting the on-disk scale layout. All three
+/// FP8 scale conventions reduce to the SAME block-scaled kernel because it
+/// indexes `scale[n/block_n, k/block_k]`:
+///   - `weight_scale_inv` `[sn, sk]`  → block-scaled (DeepSeek / Qwen native FP8)
+///   - `weight_scale` `[N]`           → per-channel (compressed-tensors
+///     `strategy="channel"`, e.g. deepreinforce-ai/Ornith-1.0-35B-FP8) → sn=N, sk=1
+///   - `weight_scale` `[1]` / scalar  → per-tensor (ModelOpt MIXED_PRECISION) → sn=1, sk=1
+///
+/// This is the single entry point the expert and dense-projection loaders should
+/// use so every FP8 scale shape routes correctly instead of erroring on an absent
+/// `weight_scale_inv` or a non-scalar `weight_scale`.
+pub(crate) fn dequant_fp8_any_to_bf16(
+    store: &WeightStore,
+    prefix: &str,
+    gpu: &dyn GpuBackend,
+) -> Result<DenseWeight> {
+    use spark_runtime::kernel_args::{KernelLaunch, div_ceil};
+
+    let w = store.get(&format!("{prefix}.weight"))?;
+    ensure!(
+        w.dtype == WeightDtype::FP8E4M3,
+        "Expected FP8E4M3 for {prefix}.weight, got {:?}",
+        w.dtype,
+    );
+    ensure!(
+        w.shape.len() == 2,
+        "Expected 2D weight for {prefix}, got {:?}",
+        w.shape
+    );
+    let n = w.shape[0];
+    let k = w.shape[1];
+    let total = n * k;
+    ensure!(
+        total == w.byte_size(),
+        "FP8 size mismatch: total={total} byte_size={}",
+        w.byte_size()
+    );
+
+    // Resolve scale tensor + its logical (sn, sk) grid.
+    let (s, sn, sk) = if let Ok(si) = store.get(&format!("{prefix}.weight_scale_inv")) {
+        ensure!(si.shape.len() == 2, "block scale {prefix}.weight_scale_inv must be 2D, got {:?}", si.shape);
+        let (sn, sk) = (si.shape[0], si.shape[1]);
+        (si, sn, sk)
+    } else {
+        let sc = store.get(&format!("{prefix}.weight_scale"))?;
+        let ne = sc.num_elements();
+        if ne == n {
+            // per-channel: one scale per output row → [N, 1]
+            (sc, n, 1)
+        } else if ne == 1 {
+            // per-tensor scalar → [1, 1]
+            (sc, 1, 1)
+        } else if sc.shape.len() == 2 {
+            let (sn, sk) = (sc.shape[0], sc.shape[1]);
+            (sc, sn, sk)
+        } else {
+            anyhow::bail!(
+                "Unexpected {prefix}.weight_scale shape {:?} ({ne} elems) for weight [{n},{k}]",
+                sc.shape
+            );
+        }
+    };
+    ensure!(
+        s.dtype == WeightDtype::BF16 || s.dtype == WeightDtype::FP32,
+        "Expected BF16 or FP32 scale for {prefix}, got {:?}",
+        s.dtype,
+    );
+    let block_n = (n / sn) as u32;
+    let block_k = (k / sk) as u32;
+    let scale_is_f32 = s.dtype == WeightDtype::FP32;
+
+    let out = gpu.alloc(total * 2)?;
+    let stream = gpu.default_stream();
+    let kernel = gpu.kernel("dequant_fp8_blockscaled_bf16", "dequant_fp8_blockscaled_bf16")?;
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(k as u32, 64), div_ceil(n as u32, 4), 1])
+        .block([64, 4, 1])
+        .arg_ptr(w.ptr)
+        .arg_ptr(s.ptr)
+        .arg_ptr(out)
+        .arg_u32(n as u32)
+        .arg_u32(k as u32)
+        .arg_u32(block_n)
+        .arg_u32(block_k)
+        .arg_u32(sk as u32)
+        .arg_u32(scale_is_f32 as u32)
+        .launch(stream)?;
+    gpu.synchronize(stream).with_context(|| {
+        format!("GPU dequant_fp8_any failed for {prefix} [{n},{k}] scale=[{sn},{sk}]")
+    })?;
+    tracing::debug!(
+        "GPU-dequanted FP8 {prefix}: [{n},{k}] scale=[{sn},{sk}] block=[{block_n},{block_k}] → BF16",
+    );
+    Ok(DenseWeight { weight: out })
+}
+
 /// Convert BF16 bytes (little-endian) to f32.
 pub(super) fn bf16_bytes_to_f32(bytes: [u8; 2]) -> f32 {
     let bits = u16::from_le_bytes(bytes);
@@ -295,29 +391,28 @@ pub(crate) fn dense_auto(
             let prefix = name
                 .strip_suffix(".weight")
                 .ok_or_else(|| anyhow::anyhow!("FP8 tensor {name} doesn't end with .weight"))?;
-            // FP8 scale conventions (merged main + V4):
+            // FP8 scale conventions (merged main + V4 + per-channel/Ornith):
             // 1. block-scaled (DeepSeek-V3 / Qwen native FP8): `weight_scale_inv` (2D)
-            // 2. per-tensor (nvidia MIXED_PRECISION, e.g. Qwen3.6-35B-A3B-NVFP4's
+            // 2. per-channel (compressed-tensors "channel" strategy, e.g.
+            //    deepreinforce-ai/Ornith-1.0-35B-FP8): `weight_scale` [N]
+            // 3. per-tensor (nvidia MIXED_PRECISION, e.g. Qwen3.6-35B-A3B-NVFP4's
             //    attn + linear_attn projections): scalar `weight_scale` (1 element)
-            // 3. block-scaled compressed-tensors (RedHatAI re-quant): 2-D / 1-D
+            // 4. block-scaled compressed-tensors (RedHatAI re-quant): 2-D
             //    multi-element `weight_scale` (incl. ModelOpt mixed-precision, e.g.
-            //    lovedheart AgentWorld-35B) / `.scale` (DeepSeek-V4, F8_E8M0)
-            // Pick by which one is present so MIXED_PRECISION loads instead of
-            // erroring on the absent `weight_scale_inv` (issue #107), while V4 /
-            // RedHatAI block-scaled checkpoints route to the block dequant.
-            // `num_elements() > 1` is the superset of main's `shape.len() == 2`
-            // (also catches 1-D per-row scales); `has_v4_scale` keeps V4 on the
-            // block path (main alone routed V4's `.scale` to the scalar path).
-            let has_blockscale = store.contains(&format!("{prefix}.weight_scale_inv"));
-            let has_per_row_scale = store
-                .get(&format!("{prefix}.weight_scale"))
-                .map(|s| s.num_elements() > 1)
-                .unwrap_or(false);
+            //    lovedheart AgentWorld-35B)
+            // 5. `.scale` (DeepSeek-V4, F8_E8M0) — distinct naming, kept on the
+            //    original block-scaled path (dequant_fp8_any_to_bf16 doesn't know
+            //    about `.scale` at all, only `weight_scale_inv`/`weight_scale`).
+            // `dequant_fp8_any_to_bf16` (per-channel Ornith fix) is a superset of
+            // the old GPU block path for cases 1-4 — routes by `weight_scale`'s
+            // actual element count instead of a coarse shape/contains check, so
+            // it dequantizes per-channel correctly instead of misreading a [N]
+            // scale as if it were the [1] scalar or a 2-D block grid.
             let has_v4_scale = store.contains(&format!("{prefix}.scale"));
-            if has_blockscale || has_per_row_scale || has_v4_scale {
+            if has_v4_scale {
                 dequant_fp8_blockscaled_to_bf16(store, prefix, gpu)
             } else {
-                dequant_fp8_to_bf16(store, prefix, gpu)
+                dequant_fp8_any_to_bf16(store, prefix, gpu)
             }
         }
         other => anyhow::bail!("dense_auto: unsupported dtype {:?} for {name}", other),
