@@ -68,7 +68,6 @@ pub(crate) fn build_model(
         kv_dtype,
         inference_reserve,
         args.gpu_memory_utilization,
-        args.target_kv_tokens,
         args.ssm_cache_slots,
         layer_dtypes,
         args.ssm_checkpoint_interval,

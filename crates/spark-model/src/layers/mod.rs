@@ -63,14 +63,6 @@ impl FfnComponent {
         matches!(self, Self::None)
     }
 
-    /// True for a dense (non-MoE) FFN. The multi-seq decode path uses this to
-    /// batch n>=4 decode through the dense `forward_batched` GEMM (weights read
-    /// once for the whole batch — bandwidth amortization), whereas MoE keeps
-    /// the per-seq loop (grouped-GEMM is a net loss at small batch).
-    pub fn is_dense(&self) -> bool {
-        matches!(self, Self::Dense(_))
-    }
-
     /// ATLAS_FP32_ROUTING active for this FFN (MoE only; false otherwise).
     pub fn fp32_routing_active(&self) -> bool {
         match self {
