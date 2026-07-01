@@ -20,18 +20,25 @@ use crate::weight_map::{
     load_moe_qwen35_fp8_experts, quantize_to_nvfp4,
 };
 
-/// True when a projection ships as native block-scaled FP8 on disk
-/// (`FP8E4M3 .weight` + `.weight_scale_inv`). Hybrid mixed-precision
-/// checkpoints (lovedheart AgentWorld-35B) keep attention/SSM projections in
-/// BF16 — or in block-FP8 under a `.weight_scale` key — even when the model is
-/// globally FP8/NVFP4. Those return false so the loader routes them through
-/// the per-tensor dense/NVFP4 path instead of the native-FP8 fast arm.
+/// True when a projection ships as native block-scaled FP8 on disk: an
+/// `FP8E4M3 .weight` plus a 2D block scale. The scale tensor name varies by
+/// producer — DeepSeek/Qwen-native FP8 uses `.weight_scale_inv`, while
+/// compressed-tensors `float-quantized` (e.g. Hcompany/Holo-3.1-*-FP8) uses a
+/// 2D `.weight_scale`; both are accepted (`load_fp8_block_scaled_as_fp8weight`
+/// resolves either). A *scalar* `.weight_scale` (ModelOpt per-tensor FP8) is
+/// NOT native-block here → returns false so those route through the
+/// per-tensor dense/NVFP4 path instead of the native-FP8 fast arm.
 fn proj_is_native_fp8(store: &WeightStore, prefix: &str) -> bool {
-    store
+    let is_fp8_weight = store
         .get(&format!("{prefix}.weight"))
         .map(|w| w.dtype == WeightDtype::FP8E4M3)
-        .unwrap_or(false)
-        && store.contains(&format!("{prefix}.weight_scale_inv"))
+        .unwrap_or(false);
+    let has_block_scale = store.contains(&format!("{prefix}.weight_scale_inv"))
+        || store
+            .get(&format!("{prefix}.weight_scale"))
+            .map(|s| s.shape.len() == 2)
+            .unwrap_or(false);
+    is_fp8_weight && has_block_scale
 }
 
 pub(super) fn load_layers(

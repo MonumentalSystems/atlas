@@ -115,6 +115,28 @@ pub fn detect_nvfp4_variant(
         if store.contains(&fp8_attn_key) {
             return Nvfp4Variant::Fp8Dequanted;
         }
+        // compressed-tensors `float-quantized` FP8 (e.g. Hcompany/Holo-3.1-*-FP8)
+        // ships block-FP8 as an FP8E4M3 `.weight` + 2D `.weight_scale` — NO
+        // `.weight_packed` (that's NVFP4) and NO `.weight_scale_inv` (that's
+        // DeepSeek/Qwen-native FP8). The `.weight_scale` name alias-collides
+        // with compressed-tensors NVFP4, so the `.weight_scale` checks below
+        // would misroute it to an NVFP4 variant. Disambiguate by the
+        // unambiguous FP8E4M3 weight dtype: an FP8E4M3 projection weight is
+        // always block-FP8 (Fp8Dequanted; the FP8→BF16→NVFP4 requant path in
+        // `quantized_from_fp8` reads the 2D `.weight_scale`).
+        for key in [
+            format!("{pfx}.mlp.experts.{local_expert}.gate_proj.weight"),
+            format!("{pfx}.mlp.gate_proj.weight"),
+            format!("{pfx}.self_attn.q_proj.weight"),
+        ] {
+            if store
+                .get(&key)
+                .map(|w| w.dtype == WeightDtype::FP8E4M3)
+                .unwrap_or(false)
+            {
+                return Nvfp4Variant::Fp8Dequanted;
+            }
+        }
     }
     // Fallback: scan any tensor name for `.weight_scale_inv` suffix.
     // Catches FP8 checkpoints where the layer prefix hasn't been resolved yet.
