@@ -28,6 +28,10 @@ extend-ignore-identifiers-re = [
 # `deint` — short form of "deinterleaved" used as the Q|K|V|Z input
 # pointer name in the fused K=2 GDN verify kernel/ops. Not a typo.
 deint = "deint"
+# `ue` — the NVFP4/MX scale-factor formats `ue4m3`/`ue8m0` (cutlass
+# `float_ue4m3_t`, helpers like `mt_float_to_ue4m3`) split on the digit, so
+# the checker reads the leading `ue` as a typo for "use"/"due". Not a typo.
+ue = "ue"
 # "subtiles" = sub-tiles: WMMA n-sub-tile partitioning in the strix-hip
 # MoE/dense GEMM kernels (PM4_SUBTILES_PER_WARP). Not a typo of "subtitles".
 subtiles = "subtiles"
