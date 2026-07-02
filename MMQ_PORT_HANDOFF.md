@@ -394,10 +394,10 @@ FP8-KV, util 0.72 -> most stable (~8660s). Config-space is EXHAUSTED at parity; 
 or GDN-scan work. Run #9 completing for the definitive number.
 
 
-## RUN #9 (int8+interval64+Marconi256+MTP nd1) — STABLE but ~9254s (turn 208, per-it 9.19s, recompute 31-671 bounded).
+## RUN #9 (int8+interval64+Marconi256+MTP num-drafts=1) — STABLE but ~9254s (turn 208, per-it 9.19s, recompute 31-671 bounded).
 Decode-DOMINATED (~6s decode + ~2.5s TTFT). interval64 stable but base TTFT higher -> per-it 9.19s -> above llama.
 ## RUN #10 (= run#9 + MTP --num-drafts 2): testing if faster decode (the per-turn bulk) tips under 8369s. If MTP gate
-## keeps nd2 (verify_multiplier<2) -> decode up ~25% -> ~7750s WIN; if gate disables (net-neg) -> falls back to ~9254s.
+## keeps num-drafts=2 (verify_multiplier<2) -> decode up ~25% -> ~7750s WIN; if gate disables (net-neg) -> falls back to ~9254s.
 ## STRIX CROSS-CHECK (pulled via ssh): Atlas-Strix agentic (git 8ba5298, NO prefix-cache fix) = 35966s/524 turns, TTFT
 ## median 50s -> the UN-FIXED prefill bug (full re-prefill/turn); llama-Strix edge_agentic = 10568s/1007. Atlas LOST the
 ## agentic WALL on Strix too; Atlas's Strix WIN was BFCL-ST ACCURACY (88.82 vs llama 86.16). Confirms: agentic wall =

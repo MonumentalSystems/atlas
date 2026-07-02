@@ -139,14 +139,24 @@ fn time_kernel_m64(
         KernelLaunch::new(gpu, h)
             .grid([n.div_ceil(128) as u32, m.div_ceil(64) as u32, 1])
             .block([128, 1, 1])
-            .arg_ptr(a).arg_ptr(packed).arg_ptr(scale).arg_f32(scale2).arg_ptr(c)
-            .arg_u32(m as u32).arg_u32(n as u32).arg_u32(k as u32)
+            .arg_ptr(a)
+            .arg_ptr(packed)
+            .arg_ptr(scale)
+            .arg_f32(scale2)
+            .arg_ptr(c)
+            .arg_u32(m as u32)
+            .arg_u32(n as u32)
+            .arg_u32(k as u32)
             .launch(stream)
     };
-    for _ in 0..3 { launch()?; }
+    for _ in 0..3 {
+        launch()?;
+    }
     gpu.synchronize(stream)?;
     let t0 = Instant::now();
-    for _ in 0..iters { launch()?; }
+    for _ in 0..iters {
+        launch()?;
+    }
     gpu.synchronize(stream)?;
     Ok(t0.elapsed().as_secs_f64() / iters as f64)
 }
@@ -213,8 +223,12 @@ fn main() -> Result<()> {
         let bf8_ptr = upload(gpu, &b_fp8)?;
         let c3 = gpu.alloc(m * n * 2)?;
 
-        let t1 = time_kernel(gpu, stream, v1, a_ptr, p_ptr, s_ptr, 0.5, c1, m, n, k, iters)?;
-        let t2 = time_kernel(gpu, stream, v2, a_ptr, p_ptr, s_ptr, 0.5, c2, m, n, k, iters)?;
+        let t1 = time_kernel(
+            gpu, stream, v1, a_ptr, p_ptr, s_ptr, 0.5, c1, m, n, k, iters,
+        )?;
+        let t2 = time_kernel(
+            gpu, stream, v2, a_ptr, p_ptr, s_ptr, 0.5, c2, m, n, k, iters,
+        )?;
         let t3 = time_kernel_fp8(gpu, stream, fp8, a_ptr, bf8_ptr, c3, m, n, k, iters)?;
         // fp8_fp8: both operands FP8 -> true m16n8k32.e4m3 MMA (2x candidate)
         let a_fp8: Vec<u8> = (0..m * k).map(|_| rng.next_u64() as u8).collect();
@@ -225,8 +239,12 @@ fn main() -> Result<()> {
         // K32 vs K64 lossless (M64 tiling) — the bubble-reduction test
         let c5 = gpu.alloc(m * n * 2)?;
         let c6 = gpu.alloc(m * n * 2)?;
-        let t5 = time_kernel_m64(gpu, stream, gt_k32, a_ptr, p_ptr, s_ptr, 0.5, c5, m, n, k, iters)?;
-        let t6 = time_kernel_m64(gpu, stream, gt_k64, a_ptr, p_ptr, s_ptr, 0.5, c6, m, n, k, iters)?;
+        let t5 = time_kernel_m64(
+            gpu, stream, gt_k32, a_ptr, p_ptr, s_ptr, 0.5, c5, m, n, k, iters,
+        )?;
+        let t6 = time_kernel_m64(
+            gpu, stream, gt_k64, a_ptr, p_ptr, s_ptr, 0.5, c6, m, n, k, iters,
+        )?;
 
         // dense_gemm_bf16_pipelined: pure bf16 A x bf16 B (predequanted weights), no in-kernel dequant
         let b_bf16: Vec<u8> = (0..n * k * 2).map(|_| rng.next_u64() as u8).collect();
@@ -237,14 +255,22 @@ fn main() -> Result<()> {
                 KernelLaunch::new(gpu, dbf16)
                     .grid([n.div_ceil(128) as u32, m.div_ceil(128) as u32, 1])
                     .block([256, 1, 1])
-                    .arg_ptr(a_ptr).arg_ptr(bbf_ptr).arg_ptr(c7)
-                    .arg_u32(m as u32).arg_u32(n as u32).arg_u32(k as u32)
+                    .arg_ptr(a_ptr)
+                    .arg_ptr(bbf_ptr)
+                    .arg_ptr(c7)
+                    .arg_u32(m as u32)
+                    .arg_u32(n as u32)
+                    .arg_u32(k as u32)
                     .launch(stream)
             };
-            for _ in 0..3 { go()?; }
+            for _ in 0..3 {
+                go()?;
+            }
             gpu.synchronize(stream)?;
             let t0 = Instant::now();
-            for _ in 0..it { go()?; }
+            for _ in 0..it {
+                go()?;
+            }
             gpu.synchronize(stream)?;
             Ok(t0.elapsed().as_secs_f64() / it as f64)
         };
@@ -256,14 +282,22 @@ fn main() -> Result<()> {
                 KernelLaunch::new(gpu, dtc)
                     .grid([n.div_ceil(64) as u32, m.div_ceil(16) as u32, 1])
                     .block([128, 1, 1])
-                    .arg_ptr(a_ptr).arg_ptr(bbf_ptr).arg_ptr(c8)
-                    .arg_u32(m as u32).arg_u32(n as u32).arg_u32(k as u32)
+                    .arg_ptr(a_ptr)
+                    .arg_ptr(bbf_ptr)
+                    .arg_ptr(c8)
+                    .arg_u32(m as u32)
+                    .arg_u32(n as u32)
+                    .arg_u32(k as u32)
                     .launch(stream)
             };
-            for _ in 0..3 { go()?; }
+            for _ in 0..3 {
+                go()?;
+            }
             gpu.synchronize(stream)?;
             let t0 = Instant::now();
-            for _ in 0..it { go()?; }
+            for _ in 0..it {
+                go()?;
+            }
             gpu.synchronize(stream)?;
             Ok(t0.elapsed().as_secs_f64() / it as f64)
         };
@@ -274,10 +308,15 @@ fn main() -> Result<()> {
         let tf8 = flops / t8 / 1e12;
         println!(
             "{label:<16} {m:>6} {n:>6} {k:>6} | bf16v2(deq) {:>6.2} | denseBF16 {:>6.2} | denseTC(ldmatrix) {:>6.2} | {:>5.3}x v2",
-            tf2, tf7, tf8, t2 / t8,
+            tf2,
+            tf7,
+            tf8,
+            t2 / t8,
         );
         let _ = (t1, t3, t4, t5, t6);
-        for ptr in [c5, c6, bbf_ptr, c7, c8] { let _ = gpu.free(ptr); }
+        for ptr in [c5, c6, bbf_ptr, c7, c8] {
+            let _ = gpu.free(ptr);
+        }
 
         for ptr in [a_ptr, p_ptr, s_ptr, c1, c2, bf8_ptr, c3, af8_ptr, c4] {
             let _ = gpu.free(ptr);

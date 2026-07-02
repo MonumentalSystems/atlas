@@ -337,7 +337,12 @@ impl ModelWeightLoader for Qwen35DenseWeightLoader {
                             load_fp8_block_scaled_as_fp8weight(store, &format!("{p}.{name}"), gpu)
                         };
                         let [q_fp8, k_fp8, v_fp8, o_fp8] = load_qkvo_tp(config, load_fp8_proj)?;
-                        attn_layer.set_fp8_weights(Some(q_fp8), Some(k_fp8), Some(v_fp8), Some(o_fp8));
+                        attn_layer.set_fp8_weights(
+                            Some(q_fp8),
+                            Some(k_fp8),
+                            Some(v_fp8),
+                            Some(o_fp8),
+                        );
                         if let Err(e) = attn_layer.transpose_fp8_for_prefill(gpu, stream) {
                             tracing::warn!("Layer {i}: dense FP8 transpose failed: {e}");
                         }

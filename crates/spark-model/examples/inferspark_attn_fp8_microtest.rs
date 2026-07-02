@@ -96,7 +96,12 @@ fn main() -> Result<()> {
     // Warm-shape override (the real agentic case: small q suffix, large paged KV).
     // ATLAS_QLEN/ATLAS_KVLEN/ATLAS_QOFF default to self-attention (qlen=kvlen=seq,
     // qoff=0). When set, q attends causally over [0, qoff+i].
-    let env_usize = |k: &str, d: usize| std::env::var(k).ok().and_then(|s| s.parse().ok()).unwrap_or(d);
+    let env_usize = |k: &str, d: usize| {
+        std::env::var(k)
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(d)
+    };
     let qlen = env_usize("ATLAS_QLEN", seq);
     let kvlen = env_usize("ATLAS_KVLEN", seq);
     let qoff = env_usize("ATLAS_QOFF", 0);
@@ -170,22 +175,41 @@ fn main() -> Result<()> {
             KernelLaunch::new(gpu, handle)
                 .grid([nq as u32, div_ceil(qlen as u32, br), 1])
                 .block([128, 1, 1])
-                .arg_ptr(qp).arg_ptr(kp).arg_ptr(vp).arg_ptr(op).arg_ptr(btp)
-                .arg_u32(qlen as u32).arg_u32(kvlen as u32).arg_u32(qoff as u32)
-                .arg_u32(nq as u32).arg_u32(nkv as u32).arg_u32(hd as u32)
-                .arg_u32(cache_block_size).arg_u32(0).arg_u32(1)
-                .arg_f32(inv_sqrt_d).arg_f32(k_scale).arg_f32(v_scale)
+                .arg_ptr(qp)
+                .arg_ptr(kp)
+                .arg_ptr(vp)
+                .arg_ptr(op)
+                .arg_ptr(btp)
+                .arg_u32(qlen as u32)
+                .arg_u32(kvlen as u32)
+                .arg_u32(qoff as u32)
+                .arg_u32(nq as u32)
+                .arg_u32(nkv as u32)
+                .arg_u32(hd as u32)
+                .arg_u32(cache_block_size)
+                .arg_u32(0)
+                .arg_u32(1)
+                .arg_f32(inv_sqrt_d)
+                .arg_f32(k_scale)
+                .arg_f32(v_scale)
                 .arg_u64(cache_stride)
                 .launch(stream)?;
             Ok(())
         };
-        for _ in 0..10 { relaunch()?; }
+        for _ in 0..10 {
+            relaunch()?;
+        }
         gpu.synchronize(stream)?;
         let t0 = std::time::Instant::now();
-        for _ in 0..iters { relaunch()?; }
+        for _ in 0..iters {
+            relaunch()?;
+        }
         gpu.synchronize(stream)?;
         let us = t0.elapsed().as_secs_f64() * 1e6 / iters as f64;
-        println!("BENCH: {us:.2} us/launch  (iters={iters}, grid_y={})", div_ceil(qlen as u32, br));
+        println!(
+            "BENCH: {us:.2} us/launch  (iters={iters}, grid_y={})",
+            div_ceil(qlen as u32, br)
+        );
     }
 
     let mut raw = vec![0u8; qlen * nq * hd * 2];
@@ -199,7 +223,10 @@ fn main() -> Result<()> {
     // shapes (timing-only runs) — correctness is gated by the small self-attention
     // cases, and the kernel path is identical regardless of shape.
     if qlen * kvlen > 4_000_000 {
-        println!("cosine skipped (warm shape qlen*kvlen={} > 4M; timing-only)", qlen * kvlen);
+        println!(
+            "cosine skipped (warm shape qlen*kvlen={} > 4M; timing-only)",
+            qlen * kvlen
+        );
         for p in [qp, kp, vp, op, btp] {
             gpu.free(p).ok();
         }

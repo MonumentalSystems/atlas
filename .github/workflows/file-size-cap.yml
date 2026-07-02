@@ -146,13 +146,22 @@ jobs:
             "crates/spark-server/src/scheduler/emit_step.rs"
             "crates/spark-server/src/scheduler/helpers.rs"
             "crates/spark-server/src/tool_parser/validation.rs"
-            # ── PR #169 (perf/qwen36-dense-ffn-tc-prefill) carry-over ──
-            # 519 LoC — dense-FFN forward. The tensor-core w4a16 prefill path
-            # adds transposed gate/up/down handles + a per-(dtype,phase) kernel
-            # dispatch macro; like the other kernel-dispatch files above, the
-            # launch sequence reads top-to-bottom and splitting fragments it.
-            # Clean split tracked as follow-up.
+            # ── PR #169 (perf/qwen36-dense-ffn-tc-prefill) carry-over,
+            # grown by PR #223 (perf/qwen36-27b-prefill-nvfp4) ──
+            # 1507 LoC — dense-FFN forward: multi-arm quantized-FFN dispatch
+            # (w4a16 t_m128 / int8 faith2 / Q4_K MMQ / NVFP4 W4A4 MMQ) under
+            # active A/B development across concurrent sessions; the per-arm
+            # launch sequences read top-to-bottom and a mid-flight split would
+            # conflict with in-progress work. Split scheduled post PR #223.
             "crates/spark-model/src/layers/dense_ffn.rs"
+            # ── PR #223 (perf/qwen36-27b-prefill-nvfp4) carry-over ──
+            # 1634 LoC — int8 W4A8 prefill GEMM microbench example: one
+            # sequential fn main (alloc → upload → launch → verify → time) whose
+            # host-reference checks mirror the kernel launch order step by step;
+            # splitting fragments that order (same rationale as the
+            # gdn_fla_e2e_gateb.rs example entry above). Dev-only harness, run
+            # manually on GB10.
+            "crates/spark-model/examples/int8_gemm_test.rs"
             # ── PR #202 (perf/vision-vit-perf) carry-over ──
             # 513 LoC — prefill phase-A (vision-embed prepare + single/batched
             # dispatch). The GEMM-based ViT perf work adds the co-dispatch

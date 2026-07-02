@@ -104,7 +104,14 @@ impl TransformerModel {
                 && cut < total
                 && (ep_active || self.prefix_cache.peek_matched_tokens(tokens, bs) > 0)
             {
-                self.prefill_chunk_dispatch(tokens, seq, chunk_start, cut - chunk_start, false, stream)?;
+                self.prefill_chunk_dispatch(
+                    tokens,
+                    seq,
+                    chunk_start,
+                    cut - chunk_start,
+                    false,
+                    stream,
+                )?;
                 return self.prefill_chunk_dispatch(tokens, seq, cut, total - cut, true, stream);
             }
         }

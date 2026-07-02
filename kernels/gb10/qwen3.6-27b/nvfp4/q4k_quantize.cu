@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+//
 // GPU Q4_K weight quantizer — faithful port of llama.cpp quantize_q4_K (null-imatrix path:
 // make_qkx3_quants + make_qp_quants, default weights av_x+|x|). One thread per 256-weight
 // superblock. Input bf16 [nrows, n_per_row] (n_per_row % 256 == 0), output GGML atlas_bq4k

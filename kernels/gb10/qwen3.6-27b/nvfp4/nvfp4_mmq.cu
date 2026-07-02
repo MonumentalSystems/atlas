@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+//
 // ATLAS FFN prefill GEMM via vendored llama.cpp NVFP4 W4A4 MMQ (Blackwell block-scale
 // MMA: mma.sync.kind::mxf4nvf4.block_scale.scale_vec::4X.m16n8k64, e2m1×e2m1, ue4m3 scales).
 // De-risk bench (libggml, GB10): 114 TFLOP/s gate/up · 88 down at the 27B FFN shapes — vs

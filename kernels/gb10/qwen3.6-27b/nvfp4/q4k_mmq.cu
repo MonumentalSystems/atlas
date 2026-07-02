@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+//
 // ATLAS FFN prefill GEMM via vendored llama.cpp Q4_K MMQ (verified 56 TFLOP/s, 1.3x faith2).
 // extern-C entries launched from Rust (ops/q4k_mmq.rs). Conventional 2D tiling (no MoE ids,
 // single channel/sample); our prefill shapes have thousands of tiles >> 48 SMs so stream-k's

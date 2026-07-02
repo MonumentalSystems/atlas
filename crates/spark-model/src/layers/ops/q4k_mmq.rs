@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+//
 // Launchers for the vendored llama Q4_K MMQ FFN prefill GEMM (ATLAS_FFN_MMQ).
 // Kernels in kernels/gb10/qwen3.6-27b/nvfp4/q4k_mmq.cu + q4k_quantize.cu (verified
 // 54.9/53.7 TFLOP/s gate/up·down, +25%/+10% vs faith2, rel_err 6-7e-3).
@@ -5,7 +7,7 @@
 // activation bf16 -> q8_1_mmq, then MMQ -> bf16 (fused store, no cast).
 use anyhow::Result;
 use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
-use spark_runtime::kernel_args::{div_ceil, KernelLaunch};
+use spark_runtime::kernel_args::{KernelLaunch, div_ceil};
 
 /// Q4_K block size (256 weights -> 144-byte block_q4_K).
 pub const QK_K: u32 = 256;
@@ -96,7 +98,7 @@ pub fn quantize_act_q8_1(
         .launch(stream)
 }
 
-/// Q4_K MMQ GEMM: C[m,n] (bf16) = A_q8[m,k] x W_q4k[n,k]. Fused bf16 store.
+/// Q4_K MMQ GEMM: C\[m,n\] (bf16) = A_q8\[m,k\] x W_q4k\[n,k\]. Fused bf16 store.
 pub fn q4k_mmq_gemm(
     gpu: &dyn GpuBackend,
     kernel_nc: KernelHandle, // atlas_q4k_mmq128_nc
@@ -109,7 +111,11 @@ pub fn q4k_mmq_gemm(
     k: u32,
     stream: u64,
 ) -> Result<()> {
-    let kernel = if n % 128 != 0 { kernel_wc } else { kernel_nc };
+    let kernel = if !n.is_multiple_of(128) {
+        kernel_wc
+    } else {
+        kernel_nc
+    };
     KernelLaunch::new(gpu, kernel)
         .grid([div_ceil(n, 128), div_ceil(m, 128), 1])
         .block([32, 8, 1])

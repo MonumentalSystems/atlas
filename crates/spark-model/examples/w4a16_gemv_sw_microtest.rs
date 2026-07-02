@@ -86,7 +86,11 @@ fn gen_weight(rng: &mut Rng, n: usize, k: usize) -> Weight {
             packed[i * half_k + j] = (hi << 4) | lo;
         }
     }
-    Weight { packed, scale, scale2: 0.5 }
+    Weight {
+        packed,
+        scale,
+        scale2: 0.5,
+    }
 }
 
 fn cosine(a: &[u16], b: &[u16]) -> (f64, usize) {
@@ -102,7 +106,11 @@ fn cosine(a: &[u16], b: &[u16]) -> (f64, usize) {
         na += x * x;
         nb += y * y;
     }
-    let cos = if na > 0.0 && nb > 0.0 { dot / (na.sqrt() * nb.sqrt()) } else { 1.0 };
+    let cos = if na > 0.0 && nb > 0.0 {
+        dot / (na.sqrt() * nb.sqrt())
+    } else {
+        1.0
+    };
     (cos, bit_eq)
 }
 
@@ -117,7 +125,9 @@ fn run_shape(
     k: usize,
 ) -> Result<(f64, f64)> {
     let mut rng = Rng(seed ^ ((n as u64) << 16) ^ (k as u64));
-    let a_bf16: Vec<u16> = (0..k).map(|_| f32_to_bf16_bits(rng.uniform(-1.0, 1.0))).collect();
+    let a_bf16: Vec<u16> = (0..k)
+        .map(|_| f32_to_bf16_bits(rng.uniform(-1.0, 1.0)))
+        .collect();
     let a_ptr = upload(gpu, &u16s_to_le(&a_bf16))?;
     let w = gen_weight(&mut rng, n, k);
     let packed = upload(gpu, &w.packed)?;
@@ -129,16 +139,26 @@ fn run_shape(
     KernelLaunch::new(gpu, base_h)
         .grid([n.div_ceil(4) as u32, 1, 1])
         .block([256, 1, 1])
-        .arg_ptr(a_ptr).arg_ptr(packed).arg_ptr(scale).arg_f32(w.scale2)
-        .arg_ptr(c_base).arg_u32(n as u32).arg_u32(k as u32)
+        .arg_ptr(a_ptr)
+        .arg_ptr(packed)
+        .arg_ptr(scale)
+        .arg_f32(w.scale2)
+        .arg_ptr(c_base)
+        .arg_u32(n as u32)
+        .arg_u32(k as u32)
         .launch(stream)?;
 
     // w4a16_gemv_sw: grid (ceil(N/8),1,1), block (256,1,1)
     KernelLaunch::new(gpu, sw_h)
         .grid([n.div_ceil(8) as u32, 1, 1])
         .block([256, 1, 1])
-        .arg_ptr(a_ptr).arg_ptr(packed).arg_ptr(scale).arg_f32(w.scale2)
-        .arg_ptr(c_sw).arg_u32(n as u32).arg_u32(k as u32)
+        .arg_ptr(a_ptr)
+        .arg_ptr(packed)
+        .arg_ptr(scale)
+        .arg_f32(w.scale2)
+        .arg_ptr(c_sw)
+        .arg_u32(n as u32)
+        .arg_u32(k as u32)
         .launch(stream)?;
 
     gpu.synchronize(stream)?;
@@ -146,8 +166,14 @@ fn run_shape(
     let mut rs = vec![0u8; n * 2];
     gpu.copy_d2h(c_base, &mut rb)?;
     gpu.copy_d2h(c_sw, &mut rs)?;
-    let out_base: Vec<u16> = rb.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
-    let out_sw: Vec<u16> = rs.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+    let out_base: Vec<u16> = rb
+        .chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .collect();
+    let out_sw: Vec<u16> = rs
+        .chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .collect();
 
     let nz = out_base.iter().filter(|&&x| x != 0).count();
     if nz == 0 {
@@ -184,8 +210,13 @@ fn main() -> Result<()> {
         ("K-tail edge", 4096, 5104),
     ];
 
-    println!("=== w4a16_gemv_sw losslessness microtest (base vs single-warp) seed=0x{seed:X} ===\n");
-    println!("{:<12} {:>7} {:>7} | {:>12} {:>9}  result", "shape", "N", "K", "cosine", "bit_id%");
+    println!(
+        "=== w4a16_gemv_sw losslessness microtest (base vs single-warp) seed=0x{seed:X} ===\n"
+    );
+    println!(
+        "{:<12} {:>7} {:>7} | {:>12} {:>9}  result",
+        "shape", "N", "K", "cosine", "bit_id%"
+    );
     println!("{}", "-".repeat(60));
 
     let mut all_pass = true;

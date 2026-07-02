@@ -332,7 +332,9 @@ fn run_shape(
     let v1_vs_v2 = compare(&out_bf16, &out_v2);
 
     // Free per-shape allocations (the harness is short-lived but be tidy).
-    for p in [a_ptr, packed_nt, scale_nt, packed_t, scale_t, c_base, c_bf16, c_v2] {
+    for p in [
+        a_ptr, packed_nt, scale_nt, packed_t, scale_t, c_base, c_bf16, c_v2,
+    ] {
         let _ = gpu.free(p);
     }
 

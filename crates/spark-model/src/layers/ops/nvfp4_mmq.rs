@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+//
 // Launchers for the vendored llama NVFP4 W4A4 MMQ FFN prefill GEMM (ATLAS_FFN_NVFP4_MMQ).
 // Kernels in kernels/gb10/qwen3.6-27b/nvfp4/nvfp4_mmq.cu (Blackwell block-scale MMA
 // kind::mxf4nvf4.m16n8k64, e2m1×e2m1, ue4m3 group-16 scales).
@@ -12,7 +14,7 @@
 // then MMQ → bf16 out; scale2 folded in the SiLU-mul.
 use anyhow::Result;
 use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
-use spark_runtime::kernel_args::{div_ceil, KernelLaunch};
+use spark_runtime::kernel_args::{KernelLaunch, div_ceil};
 
 /// NVFP4 block: 64 weights -> 36-byte block_nvfp4 {4×ue4m3 scales, 32B e2m1 nibbles}.
 pub const QK_NVFP4: u32 = 64;
@@ -38,7 +40,7 @@ pub fn fp4_act_scratch_bytes(m: u32, k: u32) -> usize {
 }
 
 /// Repack a checkpoint NVFP4 weight (packed E2M1 [n, k/2] low=even/high=odd + E4M3
-/// [n, k/16] scales) into llama block_nvfp4 rows [n][k/64]. Raw bit shuffle — the e2m1
+/// [n, k/16] scales) into llama block_nvfp4 rows \[n\]\[k/64\]. Raw bit shuffle — the e2m1
 /// codes and e4m3 scale bytes are reused verbatim (scale2 folded downstream).
 pub fn nvfp4_mmq_repack(
     gpu: &dyn GpuBackend,
@@ -87,7 +89,7 @@ pub fn nvfp4_mmq_quantize_act(
         .launch(stream)
 }
 
-/// NVFP4 W4A4 MMQ GEMM: C[m,n] (bf16, missing ×scale2) = A_fp4[m,k] x W_nvfp4[n,k].
+/// NVFP4 W4A4 MMQ GEMM: C\[m,n\] (bf16, missing ×scale2) = A_fp4\[m,k\] x W_nvfp4\[n,k\].
 pub fn nvfp4_mmq_gemm(
     gpu: &dyn GpuBackend,
     kernel_nc: KernelHandle, // atlas_nvfp4_mmq128_nc
@@ -100,7 +102,11 @@ pub fn nvfp4_mmq_gemm(
     k: u32,
     stream: u64,
 ) -> Result<()> {
-    let kernel = if n % 128 != 0 { kernel_wc } else { kernel_nc };
+    let kernel = if !n.is_multiple_of(128) {
+        kernel_wc
+    } else {
+        kernel_nc
+    };
     KernelLaunch::new(gpu, kernel)
         .grid([div_ceil(n, 128), div_ceil(m, 128), 1])
         .block([32, 8, 1])
