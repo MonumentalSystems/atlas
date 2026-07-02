@@ -159,8 +159,10 @@ pub struct DenseFfnLayer {
     nvfp4_quant_act_k: KernelHandle,
     nvfp4_repack_k: KernelHandle,
     nvfp4_silu_scaled_k: KernelHandle,
+    nvfp4_scale_k: KernelHandle,
     fp4mmq_gate: std::sync::OnceLock<Fp4MmqWeight>,
     fp4mmq_up: std::sync::OnceLock<Fp4MmqWeight>,
+    fp4mmq_down: std::sync::OnceLock<Fp4MmqWeight>,
     /// SiLU(gate)*up or GELU(gate)*up depending on activation.
     act_mul: KernelHandle,
     /// BF16 dense MLP weights — when `Some`, all forward paths use the
@@ -252,8 +254,10 @@ impl DenseFfnLayer {
             nvfp4_quant_act_k: super::try_kernel(gpu, "nvfp4_mmq", "atlas_nvfp4_quantize_bf16"),
             nvfp4_repack_k: super::try_kernel(gpu, "nvfp4_mmq", "atlas_nvfp4_repack"),
             nvfp4_silu_scaled_k: super::try_kernel(gpu, "nvfp4_mmq", "atlas_nvfp4_silu_mul_scaled"),
+            nvfp4_scale_k: super::try_kernel(gpu, "nvfp4_mmq", "atlas_nvfp4_scale_bf16"),
             fp4mmq_gate: std::sync::OnceLock::new(),
             fp4mmq_up: std::sync::OnceLock::new(),
+            fp4mmq_down: std::sync::OnceLock::new(),
             act_mul,
             bf16_weights: None,
             dense_gemv_bf16_k,
@@ -351,11 +355,24 @@ impl DenseFfnLayer {
         }
         self.ensure_nvfp4_mmq_weight(&self.fp4mmq_gate, gpu, &self.weights.gate_proj, inter, h, stream)?;
         self.ensure_nvfp4_mmq_weight(&self.fp4mmq_up, gpu, &self.weights.up_proj, inter, h, stream)?;
+        let down_mmq = std::env::var_os("ATLAS_FFN_NVFP4_MMQ_DOWN").is_some();
+        if down_mmq {
+            self.ensure_nvfp4_mmq_weight(&self.fp4mmq_down, gpu, &self.weights.down_proj, h, inter, stream)?;
+        }
         gpu.synchronize(stream)?;
-        // Free the dead gate/up transposed copies (gate/up prefill now on the MMQ arm;
-        // decode reads the non-transposed originals; down keeps down_proj_t).
+        // Free the dead transposed copies (prefill for those projections now runs on the
+        // MMQ arm; decode reads the non-transposed originals). down_proj_t is freed only
+        // when the down A/B gate is on.
+        let mut down_t = if down_mmq {
+            Some(&mut self.weights.down_proj_t)
+        } else {
+            None
+        };
         let mut freed = 0usize;
-        for wt in [&mut self.weights.gate_proj_t, &mut self.weights.up_proj_t] {
+        for wt in [&mut self.weights.gate_proj_t, &mut self.weights.up_proj_t]
+            .into_iter()
+            .chain(down_t.take().into_iter())
+        {
             if let Some(w) = wt.as_ref() {
                 if !w.weight.is_null() {
                     gpu.free(w.weight)?;
@@ -884,6 +901,14 @@ impl DenseFfnLayer {
                 );
             });
         }
+        // Down-projection A/B extension (ATLAS_FFN_NVFP4_MMQ_DOWN=1): route down through
+        // the same MMQ arm (t_m128 runs the narrow-N down at only ~34 TFLOP/s in-model).
+        // Accuracy note: down W4A4 cosine 0.9961 (random) — better than the previously
+        // coherence-validated all-W4A4 config (0.991) — but still the heavy-tailed
+        // projection, so it stays a SEPARATE opt-in gate.
+        let fp4mmq_down = fp4mmq_prefill
+            && self.nvfp4_scale_k.0 != 0
+            && std::env::var_os("ATLAS_FFN_NVFP4_MMQ_DOWN").is_some();
         // HYBRID: route the accuracy-critical down_proj OFF Q4_K onto the near-lossless faith2
         // NVFP4 path (W4A8 requant, cos 0.99998). down=SiLU(gate)*up is heavy-tailed; Q4_K
         // superblock scaling clips it (BFCL `multiple` -4.0%; llama promotes only down→Q6_K for
@@ -973,13 +998,13 @@ impl DenseFfnLayer {
         };
 
         macro_rules! w4_gemm {
-            ($w:expr, $wt:expr, $cell:expr, $qcell:expr, $fp4cell:expr, $in:expr, $out:expr, $n:expr, $k:expr, $allow_q4k:expr) => {
+            ($w:expr, $wt:expr, $cell:expr, $qcell:expr, $fp4cell:expr, $allow_fp4:expr, $in:expr, $out:expr, $n:expr, $k:expr, $allow_q4k:expr) => {
                 match $wt {
-                    // NVFP4 W4A4 MMQ prefill (ATLAS_FFN_NVFP4_MMQ) — HIGHEST priority,
-                    // gate/up only (`$allow_q4k` false for down → falls to the default path).
-                    // Activation pre-quantized ONCE into `fp4_y` by the caller; the output
-                    // is missing ×scale2, folded downstream in the scaled SiLU-mul.
-                    _ if fp4mmq_prefill && $allow_q4k => {
+                    // NVFP4 W4A4 MMQ prefill (ATLAS_FFN_NVFP4_MMQ) — HIGHEST priority.
+                    // `$allow_fp4` = fp4mmq_prefill for gate/up, fp4mmq_down for down.
+                    // Activation pre-quantized into `fp4_y` by the caller; the output is
+                    // missing ×scale2, folded downstream (scaled SiLU-mul / scale_bf16).
+                    _ if $allow_fp4 => {
                         let _ = $in;
                         let qw =
                             self.ensure_nvfp4_mmq_weight($fp4cell, ctx.gpu, $w, $n, $k, stream)?;
@@ -1149,6 +1174,7 @@ impl DenseFfnLayer {
             &self.int8_gate,
             &self.q4k_gate,
             &self.fp4mmq_gate,
+            fp4mmq_prefill,
             input,
             gate_out,
             inter,
@@ -1162,6 +1188,7 @@ impl DenseFfnLayer {
             &self.int8_up,
             &self.q4k_up,
             &self.fp4mmq_up,
+            fp4mmq_prefill,
             input,
             up_out,
             inter,
@@ -1214,6 +1241,10 @@ impl DenseFfnLayer {
         if q4k_prefill && !down_faith2 {
             ops::quantize_act_q8_1(ctx.gpu, self.q4k_quant_act_k, gate_out, q4k_a, m, inter, stream)?;
         }
+        // FP4-MMQ down: quantize the down input (SiLU(gate)*up, `[M, inter]`) to block_fp4_mmq.
+        if fp4mmq_down {
+            ops::nvfp4_mmq_quantize_act(ctx.gpu, self.nvfp4_quant_act_k, gate_out, fp4_y, m, inter, stream)?;
+        }
         // down_proj GEMM: [M, inter] → [M, H]
         // ($fp4cell is a placeholder — the FP4-MMQ arm is gated off by `false` below;
         // down stays on the default path in the FP4-MMQ hybrid.)
@@ -1223,13 +1254,26 @@ impl DenseFfnLayer {
             self.weights.down_proj_t,
             &self.int8_down,
             &self.q4k_down,
-            &self.fp4mmq_gate,
+            &self.fp4mmq_down,
+            fp4mmq_down,
             gate_out,
             output,
             h,
             inter,
             false
         );
+        // FP4-MMQ down: fold the down-projection's per-tensor scale2 (no SiLU-mul here;
+        // the consumer is the residual add).
+        if fp4mmq_down {
+            ops::nvfp4_scale_bf16(
+                ctx.gpu,
+                self.nvfp4_scale_k,
+                output,
+                self.weights.down_proj.weight_scale_2,
+                m * h,
+                stream,
+            )?;
+        }
 
         Ok(())
     }
