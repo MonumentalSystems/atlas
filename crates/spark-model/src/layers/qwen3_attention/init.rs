@@ -396,6 +396,11 @@ impl Qwen3AttentionLayer {
             w4a16_gemm_t_k: gpu.kernel("w4a16", "w4a16_gemm_t")?,
             w4a16_gemm_t_k64_k: gpu.kernel("w4a16", "w4a16_gemm_t_k64")?,
             w4a16_gemm_t_m128_k: gpu.kernel("w4a16", "w4a16_gemm_t_m128")?,
+            w4a16_gemm_t_m128_bf16_k: super::super::try_kernel(
+                gpu,
+                "w4a16",
+                "w4a16_gemm_t_m128_bf16",
+            ),
             w4a16_gemm_t_m128_v2_k: super::super::try_kernel(
                 gpu,
                 "w4a16_v2",

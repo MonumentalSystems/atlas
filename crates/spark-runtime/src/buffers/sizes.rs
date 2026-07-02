@@ -85,6 +85,17 @@ pub struct BufferSizes {
     /// so DeepSeek-V4 hash-MoE layers can read `tid2eid[token_id]`. Always
     /// allocated (small); unused by models without hash routing.
     pub token_ids: usize,
+    /// Dense-FFN activation-quant scratch, SHARED across all layers by the
+    /// MMQ (Q4_K), int8 (W4A8), and NVFP4 (W4A4) prefill paths. Was previously a
+    /// per-`DenseFfnLayer` field → 64× duplication (18 GB on Qwen3.6-27B) that
+    /// OOM'd chunked prefill layer-by-layer. Sized for the largest projection K.
+    /// `ffn_act_q8`: q8_1_mmq activations `m*kpad*4 + 1MB` (Q4_K path).
+    /// `ffn_act_a`: int8 `[m,K]` / NVFP4 packed `[m,K/2]` activations.
+    /// `ffn_act_scale`: int8 `[m,K/32]*4` / NVFP4 `[m,K/16]` group scales.
+    /// 0 for MoE models (dense FFN prefill path is Dense-only).
+    pub ffn_act_q8: usize,
+    pub ffn_act_a: usize,
+    pub ffn_act_scale: usize,
 }
 
 impl BufferSizes {
@@ -235,6 +246,22 @@ impl BufferSizes {
             0
         };
 
+        // Dense-FFN activation-quant scratch, shared across all layers (SSOT).
+        // Sized for the largest projection K = max(hidden, intermediate); the
+        // dense_ffn prefill paths pass `h.max(inter)` to the requant kernels.
+        // 0 for MoE (num_experts>0) — those never take the dense_ffn MMQ path.
+        let (ffn_act_q8, ffn_act_a, ffn_act_scale) = if config.num_experts == 0 {
+            let kmax = h.max(config.intermediate_size);
+            let kpad = kmax.div_ceil(256) * 256;
+            (
+                m * kpad * 4 + (1 << 20), // q8_1_mmq: m*kpad*4 + 1MB (matches q8_1_scratch_bytes)
+                m * kmax,                 // int8 a_i8 [m,K] ≥ NVFP4 packed [m,K/2]
+                m * (kmax / 32) * 4,      // int8 a_scale [m,K/32]*4 ≥ NVFP4 scale [m,K/16]
+            )
+        } else {
+            (0, 0, 0)
+        };
+
         Self {
             hidden_states: m * h * residual_elem,
             residual: m * h * residual_elem,
@@ -344,6 +371,9 @@ impl BufferSizes {
             },
             // Token IDs [M] u32 (stable across the layer loop for hash-MoE).
             token_ids: (m * 4).max(256),
+            ffn_act_q8,
+            ffn_act_a,
+            ffn_act_scale,
         }
     }
 
@@ -374,5 +404,8 @@ impl BufferSizes {
             + self.hc_post
             + self.hc_comb
             + self.token_ids
+            + self.ffn_act_q8
+            + self.ffn_act_a
+            + self.ffn_act_scale
     }
 }

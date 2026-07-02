@@ -107,7 +107,11 @@ impl ModelWeightLoader for Qwen35DenseWeightLoader {
             let ffn_weights = load_dense_ffn(
                 store, &lp, gpu, variant, absmax_k, quantize_k, stream, config,
             )?;
-            let ffn = FfnComponent::Dense(DenseFfnLayer::new(ffn_weights, gpu)?);
+            let mut dffn = DenseFfnLayer::new(ffn_weights, gpu)?;
+            // ATLAS_FFN_MMQ: eagerly materialize Q4_K + free the dead `_t` copies at load,
+            // BEFORE KV cache sizing, so net FFN footprint == NVFP4 baseline (no decode OOM-throttle).
+            dffn.finalize_q4k_load(gpu, h as u32, config.intermediate_size as u32, stream)?;
+            let ffn = FfnComponent::Dense(dffn);
 
             match lt {
                 LayerType::FullAttention => {

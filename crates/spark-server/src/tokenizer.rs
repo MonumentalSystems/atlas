@@ -386,16 +386,10 @@ mod tests {
     ///     "description":"Execute a bash command","parameters":{...}}},
     ///     ensure_ascii=False, sort_keys=False)
     #[test]
-    fn tojson_filter_byte_matches_python_json_dumps() {
-        // Production path step 1 (api/chat/template.rs:85):
-        // `serde_json::to_value(ToolDefinition)`. ToolDefinition's serde
-        // field order is {type, function} and FunctionDefinition's is
-        // {name, description, parameters} (tool_parser.rs:27-41), so the
-        // `to_value` output is byte-equivalent to the literal below.
-        // We build the Value directly here so the test stays in the
-        // `--lib` target (which does not re-export `tool_parser`); the
-        // filter under test is identical either way. With serde_json's
-        // `preserve_order`, this literal key order is preserved.
+    fn tojson_filter_default_compact_hf_ref_opt_in() {
+        // ToolDefinition serde order is {type, function:{name, description,
+        // parameters}} (tool_parser.rs); built directly so the test stays in the
+        // `--lib` target. `preserve_order` keeps this key order through the filter.
         let tool_value = serde_json::json!({
             "type": "function",
             "function": {
@@ -414,29 +408,43 @@ mod tests {
             }
         });
 
-        // Production path step 2 (tokenizer/chat_impl.rs:197):
-        // minijinja::Value::from_serialize over the tool list. With
-        // minijinja's `preserve_order`, the map is an IndexMap, so key
-        // order survives into the filter.
-        let mini_val = minijinja::Value::from_serialize(&tool_value);
-
-        // Production path step 3: the `tojson` filter registered in
-        // build_jinja_env. Render via the same env the server uses.
-        let env = super::jinja_helpers::build_jinja_env("{{ tool | tojson }}")
+        // DEFAULT (ST-995 fix): minijinja's builtin COMPACT `tojson` — no spaces.
+        // This is what the GDN Qwen3.6-27B needs for correct BFCL irrelevance
+        // (the spaced HF-reference form regressed hallucination 93.70 -> 30).
+        let env_default = super::jinja_helpers::build_jinja_env("{{ tool | tojson }}")
             .expect("inline template compiles");
-        let tmpl = env.get_template("chat").unwrap();
-        let rendered = tmpl
-            .render(minijinja::context! { tool => mini_val })
+        let compact = "{\"type\":\"function\",\"function\":{\"name\":\"bash\",\"description\":\"Execute a bash command\",\"parameters\":{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\",\"description\":\"The command to run\"}},\"required\":[\"command\"]}}}";
+        let got_default = env_default
+            .get_template("chat")
+            .unwrap()
+            .render(minijinja::context! { tool => minijinja::Value::from_serialize(&tool_value) })
             .expect("tojson render");
-
-        // Ground truth: Python `json.dumps(tool, ensure_ascii=False,
-        // sort_keys=False)` of the identical structure (verified with
-        // python3 against this exact fixture — len 234).
-        let expected = "{\"type\": \"function\", \"function\": {\"name\": \"bash\", \"description\": \"Execute a bash command\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\", \"description\": \"The command to run\"}}, \"required\": [\"command\"]}}}";
-
         assert_eq!(
-            rendered, expected,
-            "\nAtlas tojson:\n{rendered}\nPython json.dumps:\n{expected}\n"
+            got_default, compact,
+            "default tojson must be COMPACT (ST-995 GDN irrelevance fix)\ngot:\n{got_default}\n"
+        );
+
+        // OPT-IN (ATLAS_USE_HF_REF_JSON_DUMPS=1): spaced, byte-parity with Python
+        // `json.dumps(..., ensure_ascii=False, sort_keys=False)` — the #90 / HF
+        // reference serialization (len 234). SAFETY: this is the only test that
+        // reads this env var; it is set and cleared within this scope.
+        unsafe {
+            std::env::set_var("ATLAS_USE_HF_REF_JSON_DUMPS", "1");
+        }
+        let env_hf = super::jinja_helpers::build_jinja_env("{{ tool | tojson }}")
+            .expect("inline template compiles");
+        unsafe {
+            std::env::remove_var("ATLAS_USE_HF_REF_JSON_DUMPS");
+        }
+        let spaced = "{\"type\": \"function\", \"function\": {\"name\": \"bash\", \"description\": \"Execute a bash command\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\", \"description\": \"The command to run\"}}, \"required\": [\"command\"]}}}";
+        let got_hf = env_hf
+            .get_template("chat")
+            .unwrap()
+            .render(minijinja::context! { tool => minijinja::Value::from_serialize(&tool_value) })
+            .expect("tojson render");
+        assert_eq!(
+            got_hf, spaced,
+            "ATLAS_USE_HF_REF_JSON_DUMPS=1 must restore Python json.dumps byte parity\ngot:\n{got_hf}\n"
         );
     }
 }

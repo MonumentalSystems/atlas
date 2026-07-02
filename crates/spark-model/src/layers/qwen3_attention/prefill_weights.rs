@@ -40,6 +40,27 @@ impl Qwen3AttentionLayer {
                     _ => 0, // auto (prefer v2)
                 },
             );
+        // LOSSLESS opt-in: route QKV/o projection prefill through the BF16-TC
+        // kernel (FP4→BF16 dequant + BF16 MMA, bit-identical to base w4a16_gemm)
+        // instead of the default t_m128 which crushes activations to FP8 E4M3.
+        // Gated by ATLAS_BF16_TC_PROJ (default off → unchanged). Removes the
+        // FP8 prefill perturbation on the attention projections.
+        static BF16_PROJ: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let bf16_proj =
+            *BF16_PROJ.get_or_init(|| std::env::var_os("ATLAS_BF16_TC_PROJ").is_some());
+        if bf16_proj && self.w4a16_gemm_t_m128_bf16_k.0 != 0 {
+            return crate::layers::ops::w4a16_gemm_n128_m128_bf16(
+                gpu,
+                self.w4a16_gemm_t_m128_bf16_k,
+                input,
+                weight,
+                output,
+                m,
+                n,
+                k,
+                stream,
+            );
+        }
         if v == 3 && self.w4a16_gemm_t_m128_v3_k.0 != 0 {
             crate::layers::ops::w4a16_gemm_n128_m128_v3(
                 gpu,
