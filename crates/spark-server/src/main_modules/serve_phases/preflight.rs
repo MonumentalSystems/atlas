@@ -62,23 +62,9 @@ pub(crate) fn preflight_reserve(
     } else {
         args.max_seq_len
     };
-    // Mirror of the auto-clamp in resolve_prefill_budget (kv_cache.rs).
-    // See issue #15: when prefix caching + SSM snapshots are both on,
-    // single-chunk prefill produces no reachable intermediate snapshots.
-    let prefill_budget_pre = if !user_set_prefill_pre
-        && args.enable_prefix_caching
-        && args.ssm_checkpoint_interval > 0
-        && args.ssm_cache_slots > 0
-    {
-        let target = args.ssm_checkpoint_interval * args.block_size;
-        if prefill_budget_pre > target && target > 0 {
-            target
-        } else {
-            prefill_budget_pre
-        }
-    } else {
-        prefill_budget_pre
-    };
+    // Issue #15 auto-clamp removed (2026-07-02): snapshot reachability is
+    // handled by the tail-checkpoint split in `prefill_chunk_dispatch`, so
+    // the budget (and this arena-sizing mirror) stays at full chunk size.
     let max_batch_tokens_pre = prefill_budget_pre
         .max(spec_tokens_pre)
         .max(args.max_batch_size);
