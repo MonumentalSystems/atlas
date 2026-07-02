@@ -96,6 +96,7 @@ impl Qwen3AttentionLayer {
                     q_latent,
                     q_lora,
                     h,
+                    wqa_fp8.scale_format == crate::weight_map::WeightQuantFormat::Fp8PerRow,
                     stream,
                 )
             } else {
@@ -146,6 +147,7 @@ impl Qwen3AttentionLayer {
                     q_out,
                     q_dim,
                     q_lora,
+                    wqb_fp8.scale_format == crate::weight_map::WeightQuantFormat::Fp8PerRow,
                     stream,
                 )
             } else {
@@ -212,6 +214,7 @@ impl Qwen3AttentionLayer {
                     k_out,
                     kv_dim,
                     h,
+                    wkva_fp8.scale_format == crate::weight_map::WeightQuantFormat::Fp8PerRow,
                     stream,
                 )
             } else {
@@ -533,6 +536,7 @@ impl Qwen3AttentionLayer {
                         out_g,
                         o_lora,
                         group_in,
+                        woa_fp8.scale_format == crate::weight_map::WeightQuantFormat::Fp8PerRow,
                         stream,
                     )?;
                 } else {
@@ -567,6 +571,7 @@ impl Qwen3AttentionLayer {
                     o_out,
                     h,
                     latent_dim,
+                    wob_fp8.scale_format == crate::weight_map::WeightQuantFormat::Fp8PerRow,
                     stream,
                 )
             } else {

@@ -63,6 +63,7 @@ impl Qwen3SsmLayer {
                         deinterleaved,
                         qkvz_size,
                         h,
+                        false,
                         stream,
                     )
                 } else {
@@ -76,6 +77,7 @@ impl Qwen3SsmLayer {
                         qkvz_out,
                         qkvz_size,
                         h,
+                        false,
                         stream,
                     )?;
                     ops::deinterleave_qkvz(
@@ -405,6 +407,7 @@ impl Qwen3SsmLayer {
                 out,
                 h,
                 value_dim as u32,
+                false,
                 stream,
             )?;
         } else if let Some(ref dense_out) = self.out_proj_dense {

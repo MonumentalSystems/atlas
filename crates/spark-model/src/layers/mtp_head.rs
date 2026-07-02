@@ -201,6 +201,7 @@ impl MtpHead {
                 output,
                 n,
                 k,
+                false,
                 stream,
             ),
             ProjectionWeight::Bf16(w) => ops::dense_gemv(

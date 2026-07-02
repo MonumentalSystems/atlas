@@ -103,6 +103,7 @@ impl Qwen3AttentionLayer {
                     q_out,
                     q_proj_dim,
                     h,
+                    fp8.scale_format == crate::weight_map::WeightQuantFormat::Fp8PerRow,
                     stream,
                 )?;
                 ops::deinterleave_qg(
@@ -162,6 +163,7 @@ impl Qwen3AttentionLayer {
                     q_out,
                     q_dim,
                     h,
+                    fp8.scale_format == crate::weight_map::WeightQuantFormat::Fp8PerRow,
                     stream,
                 )?;
             } else if let Some(nvfp4) = self.q_weight.as_ref().and_then(|w| w.as_nvfp4()) {

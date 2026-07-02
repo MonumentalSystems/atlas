@@ -110,10 +110,11 @@ __device__ __constant__ float E4M3_LUT[256] = {
 extern "C" __global__ void w8a16_gemv(
     const __nv_bfloat16* __restrict__ A,            // [1, K]
     const unsigned char* __restrict__ B,             // [N, K] FP8 E4M3
-    const float* __restrict__ block_scale,           // [N/BS, K/BS] FP32
+    const float* __restrict__ block_scale,           // [N/BS, K/BS] FP32, or [N] if per_row
     __nv_bfloat16* __restrict__ C,                   // [1, N]
     unsigned int N,
-    unsigned int K
+    unsigned int K,
+    unsigned int per_row                             // 1 => scale is per-row [N] (scale[n]); 0 => block [N/BS,K/BS]
 ) {
     const unsigned int threads_per_out = BLOCK_SIZE / N_PER_BLOCK;  // 64
     const unsigned int local_out = threadIdx.x / threads_per_out;
@@ -138,9 +139,10 @@ extern "C" __global__ void w8a16_gemv(
     for (unsigned int k16 = lane; k16 < K16; k16 += threads_per_out) {
         const unsigned int base_k = k16 * 16;
 
-        // Determine which K-block this chunk falls in and load its scale
+        // Determine which K-block this chunk falls in and load its scale.
+        // Per-row: scale is [N] (one value per output row, constant over k).
         const unsigned int k_block = base_k / FP8_BLOCK;
-        float scale = block_scale[n_block * k_blocks + k_block];
+        float scale = per_row ? block_scale[n] : block_scale[n_block * k_blocks + k_block];
 
         // Load 16 FP8 weights as uint4
         uint4 b_data = ((const uint4*)(B + (unsigned long long)n * K))[k16];

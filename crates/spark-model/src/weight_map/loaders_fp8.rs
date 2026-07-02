@@ -69,6 +69,13 @@ pub fn load_fp8_block_scaled_as_fp8weight(
     } else {
         None
     };
+    // Distinguish PER-ROW (`[N,1]`, one FP32 per output row, constant over k —
+    // compressed-tensors per-channel FP8 e.g. Ornith-1.0-35B-FP8) from per-block
+    // (`[N/128,K/128]`). A per-row scale MUST be tagged `Fp8PerRow`: the W8A16
+    // kernels index a block grid `scale[n/128*k_blocks + k/128]`, so feeding an
+    // `[N]`-length per-row buffer as a block scale misreads it (N vs N/128·K/128
+    // elements) → garbage. Determined below from the loaded scale's shape.
+    let mut scale_fmt = WeightQuantFormat::Fp8BlockScaled;
     let row_scale = if let Some(scale_key) = block_scale_key {
         let s = store.get(&scale_key)?;
         ensure!(
@@ -81,6 +88,11 @@ pub fn load_fp8_block_scaled_as_fp8weight(
             "Expected BF16 or FP32 for {scale_key}, got {:?}",
             s.dtype,
         );
+        // Per-row: `[N,1]` (rows == weight rows, single column). The widened
+        // buffer below is exactly the `[N]` FP32 scale the Fp8PerRow kernels want.
+        if s.shape[0] == n && s.shape[1] == 1 {
+            scale_fmt = WeightQuantFormat::Fp8PerRow;
+        }
 
         tracing::debug!(
             "FP8 block scales: {prefix} [{n},{k}] scale=[{},{}] dtype={:?} -> FP32",
@@ -129,10 +141,10 @@ pub fn load_fp8_block_scaled_as_fp8weight(
 
     Ok(Fp8Weight {
         weight: weight_ptr,
-        row_scale, // FP32 [N/BS, K/BS] block scales on GPU
+        row_scale, // FP32: [N/BS, K/BS] block scales, or [N] per-row (see scale_fmt)
         n: n as u32,
         k: k as u32,
-        scale_format: WeightQuantFormat::Fp8BlockScaled,
+        scale_format: scale_fmt,
     })
 }
 

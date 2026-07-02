@@ -44,6 +44,7 @@ impl Qwen3AttentionLayer {
                 k_out,
                 nkv * hd,
                 h,
+                k_fp8.scale_format == crate::weight_map::WeightQuantFormat::Fp8PerRow,
                 stream,
             )?;
             ops::w8a16_gemv(
@@ -55,6 +56,7 @@ impl Qwen3AttentionLayer {
                 v_out,
                 nkv * hd,
                 h,
+                v_fp8.scale_format == crate::weight_map::WeightQuantFormat::Fp8PerRow,
                 stream,
             )?;
             return Ok(());

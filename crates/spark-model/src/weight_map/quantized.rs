@@ -234,10 +234,14 @@ pub struct Fp8Weight {
 pub struct Fp8WeightTransposed {
     /// [K, N] FP8 E4M3 transposed weight on GPU.
     pub weight_t: DevicePtr,
-    /// [K/128, N/128] FP32 transposed block scales on GPU (widened at load).
+    /// [K/128, N/128] FP32 transposed block scales, OR [N] per-row scale
+    /// (untransposed — the output dim n is preserved under weight transpose).
+    /// Interpretation depends on `scale_format`.
     pub scale_t: DevicePtr,
     pub n: u32,
     pub k: u32,
+    /// `Fp8BlockScaled` (scale_t is [K/128,N/128]) or `Fp8PerRow` (scale_t is [N]).
+    pub scale_format: WeightQuantFormat,
 }
 
 impl Fp8Weight {
@@ -266,22 +270,28 @@ impl Fp8Weight {
             stream,
         )?;
 
-        // Allocate transposed scale: [K/128, N/128] × 4 bytes (FP32).
-        // `row_scale` is now an FP32 block-scale buffer (widened at load), and
-        // `transpose_block_scale` is an FP32→FP32 transpose — see
-        // `load_fp8_block_scaled_as_fp8weight` / `w8a16_gemm_t.cu`.
-        let n_blocks = n.div_ceil(128);
-        let k_blocks = k.div_ceil(128);
-        let scale_t = gpu.alloc(k_blocks * n_blocks * 4)?;
-        crate::layers::ops::transpose_block_scale(
-            gpu,
-            transpose_scale_k,
-            self.row_scale,
-            scale_t,
-            n_blocks as u32,
-            k_blocks as u32,
-            stream,
-        )?;
+        // Per-row scale `[N]` indexes the OUTPUT dim n, which is unchanged by the
+        // weight transpose (B[N,K]→B_t[K,N] keeps N as the output). So it needs NO
+        // transpose — alias the [N] buffer directly (the source Fp8Weight is kept
+        // alongside the transposed copy, so the pointer stays live). Block scales
+        // `[N/128,K/128]` transpose to `[K/128,N/128]` as before.
+        let scale_t = if self.scale_format == WeightQuantFormat::Fp8PerRow {
+            self.row_scale
+        } else {
+            let n_blocks = n.div_ceil(128);
+            let k_blocks = k.div_ceil(128);
+            let scale_t = gpu.alloc(k_blocks * n_blocks * 4)?;
+            crate::layers::ops::transpose_block_scale(
+                gpu,
+                transpose_scale_k,
+                self.row_scale,
+                scale_t,
+                n_blocks as u32,
+                k_blocks as u32,
+                stream,
+            )?;
+            scale_t
+        };
 
         gpu.synchronize(stream)?;
 
@@ -290,6 +300,7 @@ impl Fp8Weight {
             scale_t,
             n: self.n,
             k: self.k,
+            scale_format: self.scale_format,
         })
     }
 }

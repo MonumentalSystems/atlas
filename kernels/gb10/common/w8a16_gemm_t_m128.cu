@@ -64,11 +64,12 @@ __launch_bounds__(256, 2)
 void w8a16_gemm_t_m128(
     const __nv_bfloat16* __restrict__ A,            // [M, K] BF16 activations
     const unsigned char* __restrict__ B_t,           // [K, N] FP8 E4M3 transposed
-    const float* __restrict__ block_scale_t,         // [K/128, N/128] FP32 transposed
+    const float* __restrict__ block_scale_t,         // [K/128, N/128] FP32 transposed, or [N] if per_row
     __nv_bfloat16* __restrict__ C,                   // [M, N] BF16 output
     unsigned int M,
     unsigned int N,
-    unsigned int K
+    unsigned int K,
+    unsigned int per_row                             // 1 => scale is per-row [N] (scale[n], applied in epilogue)
 ) {
     const unsigned int cta_n = blockIdx.x * WM128_N_TILE;
     const unsigned int cta_m = blockIdx.y * (2 * WM128_M_TILE);   // 128 rows
@@ -251,7 +252,7 @@ void w8a16_gemm_t_m128(
         k_step_in_block++;
         if (k_step_in_block == k_steps_per_block) {
             const unsigned int k_block = ((step - 1) * WM128_K_STEP) / WM128_FP8_BLOCK;
-            WM128_FOLD(block_scale_t[k_block * n_scale_blocks + n_block]);
+            WM128_FOLD(per_row ? 1.0f : block_scale_t[k_block * n_scale_blocks + n_block]);
             k_step_in_block = 0;
         }
 
@@ -266,12 +267,12 @@ void w8a16_gemm_t_m128(
     k_step_in_block++;
     if (k_step_in_block == k_steps_per_block) {
         const unsigned int k_block = ((n_steps - 1) * WM128_K_STEP) / WM128_FP8_BLOCK;
-        WM128_FOLD(block_scale_t[k_block * n_scale_blocks + n_block]);
+        WM128_FOLD(per_row ? 1.0f : block_scale_t[k_block * n_scale_blocks + n_block]);
         k_step_in_block = 0;
     } else if (k_step_in_block != 0) {
         // Incomplete trailing K_BLOCK (K % FP8_BLOCK != 0).
         const unsigned int k_block = (K - 1) / WM128_FP8_BLOCK;
-        WM128_FOLD(block_scale_t[k_block * n_scale_blocks + n_block]);
+        WM128_FOLD(per_row ? 1.0f : block_scale_t[k_block * n_scale_blocks + n_block]);
     }
 
     #undef WM128_LOADS
@@ -287,9 +288,15 @@ void w8a16_gemm_t_m128(
         unsigned int c1 = c0 + 1;
         unsigned int r0 = row_base + group_id;
         unsigned int r1 = r0 + 8;
-        if (r0 < M && c0 < N) C[(unsigned long long)r0 * N + c0] = __float2bfloat16(outer_acc[nt][0]);
-        if (r0 < M && c1 < N) C[(unsigned long long)r0 * N + c1] = __float2bfloat16(outer_acc[nt][1]);
-        if (r1 < M && c0 < N) C[(unsigned long long)r1 * N + c0] = __float2bfloat16(outer_acc[nt][2]);
-        if (r1 < M && c1 < N) C[(unsigned long long)r1 * N + c1] = __float2bfloat16(outer_acc[nt][3]);
+        // Per-row: apply scale[n] per output column (block path folded it already).
+        float s0 = 1.0f, s1 = 1.0f;
+        if (per_row) {
+            s0 = (c0 < N) ? block_scale_t[c0] : 0.0f;
+            s1 = (c1 < N) ? block_scale_t[c1] : 0.0f;
+        }
+        if (r0 < M && c0 < N) C[(unsigned long long)r0 * N + c0] = __float2bfloat16(outer_acc[nt][0] * s0);
+        if (r0 < M && c1 < N) C[(unsigned long long)r0 * N + c1] = __float2bfloat16(outer_acc[nt][1] * s1);
+        if (r1 < M && c0 < N) C[(unsigned long long)r1 * N + c0] = __float2bfloat16(outer_acc[nt][2] * s0);
+        if (r1 < M && c1 < N) C[(unsigned long long)r1 * N + c1] = __float2bfloat16(outer_acc[nt][3] * s1);
     }
 }

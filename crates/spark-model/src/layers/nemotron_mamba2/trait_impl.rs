@@ -61,6 +61,7 @@ impl TransformerLayer for NemotronMamba2Layer {
                 proj,
                 self.in_proj_size as u32,
                 h as u32,
+                false,
                 stream,
             )?;
         } else {
@@ -148,6 +149,7 @@ impl TransformerLayer for NemotronMamba2Layer {
                 out,
                 h as u32,
                 self.d_inner as u32,
+                false,
                 stream,
             )?;
         } else {

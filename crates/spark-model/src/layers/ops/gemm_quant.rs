@@ -179,6 +179,7 @@ pub fn w8a16_gemv(
     output: DevicePtr,
     n: u32,
     k: u32,
+    per_row: bool,
     stream: u64,
 ) -> Result<()> {
     KernelLaunch::new(gpu, kernel)
@@ -190,6 +191,7 @@ pub fn w8a16_gemv(
         .arg_ptr(output)
         .arg_u32(n)
         .arg_u32(k)
+        .arg_u32(per_row as u32)
         .launch(stream)
 }
 
@@ -578,6 +580,7 @@ pub fn w8a16_gemm_t(
     m: u32,
     n: u32,
     k: u32,
+    per_row: bool,
     stream: u64,
 ) -> Result<()> {
     KernelLaunch::new(gpu, kernel)
@@ -590,6 +593,7 @@ pub fn w8a16_gemm_t(
         .arg_u32(m)
         .arg_u32(n)
         .arg_u32(k)
+        .arg_u32(per_row as u32)
         .launch(stream)
 }
 
@@ -610,6 +614,7 @@ pub fn w8a16_gemm_n128_m128(
     m: u32,
     n: u32,
     k: u32,
+    per_row: bool,
     stream: u64,
 ) -> Result<()> {
     super::log_gemm_shape("w8a16_gemm_t_m128", m, n, k);
@@ -623,6 +628,7 @@ pub fn w8a16_gemm_n128_m128(
         .arg_u32(m)
         .arg_u32(n)
         .arg_u32(k)
+        .arg_u32(per_row as u32)
         .launch(stream)
 }
 
@@ -641,6 +647,7 @@ pub fn w8a16_gemm_t_pipelined(
     m: u32,
     n: u32,
     k: u32,
+    per_row: bool,
     stream: u64,
 ) -> Result<()> {
     super::log_gemm_shape("w8a16_gemm_t_pipelined", m, n, k);
@@ -654,6 +661,7 @@ pub fn w8a16_gemm_t_pipelined(
         .arg_u32(m)
         .arg_u32(n)
         .arg_u32(k)
+        .arg_u32(per_row as u32)
         .launch(stream)
 }
 

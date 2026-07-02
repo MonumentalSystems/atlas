@@ -151,11 +151,12 @@ __device__ __forceinline__ void w8a16_mma_and_store_t(
 extern "C" __global__ void w8a16_gemm_t(
     const __nv_bfloat16* __restrict__ A,               // [M, K] BF16
     const unsigned char* __restrict__ B_t,              // [K, N] FP8 E4M3 transposed
-    const float* __restrict__ block_scale_t,           // [K/128, N/128] FP32 transposed
+    const float* __restrict__ block_scale_t,           // [K/128, N/128] FP32 transposed, or [N] if per_row
     __nv_bfloat16* __restrict__ C,                     // [M, N] BF16
     unsigned int M,
     unsigned int N,
-    unsigned int K
+    unsigned int K,
+    unsigned int per_row                               // 1 => scale is per-row [N] (scale[n], applied in epilogue)
 ) {
     const unsigned int cta_m = blockIdx.y * M_TILE;
     const unsigned int cta_n = blockIdx.x * 64;  // Each CTA handles 64 N columns
@@ -233,8 +234,10 @@ extern "C" __global__ void w8a16_gemm_t(
         k_step_in_block++;
         if (k_step_in_block == k_steps_per_block) {
             const unsigned int k_block = k_base / FP8_BLOCK;
-            // Transposed scale layout: [K/128, N/128]
-            const float scale = block_scale_t[k_block * n_scale_blocks + n_block];
+            // Transposed scale layout: [K/128, N/128]. Per-row: accumulate
+            // UNSCALED here (scale constant over k) and apply scale[n] per
+            // output column in the store epilogue.
+            const float scale = per_row ? 1.0f : block_scale_t[k_block * n_scale_blocks + n_block];
             #pragma unroll
             for (int i = 0; i < 8; i++) {
                 outer_acc[i][0] += inner_acc[i][0] * scale;
@@ -252,7 +255,7 @@ extern "C" __global__ void w8a16_gemm_t(
     // for Qwen3.6 hidden=2048 but keeps the kernel general).
     if (k_step_in_block != 0) {
         const unsigned int k_block = (K - 1) / FP8_BLOCK;
-        const float scale = block_scale_t[k_block * n_scale_blocks + n_block];
+        const float scale = per_row ? 1.0f : block_scale_t[k_block * n_scale_blocks + n_block];
         #pragma unroll
         for (int i = 0; i < 8; i++) {
             outer_acc[i][0] += inner_acc[i][0] * scale;
@@ -271,10 +274,18 @@ extern "C" __global__ void w8a16_gemm_t(
         unsigned int row0 = cta_m + warp_m_offset + group_id;
         unsigned int row1 = row0 + 8;
 
-        if (row0 < M && col0 < N) C[row0 * N + col0] = __float2bfloat16(outer_acc[n_tile][0]);
-        if (row0 < M && col1 < N) C[row0 * N + col1] = __float2bfloat16(outer_acc[n_tile][1]);
-        if (row1 < M && col0 < N) C[row1 * N + col0] = __float2bfloat16(outer_acc[n_tile][2]);
-        if (row1 < M && col1 < N) C[row1 * N + col1] = __float2bfloat16(outer_acc[n_tile][3]);
+        // Per-row: apply scale[n] per output column (block-scale path already
+        // folded its scale during accumulation, so s0=s1=1.0 there).
+        float s0 = 1.0f, s1 = 1.0f;
+        if (per_row) {
+            s0 = (col0 < N) ? block_scale_t[col0] : 0.0f;
+            s1 = (col1 < N) ? block_scale_t[col1] : 0.0f;
+        }
+
+        if (row0 < M && col0 < N) C[row0 * N + col0] = __float2bfloat16(outer_acc[n_tile][0] * s0);
+        if (row0 < M && col1 < N) C[row0 * N + col1] = __float2bfloat16(outer_acc[n_tile][1] * s1);
+        if (row1 < M && col0 < N) C[row1 * N + col0] = __float2bfloat16(outer_acc[n_tile][2] * s0);
+        if (row1 < M && col1 < N) C[row1 * N + col1] = __float2bfloat16(outer_acc[n_tile][3] * s1);
     }
 }
 
@@ -415,11 +426,12 @@ __device__ __forceinline__ void pt_mma_kstep(
 extern "C" __global__ void w8a16_gemm_t_pipelined(
     const __nv_bfloat16* __restrict__ A,            // [M, K] BF16 activations
     const unsigned char* __restrict__ B_t,           // [K, N] FP8 E4M3 transposed
-    const float* __restrict__ block_scale_t,         // [K/128, N/128] FP32 transposed
+    const float* __restrict__ block_scale_t,         // [K/128, N/128] FP32 transposed, or [N] if per_row
     __nv_bfloat16* __restrict__ C,                   // [M, N] BF16 output
     unsigned int M,
     unsigned int N,
-    unsigned int K
+    unsigned int K,
+    unsigned int per_row                             // 1 => scale is per-row [N] (scale[n], applied in epilogue)
 ) {
     const unsigned int cta_m = blockIdx.y * PT_M_TILE;
     const unsigned int cta_n = blockIdx.x * PT_N_TILE;
@@ -558,8 +570,9 @@ extern "C" __global__ void w8a16_gemm_t_pipelined(
         k_step_in_block++;
         if (k_step_in_block == k_steps_per_block) {
             const unsigned int k_block = (step * PT_K_STEP) / PT_FP8_BLOCK;
-            // Transposed scale layout: [K/128, N/128].
-            const float scale = block_scale_t[k_block * n_scale_blocks + n_block];
+            // Transposed scale layout: [K/128, N/128]. Per-row: fold UNSCALED,
+            // apply scale[n] per output column in the epilogue.
+            const float scale = per_row ? 1.0f : block_scale_t[k_block * n_scale_blocks + n_block];
             #pragma unroll
             for (int i = 0; i < PT_N_TILES_PER_WARP; i++) {
                 outer_acc[i][0] += inner_acc[i][0] * scale;
@@ -576,7 +589,7 @@ extern "C" __global__ void w8a16_gemm_t_pipelined(
     // Fold any incomplete trailing K_BLOCK (only when K % FP8_BLOCK != 0).
     if (k_step_in_block != 0) {
         const unsigned int k_block = (K - 1) / PT_FP8_BLOCK;
-        const float scale = block_scale_t[k_block * n_scale_blocks + n_block];
+        const float scale = per_row ? 1.0f : block_scale_t[k_block * n_scale_blocks + n_block];
         #pragma unroll
         for (int i = 0; i < PT_N_TILES_PER_WARP; i++) {
             outer_acc[i][0] += inner_acc[i][0] * scale;
@@ -595,10 +608,17 @@ extern "C" __global__ void w8a16_gemm_t_pipelined(
         unsigned int row0 = cta_m + warp_m_offset + group_id;
         unsigned int row1 = row0 + 8;
 
-        if (row0 < M && col0 < N) C[row0 * N + col0] = __float2bfloat16(outer_acc[n_tile][0]);
-        if (row0 < M && col1 < N) C[row0 * N + col1] = __float2bfloat16(outer_acc[n_tile][1]);
-        if (row1 < M && col0 < N) C[row1 * N + col0] = __float2bfloat16(outer_acc[n_tile][2]);
-        if (row1 < M && col1 < N) C[row1 * N + col1] = __float2bfloat16(outer_acc[n_tile][3]);
+        // Per-row: apply scale[n] per output column (block path folded it already).
+        float s0 = 1.0f, s1 = 1.0f;
+        if (per_row) {
+            s0 = (col0 < N) ? block_scale_t[col0] : 0.0f;
+            s1 = (col1 < N) ? block_scale_t[col1] : 0.0f;
+        }
+
+        if (row0 < M && col0 < N) C[row0 * N + col0] = __float2bfloat16(outer_acc[n_tile][0] * s0);
+        if (row0 < M && col1 < N) C[row0 * N + col1] = __float2bfloat16(outer_acc[n_tile][1] * s1);
+        if (row1 < M && col0 < N) C[row1 * N + col0] = __float2bfloat16(outer_acc[n_tile][2] * s0);
+        if (row1 < M && col1 < N) C[row1 * N + col1] = __float2bfloat16(outer_acc[n_tile][3] * s1);
     }
 }
 

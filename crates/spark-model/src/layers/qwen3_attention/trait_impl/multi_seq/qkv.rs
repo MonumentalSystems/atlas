@@ -344,6 +344,7 @@ impl Qwen3AttentionLayer {
                     q_out_i,
                     q_proj_dim,
                     h as u32,
+                    fp8.scale_format == crate::weight_map::WeightQuantFormat::Fp8PerRow,
                     stream,
                 )?;
                 ops::deinterleave_qg(
@@ -401,6 +402,7 @@ impl Qwen3AttentionLayer {
                 q_out_i,
                 q_dim,
                 h as u32,
+                fp8.scale_format == crate::weight_map::WeightQuantFormat::Fp8PerRow,
                 stream,
             )?;
         } else if let Some(nvfp4) = self.q_weight.as_ref().and_then(|w| w.as_nvfp4()) {
@@ -455,6 +457,7 @@ impl Qwen3AttentionLayer {
                 k_out_i,
                 nkv * hd,
                 h as u32,
+                k_fp8.scale_format == crate::weight_map::WeightQuantFormat::Fp8PerRow,
                 stream,
             )?;
             ops::w8a16_gemv(
@@ -466,6 +469,7 @@ impl Qwen3AttentionLayer {
                 v_out_i,
                 nkv * hd,
                 h as u32,
+                v_fp8.scale_format == crate::weight_map::WeightQuantFormat::Fp8PerRow,
                 stream,
             )?;
         } else if let (Some(k_fp4), Some(v_fp4)) = (

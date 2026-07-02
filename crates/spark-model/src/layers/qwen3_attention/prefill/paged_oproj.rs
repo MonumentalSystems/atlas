@@ -107,6 +107,7 @@ impl Qwen3AttentionLayer {
                 n,
                 h,
                 nq * hd,
+                fp8t.scale_format == crate::weight_map::WeightQuantFormat::Fp8PerRow,
                 stream,
             )?;
         } else if let Some(ref fp8t) = self.o_fp8w_t
@@ -123,6 +124,7 @@ impl Qwen3AttentionLayer {
                 n,
                 h,
                 nq * hd,
+                fp8t.scale_format == crate::weight_map::WeightQuantFormat::Fp8PerRow,
                 stream,
             )?;
         } else if self.o_weight.as_ref().and_then(|w| w.as_fp8()).is_some()

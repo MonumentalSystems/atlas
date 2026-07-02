@@ -252,6 +252,7 @@ impl DenseFfnLayer {
                 gate_out,
                 inter,
                 h,
+                false,
                 stream,
             )?;
             ops::w8a16_gemv(
@@ -263,6 +264,7 @@ impl DenseFfnLayer {
                 up_out,
                 inter,
                 h,
+                false,
                 stream,
             )?;
             ops::silu_mul(
@@ -283,6 +285,7 @@ impl DenseFfnLayer {
                 output,
                 h,
                 inter,
+                false,
                 stream,
             )?;
             return Ok(output);
@@ -526,6 +529,7 @@ impl DenseFfnLayer {
                                 m,
                                 $n,
                                 $k,
+                                false,
                                 stream,
                             )?
                         }

@@ -71,6 +71,7 @@ impl Qwen3AttentionLayer {
                 o_out,
                 h,
                 nq * hd,
+                fp8.scale_format == crate::weight_map::WeightQuantFormat::Fp8PerRow,
                 stream,
             )?;
         } else {
