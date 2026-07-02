@@ -29,16 +29,34 @@ use crate::weight_map::{
 /// NOT native-block here → returns false so those route through the
 /// per-tensor dense/NVFP4 path instead of the native-FP8 fast arm.
 fn proj_is_native_fp8(store: &WeightStore, prefix: &str) -> bool {
-    let is_fp8_weight = store
-        .get(&format!("{prefix}.weight"))
-        .map(|w| w.dtype == WeightDtype::FP8E4M3)
-        .unwrap_or(false);
-    let has_block_scale = store.contains(&format!("{prefix}.weight_scale_inv"))
-        || store
-            .get(&format!("{prefix}.weight_scale"))
-            .map(|s| s.shape.len() == 2)
-            .unwrap_or(false);
-    is_fp8_weight && has_block_scale
+    let Ok(w) = store.get(&format!("{prefix}.weight")) else {
+        return false;
+    };
+    if w.dtype != WeightDtype::FP8E4M3 || w.shape.len() != 2 {
+        return false;
+    }
+    let (n, k) = (w.shape[0], w.shape[1]);
+    // Detection MUST agree with `load_fp8_block_scaled_as_fp8weight`: the native
+    // arm feeds the 2D scale straight into `w8a16_gemv`, which hardcodes
+    // FP8_BLOCK=128 and indexes `scale[(n/128)*ceil(K/128) + (k/128)]`. A
+    // per-channel `[N,1]` scale (compressed-tensors float-quantized,
+    // llm-compressor keepdim — most RedHatAI FP8-dynamic checkpoints) is 2D but
+    // NOT a block grid, so it must return false here and fall through to the
+    // requant path (which handles arbitrary geometry). NOTE: this gates the
+    // ATTENTION / linear-attn native-FP8 fast arm only; the MoE expert loader
+    // (`load_moe_qwen35_fp8_experts`) does not consult this and keeps its own
+    // proven per-row path.
+    let scale_key = if store.contains(&format!("{prefix}.weight_scale_inv")) {
+        format!("{prefix}.weight_scale_inv")
+    } else {
+        format!("{prefix}.weight_scale")
+    };
+    store
+        .get(&scale_key)
+        .map(|s| {
+            s.shape.len() == 2 && s.shape[0] == n.div_ceil(128) && s.shape[1] == k.div_ceil(128)
+        })
+        .unwrap_or(false)
 }
 
 pub(super) fn load_layers(
