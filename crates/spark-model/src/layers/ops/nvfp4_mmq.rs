@@ -117,6 +117,39 @@ pub fn nvfp4_mmq_gemm(
         .launch(stream)
 }
 
+/// Fused SiLU-mul + block_fp4_mmq quantize for the down-MMQ path: reads RAW gate/up MMQ
+/// outputs, applies the scale2 folds + swiglu clamp + SiLU-mul, and quantizes straight
+/// into the down GEMM's y-format — the intermediate bf16 activation tensor is never
+/// written (this round-trip is why the unfused down arm measured neutral).
+#[allow(clippy::too_many_arguments)]
+pub fn nvfp4_silu_mul_quant(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle, // atlas_nvfp4_silu_mul_quant
+    gate: DevicePtr,
+    up: DevicePtr,
+    out_y: DevicePtr,
+    gate_scale: f32,
+    up_scale: f32,
+    m: u32,
+    k: u32, // inter
+    stream: u64,
+) -> Result<()> {
+    let kpad = div_ceil(k, FP4_MMQ_Y_BLOCK_VALS) * FP4_MMQ_Y_BLOCK_VALS;
+    let grid_y = div_ceil(kpad, 16 * QUANT_BLOCK_THREADS);
+    KernelLaunch::new(gpu, kernel)
+        .grid([m, grid_y, 1])
+        .block([QUANT_BLOCK_THREADS, 1, 1])
+        .arg_ptr(gate)
+        .arg_ptr(up)
+        .arg_ptr(out_y)
+        .arg_f32(gate_scale)
+        .arg_f32(up_scale)
+        .arg_u64(k as u64) // ne00
+        .arg_u64(kpad as u64) // ne0
+        .arg_u32(m) // ne1
+        .launch(stream)
+}
+
 /// In-place ×scale2 for the down-projection MMQ output ([m, h] bf16).
 pub fn nvfp4_scale_bf16(
     gpu: &dyn GpuBackend,

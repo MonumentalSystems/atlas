@@ -169,6 +169,7 @@ pub struct DenseFfnLayer {
     nvfp4_quant_act_k: KernelHandle,
     nvfp4_repack_k: KernelHandle,
     nvfp4_silu_scaled_k: KernelHandle,
+    nvfp4_silu_quant_k: KernelHandle,
     nvfp4_scale_k: KernelHandle,
     fp4mmq_gate: std::sync::OnceLock<Fp4MmqWeight>,
     fp4mmq_up: std::sync::OnceLock<Fp4MmqWeight>,
@@ -281,6 +282,7 @@ impl DenseFfnLayer {
             nvfp4_quant_act_k: super::try_kernel(gpu, "nvfp4_mmq", "atlas_nvfp4_quantize_bf16"),
             nvfp4_repack_k: super::try_kernel(gpu, "nvfp4_mmq", "atlas_nvfp4_repack"),
             nvfp4_silu_scaled_k: super::try_kernel(gpu, "nvfp4_mmq", "atlas_nvfp4_silu_mul_scaled"),
+            nvfp4_silu_quant_k: super::try_kernel(gpu, "nvfp4_mmq", "atlas_nvfp4_silu_mul_quant"),
             nvfp4_scale_k: super::try_kernel(gpu, "nvfp4_mmq", "atlas_nvfp4_scale_bf16"),
             fp4mmq_gate: std::sync::OnceLock::new(),
             fp4mmq_up: std::sync::OnceLock::new(),
@@ -1392,7 +1394,25 @@ impl DenseFfnLayer {
         );
 
         // activation(gate) * up for all M tokens (SiLU or GELU)
-        if fp4mmq_prefill {
+        let fused_down_quant = fp4mmq_down && self.nvfp4_silu_quant_k.0 != 0;
+        if fused_down_quant {
+            // Fused SiLU-mul + quantize straight into the down MMQ's y-format: the
+            // [M, inter] bf16 intermediate is never written or re-read (that round-trip
+            // is why the unfused down arm measured neutral). scale2 folds happen inside,
+            // pre-clamp — identical math to the two-step path below.
+            ops::nvfp4_silu_mul_quant(
+                ctx.gpu,
+                self.nvfp4_silu_quant_k,
+                gate_out,
+                up_out,
+                fp4_y,
+                self.weights.gate_proj.weight_scale_2,
+                self.weights.up_proj.weight_scale_2,
+                m,
+                inter,
+                stream,
+            )?;
+        } else if fp4mmq_prefill {
             // FP4-MMQ outputs are missing the per-tensor FP32 scale2 (the hardware MMA
             // applies only the per-16 e4m3 scales) — fold it here, before the nonlinearity.
             ops::nvfp4_silu_mul_scaled(
@@ -1436,8 +1456,9 @@ impl DenseFfnLayer {
         if q4k_prefill && !down_faith2 {
             ops::quantize_act_q8_1(ctx.gpu, self.q4k_quant_act_k, gate_out, q4k_a, m, inter, stream)?;
         }
-        // FP4-MMQ down: quantize the down input (SiLU(gate)*up, `[M, inter]`) to block_fp4_mmq.
-        if fp4mmq_down {
+        // FP4-MMQ down (two-step fallback, only when the fused kernel is absent):
+        // quantize the down input (SiLU(gate)*up, `[M, inter]`) to block_fp4_mmq.
+        if fp4mmq_down && !fused_down_quant {
             ops::nvfp4_mmq_quantize_act(ctx.gpu, self.nvfp4_quant_act_k, gate_out, fp4_y, m, inter, stream)?;
         }
         // down_proj GEMM: [M, inter] → [M, H]

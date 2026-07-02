@@ -142,3 +142,92 @@ extern "C" __global__ void atlas_nvfp4_silu_mul_scaled(
     float sigmoid_g = 1.0f / (1.0f + __expf(-g));
     output[idx] = __float2bfloat16(g * sigmoid_g * u);
 }
+
+// FUSED SiLU-mul + block_fp4_mmq quantize for the down-MMQ path (ATLAS_FFN_NVFP4_MMQ_DOWN).
+// Replaces atlas_nvfp4_silu_mul_scaled + atlas_nvfp4_quantize_bf16: computes
+// v = SiLU(clamp(gate·gs)) · clamp(up·us) for a 16-value group and quantizes it straight
+// into the y-format the down MMQ consumes — the intermediate [M, inter] bf16 tensor is
+// never written or re-read (saves ~2 full activation-tensor round-trips per layer; this
+// traffic is exactly why the unfused down arm measured NEUTRAL). Same thread mapping and
+// ue4m3 ±2 scale search as quantize_mmq_nvfp4_worker (one thread = one 16-value group);
+// the value source is the SiLU-mul instead of a memory load. Grid (M, ceil(kpad/(16·128))),
+// block 128. kpad = inter rounded up to 256.
+extern "C" __global__ void atlas_nvfp4_silu_mul_quant(
+        const __nv_bfloat16* __restrict__ gate, const __nv_bfloat16* __restrict__ up,
+        void* __restrict__ vy, float gate_scale, float up_scale,
+        long ne00 /*inter*/, long ne0 /*kpad*/, int ne1 /*M rows*/) {
+#if defined(BLACKWELL_MMA_AVAILABLE)
+    const int64_t i0_base = ((int64_t) blockDim.x * blockIdx.y + threadIdx.x) * QK_NVFP4_SUB;
+    if (i0_base >= ne0) return;
+    const int64_t i1 = blockIdx.x;
+    const int64_t k_block = i0_base / QK_K;
+    const int64_t blocks_per_col = (ne0 + QK_K - 1) / QK_K;
+    if (k_block >= blocks_per_col) return;
+
+    const int64_t ib = k_block * ne1 + i1;
+    block_fp4_mmq* yb = (block_fp4_mmq*) vy + ib;
+    const int sub = (int) ((i0_base % QK_K) / QK_NVFP4_SUB);
+
+    const float SWIGLU_LIMIT = 10.0f;
+    float vals_raw[QK_NVFP4_SUB];
+    float amax_raw = 0.0f;
+    const int64_t base_idx = i1 * ne00;
+#pragma unroll
+    for (int k = 0; k < QK_NVFP4_SUB; k++) {
+        const int64_t i00 = i0_base + k;
+        float v = 0.0f;
+        if (i00 < ne00) {
+            float g = __bfloat162float(gate[base_idx + i00]) * gate_scale;
+            float u = __bfloat162float(up[base_idx + i00]) * up_scale;
+            g = fminf(g, SWIGLU_LIMIT);
+            u = fminf(fmaxf(u, -SWIGLU_LIMIT), SWIGLU_LIMIT);
+            v = g * (1.0f / (1.0f + __expf(-g))) * u;
+        }
+        vals_raw[k] = v;
+        amax_raw = fmaxf(amax_raw, fabsf(v));
+    }
+
+    static constexpr int test_offsets[5] = {0, -1, 1, -2, 2};
+    const int first_fp8_code = (int) ggml_cuda_fp32_to_ue4m3(amax_raw / 6.0f);
+    float best_err = FLT_MAX;
+    uint8_t fp8_code = 0;
+    float subblock_scale = 0.0f;
+#pragma unroll
+    for (int i = 0; i < 5; i++) {
+        const int test_code = first_fp8_code + test_offsets[i];
+        if (test_code < 0 || test_code > 0x7e) continue;
+        const uint8_t code = (uint8_t) test_code;
+        const float test_scale = ggml_cuda_ue4m3_to_fp32(code);
+        const float test_inv_scale = test_scale > 0.0f ? 0.5f / test_scale : 0.0f;
+        float cur_err = 0.0f;
+#pragma unroll
+        for (int k = 0; k < QK_NVFP4_SUB; ++k) {
+            const float v = vals_raw[k];
+            const uint8_t q = ggml_cuda_float_to_fp4_e2m1(v, test_inv_scale);
+            const float err_diff = fabsf(v) - fabsf(kvalues_mxfp4[q & 0x7]) * test_scale;
+            cur_err = fmaf(err_diff, err_diff, cur_err);
+        }
+        if (cur_err < best_err) {
+            best_err = cur_err;
+            fp8_code = code;
+            subblock_scale = test_scale;
+        }
+    }
+
+    const float inv_scale = subblock_scale > 0.0f ? 0.5f / subblock_scale : 0.0f;
+    uint32_t q0 = 0, q1 = 0;
+#pragma unroll
+    for (int k = 0; k < QK_NVFP4_SUB / 4; ++k) {
+        q0 |= (uint32_t) ggml_cuda_float_to_fp4_e2m1(vals_raw[k + 0], inv_scale) << (8 * k);
+        q0 |= (uint32_t) ggml_cuda_float_to_fp4_e2m1(vals_raw[k + 8], inv_scale) << (8 * k + 4);
+        q1 |= (uint32_t) ggml_cuda_float_to_fp4_e2m1(vals_raw[k + 4], inv_scale) << (8 * k);
+        q1 |= (uint32_t) ggml_cuda_float_to_fp4_e2m1(vals_raw[k + 12], inv_scale) << (8 * k + 4);
+    }
+    uint32_t* yqs = reinterpret_cast<uint32_t*>(yb->qs);
+    yqs[2 * sub + 0] = q0;
+    yqs[2 * sub + 1] = q1;
+    reinterpret_cast<uint8_t*>(yb->d4)[sub] = fp8_code;
+#else
+    NO_DEVICE_CODE;
+#endif
+}
