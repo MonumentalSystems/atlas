@@ -16,7 +16,7 @@ pub mod qwen3_ssm;
 pub mod vision_encoder;
 
 pub use deepseek_v4_mtp::{DeepseekV4MtpHead, DeepseekV4MtpProposerState};
-pub use dense_ffn::{DenseFfnLayer, FfnActivation};
+pub use dense_ffn::{DenseFfnLayer, DenseFfnWeights, FfnActivation};
 pub use dflash_head::{
     BlockDiffusionDraftHead, DflashLayer, DflashProposerState, DflashQuantization,
 };
@@ -61,6 +61,14 @@ pub enum FfnComponent {
 impl FfnComponent {
     pub fn is_none(&self) -> bool {
         matches!(self, Self::None)
+    }
+
+    /// True for a dense (non-MoE) FFN. The multi-seq decode path uses this to
+    /// batch n>=4 decode through the dense `forward_batched` GEMM (weights read
+    /// once for the whole batch — bandwidth amortization), whereas MoE keeps
+    /// the per-seq loop (grouped-GEMM is a net loss at small batch).
+    pub fn is_dense(&self) -> bool {
+        matches!(self, Self::Dense(_))
     }
 
     /// ATLAS_FP32_ROUTING active for this FFN (MoE only; false otherwise).

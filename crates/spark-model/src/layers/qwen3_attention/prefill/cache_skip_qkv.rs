@@ -190,6 +190,23 @@ impl Qwen3AttentionLayer {
                 h,
                 stream,
             )?;
+        } else if let Some(fp8t) = fp8w_t
+            && self.w8a16_gemm_t_m128_k.0 != 0
+        {
+            // Fast transposed FP8 prefill: 128x128 / 8-warp / two-level FP32 fold.
+            // Consumes the same B_t[K,N] + block_scale_t the transpose produced.
+            ops::w8a16_gemm_n128_m128(
+                ctx.gpu,
+                self.w8a16_gemm_t_m128_k,
+                normed,
+                fp8t.weight_t,
+                fp8t.scale_t,
+                out,
+                n,
+                out_dim,
+                h,
+                stream,
+            )?;
         } else if let Some(fp8t) = fp8w_t {
             ops::w8a16_gemm_t(
                 ctx.gpu,

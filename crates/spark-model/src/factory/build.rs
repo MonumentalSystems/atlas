@@ -39,6 +39,9 @@ pub fn build_model(
     kv_dtype: KvCacheDtype,
     inference_reserve: usize,
     gpu_memory_utilization: f64,
+    // When > 0, size the KV pool to hold exactly this many tokens (auto-
+    // provision) instead of using the gpu_memory_utilization-derived budget.
+    target_kv_tokens: usize,
     ssm_cache_slots: usize,
     layer_dtypes: Vec<KvCacheDtype>,
     ssm_checkpoint_interval: usize,
@@ -374,6 +377,40 @@ pub fn build_model(
                 max_batch_size
             );
             n
+        }
+        None if target_kv_tokens > 0 => {
+            // Auto-provision: size the pool to the requested token target (rounded
+            // up to whole blocks) and validate it fits in free memory after
+            // weights/buffers/reserve — no --gpu-memory-utilization guesswork.
+            let want_blocks = target_kv_tokens.div_ceil(kv_block_size);
+            let want_bytes = want_blocks * kv_config.block_bytes_kv_all_layers();
+            let avail = actual_free.saturating_sub(inference_reserve);
+            let gb = |b: usize| b as f64 / (1024.0 * 1024.0 * 1024.0);
+            if want_bytes > avail {
+                anyhow::bail!(
+                    "--target-kv-tokens {} needs {:.1} GB for KV ({} blocks × {} tok/block) but only \
+                     {:.1} GB is free after weights+buffers+reserve ({:.1} GB reserve). Lower \
+                     --target-kv-tokens or free GPU memory.",
+                    target_kv_tokens,
+                    gb(want_bytes),
+                    want_blocks,
+                    kv_block_size,
+                    gb(avail),
+                    gb(inference_reserve),
+                );
+            }
+            tracing::info!(
+                "KV cache: --target-kv-tokens {} → {} blocks × {} tok/block = {} max KV tokens \
+                 ({:.1} GB), auto-provisioned ({:.1} GB free after reserve; --gpu-memory-utilization \
+                 ignored for KV sizing)",
+                target_kv_tokens,
+                want_blocks,
+                kv_block_size,
+                want_blocks * kv_block_size,
+                gb(want_bytes),
+                gb(avail),
+            );
+            want_blocks
         }
         None => {
             if kv_budget == 0 {
