@@ -79,6 +79,7 @@ pub fn quant_gemm(
             m,
             n,
             k,
+            false,
             stream,
         ),
         QuantWeight::Dense(w) => dense_gemm(gpu, gemm_dense, input, w, output, m, n, k, stream),

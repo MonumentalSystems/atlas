@@ -289,7 +289,8 @@ extern "C" __global__ void __launch_bounds__(PM4_THREADS, 2) moe_fp8_grouped_gem
     unsigned int N,
     unsigned int K,
     const unsigned int* __restrict__ worklist,   // [*total_tiles * 2] (expert, packed m/n)
-    const int* __restrict__ total_tiles          // [1] (read-after-write on same stream)
+    const int* __restrict__ total_tiles,         // [1] (read-after-write on same stream)
+    unsigned int per_row                         // 1 => scale is per-row [N] (scale[n], applied in epilogue)
 ) {
     // E4M3 LUT staged into shared memory (data-dependent divergent lookups
     // serialize in __constant__ memory; the smem copy holds byte-identical
@@ -473,7 +474,9 @@ extern "C" __global__ void __launch_bounds__(PM4_THREADS, 2) moe_fp8_grouped_gem
             k_step_in_block++;
             if (k_step_in_block == k_steps_per_block) {
                 const unsigned int k_block = (step * PM4_K_STEP) / FP8_BLOCK;
-                const float scale = S_exp[n_block * k_blocks + k_block];
+                // Per-row: fold UNSCALED (scale constant over k), apply scale[n]
+                // per output column in the store epilogue.
+                const float scale = per_row ? 1.0f : S_exp[n_block * k_blocks + k_block];
                 #pragma unroll
                 for (int i = 0; i < PM4_N_TILES_PER_WARP; i++) {
                     outer_acc[i][0] += inner_acc[i][0] * scale;
@@ -490,7 +493,7 @@ extern "C" __global__ void __launch_bounds__(PM4_THREADS, 2) moe_fp8_grouped_gem
         // Fold any incomplete trailing K_BLOCK (only when K % FP8_BLOCK != 0).
         if (k_step_in_block != 0) {
             const unsigned int k_block = (K - 1) / FP8_BLOCK;
-            const float scale = S_exp[n_block * k_blocks + k_block];
+            const float scale = per_row ? 1.0f : S_exp[n_block * k_blocks + k_block];
             #pragma unroll
             for (int i = 0; i < PM4_N_TILES_PER_WARP; i++) {
                 outer_acc[i][0] += inner_acc[i][0] * scale;
@@ -509,15 +512,23 @@ extern "C" __global__ void __launch_bounds__(PM4_THREADS, 2) moe_fp8_grouped_gem
             unsigned int row0 = cta_m_local + warp_m_offset + group_id;   // expert-relative
             unsigned int row1 = row0 + 8;
 
+            // Per-row: apply scale[n] per output column (block path folded it
+            // already, so s0=s1=1.0 there). col0/col1 = global output N indices.
+            float rs0 = 1.0f, rs1 = 1.0f;
+            if (per_row) {
+                rs0 = (col0 < N) ? S_exp[col0] : 0.0f;
+                rs1 = (col1 < N) ? S_exp[col1] : 0.0f;
+            }
+
             if (row0 < (unsigned int)M_expert) {
                 unsigned int out_row = m_start + row0;
-                if (col0 < N) C[(unsigned long long)out_row * N + col0] = __float2bfloat16(outer_acc[n_tile][0]);
-                if (col1 < N) C[(unsigned long long)out_row * N + col1] = __float2bfloat16(outer_acc[n_tile][1]);
+                if (col0 < N) C[(unsigned long long)out_row * N + col0] = __float2bfloat16(outer_acc[n_tile][0] * rs0);
+                if (col1 < N) C[(unsigned long long)out_row * N + col1] = __float2bfloat16(outer_acc[n_tile][1] * rs1);
             }
             if (row1 < (unsigned int)M_expert) {
                 unsigned int out_row = m_start + row1;
-                if (col0 < N) C[(unsigned long long)out_row * N + col0] = __float2bfloat16(outer_acc[n_tile][2]);
-                if (col1 < N) C[(unsigned long long)out_row * N + col1] = __float2bfloat16(outer_acc[n_tile][3]);
+                if (col0 < N) C[(unsigned long long)out_row * N + col0] = __float2bfloat16(outer_acc[n_tile][2] * rs0);
+                if (col1 < N) C[(unsigned long long)out_row * N + col1] = __float2bfloat16(outer_acc[n_tile][3] * rs1);
             }
         }
     }

@@ -69,6 +69,12 @@ impl MoeLayer {
         self.fp8_up_weight_ptrs = Some(build_fp8_ptr_table(experts, |e| &e.up_proj, gpu)?);
         self.fp8_down_weight_ptrs = Some(build_fp8_ptr_table(experts, |e| &e.down_proj, gpu)?);
         self.fp8_shared_expert = Some(shared_expert);
+        // Ornith-1.0-35B-FP8 ships per-row ([N] fp32) expert scales; all experts
+        // in a checkpoint share ONE format, so probe the first expert's gate_proj.
+        self.fp8_experts_per_row = experts
+            .first()
+            .map(|e| e.gate_proj.scale_format == crate::weight_map::WeightQuantFormat::Fp8PerRow)
+            .unwrap_or(false);
         Ok(())
     }
 

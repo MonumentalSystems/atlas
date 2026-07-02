@@ -318,6 +318,10 @@ pub struct MoeLayer {
     bf16_shared_down: Option<DevicePtr>,
     // FP8 shared expert weights (None when shared expert is NVFP4)
     fp8_shared_expert: Option<Fp8ExpertWeight>,
+    /// True when the FP8 expert weights carry per-row ([N] fp32) scales
+    /// (Ornith-1.0-35B-FP8) rather than 2D block ([N/128,K/128]) scales.
+    /// Threaded into every FP8 expert GEMM kernel as the `per_row` flag.
+    fp8_experts_per_row: bool,
     /// FP4 down kernel handle (`moe_w4a16_down_t_k64_fp4`). `try_kernel` =>
     /// `KernelHandle(0)` on images lacking it; the FP4-down dispatch checks this
     /// handle != 0, `down_fp4` is set, and the shared `down_ptrs_t` table is present.

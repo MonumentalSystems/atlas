@@ -141,6 +141,7 @@ impl Qwen3AttentionLayer {
                 n,
                 h,
                 nq * hd,
+                false,
                 stream,
             )?;
         } else if let Some(fp8) = self.o_fp8 {

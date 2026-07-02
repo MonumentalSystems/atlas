@@ -122,6 +122,7 @@ impl Qwen3SsmLayer {
                 k,
                 h as u32,
                 value_dim as u32,
+                false,
                 stream,
             )
         } else if let Some(ref fp8w) = self.out_proj_fp8w
@@ -137,6 +138,7 @@ impl Qwen3SsmLayer {
                 k,
                 h as u32,
                 value_dim as u32,
+                false,
                 stream,
             )
         } else if let Some(fp8) = self.out_proj_fp8 {

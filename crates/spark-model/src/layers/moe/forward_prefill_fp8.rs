@@ -162,6 +162,7 @@ impl MoeLayer {
                         mm,
                         nn,
                         kk,
+                        self.fp8_experts_per_row,
                         stream,
                     )
                 } else {
@@ -175,6 +176,7 @@ impl MoeLayer {
                         mm,
                         nn,
                         kk,
+                        self.fp8_experts_per_row,
                         stream,
                     )
                 }
@@ -462,6 +464,7 @@ impl MoeLayer {
                 wl_gu,
                 tt_gu,
                 wl_cap_items as u32,
+                self.fp8_experts_per_row,
                 stream,
             )?;
             ops::moe_fp8_grouped_gemm(
@@ -479,6 +482,7 @@ impl MoeLayer {
                 wl_gu,
                 tt_gu,
                 wl_cap_items as u32,
+                self.fp8_experts_per_row,
                 stream,
             )?;
             ctx.gpu.synchronize(stream)?;
@@ -579,6 +583,7 @@ impl MoeLayer {
                 wl_dn,
                 tt_dn,
                 wl_cap_items as u32,
+                self.fp8_experts_per_row,
                 stream,
             )?;
             ctx.gpu.synchronize(stream)?;

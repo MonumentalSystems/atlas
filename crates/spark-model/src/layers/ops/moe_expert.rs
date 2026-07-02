@@ -353,6 +353,7 @@ pub fn moe_expert_gate_up_shared_fp8(
     n: u32,
     k: u32,
     top_k: u32,
+    per_row: bool,
     stream: u64,
 ) -> Result<()> {
     KernelLaunch::new(gpu, kernel)
@@ -375,6 +376,7 @@ pub fn moe_expert_gate_up_shared_fp8(
         .arg_u32(n)
         .arg_u32(k)
         .arg_u32(top_k)
+        .arg_u32(per_row as u32)
         .launch(stream)
 }
 
@@ -487,6 +489,7 @@ pub fn moe_expert_silu_down_shared_fp8(
     n: u32,
     k: u32,
     top_k: u32,
+    per_row: bool,
     stream: u64,
 ) -> Result<()> {
     KernelLaunch::new(gpu, kernel)
@@ -506,5 +509,6 @@ pub fn moe_expert_silu_down_shared_fp8(
         .arg_u32(n)
         .arg_u32(k)
         .arg_u32(top_k)
+        .arg_u32(per_row as u32)
         .launch(stream)
 }

@@ -345,6 +345,7 @@ impl MoeLayer {
                     inter,
                     h,
                     top_k,
+                    self.fp8_experts_per_row,
                     stream,
                 )
             })?;
@@ -367,6 +368,7 @@ impl MoeLayer {
                     h,
                     inter,
                     top_k,
+                    self.fp8_experts_per_row,
                     stream,
                 )
             })?;

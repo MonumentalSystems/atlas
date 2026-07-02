@@ -250,6 +250,7 @@ impl Qwen3AttentionLayer {
                 n,
                 out_dim,
                 h,
+                false,
                 stream,
             )?;
         } else if weight_opt.and_then(|w| w.as_fp8()).is_some() && self.w8a16_gemm_k.0 != 0 {
@@ -265,6 +266,7 @@ impl Qwen3AttentionLayer {
                 n,
                 out_dim,
                 h,
+                false,
                 stream,
             )?;
         } else if weight_opt.and_then(|w| w.as_fp8()).is_some() {

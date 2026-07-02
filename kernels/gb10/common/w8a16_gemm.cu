@@ -86,11 +86,12 @@ __device__ __forceinline__ void w8a16_mma_and_store(
 extern "C" __global__ void w8a16_gemm(
     const __nv_bfloat16* __restrict__ A,            // [M, K] BF16 activations
     const unsigned char* __restrict__ B,             // [N, K] FP8 E4M3
-    const float* __restrict__ block_scale,           // [N/128, K/128] FP32
+    const float* __restrict__ block_scale,           // [N/128, K/128] FP32, or [N] if per_row
     __nv_bfloat16* __restrict__ C,                   // [M, N] BF16 output
     unsigned int M,
     unsigned int N,
-    unsigned int K
+    unsigned int K,
+    unsigned int per_row                             // 1 => scale is per-row [N] (scale[n], applied in epilogue)
 ) {
     const unsigned int cta_m = blockIdx.y * M_TILE;
     const unsigned int cta_n = blockIdx.x * N_TILE;
@@ -174,7 +175,9 @@ extern "C" __global__ void w8a16_gemm(
         k_step_in_block++;
         if (k_step_in_block == k_steps_per_block) {
             const unsigned int k_block = k_base / FP8_BLOCK;
-            const float scale = block_scale[n_block * k_blocks + k_block];
+            // Per-row: fold UNSCALED (scale constant over k), apply scale[n] per
+            // output column in the store epilogue.
+            const float scale = per_row ? 1.0f : block_scale[n_block * k_blocks + k_block];
             #pragma unroll
             for (int i = 0; i < 8; i++) {
                 outer_acc[i][0] += inner_acc[i][0] * scale;
@@ -193,7 +196,7 @@ extern "C" __global__ void w8a16_gemm(
     // but keeps the kernel correct on other configs).
     if (k_step_in_block != 0) {
         const unsigned int k_block = (K - 1) / FP8_BLOCK;
-        const float scale = block_scale[n_block * k_blocks + k_block];
+        const float scale = per_row ? 1.0f : block_scale[n_block * k_blocks + k_block];
         #pragma unroll
         for (int i = 0; i < 8; i++) {
             outer_acc[i][0] += inner_acc[i][0] * scale;
@@ -212,10 +215,17 @@ extern "C" __global__ void w8a16_gemm(
         unsigned int row0 = cta_m + warp_m_offset + group_id;
         unsigned int row1 = row0 + 8;
 
-        if (row0 < M && col0 < N) C[row0 * N + col0] = __float2bfloat16(outer_acc[n_tile][0]);
-        if (row0 < M && col1 < N) C[row0 * N + col1] = __float2bfloat16(outer_acc[n_tile][1]);
-        if (row1 < M && col0 < N) C[row1 * N + col0] = __float2bfloat16(outer_acc[n_tile][2]);
-        if (row1 < M && col1 < N) C[row1 * N + col1] = __float2bfloat16(outer_acc[n_tile][3]);
+        // Per-row: apply scale[n] per output column (block path folded it already).
+        float s0 = 1.0f, s1 = 1.0f;
+        if (per_row) {
+            s0 = (col0 < N) ? block_scale[col0] : 0.0f;
+            s1 = (col1 < N) ? block_scale[col1] : 0.0f;
+        }
+
+        if (row0 < M && col0 < N) C[row0 * N + col0] = __float2bfloat16(outer_acc[n_tile][0] * s0);
+        if (row0 < M && col1 < N) C[row0 * N + col1] = __float2bfloat16(outer_acc[n_tile][1] * s1);
+        if (row1 < M && col0 < N) C[row1 * N + col0] = __float2bfloat16(outer_acc[n_tile][2] * s0);
+        if (row1 < M && col1 < N) C[row1 * N + col1] = __float2bfloat16(outer_acc[n_tile][3] * s1);
     }
 }
 

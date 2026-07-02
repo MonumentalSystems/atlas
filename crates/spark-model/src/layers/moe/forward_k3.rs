@@ -130,6 +130,7 @@ impl MoeLayer {
                 inter,
                 h,
                 top_k,
+                self.fp8_experts_per_row,
                 stream,
             )?;
             ops::moe_expert_silu_down_shared_fp8_batch3(
@@ -148,6 +149,7 @@ impl MoeLayer {
                 h,
                 inter,
                 top_k,
+                self.fp8_experts_per_row,
                 stream,
             )?;
             // EP fix: after silu_down, expert_gate_out is free — use as zero buffer

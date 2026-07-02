@@ -543,6 +543,7 @@ impl DenseFfnLayer {
                             m,
                             $n,
                             $k,
+                            false,
                             stream,
                         )?,
                     }

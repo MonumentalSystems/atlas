@@ -156,6 +156,7 @@ impl Qwen3SsmLayer {
                     n as u32,
                     qkvz_size as u32,
                     h as u32,
+                    false,
                     stream,
                 )?;
             } else {
@@ -169,6 +170,7 @@ impl Qwen3SsmLayer {
                     n as u32,
                     qkvz_size as u32,
                     h as u32,
+                    false,
                     stream,
                 )?;
             }
@@ -261,6 +263,7 @@ impl Qwen3SsmLayer {
                     n as u32,
                     h as u32,
                     value_dim as u32,
+                    false,
                     stream,
                 )?;
             } else {
@@ -274,6 +277,7 @@ impl Qwen3SsmLayer {
                     n as u32,
                     h as u32,
                     value_dim as u32,
+                    false,
                     stream,
                 )?;
             }

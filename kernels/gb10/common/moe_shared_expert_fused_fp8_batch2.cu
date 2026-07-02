@@ -111,7 +111,8 @@ extern "C" __global__ void moe_expert_gate_up_shared_fp8_batch2(
     const unsigned char* __restrict__ sh_up_weight,
     const float* __restrict__ sh_up_block_scale,
     __nv_bfloat16* __restrict__ sh_up_out,     // [2, inter] BF16
-    unsigned int N, unsigned int K, unsigned int top_k
+    unsigned int N, unsigned int K, unsigned int top_k,
+    unsigned int per_row   // 1 => scale is per-row [N] (scale[n], constant over k)
 ) {
     const unsigned int total_routed = 2 * top_k;
     const unsigned int y = blockIdx.y;
@@ -194,8 +195,8 @@ extern "C" __global__ void moe_expert_gate_up_shared_fp8_batch2(
 
         // Block scale for this K chunk
         const unsigned int k_block = base_k / FP8_BLOCK;
-        float sc1 = B_block_scale[n1_block * k_blocks + k_block];
-        float sc2 = have_n2 ? B_block_scale[n2_block * k_blocks + k_block] : 0.0f;
+        float sc1 = per_row ? B_block_scale[n1] : B_block_scale[n1_block * k_blocks + k_block];
+        float sc2 = have_n2 ? (per_row ? B_block_scale[n2] : B_block_scale[n2_block * k_blocks + k_block]) : 0.0f;
 
         // Load 8 FP8 weights for n1
         unsigned int w4_1a = *(const unsigned int*)(B_weight + (unsigned long long)n1 * K + k8 * 8);
@@ -266,7 +267,8 @@ extern "C" __global__ void moe_expert_silu_down_shared_fp8_batch2(
     const unsigned char* __restrict__ sh_down_weight,
     const float* __restrict__ sh_down_block_scale,
     __nv_bfloat16* __restrict__ sh_down_out,       // [2, H] BF16
-    unsigned int N, unsigned int K, unsigned int top_k
+    unsigned int N, unsigned int K, unsigned int top_k,
+    unsigned int per_row   // 1 => scale is per-row [N] (scale[n], constant over k)
 ) {
     const unsigned int total_routed = 2 * top_k;
     const unsigned int y = blockIdx.y;
@@ -345,8 +347,8 @@ extern "C" __global__ void moe_expert_silu_down_shared_fp8_batch2(
 
         // Block scale for this K chunk
         const unsigned int k_block = base_k / FP8_BLOCK;
-        float sc1 = B_block_scale[n1_block * k_blocks + k_block];
-        float sc2 = have_n2 ? B_block_scale[n2_block * k_blocks + k_block] : 0.0f;
+        float sc1 = per_row ? B_block_scale[n1] : B_block_scale[n1_block * k_blocks + k_block];
+        float sc2 = have_n2 ? (per_row ? B_block_scale[n2] : B_block_scale[n2_block * k_blocks + k_block]) : 0.0f;
 
         // Load 8 FP8 weights for n1
         unsigned int w4_1a = *(const unsigned int*)(B_weight + (unsigned long long)n1 * K + k8 * 8);

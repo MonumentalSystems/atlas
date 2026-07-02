@@ -40,7 +40,8 @@ extern "C" __global__ void moe_expert_gate_up_shared_fp8_batch2_t(
     const unsigned char* __restrict__ sh_up_t_weight,
     const float* __restrict__ sh_up_t_block_scale,
     __nv_bfloat16* __restrict__ sh_up_out,
-    unsigned int N, unsigned int K, unsigned int top_k
+    unsigned int N, unsigned int K, unsigned int top_k,
+    unsigned int per_row   // 1 => scale is per-row [N] (scale[n], constant over k)
 ) {
     const unsigned int total_routed = 2 * top_k;
     const unsigned int y = blockIdx.y;
@@ -91,7 +92,7 @@ extern "C" __global__ void moe_expert_gate_up_shared_fp8_batch2_t(
     const unsigned int k_blocks = (K + FP8_BLOCK - 1) / FP8_BLOCK;
     float acc = 0.0f;
     for (unsigned int kb = 0; kb < k_blocks; kb++) {
-        float sc = B_block_scale[(unsigned long long)kb * n_blocks + n_block];
+        float sc = per_row ? B_block_scale[n] : B_block_scale[(unsigned long long)kb * n_blocks + n_block];
         const unsigned int k_start = kb * FP8_BLOCK;
         const unsigned int k_end = (k_start + FP8_BLOCK) < K ? (k_start + FP8_BLOCK) : K;
         #pragma unroll 8
@@ -115,7 +116,8 @@ extern "C" __global__ void moe_expert_silu_down_shared_fp8_batch2_t(
     const unsigned char* __restrict__ sh_down_t_weight,
     const float* __restrict__ sh_down_t_block_scale,
     __nv_bfloat16* __restrict__ sh_down_out,
-    unsigned int N, unsigned int K, unsigned int top_k
+    unsigned int N, unsigned int K, unsigned int top_k,
+    unsigned int per_row   // 1 => scale is per-row [N] (scale[n], constant over k)
 ) {
     const unsigned int total_routed = 2 * top_k;
     const unsigned int y = blockIdx.y;
@@ -167,7 +169,7 @@ extern "C" __global__ void moe_expert_silu_down_shared_fp8_batch2_t(
     const unsigned int k_blocks = (K + FP8_BLOCK - 1) / FP8_BLOCK;
     float acc = 0.0f;
     for (unsigned int kb = 0; kb < k_blocks; kb++) {
-        float sc = B_block_scale[(unsigned long long)kb * n_blocks + n_block];
+        float sc = per_row ? B_block_scale[n] : B_block_scale[(unsigned long long)kb * n_blocks + n_block];
         const unsigned int k_start = kb * FP8_BLOCK;
         const unsigned int k_end = (k_start + FP8_BLOCK) < K ? (k_start + FP8_BLOCK) : K;
         #pragma unroll 8

@@ -210,6 +210,7 @@ pub fn w8a16_gemm(
     m: u32,
     n: u32,
     k: u32,
+    per_row: bool,
     stream: u64,
 ) -> Result<()> {
     // Launch geometry is target-specific because the `w8a16_gemm` kernel SOURCE
@@ -233,6 +234,7 @@ pub fn w8a16_gemm(
         .arg_u32(m)
         .arg_u32(n)
         .arg_u32(k)
+        .arg_u32(per_row as u32)
         .launch(stream)
 }
 
@@ -255,6 +257,7 @@ pub fn w8a16_gemm_pipelined(
     m: u32,
     n: u32,
     k: u32,
+    per_row: bool,
     stream: u64,
 ) -> Result<()> {
     KernelLaunch::new(gpu, kernel)
@@ -267,6 +270,7 @@ pub fn w8a16_gemm_pipelined(
         .arg_u32(m)
         .arg_u32(n)
         .arg_u32(k)
+        .arg_u32(per_row as u32)
         .launch(stream)
 }
 
@@ -453,6 +457,7 @@ pub fn moe_fp8_grouped_gemm(
     worklist: DevicePtr,    // [*total_tiles * 2] u32 (built on the same stream)
     total_tiles: DevicePtr, // [1] i32 (built on the same stream)
     max_tiles: u32,         // caller's upper bound on tile count (wl_cap_items)
+    per_row: bool,          // true => scale_ptrs are per-row [N] fp32 (Ornith FP8)
     stream: u64,
 ) -> Result<()> {
     // The kernel strides by gridDim.x, so the grid is sized to the work-list's
@@ -486,6 +491,7 @@ pub fn moe_fp8_grouped_gemm(
         .arg_u32(k)
         .arg_ptr(worklist)
         .arg_ptr(total_tiles)
+        .arg_u32(per_row as u32)
         .launch(stream)
 }
 

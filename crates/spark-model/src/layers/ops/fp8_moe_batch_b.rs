@@ -33,6 +33,7 @@ pub fn moe_expert_gate_up_shared_fp8_batch2_t(
     n: u32,
     k: u32,
     top_k: u32,
+    per_row: bool,
     stream: u64,
 ) -> Result<()> {
     KernelLaunch::new(gpu, kernel)
@@ -55,6 +56,7 @@ pub fn moe_expert_gate_up_shared_fp8_batch2_t(
         .arg_u32(n)
         .arg_u32(k)
         .arg_u32(top_k)
+        .arg_u32(per_row as u32)
         .launch(stream)
 }
 
@@ -76,6 +78,7 @@ pub fn moe_expert_silu_down_shared_fp8_batch2_t(
     n: u32,
     k: u32,
     top_k: u32,
+    per_row: bool,
     stream: u64,
 ) -> Result<()> {
     let smem_bytes = (k as usize * std::mem::size_of::<f32>()) as u32;
@@ -97,6 +100,7 @@ pub fn moe_expert_silu_down_shared_fp8_batch2_t(
         .arg_u32(n)
         .arg_u32(k)
         .arg_u32(top_k)
+        .arg_u32(per_row as u32)
         .launch(stream)
 }
 
@@ -120,6 +124,7 @@ pub fn moe_expert_gate_up_shared_fp8_batch3_t(
     n: u32,
     k: u32,
     top_k: u32,
+    per_row: bool,
     stream: u64,
 ) -> Result<()> {
     KernelLaunch::new(gpu, kernel)
@@ -142,6 +147,7 @@ pub fn moe_expert_gate_up_shared_fp8_batch3_t(
         .arg_u32(n)
         .arg_u32(k)
         .arg_u32(top_k)
+        .arg_u32(per_row as u32)
         .launch(stream)
 }
 
@@ -163,6 +169,7 @@ pub fn moe_expert_silu_down_shared_fp8_batch3_t(
     n: u32,
     k: u32,
     top_k: u32,
+    per_row: bool,
     stream: u64,
 ) -> Result<()> {
     let smem_bytes = (k as usize * std::mem::size_of::<f32>()) as u32;
@@ -184,5 +191,6 @@ pub fn moe_expert_silu_down_shared_fp8_batch3_t(
         .arg_u32(n)
         .arg_u32(k)
         .arg_u32(top_k)
+        .arg_u32(per_row as u32)
         .launch(stream)
 }

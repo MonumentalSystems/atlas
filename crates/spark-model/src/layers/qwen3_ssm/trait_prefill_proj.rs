@@ -200,6 +200,7 @@ impl Qwen3SsmLayer {
                 k,
                 qkvz_size as u32,
                 h as u32,
+                false,
                 stream,
             )
             .map_err(|e| {
@@ -223,6 +224,7 @@ impl Qwen3SsmLayer {
                 k,
                 qkvz_size as u32,
                 h as u32,
+                false,
                 stream,
             )
             .map_err(|e| {

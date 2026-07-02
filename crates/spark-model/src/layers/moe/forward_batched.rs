@@ -270,6 +270,7 @@ impl MoeLayer {
                     inter,
                     h,
                     top_k,
+                    self.fp8_experts_per_row,
                     stream,
                 )?;
                 ops::moe_expert_silu_down_shared_fp8(
@@ -288,6 +289,7 @@ impl MoeLayer {
                     h,
                     inter,
                     top_k,
+                    self.fp8_experts_per_row,
                     stream,
                 )?;
             } else if self.use_t_layout_for_prefill() {
