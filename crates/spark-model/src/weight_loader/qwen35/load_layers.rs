@@ -33,12 +33,19 @@ fn proj_is_native_fp8(store: &WeightStore, prefix: &str) -> bool {
         .get(&format!("{prefix}.weight"))
         .map(|w| w.dtype == WeightDtype::FP8E4M3)
         .unwrap_or(false);
-    let has_block_scale = store.contains(&format!("{prefix}.weight_scale_inv"))
-        || store
-            .get(&format!("{prefix}.weight_scale"))
-            .map(|s| s.shape.len() == 2)
-            .unwrap_or(false);
-    is_fp8_weight && has_block_scale
+    // Any FP8 dequant scale qualifies for the native-FP8 load:
+    //  - 2D block scale (`weight_scale_inv`, or a 2D `weight_scale`) —
+    //    DeepSeek/Qwen-native + compressed-tensors float-quantized, OR
+    //  - a *scalar* per-tensor `weight_scale` — ModelOpt MIXED_PRECISION
+    //    (e.g. nvidia/Qwen3.6-27B-NVFP4's FP8 attention, which pairs NVFP4
+    //    MoE with per-tensor-FP8 q/k/v/o).
+    // `load_fp8_block_scaled_as_fp8weight` handles all three (it broadcasts a
+    // scalar into the [N/128,K/128] block-scale matrix), and the W8A16
+    // gemv/gemm kernels consume the result — so keeping the attention native
+    // FP8 avoids the lossy FP8→BF16→NVFP4 re-quant.
+    let has_fp8_scale = store.contains(&format!("{prefix}.weight_scale_inv"))
+        || store.contains(&format!("{prefix}.weight_scale"));
+    is_fp8_weight && has_fp8_scale
 }
 
 pub(super) fn load_layers(
@@ -606,9 +613,18 @@ pub(super) fn load_layers(
                 layers.push(Box::new(layer));
                 attn_idx += 1;
             }
+            // Native-FP8 attention fires whenever the attention projections are
+            // FP8E4M3 on disk — driven by the actual weight dtype, not the
+            // whole-model `native_fp8`/model-type allowlist. This keeps FP8
+            // attention native (no FP8→BF16→NVFP4 re-quant) for mixed-precision
+            // checkpoints too: NVFP4 MoE + per-tensor-FP8 attn (nvidia
+            // Qwen3.6-27B-NVFP4, Holo-3.1 ModelOpt MIXED_PRECISION). Fully-NVFP4
+            // attention (q_proj is packed E2M1, not FP8E4M3) fails
+            // `proj_is_native_fp8` and takes the NVFP4 arm below unchanged. The
+            // `force_nvfp4_all`/`fp4_proj_decode` escape hatches still win, and
+            // `native_modelopt_attn` (env) remains an explicit override.
             LayerType::FullAttention
-                if ((native_fp8
-                    && proj_is_native_fp8(store, &format!("{lp}.self_attn.q_proj")))
+                if (proj_is_native_fp8(store, &format!("{lp}.self_attn.q_proj"))
                     || native_modelopt_attn)
                     && !(force_nvfp4_all || fp4_proj_decode) =>
             {

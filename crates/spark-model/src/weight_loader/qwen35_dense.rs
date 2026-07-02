@@ -26,12 +26,14 @@ fn proj_is_native_fp8(store: &WeightStore, prefix: &str) -> bool {
         .get(&format!("{prefix}.weight"))
         .map(|w| w.dtype == WeightDtype::FP8E4M3)
         .unwrap_or(false);
-    let has_block_scale = store.contains(&format!("{prefix}.weight_scale_inv"))
-        || store
-            .get(&format!("{prefix}.weight_scale"))
-            .map(|s| s.shape.len() == 2)
-            .unwrap_or(false);
-    is_fp8_weight && has_block_scale
+    // Any FP8 dequant scale qualifies: 2D block scale (`weight_scale_inv` or a
+    // 2D `weight_scale`) OR a scalar per-tensor `weight_scale` (ModelOpt
+    // MIXED_PRECISION, e.g. nvidia/Qwen3.6-27B-NVFP4's per-tensor-FP8 attention).
+    // `load_fp8_block_scaled_as_fp8weight` broadcasts a scalar into the
+    // [N/128,K/128] block matrix, so all three are consumable by the W8A16 kernels.
+    let has_fp8_scale = store.contains(&format!("{prefix}.weight_scale_inv"))
+        || store.contains(&format!("{prefix}.weight_scale"));
+    is_fp8_weight && has_fp8_scale
 }
 
 /// Opt-in gate for native dense-FP8 attention + FFN dispatch (Qwythos / dense
@@ -302,9 +304,16 @@ impl ModelWeightLoader for Qwen35DenseWeightLoader {
                     // enabled (single-GPU FP8 checkpoint). Hot decode/prefill paths
                     // dispatch FP8 (w8a16); any path without an FP8 branch falls back
                     // to the real NVFP4 weights above (never a null → no CUDA-700).
+                    // Overlay fires whenever attention is natively FP8 on disk —
+                    // NOT gated on the whole-model `Fp8Dequanted` variant, so
+                    // mixed-precision NVFP4-FFN + FP8-attn dense checkpoints
+                    // (nvidia/Qwen3.6-27B-NVFP4, `Standard` variant, per-tensor-FP8
+                    // attn) keep attention native FP8 instead of the lossy
+                    // FP8->BF16->NVFP4 requant. Still opt-in via ATLAS_DENSE_FP8=1
+                    // (dense FP8 W8A16 attn kernels are ~lossless but slower than the
+                    // NVFP4 W4A16 fallback — a quality/speed tradeoff).
                     if dense_fp8_enabled()
                         && config.tp_world_size.max(1) == 1
-                        && matches!(variant, Nvfp4Variant::Fp8Dequanted)
                         && proj_is_native_fp8(store, &format!("{p}.q_proj"))
                     {
                         let load_fp8_proj = |name: &str,
@@ -316,6 +325,11 @@ impl ModelWeightLoader for Qwen35DenseWeightLoader {
                         };
                         let [q_fp8, k_fp8, v_fp8, o_fp8] = load_qkvo_tp(config, load_fp8_proj)?;
                         layer.set_fp8_weights(Some(q_fp8), Some(k_fp8), Some(v_fp8), Some(o_fp8));
+                        if i < 2 {
+                            tracing::info!(
+                                "Layer {i}: attention native FP8 overlay ACTIVE (W8A16, no NVFP4 requant)"
+                            );
+                        }
                         if let Err(e) = layer.transpose_fp8_for_prefill(gpu, stream) {
                             tracing::warn!("Layer {i}: dense FP8 transpose failed: {e}");
                         }
