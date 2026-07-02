@@ -118,6 +118,16 @@ extern "C" __global__ void atlas_nvfp4_repack(
 // here, BEFORE the clamp/nonlinearity, where the values first become "true"-scaled.
 // Contained duplicate of moe_silu_mul (5 lines of math) to avoid an ABI change on the
 // shared kernel for this flag-gated path.
+// In-place ×scale for the down-projection MMQ output (its scale2 has no SiLU-mul to
+// ride; the consumer is the residual add). [M, H] bf16, ~0.3ms at M=4096 vs the ~6ms
+// the MMQ down GEMM saves.
+extern "C" __global__ void atlas_nvfp4_scale_bf16(
+    __nv_bfloat16* __restrict__ data, float scale, unsigned int total_elements) {
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total_elements) return;
+    data[idx] = __float2bfloat16(__bfloat162float(data[idx]) * scale);
+}
+
 extern "C" __global__ void atlas_nvfp4_silu_mul_scaled(
     const __nv_bfloat16* __restrict__ gate, const __nv_bfloat16* __restrict__ up,
     __nv_bfloat16* __restrict__ output, float gate_scale, float up_scale,

@@ -117,6 +117,24 @@ pub fn nvfp4_mmq_gemm(
         .launch(stream)
 }
 
+/// In-place ×scale2 for the down-projection MMQ output ([m, h] bf16).
+pub fn nvfp4_scale_bf16(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle, // atlas_nvfp4_scale_bf16
+    data: DevicePtr,
+    scale: f32,
+    total: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(total, 256), 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(data)
+        .arg_f32(scale)
+        .arg_u32(total)
+        .launch(stream)
+}
+
 /// SiLU(gate×gs)×(up×us) with the per-projection scale2 fold (swiglu ±10 clamp,
 /// mirrors moe_silu_mul). In-place safe (out may alias gate).
 #[allow(clippy::too_many_arguments)]
