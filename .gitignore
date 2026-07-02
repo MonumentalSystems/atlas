@@ -128,3 +128,8 @@ bench/**/*.jsonl
 bench/**/*.csv
 bench/**/*.pid
 bench/fp8_dgx2_drift/harness/oc
+
+# GDN AOT-exported kernel object — the version-controlled build artifact for
+# libatlasgdn.so (regenerating needs the CUDA-13.2 cute-DSL export toolchain;
+# see 3rdparty_patches/gdn_aot/STATUS.md). Committed deliberately per review.
+!3rdparty_patches/gdn_aot/gdn_holo_0.o
