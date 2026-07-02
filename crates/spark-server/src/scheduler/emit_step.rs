@@ -175,14 +175,9 @@ pub fn emit_token(a: &mut ActiveSeq, tok: u32, logprobs: Option<crate::api::Toke
 
     a.output_tokens.push(tok);
 
-    // Thinking tokens are "free" (don't decrement remaining) by default.
-    // `ATLAS_MAX_TOKENS_TOTAL=1` makes them count too, so `max_tokens` caps the
-    // TOTAL output (reasoning + content) like vLLM/OpenAI (e.g. for benchmarking).
+    // Thinking tokens are "free" (don't decrement remaining).
     // Detect </think> transition. Track thinking token count for budget enforcement.
     if a.inside_thinking {
-        if crate::scheduler::helpers::max_tokens_counts_reasoning() {
-            a.consume_generation_budget();
-        }
         if a.think_end_token == Some(tok) {
             a.inside_thinking = false;
             a.force_end_thinking = false;
