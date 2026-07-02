@@ -340,18 +340,6 @@ pub(super) fn load_layers(
         if (!native_fp8 || force_nvfp4_moe) && !skip_moe_prefill_copies {
             moe_layer.predequant_for_prefill(gpu, config, stream)?;
         }
-        // CUTLASS grouped NVFP4 gate_up (ATLAS_HOLO_MOE_GROUPED_CUTLASS): swizzle
-        // the per-expert [K/16,N] weight scales into the CUTLASS SFB atom once at
-        // load (the grouped kernel pairs them with gate_ptrs [N,K/2] + real scale2).
-        // Needs the shared gate_ptrs_t/up_ptrs_t scales (FAST_MOE=full).
-        if fast_holo_moe_layer
-            && std::env::var("ATLAS_HOLO_MOE_GROUPED_CUTLASS")
-                .ok()
-                .as_deref()
-                == Some("1")
-        {
-            moe_layer.build_cutlass_grouped_sfb(gpu, config, stream)?;
-        }
 
         // ATLAS_FP8_DEQUANT_MOE_TO_BF16: dequant FP8 experts to BF16 at load,
         // route MoE through the BF16 grouped GEMM + fused-decode kernels.

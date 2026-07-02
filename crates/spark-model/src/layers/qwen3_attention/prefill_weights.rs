@@ -135,12 +135,6 @@ impl Qwen3AttentionLayer {
         gpu: &dyn GpuBackend,
         stream: u64,
     ) -> anyhow::Result<()> {
-        if crate::layers::ops::cutlass_nvfp4_gemm_enabled() {
-            tracing::info!(
-                "Skipping attention FP8 prefill transposes because ATLAS_CUTLASS_NVFP4_GEMM=1"
-            );
-            return Ok(());
-        }
         if self.w8a16_gemm_t_k.0 == 0 {
             return Ok(()); // kernel not available
         }
@@ -173,18 +167,6 @@ impl Qwen3AttentionLayer {
         config: &atlas_core::config::ModelConfig,
         stream: u64,
     ) -> Result<()> {
-        // Under native NVFP4 prefill (ATLAS_CUTLASS_NVFP4_GEMM=1) all of Q/K/V/O
-        // take the CUTLASS NVFP4 path; the FP8 predequant outputs (q_fp8..o_fp8)
-        // are read only by the legacy FP8 prefill path and decode never reads
-        // them (decode attention uses its own weights), so they'd be allocated
-        // at load and never used. Skip them — saves ~260MB and a wasted per-
-        // prefill BF16->FP8 activation conversion. Mirrors transpose_fp8_for_prefill.
-        if crate::layers::ops::cutlass_nvfp4_gemm_enabled() {
-            tracing::info!(
-                "Skipping attention FP8 prefill predequant because ATLAS_CUTLASS_NVFP4_GEMM=1"
-            );
-            return Ok(());
-        }
         let predequant_k = gpu.kernel("w4a16", "predequant_nvfp4_to_fp8")?;
         let h = config.hidden_size;
         let nq = config.num_attention_heads;

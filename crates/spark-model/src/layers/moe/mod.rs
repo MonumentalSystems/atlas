@@ -128,17 +128,6 @@ pub struct MoeLayer {
     gate_ptrs_t: Option<ExpertPtrTable>,
     up_ptrs_t: Option<ExpertPtrTable>,
     down_ptrs_t: Option<ExpertPtrTable>,
-    /// CUTLASS grouped-NVFP4 swizzled SFB weight-scale tables
-    /// (`ATLAS_HOLO_MOE_GROUPED_CUTLASS`). Device `[num_experts]` u64 arrays of
-    /// per-expert SFB pointers, built at load by `build_cutlass_grouped_sfb` from
-    /// the `gate_ptrs_t`/`up_ptrs_t` `[K/16,N]` scales (`pack_weight_sfb` swizzle).
-    /// The grouped kernel reads `gate_ptrs.packed` (`[N,K/2]`) + these SFB + the
-    /// real per-expert `scale2`. `None` => the CUTLASS grouped path is unavailable.
-    gate_sfb_cutlass: Option<DevicePtr>,
-    up_sfb_cutlass: Option<DevicePtr>,
-    down_sfb_cutlass: Option<DevicePtr>,
-    /// Keeps the per-expert SFB buffers + the two pointer arrays alive.
-    _cutlass_sfb_owned: Vec<DevicePtr>,
     /// Lazy down_proj transpose scratch — populated at the start of each
     /// prefill call when the persistent transpose pass couldn't fit
     /// down_proj. Decode keeps using `down_ptrs` (untransposed); prefill
