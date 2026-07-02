@@ -121,17 +121,22 @@ extern "C" __global__ void w8a16_gemv(
     const unsigned int lane = threadIdx.x % threads_per_out;
 
     const unsigned int n = blockIdx.x * N_PER_BLOCK + local_out;
+
+    // Load E4M3 LUT into shared memory (256 entries, 1 KB). ALL 256 threads must
+    // fill their slot (and hit the barrier) BEFORE any early-out: for a partial
+    // last block (N % N_PER_BLOCK != 0) an early `return` here would leave
+    // s_lut[64..255] uninitialized and the surviving output rows would dequant
+    // against a garbage LUT (plus a divergent __syncthreads).
+    __shared__ float s_lut[256];
+    __shared__ float smem[N_PER_BLOCK * 2];
+    s_lut[threadIdx.x] = E4M3_LUT[threadIdx.x];
+    __syncthreads();
+
     if (n >= N) return;
 
     const unsigned int K16 = K / 16;
     const unsigned int k_blocks = (K + FP8_BLOCK - 1) / FP8_BLOCK;  // ceil(K/128)
     const unsigned int n_block = n / FP8_BLOCK;
-
-    // Load E4M3 LUT into shared memory (256 entries, 1 KB)
-    __shared__ float s_lut[256];
-    __shared__ float smem[N_PER_BLOCK * 2];
-    s_lut[threadIdx.x] = E4M3_LUT[threadIdx.x];
-    __syncthreads();
 
     float acc = 0.0f;
 
