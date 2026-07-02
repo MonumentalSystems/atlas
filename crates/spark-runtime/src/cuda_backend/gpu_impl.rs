@@ -257,36 +257,34 @@ impl GpuBackend for AtlasCudaBackend {
         height: usize,
         stream: u64,
     ) -> Result<()> {
-        // One pitched copy (cudaMemcpyDeviceToDevice = 3) on the caller's stream,
-        // replacing a per-row copy_d2d_async loop. cudart is linked (cutlass/
-        // flashinfer use the runtime API); a CUstream handle is a valid
-        // cudaStream_t.
-        unsafe extern "C" {
-            fn cudaMemcpy2DAsync(
-                dst: *mut c_void,
-                dpitch: usize,
-                src: *const c_void,
-                spitch: usize,
-                width: usize,
-                height: usize,
-                kind: i32,
-                stream: u64,
-            ) -> i32;
-        }
-        let status = unsafe {
-            cudaMemcpy2DAsync(
-                dst.0 as *mut c_void,
-                dst_pitch,
-                src.0 as *const c_void,
-                src_pitch,
-                width_bytes,
-                height,
-                3,
-                stream,
-            )
+        // One pitched device-to-device copy on the caller's stream, replacing a
+        // per-row copy_d2d_async loop. Uses the CUDA *driver* API
+        // (cuMemcpy2DAsync_v2) via cudarc: Atlas links driver-only (-lcuda), so
+        // the cudart runtime symbol cudaMemcpy2DAsync is not guaranteed present.
+        use cudarc::driver::sys::{
+            CUDA_MEMCPY2D_st, CUmemorytype, CUresult, CUstream, cuMemcpy2DAsync_v2,
         };
-        if status != 0 {
-            bail!("cudaMemcpy2DAsync failed: status {status}");
+        let desc = CUDA_MEMCPY2D_st {
+            srcXInBytes: 0,
+            srcY: 0,
+            srcMemoryType: CUmemorytype::CU_MEMORYTYPE_DEVICE,
+            srcHost: std::ptr::null(),
+            srcDevice: src.0,
+            srcArray: std::ptr::null_mut(),
+            srcPitch: src_pitch,
+            dstXInBytes: 0,
+            dstY: 0,
+            dstMemoryType: CUmemorytype::CU_MEMORYTYPE_DEVICE,
+            dstHost: std::ptr::null_mut(),
+            dstDevice: dst.0,
+            dstArray: std::ptr::null_mut(),
+            dstPitch: dst_pitch,
+            WidthInBytes: width_bytes,
+            Height: height,
+        };
+        let status = unsafe { cuMemcpy2DAsync_v2(&desc, stream as CUstream) };
+        if status != CUresult::CUDA_SUCCESS {
+            bail!("cuMemcpy2DAsync_v2 failed: {status:?}");
         }
         Ok(())
     }

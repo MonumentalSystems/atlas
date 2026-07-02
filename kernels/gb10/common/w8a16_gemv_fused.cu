@@ -141,19 +141,22 @@ extern "C" __global__ void w8a16_gemv_dual(
     const unsigned int lane = threadIdx.x % threads_per_out;
 
     const unsigned int n = blockIdx.x * N_PER_BLOCK + local_out;
+    // 256-entry E4M3 LUT in shared memory (branchless dequant; smem services
+    // the data-dependent divergent byte indices in parallel vs __constant__
+    // broadcast-cache serialization). The cooperative load + __syncthreads MUST
+    // run for ALL 256 threads BEFORE the `n >= N` early-out: in a partial last
+    // block (N % N_PER_BLOCK != 0) the returning threads would otherwise leave
+    // s_lut[64..255] uninitialized and desync the barrier for the survivors.
+    __shared__ float s_lut[256];
+    __shared__ float smem[N_PER_BLOCK * 2];
+    s_lut[threadIdx.x] = E4M3_LUT_FUSED_W8[threadIdx.x];
+    __syncthreads();
+
     if (n >= N) return;
 
     const unsigned int K16 = K / 16;
     const unsigned int k_blocks = (K + FP8_BLOCK - 1) / FP8_BLOCK;  // ceil(K/128)
     const unsigned int n_block = n / FP8_BLOCK;
-
-    // 256-entry E4M3 LUT in shared memory (branchless dequant; smem services
-    // the data-dependent divergent byte indices in parallel vs __constant__
-    // broadcast-cache serialization).
-    __shared__ float s_lut[256];
-    __shared__ float smem[N_PER_BLOCK * 2];
-    s_lut[threadIdx.x] = E4M3_LUT_FUSED_W8[threadIdx.x];
-    __syncthreads();
 
     float acc = 0.0f;
 
@@ -260,16 +263,20 @@ extern "C" __global__ void w8a16_gemv_silu_input(
     const unsigned int lane = threadIdx.x % threads_per_out;
 
     const unsigned int n = blockIdx.x * N_PER_BLOCK + local_out;
+    // Cooperative 256-entry E4M3 LUT load + __syncthreads BEFORE the n >= N
+    // early-out (see w8a16_gemv_dual): a partial last block (N % N_PER_BLOCK != 0)
+    // must not let returning threads skip the barrier / leave s_lut[64..255]
+    // uninitialized for the surviving output-row group.
+    __shared__ float s_lut[256];
+    __shared__ float smem[N_PER_BLOCK * 2];
+    s_lut[threadIdx.x] = E4M3_LUT_FUSED_W8[threadIdx.x];
+    __syncthreads();
+
     if (n >= N) return;
 
     const unsigned int K16 = K / 16;
     const unsigned int k_blocks = (K + FP8_BLOCK - 1) / FP8_BLOCK;  // ceil(K/128)
     const unsigned int n_block = n / FP8_BLOCK;
-
-    __shared__ float s_lut[256];
-    __shared__ float smem[N_PER_BLOCK * 2];
-    s_lut[threadIdx.x] = E4M3_LUT_FUSED_W8[threadIdx.x];
-    __syncthreads();
 
     float acc = 0.0f;
 
