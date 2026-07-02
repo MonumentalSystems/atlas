@@ -75,8 +75,12 @@ __device__ __forceinline__ uint8_t compute_e8m0_scale(float amax) {
 }
 
 
-static __global__ void quantize_mmq_nvfp4(
-        const float * __restrict__ x, const int32_t * __restrict__ ids, void * __restrict__ vy,
+// ATLAS vendoring: body extracted to a __device__ worker so an extern-C __global__ entry
+// (nvfp4_mmq.cu) can reuse it with bf16-input activations; the thin __global__ below
+// preserves llama's host launcher. (Same pattern as quantize_mmq_q8_1_worker above.)
+template <typename src_t = float>
+static __device__ __forceinline__ void quantize_mmq_nvfp4_worker(
+        const src_t * __restrict__ x, const int32_t * __restrict__ ids, void * __restrict__ vy,
         const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
         const int64_t ne0, const int64_t ne1, const int64_t ne2) {
 #if defined(BLACKWELL_MMA_AVAILABLE)
@@ -109,7 +113,7 @@ static __global__ void quantize_mmq_nvfp4(
     for (int k = 0; k < QK_NVFP4_SUB; k++) {
         const int64_t i00 = i0_base + k;
         if (i00 < ne00) {
-            const float v = x[base_idx + i00];
+            const float v = static_cast<float>(x[base_idx + i00]);
             vals_raw[k] = v;
             amax_raw = fmaxf(amax_raw, fabsf(v));
         } else {
@@ -168,6 +172,13 @@ static __global__ void quantize_mmq_nvfp4(
     NO_DEVICE_CODE; // This is for Blackwell NVFP4 activations only.
 #endif // defined(BLACKWELL_MMA_AVAILABLE)
 
+}
+
+static __global__ void quantize_mmq_nvfp4(
+        const float * __restrict__ x, const int32_t * __restrict__ ids, void * __restrict__ vy,
+        const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
+        const int64_t ne0, const int64_t ne1, const int64_t ne2) {
+    quantize_mmq_nvfp4_worker<float>(x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2);
 }
 
 // quantize values in the format mxfp4 is stored which is interleaved nibbles
