@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! cuBLAS projection routers + their cached weight-prep helpers.
+//! cuBLAS / CUTLASS projection routers + their cached weight-prep helpers.
 //! Extracted from `dispatch_helpers.rs` during the ≤500-line split. Re-exported
 //! at `crate::layers::ops::*` via `ops.rs`.
 
@@ -211,6 +211,36 @@ fn dequant_fp8_bf16_cached(
     Ok(out.0)
 }
 
+fn dequant_fp8_bf16_uncached(
+    gpu: &dyn spark_runtime::gpu::GpuBackend,
+    fp8w: &crate::weight_map::Fp8Weight,
+    stream: u64,
+) -> anyhow::Result<spark_runtime::gpu::DevicePtr> {
+    use spark_runtime::kernel_args::{KernelLaunch, div_ceil};
+    let (n, kk) = (fp8w.n, fp8w.k);
+    let out = gpu.alloc(n as usize * kk as usize * 2)?;
+    let block = 128u32;
+    let sk = kk / block;
+    let kernel = gpu.kernel(
+        "dequant_fp8_blockscaled_bf16",
+        "dequant_fp8_blockscaled_bf16",
+    )?;
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(kk, 64), div_ceil(n, 4), 1])
+        .block([64, 4, 1])
+        .arg_ptr(fp8w.weight)
+        .arg_ptr(fp8w.row_scale)
+        .arg_ptr(out)
+        .arg_u32(n)
+        .arg_u32(kk)
+        .arg_u32(block)
+        .arg_u32(block)
+        .arg_u32(sk)
+        .arg_u32(1)
+        .launch(stream)?;
+    Ok(out)
+}
+
 /// Route a projection `out[M,N] = act[M,K] @ weightᵀ` through cuBLASLt BF16.
 /// The FP8 weight is dequantized to BF16 once (cached); W16A16 here is strictly
 /// more accurate than the blockscaled W8A8 path it replaces.
@@ -227,4 +257,127 @@ pub fn cublas_bf16_proj(
 ) -> anyhow::Result<()> {
     let w_bf16 = dequant_fp8_bf16_cached(gpu, fp8w, stream)?;
     spark_runtime::cublaslt::bf16_gemm_act_weight_t(act.0, w_bf16, out.0, m, n, k, stream)
+}
+
+/// Route a projection `out[M,N] = act[M,K] @ weightᵀ` through CUTLASS BF16.
+/// This is the M0 de-risk path for replacing Atlas/cuBLAS GEMMs with
+/// CUTLASS-backed kernels on GB10; keep it behind `ATLAS_CUTLASS_GEMM=1`.
+#[allow(clippy::too_many_arguments)]
+pub fn cutlass_bf16_proj(
+    gpu: &dyn spark_runtime::gpu::GpuBackend,
+    act: spark_runtime::gpu::DevicePtr,
+    fp8w: &crate::weight_map::Fp8Weight,
+    out: spark_runtime::gpu::DevicePtr,
+    m: u32,
+    n: u32,
+    k: u32,
+    stream: u64,
+) -> anyhow::Result<()> {
+    let w_bf16 = dequant_fp8_bf16_cached(gpu, fp8w, stream)?;
+    spark_runtime::cutlass::bf16_gemm_act_weight_t(act.0, w_bf16, out.0, m, n, k, stream)
+}
+
+/// Route a projection `out[M,N] = act[M,K] @ weightᵀ` through native CUTLASS
+/// NVFP4. The activation is packed to CUTLASS NVFP4 inside the runtime wrapper.
+/// `weight_t` must be Atlas's transposed NVFP4 layout `[K/2,N]` plus
+/// `[K/16,N]` scales, as produced by `QuantizedWeight::transpose_for_gemm`.
+#[allow(clippy::too_many_arguments)]
+/// Transpose a native NVFP4 checkpoint weight from Atlas `[K/2,N]` into the
+/// CUTLASS `[N,K/2]` byte layout the GEMM consumes, caching the result by
+/// source weight ptr. Without this the ColumnMajor B operand is read
+/// transposed and the GEMM produces garbage (cos≈0 vs reference).
+fn cutlass_nvfp4_weight_transposed_cached(
+    gpu: &dyn spark_runtime::gpu::GpuBackend,
+    weight_t: &crate::weight_map::QuantizedWeight,
+    n: u32,
+    k: u32,
+    stream: u64,
+) -> anyhow::Result<u64> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<HashMap<u64, u64>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(&p) = cache.lock().unwrap().get(&weight_t.weight.0) {
+        return Ok(p);
+    }
+    let dst = gpu.alloc((n as usize) * (k as usize) / 2)?;
+    spark_runtime::cutlass::transpose_nvfp4_packed_kton(weight_t.weight.0, dst.0, n, k, stream)?;
+    gpu.synchronize(stream)?;
+    cache.lock().unwrap().insert(weight_t.weight.0, dst.0);
+    Ok(dst.0)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn cutlass_nvfp4_proj(
+    gpu: &dyn spark_runtime::gpu::GpuBackend,
+    act: spark_runtime::gpu::DevicePtr,
+    weight_t: &crate::weight_map::QuantizedWeight,
+    out: spark_runtime::gpu::DevicePtr,
+    m: u32,
+    n: u32,
+    k: u32,
+    stream: u64,
+) -> anyhow::Result<()> {
+    let packed = cutlass_nvfp4_weight_transposed_cached(gpu, weight_t, n, k, stream)?;
+    spark_runtime::cutlass::nvfp4_gemm_bf16_act_weight_t(
+        act.0,
+        packed,
+        weight_t.weight_scale.0,
+        weight_t.weight_scale_2,
+        out.0,
+        m,
+        n,
+        k,
+        stream,
+    )
+}
+
+fn cutlass_nvfp4_weight_from_fp8_cached(
+    gpu: &dyn spark_runtime::gpu::GpuBackend,
+    fp8w: &crate::weight_map::Fp8Weight,
+    stream: u64,
+) -> anyhow::Result<(u64, u64)> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<HashMap<u64, (u64, u64)>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(&p) = cache.lock().unwrap().get(&fp8w.weight.0) {
+        return Ok(p);
+    }
+
+    let n = fp8w.n as usize;
+    let k = fp8w.k as usize;
+    let w_bf16 = dequant_fp8_bf16_uncached(gpu, fp8w, stream)?;
+    let packed_t = gpu.alloc(n * k / 2)?;
+    let scale_t = gpu.alloc(n * k / 16)?;
+    spark_runtime::cutlass::pack_bf16_weight_to_nvfp4_t(
+        w_bf16.0, packed_t.0, scale_t.0, fp8w.n, fp8w.k, stream,
+    )?;
+    gpu.synchronize(stream)?;
+    gpu.free(w_bf16)?;
+    cache
+        .lock()
+        .unwrap()
+        .insert(fp8w.weight.0, (packed_t.0, scale_t.0));
+    Ok((packed_t.0, scale_t.0))
+}
+
+/// Native CUTLASS NVFP4 projection for FP8 checkpoint weights. The FP8 weight
+/// is dequantized to BF16 using the existing cache, then packed once into
+/// Atlas-transposed NVFP4 data/scales and reused for future calls.
+#[allow(clippy::too_many_arguments)]
+pub fn cutlass_nvfp4_proj_from_fp8(
+    gpu: &dyn spark_runtime::gpu::GpuBackend,
+    act: spark_runtime::gpu::DevicePtr,
+    fp8w: &crate::weight_map::Fp8Weight,
+    out: spark_runtime::gpu::DevicePtr,
+    m: u32,
+    n: u32,
+    k: u32,
+    stream: u64,
+) -> anyhow::Result<()> {
+    let (packed_t, scale_t) = cutlass_nvfp4_weight_from_fp8_cached(gpu, fp8w, stream)?;
+    spark_runtime::cutlass::nvfp4_gemm_bf16_act_weight_t(
+        act.0, packed_t, scale_t, 1.0, out.0, m, n, k, stream,
+    )
 }

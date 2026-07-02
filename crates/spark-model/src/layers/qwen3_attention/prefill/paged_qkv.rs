@@ -102,7 +102,7 @@ impl Qwen3AttentionLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
-        let (fp8w_t, weight_opt, fp8, nvfp4_t, dense, _label) = match proj {
+        let (fp8w_t, weight_opt, fp8, nvfp4_t, dense, label) = match proj {
             Proj::Q => (
                 self.q_fp8w_t.as_ref(),
                 self.q_weight.as_ref(),
@@ -133,7 +133,17 @@ impl Qwen3AttentionLayer {
         // W8A8 + FP32 epilogue: requires NON-transposed FP8 weights with
         // block scales (matches the kernel signature). The attn layer stores
         // those via set_fp8_weights — accessible via weight_opt.as_fp8().
-        if force_w8a8
+        if ops::cutlass_nvfp4_attn_qkv_enabled(label)
+            && let Some(nvfp4_t) = nvfp4_t
+        {
+            ops::log_cutlass_nvfp4_route(label, n, out_dim, h);
+            ops::cutlass_nvfp4_proj(ctx.gpu, normed, nvfp4_t, out, n, out_dim, h, stream)?;
+        } else if ops::cutlass_nvfp4_attn_qkv_enabled(label)
+            && let Some(fp8w) = weight_opt.and_then(|w| w.as_fp8())
+        {
+            ops::log_cutlass_nvfp4_route(label, n, out_dim, h);
+            ops::cutlass_nvfp4_proj_from_fp8(ctx.gpu, normed, fp8w, out, n, out_dim, h, stream)?;
+        } else if force_w8a8
             && let Some(fp8w) = weight_opt.and_then(|w| w.as_fp8())
             && self.per_token_group_quant_fp8_k.0 != 0
             && self.fp8_gemm_t_blockscaled_k.0 != 0

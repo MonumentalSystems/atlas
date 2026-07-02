@@ -10,6 +10,16 @@
 
 use super::*;
 
+/// Whether the single-launch CUTLASS grouped NVFP4 gate_up path is enabled
+/// (`ATLAS_HOLO_MOE_GROUPED_CUTLASS=1`). Off by default; falls back to the
+/// hand-rolled fused FP4/FP8 grouped kernels when unset.
+fn grouped_cutlass_gate_up_enabled() -> bool {
+    std::env::var("ATLAS_HOLO_MOE_GROUPED_CUTLASS")
+        .ok()
+        .as_deref()
+        == Some("1")
+}
+
 impl MoeLayer {
     /// Routed-expert grouped-GEMM path: upper-bound grid sizing → grouped
     /// gate+up GEMM → SiLU+mul → grouped down GEMM.
@@ -116,7 +126,40 @@ impl MoeLayer {
         }
         if max_m_tiles > 0 {
             if let (Some(gp), Some(up)) = (&self.gate_ptrs_t, &self.up_ptrs_t) {
-                if self.gateup_fp4 && self.moe_fused_gate_up_t_k64_fp4.0 != 0 {
+                if grouped_cutlass_gate_up_enabled()
+                    && self.gate_sfb_cutlass.is_some()
+                    && self.up_sfb_cutlass.is_some()
+                {
+                    // ── SINGLE-LAUNCH CUTLASS grouped NVFP4 gate_up
+                    // (ATLAS_HOLO_MOE_GROUPED_CUTLASS=1) ── one
+                    // GemmUniversalMode::kGrouped launch over all active experts in
+                    // place of the per-expert collective loop. Weights: the decode
+                    // `gate_ptrs`/`up_ptrs` packed `[N,K/2]` (CUTLASS ColumnMajor B) +
+                    // the load-built swizzled SFB tables (`gate_sfb_cutlass`) + the real
+                    // per-expert scale2 (epilogue alpha). The token gather is FUSED into
+                    // the kernel's per-group A-pack (lever 2): pass token-major
+                    // expert_input + sorted_token_ids directly, no separate permute pass.
+                    // Writes C_gate/C_up in the sorted layout so silu+down+unpermute are
+                    // unchanged.
+                    ops::moe_grouped_gate_up_cutlass(
+                        ctx.gpu,
+                        expert_input,
+                        sorted_token_ids,
+                        self.gate_ptrs.packed_ptrs,
+                        self.gate_sfb_cutlass.expect("gate sfb checked above"),
+                        self.gate_ptrs.scale2_vals,
+                        self.up_ptrs.packed_ptrs,
+                        self.up_sfb_cutlass.expect("up sfb checked above"),
+                        self.up_ptrs.scale2_vals,
+                        expert_gate_out,
+                        expert_up_out,
+                        expert_offsets,
+                        num_experts as usize,
+                        inter,
+                        h,
+                        stream,
+                    )?;
+                } else if self.gateup_fp4 && self.moe_fused_gate_up_t_k64_fp4.0 != 0 {
                     // ── FUSED FP4 gate_up (ATLAS_HOLO_MOE_GATEUP_FP4) ──
                     // Block-scaled FP4 over the SHARED FAST_MOE=full [K/2,N] tables
                     // (gate_ptrs_t/up_ptrs_t — the SAME bytes the FP8 fused path
@@ -256,7 +299,30 @@ impl MoeLayer {
             // FP8/w4a16 down kernels, so unpermute downstream is unchanged.
             // Compounds with the FP4 gate_up path to run the whole FFN at FP4.
             if let Some(dp) = &self.down_ptrs_t {
-                if self.down_fp4 && self.moe_down_t_k64_fp4.0 != 0 {
+                if grouped_cutlass_gate_up_enabled()
+                    && self.down_sfb_cutlass.is_some()
+                    && std::env::var("ATLAS_HOLO_MOE_GROUPED_DOWN").ok().as_deref() == Some("1")
+                {
+                    // ── CUTLASS grouped NVFP4 down (ATLAS_HOLO_MOE_GROUPED_CUTLASS
+                    //    + ATLAS_HOLO_MOE_GROUPED_DOWN) ──
+                    // A = post-SiLU expert_gate_out, already expert-contiguous (the grouped
+                    // gate_up wrote it sorted), so NO gather. Weights = decode down_ptrs
+                    // packed [N=hidden,K/2] + load-built swizzled SFB + real scale2. Writes
+                    // expert_down_out in the sorted layout (unpermute downstream unchanged).
+                    ops::moe_grouped_down_cutlass(
+                        ctx.gpu,
+                        expert_gate_out,
+                        self.down_ptrs.packed_ptrs,
+                        self.down_sfb_cutlass.expect("down sfb checked above"),
+                        self.down_ptrs.scale2_vals,
+                        expert_down_out,
+                        expert_offsets,
+                        num_experts as usize,
+                        h,
+                        inter,
+                        stream,
+                    )?;
+                } else if self.down_fp4 && self.moe_down_t_k64_fp4.0 != 0 {
                     // ── FP4 down (ATLAS_HOLO_MOE_DOWN_FP4) over the SHARED down_ptrs_t
                     // [K/2,N] table (real per-expert scale2; coalesced K-major load +
                     // on-chip DN4_TRANSPOSE). Same sorted layout + null

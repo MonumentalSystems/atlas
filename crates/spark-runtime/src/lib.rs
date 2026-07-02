@@ -13,8 +13,18 @@ pub mod cublaslt;
 pub mod cublaslt;
 #[cfg(feature = "cuda")]
 pub mod cuda_backend;
+#[cfg(feature = "cuda")]
+pub mod cutlass;
+#[cfg(not(feature = "cuda"))]
+#[path = "cutlass_metal_stub.rs"]
+pub mod cutlass;
 #[cfg(unix)]
 pub mod fast_weights;
+#[cfg(feature = "cuda")]
+pub mod flashinfer;
+#[cfg(not(feature = "cuda"))]
+#[path = "flashinfer_metal_stub.rs"]
+pub mod flashinfer;
 pub mod gpu;
 pub mod kernel_args;
 pub mod kernel_audit;

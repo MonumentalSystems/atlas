@@ -50,7 +50,48 @@ impl Qwen3SsmLayer {
         // ceiling on GB10 (32 vs 85 TFLOPS bf16 on this shape). Dequant the FP8
         // weight to BF16 once (cached), then route the projection through
         // cuBLASLt. W16A16 here is strictly more accurate than the W8A8 path.
-        if ops::cublas_fp8_enabled()
+        if ops::cutlass_nvfp4_qkvz_enabled()
+            && let Some(ref nvfp4_t) = self.qkvz_nvfp4_t
+        {
+            ops::log_cutlass_nvfp4_route("ssm_qkvz_nvfp4", k, qkvz_size as u32, h as u32);
+            ops::cutlass_nvfp4_proj(
+                ctx.gpu,
+                normed,
+                nvfp4_t,
+                proj_dst,
+                k,
+                qkvz_size as u32,
+                h as u32,
+                stream,
+            )?;
+        } else if ops::cutlass_nvfp4_qkvz_enabled()
+            && let Some(ref fp8w) = self.qkvz_fp8w
+        {
+            ops::log_cutlass_nvfp4_route("ssm_qkvz_fp8pack", k, qkvz_size as u32, h as u32);
+            ops::cutlass_nvfp4_proj_from_fp8(
+                ctx.gpu,
+                normed,
+                fp8w,
+                proj_dst,
+                k,
+                qkvz_size as u32,
+                h as u32,
+                stream,
+            )?;
+        } else if ops::cutlass_gemm_enabled()
+            && let Some(ref fp8w) = self.qkvz_fp8w
+        {
+            ops::cutlass_bf16_proj(
+                ctx.gpu,
+                normed,
+                fp8w,
+                proj_dst,
+                k,
+                qkvz_size as u32,
+                h as u32,
+                stream,
+            )?;
+        } else if ops::cublas_fp8_enabled()
             && let Some(ref fp8w) = self.qkvz_fp8w
         {
             ops::cublas_fp8_rowwise_proj(
