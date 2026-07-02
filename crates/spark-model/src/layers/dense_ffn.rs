@@ -413,7 +413,7 @@ impl DenseFfnLayer {
             && self.nvfp4_repack_k.0 != 0
             && self.nvfp4_silu_scaled_k.0 != 0
             && matches!(self.activation, FfnActivation::SiLU)
-            && std::env::var_os("ATLAS_FFN_NVFP4_MMQ").is_some();
+            && std::env::var_os("ATLAS_NO_FFN_NVFP4_MMQ").is_none();
         if !active {
             return Ok(());
         }
@@ -433,7 +433,7 @@ impl DenseFfnLayer {
             h,
             stream,
         )?;
-        let down_mmq = std::env::var_os("ATLAS_FFN_NVFP4_MMQ_DOWN").is_some();
+        let down_mmq = std::env::var_os("ATLAS_NO_FFN_NVFP4_MMQ_DOWN").is_none();
         if down_mmq {
             self.ensure_nvfp4_mmq_weight(
                 &self.fp4mmq_down,
@@ -1135,7 +1135,7 @@ impl DenseFfnLayer {
             && self.nvfp4_quant_act_k.0 != 0
             && self.nvfp4_silu_scaled_k.0 != 0
             && matches!(self.activation, FfnActivation::SiLU)
-            && std::env::var_os("ATLAS_FFN_NVFP4_MMQ").is_some();
+            && std::env::var_os("ATLAS_NO_FFN_NVFP4_MMQ").is_none();
         if fp4mmq_prefill {
             static FP4MMQ_LOG: std::sync::Once = std::sync::Once::new();
             FP4MMQ_LOG.call_once(|| {
@@ -1144,14 +1144,14 @@ impl DenseFfnLayer {
                 );
             });
         }
-        // Down-projection A/B extension (ATLAS_FFN_NVFP4_MMQ_DOWN=1): route down through
+        // Down-projection MMQ arm (DEFAULT ON; kill-switch ATLAS_NO_FFN_NVFP4_MMQ_DOWN=1): route down through
         // the same MMQ arm (t_m128 runs the narrow-N down at only ~34 TFLOP/s in-model).
         // Accuracy note: down W4A4 cosine 0.9961 (random) — better than the previously
         // coherence-validated all-W4A4 config (0.991) — but still the heavy-tailed
         // projection, so it stays a SEPARATE opt-in gate.
         let fp4mmq_down = fp4mmq_prefill
             && self.nvfp4_scale_k.0 != 0
-            && std::env::var_os("ATLAS_FFN_NVFP4_MMQ_DOWN").is_some();
+            && std::env::var_os("ATLAS_NO_FFN_NVFP4_MMQ_DOWN").is_none();
         // HYBRID: route the accuracy-critical down_proj OFF Q4_K onto the near-lossless faith2
         // NVFP4 path (W4A8 requant, cos 0.99998). down=SiLU(gate)*up is heavy-tailed; Q4_K
         // superblock scaling clips it (BFCL `multiple` -4.0%; llama promotes only down→Q6_K for
