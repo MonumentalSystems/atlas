@@ -13,7 +13,7 @@ use spark_runtime::weights::{WeightDtype, WeightStore};
 use super::super::{ModelWeightLoader, QuantFormat, WeightFormat};
 use crate::layer::TransformerLayer;
 use crate::layers::{FfnComponent, MoeLayer, Qwen3AttentionLayer};
-use crate::tp_shard::{TpShardKind, load_qkvo_tp, shard_fp8_block_scaled};
+use crate::tp_shard::{TpShardKind, load_qkvo_tp, shard_dense_weight, shard_fp8_block_scaled};
 use crate::weight_map::{
     AttentionWeights, DenseWeight, Nvfp4Variant, QuantizedWeight, dense_auto, detect_nvfp4_variant,
     load_fp8_block_scaled_as_fp8weight, load_kv_scales, load_moe_qwen35,
@@ -543,18 +543,20 @@ pub(super) fn load_layers(
                     && proj_is_native_fp8(store, &format!("{lp}.self_attn.q_proj")))
                     || (modelopt_mixed_precision && !native_modelopt_attn && !fp4_proj_decode) =>
             {
-                // ── BF16-dequant attention (diagnostic, TP=1) ──
-                // Dequant FP8 Q/K/V/O → BF16 on GPU, store as dense weights,
-                // and leave q/k/v/o quant-weights None so both prefill and
-                // decode fall through to the dense GEMM/GEMV paths.
-                if config.tp_world_size.max(1) != 1 {
-                    anyhow::bail!(
-                        "BF16-dequant attention supports TP=1 only (got tp={})",
-                        config.tp_world_size,
-                    );
-                }
+                // ── BF16-dequant attention (known-good quality; TP-aware) ──
+                // Dequant FP8 Q/K/V/O → BF16 on GPU, then TP-shard the dense
+                // weights (Q/K/V ColumnParallel, O RowParallel) exactly like
+                // the native-FP8 arm below, and store as dense weights so both
+                // prefill and decode fall through to the dense GEMM/GEMV paths.
+                // The o_proj all-reduce fires in the attention forward under
+                // tp_world_size>1 (loading is all that changes here).
                 let p = format!("{lp}.self_attn");
-                tracing::info!("Layer {i}: dequanting attention Q/K/V/O FP8→BF16 (dense)");
+                let tp_rank = config.tp_rank;
+                let tp_size = config.tp_world_size.max(1);
+                tracing::info!(
+                    "Layer {i}: dequanting attention Q/K/V/O FP8→BF16 (dense, tp={tp_size})"
+                );
+                // Load one full-size projection as BF16 dense (pre-shard).
                 let load_fp8_dense = |name: &str| -> Result<DenseWeight> {
                     if modelopt_mixed_precision {
                         dense_auto(store, &format!("{p}.{name}.weight"), gpu)
@@ -566,10 +568,33 @@ pub(super) fn load_layers(
                         )
                     }
                 };
-                let q_bf16 = load_fp8_dense("q_proj")?;
-                let k_bf16 = load_fp8_dense("k_proj")?;
-                let v_bf16 = load_fp8_dense("v_proj")?;
-                let o_bf16 = load_fp8_dense("o_proj")?;
+                // Mirror the native-FP8 arm's `load_qkvo_tp` sequencing: load
+                // the full BF16 dense weight, then slice the local rank's shard.
+                // `TpAttentionDims::from_config` (inside `load_qkvo_tp`) supplies
+                // the pre-shard (full_n, full_k). At tp==1 `shard_dense_weight`
+                // returns the source untouched → byte-identical, no free.
+                let load_bf16_proj = |name: &str,
+                                      full_n: usize,
+                                      full_k: usize,
+                                      kind: TpShardKind|
+                 -> Result<DenseWeight> {
+                    let src = load_fp8_dense(name)?;
+                    if tp_size == 1 {
+                        return Ok(src);
+                    }
+                    let (sharded, local_n, local_k) =
+                        shard_dense_weight(&src, full_n, full_k, kind, tp_rank, tp_size, gpu)?;
+                    gpu.free(src.weight)?;
+                    tracing::debug!(
+                        target: "spark_model::tp_shard",
+                        name, full_n, full_k, local_n, local_k, tp_rank, tp_size,
+                        ?kind,
+                        "BF16-dequant attention proj sharded"
+                    );
+                    Ok(sharded)
+                };
+                let [q_bf16, k_bf16, v_bf16, o_bf16] =
+                    load_qkvo_tp(config, load_bf16_proj)?;
 
                 let (k_scale, v_scale) = load_kv_scales(store, &p, gpu);
                 let dummy_qw = QuantizedWeight::null();
