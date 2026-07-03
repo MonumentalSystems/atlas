@@ -99,7 +99,9 @@ impl TransformerModel {
             let bs = self.kv_cache.lock().block_size();
             // One block below the last block boundary strictly under `total`.
             let cut = ((total.saturating_sub(1) / bs) * bs).saturating_sub(bs);
-            let ep_active = self.comm.is_some() && self.config.ep_world_size > 1;
+            // Any multi-rank world (EP or pure TP): chunk sequences must be
+            // deterministic on (tokens, config) across ranks (bug #33).
+            let ep_active = self.multi_rank_protocol_active();
             if cut > chunk_start
                 && cut < total
                 && (ep_active || self.prefix_cache.peek_matched_tokens(tokens, bs) > 0)
@@ -127,9 +129,11 @@ impl TransformerModel {
             );
         }
 
-        // Use the caller-provided stream for compute-copy overlap,
-        // unless EP is active (NCCL requires the default stream).
-        let stream = if self.comm.is_some() && self.config.ep_world_size > 1 {
+        // Use the caller-provided stream for compute-copy overlap, unless
+        // a multi-rank world is active (EP or pure TP — NCCL collectives
+        // must stay stream-ordered with the cmd broadcasts, which run on
+        // the default stream).
+        let stream = if self.multi_rank_protocol_active() {
             self.gpu.default_stream()
         } else {
             stream
