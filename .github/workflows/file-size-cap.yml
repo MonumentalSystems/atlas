@@ -215,6 +215,22 @@ jobs:
             # max-batch-size + FP8-KV flags. Marginally over; back under 500 in
             # the follow-on dense-FP8 PR. Clean split tracked as follow-up.
             "crates/spark-server/src/cli/serve_args.rs"
+            # ── PR #229 (perf/qwen36-27b-prefill-nvfp4) carry-overs ──
+            # Three files inherited over-cap from main unchanged (grew on
+            # main between this branch's base and its main-merge; would fail
+            # on any fresh PR): 632 / 521 / 533 LoC. Clean splits tracked
+            # as follow-up.
+            "crates/spark-server/src/scheduler/sample_step.rs"
+            "crates/spark-server/src/tool_parser/tests/group_g_parallel.rs"
+            "crates/spark-server/src/api/chat_stream/tool_handlers.rs"
+            # 572 LoC — SSM batched-decode dispatcher grew with the
+            # native-FP8 NULL-QKVZ/out_proj dispatch fix (K=2/K=3 MTP-verify
+            # would deref a NULL QuantizedWeight on FP8-only builds). Single
+            # impl block, launch-order-critical like the qwen3_attention
+            # decode dispatchers above; conv/GDN halves were already
+            # extracted to trait_decode_batched_conv_gdn.rs. Clean split
+            # tracked as follow-up.
+            "crates/spark-model/src/layers/qwen3_ssm/trait_decode_batched.rs"
           )
 
           violations=0

@@ -816,7 +816,15 @@ impl DenseFfnLayer {
             && self.w4a16_gemv.0 != 0
             && std::env::var_os("ATLAS_NO_DECODE_SPLIT_SILU").is_none();
         if split_silu {
-            ops::silu_mul(ctx.gpu, self.act_mul, gate_out, up_out, gate_out, inter, stream)?;
+            ops::silu_mul(
+                ctx.gpu,
+                self.act_mul,
+                gate_out,
+                up_out,
+                gate_out,
+                inter,
+                stream,
+            )?;
             ops::w4a16_gemv(
                 ctx.gpu,
                 self.w4a16_gemv,

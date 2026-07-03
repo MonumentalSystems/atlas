@@ -525,9 +525,10 @@ fn test_parse_deepseek_v4_config() {
     assert_eq!(caps.attention_type, crate::capabilities::AttentionType::Mla);
 }
 
-#[test]
-fn test_parse_holo31_vlm_config() {
-    let json = r#"{
+// Shared fixture: the Holo-3.1-35B config, which is byte-for-byte the
+// Qwen3.6-35B-A3B config MINUS the MTP head (Hcompany strips it). The
+// genuine Qwen3.6 release is this fixture PLUS mtp_num_hidden_layers=1.
+const HOLO31_VLM_CONFIG: &str = r#"{
         "model_type": "qwen3_5_moe",
         "image_token_id": 248056,
         "vision_start_token_id": 248053,
@@ -583,7 +584,10 @@ fn test_parse_holo31_vlm_config() {
             "temporal_patch_size": 2
         }
     }"#;
-    let cfg = parse_config(json).unwrap();
+
+#[test]
+fn test_parse_holo31_vlm_config() {
+    let cfg = parse_config(HOLO31_VLM_CONFIG).unwrap();
     assert_eq!(cfg.model_type, "holo3_1_moe");
     assert_eq!(cfg.hidden_size, 2048);
     assert_eq!(cfg.num_experts, 256);
@@ -598,4 +602,23 @@ fn test_parse_holo31_vlm_config() {
     assert_eq!(vision.out_hidden_size, 2048);
     assert!(vision.deepstack_visual_indexes.is_empty());
     assert_eq!(vision.image_pad_token_id, 248056);
+}
+
+// Regression: the FLAGSHIP Qwen/Qwen3.6-35B-A3B-FP8 checkpoint carries the
+// SAME vision tower + image_token_id 248056 as Holo-3.1 but ships an MTP
+// head (mtp_num_hidden_layers=1). It must stay qwen3_6_moe — the Holo
+// discriminator misclassifying it broke kernel-target resolution
+// (2026-07-02, webserver_ok flagship gate).
+#[test]
+fn test_qwen36_35b_with_mtp_is_not_holo() {
+    let json = HOLO31_VLM_CONFIG.replace(
+        "\"model_type\": \"qwen3_5_moe_text\",",
+        "\"model_type\": \"qwen3_5_moe_text\",\n            \"mtp_num_hidden_layers\": 1,",
+    );
+    let cfg = parse_config(&json).unwrap();
+    assert_eq!(cfg.model_type, "qwen3_6_moe");
+    assert_eq!(cfg.mtp_num_hidden_layers, 1);
+    // Vision tower still parses — the flagship ships a ViT even though
+    // text-only serving keeps H/W position IDs at zero.
+    assert!(cfg.vision.is_some());
 }
