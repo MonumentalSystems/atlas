@@ -804,6 +804,31 @@ impl DenseFfnLayer {
         }
 
         let output = ctx.buffers.moe_output();
+        // Split SiLU+down (DEFAULT; kill-switch ATLAS_NO_DECODE_SPLIT_SILU): the fused
+        // silu_input kernel recomputes the SiLU transcendentals per OUTPUT ROW (N/4
+        // blocks × redundant __expf) and measures COMPUTE-bound — ncu: SM 57% vs
+        // memory 23%, 186 GB/s vs the dual GEMV's 266. Staging silu(gate)*up once
+        // (one elementwise launch, CUDA graphs amortize it) lets the down GEMV run
+        // memory-bound like the dual. Also aligns decode with the prefill SiLU
+        // numerics (swiglu clamp), which the fused kernel lacked.
+        let split_silu = self.activation == FfnActivation::SiLU
+            && self.act_mul.0 != 0
+            && self.w4a16_gemv.0 != 0
+            && std::env::var_os("ATLAS_NO_DECODE_SPLIT_SILU").is_none();
+        if split_silu {
+            ops::silu_mul(ctx.gpu, self.act_mul, gate_out, up_out, gate_out, inter, stream)?;
+            ops::w4a16_gemv(
+                ctx.gpu,
+                self.w4a16_gemv,
+                gate_out,
+                &self.weights.down_proj,
+                output,
+                h,
+                inter,
+                stream,
+            )?;
+            return Ok(output);
+        }
         match self.activation {
             FfnActivation::SiLU => {
                 // Fused SiLU(gate)*up + down_proj: [1, inter] → [1, H]
