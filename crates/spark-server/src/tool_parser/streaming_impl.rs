@@ -344,7 +344,17 @@ impl StreamingToolDetector {
         // one or dispatches the wrong one with empty args. Mirror the
         // in-stream close path: emit ToolCallDelta + ToolCallEnd against
         // the already-streamed header, not a full ToolCall.
-        if was_inside_tag && let Some(tc) = parse_one_call(text.trim(), self.call_counter) {
+        // #192 containment (parity with `parse_tool_calls`): this buffer has NO
+        // `</tool_call>` close, so an unterminated trailing `<parameter=…>`
+        // value is unbounded — cut at the last complete `</parameter>` (else
+        // drop the param section) before salvaging, so drifted tail garbage
+        // is never swallowed into an argument string.
+        if was_inside_tag
+            && let Some(tc) = parse_one_call(
+                contain_unterminated_call_tail(text.trim()),
+                self.call_counter,
+            )
+        {
             let idx = self.call_counter as usize;
             if self.current_tc_name.is_some() {
                 // Live path: if we already streamed fragments, emit only the
@@ -436,6 +446,18 @@ impl StreamingToolDetector {
 
     pub fn has_tool_calls(&self) -> bool {
         self.call_counter > 0
+    }
+
+    /// True while the detector is between a `<tool_call>` opener and its
+    /// matching close — i.e. accumulating a tool-call body. Callers use this
+    /// to suppress content-level scrubbing (e.g. the bare role-literal strip
+    /// in `handle_token`) that would otherwise eat a legitimate name/argument
+    /// fragment. A standalone `tool` BPE token inside the body is the leading
+    /// fragment of a `tool_*`-prefixed NAME (`tool_search`, `tool_call`,
+    /// `tool_describe`) being reassembled across token boundaries — dropping
+    /// it truncates the streamed name by exactly `len("tool")` == 4 chars.
+    pub fn inside_tool_call(&self) -> bool {
+        self.inside_tag
     }
 
     /// Returns safe byte length to emit without splitting a partial tag.

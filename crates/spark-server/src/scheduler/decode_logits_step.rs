@@ -374,9 +374,10 @@ pub fn process_decode_logits(
             a.logprobs_data.push(lp);
         }
 
-        // </tool_call> stop: in legacy mode (no grammar), stop after first tool call.
-        // When grammar is active, allow the model to generate multiple tool calls —
-        // the grammar controls when EOS is valid.
+        // </tool_call> handling. Tool-armed requests (grammar active OR
+        // `tools_present`) continue generating past a closed call so the model
+        // can emit multiple/parallel calls (#192); only a NON-tool request
+        // that spuriously emits `</tool_call>` hard-stops here.
         if tool_call_end_token == Some(tok) && !a.inside_thinking {
             a.output_tokens.push(tok);
             // Fix A (2026-06-05): mark the tool call complete so the EOS-escape
@@ -409,8 +410,21 @@ pub fn process_decode_logits(
                     }
                 }
             }
-            if a.grammar_state.is_none() {
-                // Legacy mode: one tool call per response
+            if a.grammar_state.is_none() && !a.tools_present {
+                // Plain-chat hard stop: a request with NO tools declared has no
+                // business emitting `<tool_call>` blocks — end the turn (the
+                // historical "legacy mode" behavior, now scoped to non-tool
+                // requests only).
+                //
+                // #192: when tools ARE declared (`tools_present`), a closed
+                // tool call no longer finishes the sequence even without an
+                // active grammar (grammar disengaged mid-response on a
+                // model/matcher disagreement, opted out, or disabled). vLLM
+                // parity: keep decoding so the model can emit PARALLEL calls;
+                // the turn ends at natural EOS (require_tool_call was cleared
+                // at `<tool_call>`, so EOS is no longer suppressed) or via the
+                // tool watchdogs (post-completion open cap above, prose
+                // budget, loop detectors) if it runs on.
                 a.finished = true;
             }
             // Mirror finish_sequence (lines ~3445-3448): keep
@@ -452,11 +466,18 @@ pub fn process_decode_logits(
             && a.tool_call_completed
             && !a.inside_tool_body
             && !a.inside_thinking;
-        let grammar_suppresses_eos = a
-            .grammar_state
-            .as_ref()
-            .is_some_and(|gs| !gs.is_terminated())
-            && !eos_escape;
+        // #192: grammar EOS suppression is STOP-LEGALITY based (may the
+        // response legally end at the current matcher position?), not
+        // `!is_terminated()`. A tool_choice="auto" trigger grammar never
+        // terminates, so the old gate suppressed EOS for the whole turn when
+        // no call completed — armed-but-unused tools ran to
+        // finish_reason="length" (live probe #6, 2026-07-02). Evaluated only
+        // when the sampled token IS an EOS token: `grammar_blocks_stop`
+        // fills a bitmask (`stop_legal`), too costly as a per-token
+        // predicate and meaningless otherwise.
+        let grammar_suppresses_eos = a.eos_tokens.contains(&tok)
+            && !eos_escape
+            && crate::grammar::grammar_blocks_stop(a.grammar_state.as_mut(), &a.eos_tokens);
         let legacy_suppresses_eos = a.require_tool_call;
         let min_tokens_suppresses = a.output_tokens.len() < a.min_tokens;
         // Suppress EOS during thinking: <|im_end|> inside <think> is spurious.
