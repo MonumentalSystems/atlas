@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use super::super::{WeightDtype, WeightTensor, evict_page_cache};
-use super::{SafetensorsIndex, check_oom_guard, estimate_has_fp8, estimate_load_bytes};
+use super::{EpEstimate, SafetensorsIndex, check_oom_guard, estimate_has_fp8, estimate_load_bytes};
 use crate::gpu::GpuBackend;
 
 pub(super) fn load_sharded(
@@ -18,6 +18,7 @@ pub(super) fn load_sharded(
     oom_reserve_bytes: usize,
     skip_fn: &dyn Fn(&str) -> bool,
     peak_multiplier_override: Option<f64>,
+    ep: EpEstimate,
 ) -> Result<HashMap<String, WeightTensor>> {
     let index_json = std::fs::read_to_string(index_path)
         .with_context(|| format!("Failed to read {}", index_path.display()))?;
@@ -37,7 +38,7 @@ pub(super) fn load_sharded(
     // Pre-flight: estimate bytes from index with model-building overhead.
     let shard_files: Vec<std::path::PathBuf> =
         shard_to_tensors.keys().map(|s| model_dir.join(s)).collect();
-    let estimated = estimate_load_bytes(&shard_files, skip_fn)?;
+    let estimated = estimate_load_bytes(&shard_files, skip_fn, ep)?;
     let has_fp8 = estimate_has_fp8(&shard_files, skip_fn)?;
     let overhead_multiplier: f64 =
         peak_multiplier_override.unwrap_or(if has_fp8 { 1.5 } else { 1.3 });

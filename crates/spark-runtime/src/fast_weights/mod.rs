@@ -18,7 +18,7 @@
 
 use crate::gpu::GpuBackend;
 use crate::weights::{
-    WeightLoader, WeightStore, WeightTensor, check_oom_guard, estimate_has_fp8,
+    EpEstimate, WeightLoader, WeightStore, WeightTensor, check_oom_guard, estimate_has_fp8,
     estimate_load_bytes, evict_page_cache, parse_expert_index,
 };
 use anyhow::{Context, Result, bail};
@@ -125,7 +125,12 @@ impl WeightLoader for FastSafetensorsLoader {
 
         // Pre-flight OOM estimate (identical to SafetensorsLoader).
         {
-            let estimated = estimate_load_bytes(&shard_files, &skip_fn)?;
+            let ep = EpEstimate {
+                ep_rank: self.ep_rank,
+                ep_world_size: self.ep_world_size,
+                num_experts: self.num_experts,
+            };
+            let estimated = estimate_load_bytes(&shard_files, &skip_fn, ep)?;
             let has_fp8 = estimate_has_fp8(&shard_files, &skip_fn)?;
             let mult = self
                 .peak_memory_multiplier
