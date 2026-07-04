@@ -1338,8 +1338,7 @@ gated_delta_rule_chunk3(
         H_global[j * v_dim + tid] = H_reg[j];
     }
 }
-extern "C" __global__ void __launch_bounds__(128, 1)
-gated_delta_rule_decode_f32_strided_norm(
+extern "C" __global__ void gated_delta_rule_decode_f32_strided_norm(
     float* __restrict__ h_state,
     const float* __restrict__ query,
     const float* __restrict__ key,
@@ -1389,48 +1388,42 @@ gated_delta_rule_decode_f32_strided_norm(
     }
     __syncthreads();
 
-    // Register-tile this thread's H column: load once, run both recurrence
-    // passes + the norm-sq + a single writeback from registers instead of
-    // re-reading H from global 2-3x. Thread tid exclusively owns column tid
-    // (H[j*v_dim+tid]) so there is no cross-thread aliasing. Loops use the
-    // compile-time K_DIM bound with full unroll so H_reg stays in registers
-    // (a runtime-bounded loop would spill it back to local memory and defeat
-    // the tiling). Bit-identical to the global version: same FP32 operands,
-    // same single-accumulator order (KERNEL.toml sets --fmad=false). Mirrors
-    // the already-tiled sibling gated_delta_rule_decode_f32_strided.
-    float H_reg[K_DIM];
-    #pragma unroll
-    for (unsigned int j = 0; j < K_DIM; j++) {
-        H_reg[j] = H[j * v_dim + tid];
-    }
-
     float v_i = v_ptr[tid];
     float hk_dot = 0.0f;
-    #pragma unroll
-    for (unsigned int j = 0; j < K_DIM; j += 4) {
-        hk_dot += H_reg[j] * smem_k[j] + H_reg[j+1] * smem_k[j+1]
-                + H_reg[j+2] * smem_k[j+2] + H_reg[j+3] * smem_k[j+3];
+    #pragma unroll 4
+    for (unsigned int j = 0; j < k_dim; j += 4) {
+        float h0 = H[(j + 0) * v_dim + tid];
+        float h1 = H[(j + 1) * v_dim + tid];
+        float h2 = H[(j + 2) * v_dim + tid];
+        float h3 = H[(j + 3) * v_dim + tid];
+        hk_dot += h0 * smem_k[j] + h1 * smem_k[j+1] + h2 * smem_k[j+2] + h3 * smem_k[j+3];
     }
 
     float v_new_i = (v_i - g * hk_dot) * bt;
 
     float q_dot = 0.0f;
-    #pragma unroll
-    for (unsigned int j = 0; j < K_DIM; j += 4) {
-        H_reg[j + 0] = g * H_reg[j + 0] + smem_k[j]     * v_new_i;
-        H_reg[j + 1] = g * H_reg[j + 1] + smem_k[j + 1] * v_new_i;
-        H_reg[j + 2] = g * H_reg[j + 2] + smem_k[j + 2] * v_new_i;
-        H_reg[j + 3] = g * H_reg[j + 3] + smem_k[j + 3] * v_new_i;
-        q_dot += H_reg[j] * smem_q[j] + H_reg[j+1] * smem_q[j+1]
-               + H_reg[j+2] * smem_q[j+2] + H_reg[j+3] * smem_q[j+3];
+    #pragma unroll 4
+    for (unsigned int j = 0; j < k_dim; j += 4) {
+        float h0 = H[(j + 0) * v_dim + tid];
+        float h1 = H[(j + 1) * v_dim + tid];
+        float h2 = H[(j + 2) * v_dim + tid];
+        float h3 = H[(j + 3) * v_dim + tid];
+        h0 = g * h0 + smem_k[j]     * v_new_i;
+        h1 = g * h1 + smem_k[j + 1] * v_new_i;
+        h2 = g * h2 + smem_k[j + 2] * v_new_i;
+        h3 = g * h3 + smem_k[j + 3] * v_new_i;
+        H[(j + 0) * v_dim + tid] = h0;
+        H[(j + 1) * v_dim + tid] = h1;
+        H[(j + 2) * v_dim + tid] = h2;
+        H[(j + 3) * v_dim + tid] = h3;
+        q_dot += h0 * smem_q[j] + h1 * smem_q[j+1] + h2 * smem_q[j+2] + h3 * smem_q[j+3];
     }
 
     #ifdef SSM_STATE_NORM_ENABLED
     {
         float local_sq = 0.0f;
-        #pragma unroll
-        for (unsigned int j = 0; j < K_DIM; j++) {
-            float hv = H_reg[j];
+        for (unsigned int j = 0; j < k_dim; j++) {
+            float hv = H[j * v_dim + tid];
             local_sq += hv * hv;
         }
         for (int offset = 16; offset >= 1; offset >>= 1)
@@ -1447,19 +1440,12 @@ gated_delta_rule_decode_f32_strided_norm(
         float head_norm_sq = norm_sums[0];
         if (head_norm_sq > SSM_STATE_MAX_NORM * SSM_STATE_MAX_NORM) {
             float scale = SSM_STATE_MAX_NORM * rsqrtf(head_norm_sq);
-            #pragma unroll
-            for (unsigned int j = 0; j < K_DIM; j++) {
-                H_reg[j] *= scale;
+            for (unsigned int j = 0; j < k_dim; j++) {
+                H[j * v_dim + tid] *= scale;
             }
         }
     }
     #endif
-
-    // Single writeback of the updated (and possibly norm-clamped) H column.
-    #pragma unroll
-    for (unsigned int j = 0; j < K_DIM; j++) {
-        H[j * v_dim + tid] = H_reg[j];
-    }
 
     const float inv_sqrt_d = rsqrtf((float)k_dim);
     const float x = q_dot * inv_sqrt_d;
