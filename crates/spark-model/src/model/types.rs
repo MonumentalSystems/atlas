@@ -41,6 +41,12 @@ pub struct TransformerModel {
     pub(super) lm_head_fp8: Option<Fp8DenseWeight>,
     pub(super) layers: Vec<Box<dyn TransformerLayer>>,
     pub(super) buffers: BufferArena,
+    /// Startup-static LoRA adapter (pool + per-layer pairs + M2 pointer
+    /// tables). `None` = no adapter. Installed post-construction via
+    /// `set_lora_weights`, which also copies the per-layer pairs into the
+    /// layer structs; kept here as the owner of the pool/tables and for
+    /// status introspection. M0: stored only — compute reads land in M1.
+    pub(super) lora: Option<crate::lora::LoraWeights>,
     pub(super) kv_cache: Mutex<PagedKvCache>,
     pub(super) gpu: Box<dyn GpuBackend>,
     pub(super) rms_norm_kernel: KernelHandle,

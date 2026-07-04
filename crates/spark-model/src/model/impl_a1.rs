@@ -403,6 +403,7 @@ impl TransformerModel {
             lm_head_fp8,
             layers,
             buffers,
+            lora: None,
             kv_cache: Mutex::new(kv_cache),
             gpu,
             rms_norm_kernel,

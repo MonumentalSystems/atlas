@@ -137,6 +137,66 @@ impl TransformerModel {
         self.proposer = Some(proposer);
     }
 
+    /// Install a startup-static LoRA adapter (post-construction, mirroring
+    /// [`Self::set_dflash_proposer`]). Walks the model layers by GLOBAL
+    /// index — `LoraWeights.layers` is indexed the same way — and copies
+    /// each adapted layer's K/V/O (+ optional gate/up/down) pairs into the
+    /// `Qwen3AttentionLayer` (which routes FFN pairs into its dense FFN
+    /// component). M0: layers only STORE the adapter; base output is
+    /// unchanged until the M1 compute insertions read it.
+    pub fn set_lora_weights(&mut self, lora: Option<crate::lora::LoraWeights>) -> Result<()> {
+        if let Some(ref lw) = lora {
+            let kernels = ops::lora_delta::LoraKernels::new(self.gpu.as_ref())?;
+            let mut installed = 0usize;
+            for (idx, layer) in self.layers.iter_mut().enumerate() {
+                let Some(layer_weights) = lw.layers.get(idx).and_then(|o| o.as_ref()) else {
+                    continue;
+                };
+                let attn = layer
+                    .as_any_mut()
+                    .and_then(|a| a.downcast_mut::<crate::layers::Qwen3AttentionLayer>())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "LoRA: adapted layer {idx} is not a Qwen3AttentionLayer \
+                             (loader/adapter layer-type mismatch)"
+                        )
+                    })?;
+                let attn_weights = ops::lora_delta::LoraAttnWeights {
+                    k: layer_weights.k_proj,
+                    v: layer_weights.v_proj,
+                    o: layer_weights.o_proj,
+                    kernels,
+                };
+                let ffn_weights = if layer_weights.gate_proj.is_some()
+                    || layer_weights.up_proj.is_some()
+                    || layer_weights.down_proj.is_some()
+                {
+                    Some(ops::lora_delta::LoraFfnWeights {
+                        gate: layer_weights.gate_proj,
+                        up: layer_weights.up_proj,
+                        down: layer_weights.down_proj,
+                        kernels,
+                    })
+                } else {
+                    None
+                };
+                attn.set_lora_weights(attn_weights, ffn_weights)?;
+                installed += 1;
+            }
+            tracing::info!(
+                "LoRA adapter '{}' installed on {installed} layers \
+                 (r={}, max_rank={}, max_loras={}, pool={:.1} MiB)",
+                lw.name,
+                lw.adapter_config.r,
+                lw.max_rank,
+                lw.max_loras,
+                lw.pool_bytes as f64 / (1024.0 * 1024.0),
+            );
+        }
+        self.lora = lora;
+        Ok(())
+    }
+
     /// DFlash prefill capture: copy `proc_count` tokens × hidden_size BF16
     /// from `self.buffers.hidden_states()` (filled by the just-completed
     /// prefill layer) into the per-sequence DFlash accumulator. Called
