@@ -555,7 +555,57 @@ impl Qwen3AttentionLayer {
                 .arg_u32(hd)
                 .launch(stream)?;
         }
-        if hd > 256 && self.prefill_attn_512_k.0 != 0 {
+        let use_fi_prefill = hd == 256
+            && !k_is_turbo
+            && !v_is_turbo
+            && flash_batch == 1
+            && self.sliding_window.unwrap_or(0) == 0
+            && spark_runtime::flashinfer::available()
+            && std::env::var("ATLAS_FLASHINFER_PREFILL").ok().as_deref() == Some("1");
+        if use_fi_prefill {
+            // DE-RISK (ATLAS_FLASHINFER_PREFILL=1): FlashInfer ragged self-attention
+            // for single-stream chunk-0 full attention, replacing the hand-rolled
+            // per-Q-head prefill_attention_64 (which does ~8x redundant GQA K/V
+            // global reads — the measured long-context prefill gap). Q/K/V are
+            // fresh, contiguous, post-RoPE, non-turbo bf16 here → already in
+            // FlashInfer's [rows, heads, 256] layout. batch=1 → cu=[0, seq_len].
+            let cu = [0i32, flash_seq_len as i32];
+            let cu_bytes = unsafe {
+                std::slice::from_raw_parts(cu.as_ptr() as *const u8, std::mem::size_of_val(&cu))
+            };
+            let dev = ctx.gpu.alloc(std::mem::size_of_val(&cu))?;
+            ctx.gpu.copy_h2d_async(cu_bytes, dev, stream)?;
+            {
+                use std::sync::atomic::{AtomicBool, Ordering};
+                static LOGGED: AtomicBool = AtomicBool::new(false);
+                if !LOGGED.swap(true, Ordering::Relaxed) {
+                    tracing::warn!(
+                        "FI_PREFILL_CACHESKIP: flash_seq_len={flash_seq_len} nq={nq} \
+                         nkv={nkv} hd={hd} sm_scale={inv_sqrt_d}"
+                    );
+                }
+            }
+            spark_runtime::flashinfer::ragged_prefill_bf16_hd256(
+                q_contiguous.0,
+                k_contiguous.0,
+                v_contiguous.0,
+                attn_out.0,
+                &cu,
+                &cu,
+                dev.0,
+                dev.0,
+                1,
+                flash_seq_len,
+                flash_seq_len,
+                nq,
+                nkv,
+                hd,
+                inv_sqrt_d,
+                true,
+                stream,
+            )?;
+            ctx.gpu.free(dev)?;
+        } else if hd > 256 && self.prefill_attn_512_k.0 != 0 {
             // HDIM=512: use scalar reference kernel (BR=16, correct for any head_dim)
             // Full-attention layers (this path) always pass sliding_window=0.
             ops::prefill_attention(
