@@ -185,6 +185,60 @@ __global__ void pack_act_group(
   }
 }
 
+// Flattened single-launch variant of pack_act_group: ONE launch packs A for ALL
+// active groups, collapsing the former per-expert launch loop (up to 256 tiny
+// launches per grouped GEMM = the pack_act_group 167K-launch tax). Grid.x =
+// total sorted rows (sum of m_e = EXACTLY the useful work, no grid waste); each
+// block's global row `bx` maps to its group via `g_block_gi[bx]` (tokens are
+// already expert-sorted, so bx indexes sorted_token_ids directly). Grid =
+// (total_rows, ceil(k/16 / blk), 1).
+template <class LayoutSFA_t>
+__global__ void pack_act_grouped_all(
+    const __nv_bfloat16* __restrict__ act_global,  // TOKEN-MAJOR base [*, k]
+    const int* __restrict__ sorted_token_ids,      // null => identity
+    const int* __restrict__ g_block_gi,            // [total_rows] group per sorted row
+    const int* __restrict__ g_ms,                  // [G] group's first sorted row
+    unsigned char* __restrict__ ws_a_base,         // ws + a_off
+    unsigned char* __restrict__ ws_sfa_base,       // ws + sfa_off
+    const unsigned long long* __restrict__ g_a_off,    // [G] packed-A byte offset
+    const unsigned long long* __restrict__ g_sfa_off,  // [G] SFA byte offset
+    const LayoutSFA_t* __restrict__ g_layout,      // [G] per-group SFA layout
+    int k) {
+  int bx = blockIdx.x;
+  int group = blockIdx.y * blockDim.x + threadIdx.x;
+  int groups = k / 16;
+  if (group >= groups) {
+    return;
+  }
+  int gi = g_block_gi[bx];
+  int ms = g_ms[gi];
+  int row = bx - ms;  // local row within the group's packed region
+  unsigned char* packed = ws_a_base + g_a_off[gi];
+  unsigned char* scales = ws_sfa_base + g_sfa_off[gi];
+  LayoutSFA_t layout_sfa = g_layout[gi];
+  int tok = sorted_token_ids ? sorted_token_ids[bx] : bx;
+  const __nv_bfloat16* arow = act_global + (unsigned long long)tok * k;
+  int base = group * 16;
+  float max_abs = 0.0f;
+#pragma unroll
+  for (int i = 0; i < 16; ++i) {
+    float v = __bfloat162float(arow[base + i]);
+    max_abs = fmaxf(max_abs, fabsf(v));
+  }
+  float scale = max_abs > 0.0f ? max_abs / 6.0f : 1.0f;
+  cutlass::float_ue4m3_t sf(scale);
+  scales[layout_sfa(row, base, 0)] = *reinterpret_cast<unsigned char*>(&sf);
+  float dec = static_cast<float>(sf);
+  float inv = dec > 0.0f ? 1.0f / dec : 0.0f;
+#pragma unroll
+  for (int i = 0; i < 16; i += 2) {
+    float v0 = __bfloat162float(arow[base + i]) * inv;
+    float v1 = __bfloat162float(arow[base + i + 1]) * inv;
+    packed[(unsigned long long)row * (k / 2) + base / 2 + i / 2] =
+        static_cast<unsigned char>(float_to_e2m1_g(v0) | (float_to_e2m1_g(v1) << 4));
+  }
+}
+
 // ─── per-{n,k} SFB swizzle pack (load-time helper) ───
 // Reads Atlas-transposed E4M3 weight scale [K/16, N] (the pack_bf16_weight_to_nvfp4_t
 // layout) and writes it into the grouped/dense SFB atom for one expert. SFB depends
@@ -312,7 +366,8 @@ static GroupedAPrep prep_grouped_a(
   size_t sfa_off = align_up_(a_acc, 256);
   size_t cursor = align_up_(sfa_off + sfa_acc, 256);
 
-  // Second pass: pack A per active group + build A-side host arrays.
+  // Second pass: build A-side host arrays (the A-pack itself is deferred to a
+  // single grid-Z-batched launch once the device arrays are uploaded, below).
   int gi = 0;
   for (int e = 0; e < num_experts; ++e) {
     int ms = expert_offsets_host[e];
@@ -320,15 +375,8 @@ static GroupedAPrep prep_grouped_a(
     if (m_e <= 0) {
       continue;
     }
-    auto lsa =
-        Sm1xxBlkScaledConfig::tile_atom_to_shape_SFA(cute::make_shape(m_e, n, k, 1));
     unsigned char* a_e = ws + a_off + a_grp_off[gi];
     unsigned char* sfa_e = ws + sfa_off + sfa_grp_off[gi];
-
-    dim3 blk(256);
-    dim3 grd(m_e, (k / 16 + blk.x - 1) / blk.x);
-    pack_act_group<<<grd, blk, 0, stream>>>(
-        A_global, sorted_token_ids, ms, a_e, sfa_e, m_e, k, lsa);
 
     p.host_shapes.push_back(ProblemShape{m_e, n, k});
     p.ms.push_back(ms);
@@ -362,6 +410,35 @@ static GroupedAPrep prep_grouped_a(
           Sm1xxBlkScaledConfig::tile_atom_to_shape_SFA(cute::make_shape(p.me[g], n, k, 1));
     }
     p.dlSFA = (LayoutSFA*)put(lSFA.data(), p.G * sizeof(LayoutSFA));
+  }
+  // Single flattened A-pack over all active groups — replaces the former
+  // per-expert pack_act_group launch loop (up to 256 launches/GEMM). grid.x =
+  // total sorted rows (exactly the useful work, no waste); g_block_gi maps each
+  // global row to its group.
+  {
+    int total_rows = expert_offsets_host[num_experts];
+    std::vector<int> vblock_gi(total_rows > 0 ? total_rows : 1, 0);
+    for (int g = 0; g < p.G; ++g) {
+      int ms = p.ms[g];
+      int me = p.me[g];
+      for (int r = 0; r < me; ++r) {
+        vblock_gi[ms + r] = g;
+      }
+    }
+    std::vector<unsigned long long> vaoff(p.G), vsoff(p.G);
+    for (int g = 0; g < p.G; ++g) {
+      vaoff[g] = (unsigned long long)a_grp_off[g];
+      vsoff[g] = (unsigned long long)sfa_grp_off[g];
+    }
+    int* d_block_gi = (int*)put(vblock_gi.data(), (size_t)total_rows * sizeof(int));
+    int* d_ms = (int*)put(p.ms.data(), p.G * sizeof(int));
+    auto* d_aoff = (unsigned long long*)put(vaoff.data(), p.G * sizeof(unsigned long long));
+    auto* d_soff = (unsigned long long*)put(vsoff.data(), p.G * sizeof(unsigned long long));
+    dim3 blk(256);
+    dim3 grd((unsigned)total_rows, (unsigned)((k / 16 + blk.x - 1) / blk.x), 1u);
+    pack_act_grouped_all<<<grd, blk, 0, stream>>>(
+        A_global, sorted_token_ids, d_block_gi, d_ms, ws + a_off, ws + sfa_off,
+        d_aoff, d_soff, p.dlSFA, k);
   }
   p.cursor = cursor;
   return p;
