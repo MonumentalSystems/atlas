@@ -150,6 +150,19 @@ pub(crate) async fn chat_completions_inner(
         req.repetition_penalty,
     );
 
+    // v0 LoRA wart (documented, accepted): one always-on adapter, no routing.
+    // Requests naming the base model (or anything else) still get ADAPTED output.
+    if let Some(ref adapter) = state.adapter_name
+        && req.model != *adapter
+    {
+        tracing::warn!(
+            "request.model='{}' but LoRA adapter '{}' is always-on — response uses \
+             adapted weights (per-request routing lands in M2)",
+            req.model,
+            adapter,
+        );
+    }
+
     // ── Phase 1: build MsgEntry vec + image preprocess + cwd ────
     let msg_entry::BuildOut {
         messages,

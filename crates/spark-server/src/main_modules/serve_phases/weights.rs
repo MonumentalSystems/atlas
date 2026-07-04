@@ -154,3 +154,66 @@ pub(crate) fn load_dflash_drafter(
     );
     Ok(Some((drafter_store, drafter_config)))
 }
+
+/// Startup-loaded LoRA adapter: its own WeightStore + parsed PEFT config.
+/// v0: exactly one, always-on.
+pub(crate) struct LoraAdapterState {
+    pub name: String,
+    pub peft_config: atlas_core::config::PeftAdapterConfig,
+    pub store: spark_runtime::weights::WeightStore,
+}
+
+pub(crate) fn load_lora_adapter(
+    args: &cli::ServeArgs,
+    gpu: &dyn spark_runtime::gpu::GpuBackend,
+) -> Result<Option<LoraAdapterState>> {
+    if args.lora_adapter.is_empty() {
+        return Ok(None);
+    }
+    if args.lora_adapter.len() > 1 {
+        anyhow::bail!(
+            "--lora-adapter given {} times: v0 supports exactly ONE startup adapter \
+             (multi-adapter slots land in M2)",
+            args.lora_adapter.len(),
+        );
+    }
+    let (name, spec) = &args.lora_adapter[0];
+    tracing::info!("LoRA: resolving adapter '{name}' ← '{spec}'");
+    let adapter_dir = crate::model_resolver::resolve_adapter_dir(spec, args.cache_dir.as_deref())
+        .context("Failed to resolve LoRA adapter")?;
+    let cfg_path = adapter_dir.join("adapter_config.json");
+    let raw = std::fs::read_to_string(&cfg_path)
+        .with_context(|| format!("Failed to read {}", cfg_path.display()))?;
+    // Hard-error parser (atlas-core config/parsers/lora.rs) — scaling is read
+    // per adapter (alpha/r, alpha/sqrt(r) under use_rslora), NEVER defaulted.
+    let peft_config = atlas_core::config::parse_peft_adapter_config(&raw)
+        .with_context(|| format!("Failed to parse {}", cfg_path.display()))?;
+    if peft_config.r > args.max_lora_rank {
+        anyhow::bail!(
+            "LoRA adapter '{}' has r={} > --max-lora-rank {} — raise the flag \
+             (slot pool is rank-padded to it) or use a smaller adapter",
+            name,
+            peft_config.r,
+            args.max_lora_rank,
+        );
+    }
+    let store = spark_runtime::weights::adapter::load_adapter_safetensors(&adapter_dir, gpu, 0)
+        .context("Failed to load LoRA adapter weights")?;
+    tracing::info!(
+        "LoRA adapter '{}': {} tensors, {} bytes loaded; r={}, alpha={}, \
+         use_rslora={}, scaling={:.6}, target_modules={:?}",
+        name,
+        store.len(),
+        store.total_bytes(),
+        peft_config.r,
+        peft_config.lora_alpha,
+        peft_config.use_rslora,
+        peft_config.scaling(),
+        peft_config.target_modules,
+    );
+    Ok(Some(LoraAdapterState {
+        name: name.clone(),
+        peft_config,
+        store,
+    }))
+}

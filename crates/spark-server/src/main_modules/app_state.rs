@@ -17,6 +17,10 @@ use crate::{
 pub struct AppState {
     pub tokenizer: ChatTokenizer,
     pub model_name: String,
+    /// Startup LoRA adapter name (`--lora-adapter NAME=…`). `None` = no
+    /// adapter (every existing deployment byte-identical). v0: one adapter,
+    /// always-on; advertised by /v1/models and matched by /v1/models/{id}.
+    pub adapter_name: Option<String>,
     pub max_seq_len: usize,
     pub request_tx: mpsc::Sender<InferenceRequest>,
     /// Vision config for VL models — None for text-only models.
