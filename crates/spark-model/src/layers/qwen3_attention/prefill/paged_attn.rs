@@ -165,6 +165,10 @@ impl Qwen3AttentionLayer {
             // block_table IS the paged indices array. BF16 / non-turbo / no-SWA
             // only; head_dim 256. Replaces the hand-rolled inferspark_prefill_paged
             // (~8x redundant GQA K/V reads at long context).
+            //
+            // DEFAULT-ON (validated +11/+23/+40% @17K/35K/60K, needle-correct,
+            // grows with ctx). Opt out with ATLAS_FLASHINFER_PAGED_PREFILL=0.
+            // Inert on non-FlashInfer builds (available()==false → hand-rolled).
             let (wk, wv) = self.kv_dtype.kv_pair();
             let fi_paged = seq_len_start > 0
                 && hd == 256
@@ -173,7 +177,7 @@ impl Qwen3AttentionLayer {
                 && !wv.is_wht_rotated()
                 && self.sliding_window.unwrap_or(0) == 0
                 && spark_runtime::flashinfer::available()
-                && std::env::var("ATLAS_FLASHINFER_PAGED_PREFILL").ok().as_deref() == Some("1");
+                && std::env::var("ATLAS_FLASHINFER_PAGED_PREFILL").ok().as_deref() != Some("0");
             if fi_paged {
                 // Page geometry for the single request (batch=1): np pages cover
                 // [0, kv_len); the last holds lpl tokens in [1, bs].
