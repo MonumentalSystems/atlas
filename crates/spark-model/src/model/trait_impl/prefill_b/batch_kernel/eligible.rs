@@ -28,6 +28,21 @@ pub(super) fn first_chunk_batched_enabled() -> bool {
         })
 }
 
+/// Chunk-0 batching for the *correct* FlashInfer ragged path (distinct from the
+/// experimental batched-paged kernel, which is numerically off + slow at
+/// chunk-0). Enabled by the shipped single-stream de-risk flag alone
+/// (`ATLAS_FLASHINFER_PREFILL=1`) when a FlashInfer build is present, so
+/// co-dispatched fresh prompts run ONE varlen launch over all streams' chunk-0
+/// self-attention (the paged.rs `use_flashinfer` branch, which reads the
+/// always-populated bmeta.cu_seqlens). head_dim==256 / non-turbo eligibility is
+/// enforced by the caller + the paged.rs gate; any non-FI batch that slips
+/// through falls back to per-stream via the ATLAS_Q12_BATCHED_FIRST_CHUNK bail
+/// in paged_attn_batched.rs.
+pub(super) fn first_chunk_fi_enabled() -> bool {
+    spark_runtime::flashinfer::available()
+        && std::env::var("ATLAS_FLASHINFER_PREFILL").ok().as_deref() == Some("1")
+}
+
 impl TransformerModel {
     /// Returns true when the batched-kernel path is viable for these
     /// streams. Cheap upfront check — caller (dispatch) falls back to
@@ -59,6 +74,10 @@ impl TransformerModel {
             return false;
         }
         let varlen = varlen_prefill_enabled();
+        // FI ragged can co-dispatch chunk-0 with the shipped ATLAS_FLASHINFER_PREFILL
+        // flag alone; restrict to head_dim==256 (the only dim the ragged wrapper
+        // supports) so non-256 batches aren't admitted just to fall back later.
+        let fi_chunk0 = first_chunk_fi_enabled() && self.config.head_dim == 256;
         check_kernel_batched_eligible(
             streams
                 .iter()
@@ -71,7 +90,7 @@ impl TransformerModel {
             self.config.num_experts_per_tok,
             self.config.mrope_interleaved,
             // VARLEN v1 batches chunk-0 (fresh K/V) through FlashInfer ragged.
-            first_chunk_batched_enabled() || varlen,
+            first_chunk_batched_enabled() || fi_chunk0 || varlen,
             varlen,
         )
     }

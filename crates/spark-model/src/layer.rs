@@ -150,13 +150,16 @@ pub struct BatchedAttnMetadata {
     /// Total tokens stacked across streams. Legacy: `batch_size * chunk_len`.
     /// VARLEN: `Σ per-stream lengths` (= `cu_seqlens_host[batch_size]`).
     pub total_tokens: u32,
-    /// VARLEN geometry: `[batch_size+1]` i32 prefix-sum of per-request token
-    /// counts, on device (read by the GDN kernel + FlashInfer). `DevicePtr::NULL`
-    /// in the legacy same-length path (callers fall back to `b*chunk_len`).
+    /// `[batch_size+1]` i32 prefix-sum of per-request token counts, on device
+    /// (read by the GDN kernel + FlashInfer). ALWAYS populated by the sole
+    /// constructor `stage_batched_attn_metadata` (built unconditionally as a
+    /// uniform prefix-sum in the legacy same-length path, a true prefix-sum
+    /// under VARLEN) — never `DevicePtr::NULL`, so the batched FI ragged path
+    /// can rely on it without a NULL guard.
     pub cu_seqlens: DevicePtr,
     /// Host copy of `cu_seqlens` (`[batch_size+1]` i32) — FlashInfer's PrefillPlan
     /// dereferences the indptr on the CPU, and per-request slice offsets are
-    /// computed host-side. Empty in the legacy path.
+    /// computed host-side. Always populated (min `[0]`); see `cu_seqlens`.
     pub cu_seqlens_host: Vec<i32>,
     /// Maximum block_table length across the batch (kernel uses for
     /// bounds checking; per-stream block_table reads via the pointer

@@ -128,10 +128,23 @@ impl Qwen3AttentionLayer {
         // tried and FAILED for large prefill chunks — numerically off + ~7x
         // slower (the kernel's batch dim is not compatible with the co-dispatch
         // stacking at large seq_len). So batched chunk-0 still uses paged.
+        // Chunk-0 co-dispatch is permitted when EITHER the experimental
+        // batched-paged first-chunk flag is set OR the correct FlashInfer ragged
+        // path is available + enabled. In the FI case paged.rs takes its
+        // `use_flashinfer` branch (ONE varlen launch over all streams via the
+        // always-populated bmeta.cu_seqlens); non-FI batches hit the
+        // paged_attn_batched.rs chunk-0 bail and the caller falls back to
+        // per-stream. hd==256 is the ragged wrapper's only supported dim; turbo
+        // is re-checked by paged.rs.
+        let hd_eff = self.head_dim_override.unwrap_or(ctx.config.head_dim);
+        let fi_first_chunk = hd_eff == 256
+            && spark_runtime::flashinfer::available()
+            && std::env::var("ATLAS_FLASHINFER_PREFILL").ok().as_deref() == Some("1");
         let allow_batched_first_chunk = batched_meta.is_some()
-            && std::env::var("ATLAS_Q12_BATCHED_FIRST_CHUNK")
+            && (std::env::var("ATLAS_Q12_BATCHED_FIRST_CHUNK")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-                .unwrap_or(false);
+                .unwrap_or(false)
+                || fi_first_chunk);
         if batched_meta.is_some() && seq_len_start == 0 && !allow_batched_first_chunk {
             anyhow::bail!(
                 "prefill_inner: batched mode requires seq_len_start > 0 (paged path); \
