@@ -184,6 +184,18 @@ pub fn classify_key(key: &str, cfg: &ModelConfig) -> Result<(usize, LoraModule, 
     Ok((layer_idx, module, ab))
 }
 
+/// Permanent LoRA debugging hatch: `ATLAS_LORA_EAGER=1` (or `true`) forces
+/// eager decode (no CUDA-graph capture) when an adapter is active, so
+/// graph-vs-eager output parity can be compared in the field. Read ONCE —
+/// the decode graph gate runs per token.
+pub fn lora_eager_env() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("ATLAS_LORA_EAGER")
+            .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+    })
+}
+
 pub fn full_attention_layers(cfg: &ModelConfig) -> Vec<usize> {
     (0..cfg.num_hidden_layers)
         .filter(|&i| cfg.layer_type(i) == LayerType::FullAttention)
@@ -400,6 +412,9 @@ pub fn load_lora_adapters_generic(
                     k_in: in_dim as u32,
                     n_out: out_dim as u32,
                     scale,
+                    // Kernel contraction dim: B's packed row stride (and A's
+                    // padded row count) — see LoraPair docs in lora_delta.rs.
+                    max_rank: max_lora_rank as u32,
                 };
                 tracing::info!(
                     "LoRA: layer {layer_idx} {module:?} r={} scale={:.6} \

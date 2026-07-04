@@ -170,13 +170,20 @@ impl TransformerModel {
         // and remove per-kernel launch overhead. Env-gated so it can be toggled
         // off at deploy time (instant revert) if capture crashes / replay hangs.
         let ep_graphs = std::env::var("ATLAS_EP_GRAPHS").is_ok_and(|v| v == "1" || v == "true");
+        // LoRA debugging hatch (ATLAS_LORA_EAGER=1): force eager decode when
+        // an adapter is active so graph-vs-eager delta parity can be compared.
+        // Default (unset) keeps graphs ON — the LoRA delta launches are
+        // capture-safe (pool weights / arena scratch / f32 scale are all
+        // load-time-fixed).
+        let lora_eager = self.lora.is_some() && crate::lora::lora_eager_env();
         let use_graphs = (self.comm.is_none() || ep_graphs)
             && !self.profile
             && !self
                 .suppress_graphs
                 .load(std::sync::atomic::Ordering::Relaxed)
             && !hss_engaged
-            && !dump_step0;
+            && !dump_step0
+            && !lora_eager;
 
         let ctx = ForwardContext {
             buffers: &self.buffers,

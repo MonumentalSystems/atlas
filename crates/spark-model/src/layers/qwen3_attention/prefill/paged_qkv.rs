@@ -311,6 +311,32 @@ impl Qwen3AttentionLayer {
                 )?;
             }
         }
+        // ── LoRA runtime delta: out += scale·(normed@Aᵀ)@Bᵀ (v0: K/V only;
+        // q_proj is rejected at adapter load — gated [Q|gate] interleave).
+        // Runs before the caller's ATLAS_OP_DUMP, so dumps show ADAPTED
+        // outputs (what an HF+PEFT forward hook shows).
+        if let Some(ref lw) = self.lora {
+            let pair = match proj {
+                Proj::Q => None,
+                Proj::K => lw.k.as_ref(),
+                Proj::V => lw.v.as_ref(),
+            };
+            if let Some(pair) = pair {
+                debug_assert_eq!(pair.k_in, h);
+                debug_assert_eq!(pair.n_out, out_dim);
+                ops::lora_delta::apply_lora_delta(
+                    ctx.gpu,
+                    &lw.kernels,
+                    pair,
+                    normed,
+                    out,
+                    n,
+                    ctx.buffers.lora_xa(),
+                    ctx.buffers.lora_delta(),
+                    stream,
+                )?;
+            }
+        }
         Ok(())
     }
 }

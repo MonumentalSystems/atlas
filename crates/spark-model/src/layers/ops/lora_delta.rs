@@ -49,6 +49,14 @@ pub struct LoraPair {
     pub k_in: u32,
     pub n_out: u32,
     pub scale: f32,
+    /// The pool's padded rank — the ROW STRIDE of `b` (and row count of `a`).
+    /// Kernels MUST contract/produce at this dim, not `rank`: B rows are
+    /// `max_rank` elements apart in the pool, so a `k = rank` expand would
+    /// misread every row past the first when `rank < max_rank`. Pad rows of
+    /// A and pad cols of B are zeroed at pack time, so running the shrink at
+    /// `n = max_rank` and the expand at `k = max_rank` is bit-identical to
+    /// the true-rank product.
+    pub max_rank: u32,
 }
 
 /// Per-layer attention-side LoRA weights, installed by copy onto
@@ -87,9 +95,12 @@ pub struct LoraFfnWeights {
 /// pointer/value-stable across capture and replay — identical status to base
 /// weights. m==1 -> GEMV; m>1 -> tensor-core GEMM (scalar fallback).
 ///
-/// No callers until M1 (compute insertion) — layers only STORE the adapter
-/// for now.
-#[allow(dead_code)]
+/// POOL LAYOUT (lora/mod.rs pack): A is [max_rank, k_in] (real rows at the
+/// head, pad rows zero), B is [n_out, max_rank] row-major (pad COLS zero,
+/// row stride = max_rank). Both stages therefore run at `pair.max_rank`:
+/// shrink n = max_rank (xa pad cols come out zero), expand k = max_rank
+/// (matches B's row stride; zero pads contribute nothing) — bit-identical
+/// to a true-rank product.
 #[allow(clippy::too_many_arguments)]
 pub fn apply_lora_delta(
     gpu: &dyn GpuBackend,
@@ -98,23 +109,23 @@ pub fn apply_lora_delta(
     x: DevicePtr,          // [m, pair.k_in] BF16
     base_out: DevicePtr,   // [m, pair.n_out] BF16, modified in place
     m: u32,
-    lora_xa: DevicePtr,    // arena scratch >= m * rank BF16
+    lora_xa: DevicePtr,    // arena scratch >= m * max_rank BF16
     lora_delta: DevicePtr, // arena scratch >= m * n_out BF16
     stream: u64,
 ) -> Result<()> {
     if m == 1 {
-        // shrink: [1,k_in] @ A[r,k_in]^T -> xa[1,r]
+        // shrink: [1,k_in] @ A[max_rank,k_in]^T -> xa[1,max_rank]
         ops::dense_gemv(
             gpu,
             kernels.gemv_k,
             x,
             &pair.a,
             lora_xa,
-            pair.rank,
+            pair.max_rank,
             pair.k_in,
             stream,
         )?;
-        // expand: [1,r] @ B[n_out,r]^T -> delta[1,n_out]
+        // expand: [1,max_rank] @ B[n_out,max_rank]^T -> delta[1,n_out]
         ops::dense_gemv(
             gpu,
             kernels.gemv_k,
@@ -122,7 +133,7 @@ pub fn apply_lora_delta(
             &pair.b,
             lora_delta,
             pair.n_out,
-            pair.rank,
+            pair.max_rank,
             stream,
         )?;
     } else if kernels.gemm_tc_k.0 != 0 {
@@ -133,7 +144,7 @@ pub fn apply_lora_delta(
             &pair.a,
             lora_xa,
             m,
-            pair.rank,
+            pair.max_rank,
             pair.k_in,
             stream,
         )?;
@@ -145,7 +156,7 @@ pub fn apply_lora_delta(
             lora_delta,
             m,
             pair.n_out,
-            pair.rank,
+            pair.max_rank,
             stream,
         )?;
     } else {
@@ -156,7 +167,7 @@ pub fn apply_lora_delta(
             &pair.a,
             lora_xa,
             m,
-            pair.rank,
+            pair.max_rank,
             pair.k_in,
             stream,
         )?;
@@ -168,7 +179,7 @@ pub fn apply_lora_delta(
             lora_delta,
             m,
             pair.n_out,
-            pair.rank,
+            pair.max_rank,
             stream,
         )?;
     }

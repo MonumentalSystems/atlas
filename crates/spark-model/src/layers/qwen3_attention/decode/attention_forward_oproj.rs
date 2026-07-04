@@ -85,6 +85,25 @@ impl Qwen3AttentionLayer {
                 stream,
             )?;
         }
+        // ── LoRA delta on o_proj (decode, m=1). attn_out is already
+        // sigmoid-gated by the caller — exactly the tensor HF feeds o_proj.
+        if let Some(ref lw) = self.lora
+            && let Some(ref pair) = lw.o
+        {
+            debug_assert_eq!(pair.k_in, nq * hd);
+            debug_assert_eq!(pair.n_out, h);
+            ops::lora_delta::apply_lora_delta(
+                ctx.gpu,
+                &lw.kernels,
+                pair,
+                attn_out,
+                o_out,
+                1,
+                ctx.buffers.lora_xa(),
+                ctx.buffers.lora_delta(),
+                stream,
+            )?;
+        }
         Ok(o_out)
     }
 }
