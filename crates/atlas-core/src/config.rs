@@ -492,12 +492,12 @@ mod parsers;
 mod tests;
 
 pub use dispatch::parse_config;
-pub(crate) use parsers::{
-    parse_deepseek_v4, parse_gemma4_params, parse_minimax_m2, parse_step3p7, parse_vision_config,
-};
 pub use parsers::{
     PEFT_SUPPORTED_TARGET_MODULES, PeftAdapterConfig, parse_mistral_params,
     parse_peft_adapter_config, parse_quantization_config,
+};
+pub(crate) use parsers::{
+    parse_deepseek_v4, parse_gemma4_params, parse_minimax_m2, parse_step3p7, parse_vision_config,
 };
 
 pub(crate) fn finalize_config(config: &mut ModelConfig, raw: &serde_json::Value) -> Result<()> {

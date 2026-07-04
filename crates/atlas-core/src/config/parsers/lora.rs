@@ -25,7 +25,12 @@ use serde::Deserialize;
 /// v0 rather than mis-sliced. GDN/linear-attention modules are likewise
 /// rejected (no exact-replay parity harness for the recurrence yet).
 pub const PEFT_SUPPORTED_TARGET_MODULES: &[&str] = &[
-    "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj",
+    "k_proj",
+    "v_proj",
+    "o_proj",
+    "gate_proj",
+    "up_proj",
+    "down_proj",
 ];
 
 /// Parsed subset of a PEFT `adapter_config.json` that Atlas consumes.
@@ -121,7 +126,9 @@ pub fn parse_peft_adapter_config(json: &str) -> Result<PeftAdapterConfig> {
         bail!("REJECT(peft_type): adapter declares peft_type='{pt}'; only LORA is supported");
     }
     if raw.use_dora {
-        bail!("REJECT(use_dora): DoRA adapters are unsupported (magnitude decomposition has no runtime-delta form)");
+        bail!(
+            "REJECT(use_dora): DoRA adapters are unsupported (magnitude decomposition has no runtime-delta form)"
+        );
     }
     if let Some(ref b) = raw.bias
         && b != "none"
@@ -129,10 +136,14 @@ pub fn parse_peft_adapter_config(json: &str) -> Result<PeftAdapterConfig> {
         bail!("REJECT(bias): bias='{b}' ships trained bias deltas; only bias='none' is supported");
     }
     if raw.rank_pattern.as_ref().is_some_and(|m| !m.is_empty()) {
-        bail!("REJECT(rank_pattern): per-module rank overrides are unsupported in v0 (uniform r only)");
+        bail!(
+            "REJECT(rank_pattern): per-module rank overrides are unsupported in v0 (uniform r only)"
+        );
     }
     if raw.alpha_pattern.as_ref().is_some_and(|m| !m.is_empty()) {
-        bail!("REJECT(alpha_pattern): per-module alpha overrides are unsupported in v0 (uniform lora_alpha only)");
+        bail!(
+            "REJECT(alpha_pattern): per-module alpha overrides are unsupported in v0 (uniform lora_alpha only)"
+        );
     }
     if raw.modules_to_save.as_ref().is_some_and(|v| !v.is_empty()) {
         bail!(
@@ -157,7 +168,10 @@ pub fn parse_peft_adapter_config(json: &str) -> Result<PeftAdapterConfig> {
         bail!("REJECT(r): LoRA rank must be > 0");
     }
     if !(raw.lora_alpha.is_finite() && raw.lora_alpha > 0.0) {
-        bail!("REJECT(lora_alpha): must be a finite positive number, got {}", raw.lora_alpha);
+        bail!(
+            "REJECT(lora_alpha): must be a finite positive number, got {}",
+            raw.lora_alpha
+        );
     }
 
     let target_modules = parse_target_modules(&raw.target_modules)?;
@@ -181,9 +195,9 @@ fn parse_layers_to_transform(v: &Option<serde_json::Value>) -> Result<Option<Vec
             let layers = arr
                 .iter()
                 .map(|e| {
-                    e.as_u64()
-                        .map(|n| n as usize)
-                        .context("REJECT(layers_to_transform): entries must be non-negative integers")
+                    e.as_u64().map(|n| n as usize).context(
+                        "REJECT(layers_to_transform): entries must be non-negative integers",
+                    )
                 })
                 .collect::<Result<Vec<_>>>()?;
             Ok(Some(layers))
@@ -233,14 +247,14 @@ fn validate_target_module(entry: &str) -> Result<()> {
         // GDN / linear-attention projections — reject both the fused
         // (`in_proj_qkvz`/`in_proj_ba`) and split (`in_proj_qkv`/`in_proj_z`/
         // `in_proj_a`/`in_proj_b`) spellings, plus `out_proj`/`conv1d`.
-        "in_proj_qkvz" | "in_proj_ba" | "in_proj_qkv" | "in_proj_z" | "in_proj_a"
-        | "in_proj_b" | "out_proj" | "conv1d" => bail!(
+        "in_proj_qkvz" | "in_proj_ba" | "in_proj_qkv" | "in_proj_z" | "in_proj_a" | "in_proj_b"
+        | "out_proj" | "conv1d" => bail!(
             "REJECT(gdn): target module '{leaf}' is a GDN/linear-attention projection; GDN \
              layers are unsupported in v0 (full-attention layers only)"
         ),
-        "embed_tokens" | "lm_head" => bail!(
-            "REJECT(embedding): target module '{leaf}' is unsupported in v0"
-        ),
+        "embed_tokens" | "lm_head" => {
+            bail!("REJECT(embedding): target module '{leaf}' is unsupported in v0")
+        }
         m if PEFT_SUPPORTED_TARGET_MODULES.contains(&m) => Ok(()),
         other => bail!(
             "REJECT(unknown_module): target module '{other}' is not in the v0 allow-list \
@@ -312,7 +326,9 @@ mod tests {
     fn missing_use_rslora_rejected_named() {
         let mut j = base_json();
         j.as_object_mut().unwrap().remove("use_rslora");
-        let err = parse_peft_adapter_config(&j.to_string()).unwrap_err().to_string();
+        let err = parse_peft_adapter_config(&j.to_string())
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("REJECT(use_rslora)"), "{err}");
     }
 
@@ -320,17 +336,27 @@ mod tests {
     fn q_proj_rejected_named() {
         let mut j = base_json();
         j["target_modules"] = serde_json::json!(["q_proj", "v_proj"]);
-        let err = parse_peft_adapter_config(&j.to_string()).unwrap_err().to_string();
+        let err = parse_peft_adapter_config(&j.to_string())
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("REJECT(q_proj)"), "{err}");
         assert!(err.contains("attn_output_gate"), "{err}");
     }
 
     #[test]
     fn gdn_module_rejected_named() {
-        for m in ["in_proj_qkvz", "in_proj_qkv", "in_proj_z", "out_proj", "conv1d"] {
+        for m in [
+            "in_proj_qkvz",
+            "in_proj_qkv",
+            "in_proj_z",
+            "out_proj",
+            "conv1d",
+        ] {
             let mut j = base_json();
             j["target_modules"] = serde_json::json!([m]);
-            let err = parse_peft_adapter_config(&j.to_string()).unwrap_err().to_string();
+            let err = parse_peft_adapter_config(&j.to_string())
+                .unwrap_err()
+                .to_string();
             assert!(err.contains("REJECT(gdn)"), "{m}: {err}");
         }
     }
@@ -339,7 +365,9 @@ mod tests {
     fn all_linear_rejected_named() {
         let mut j = base_json();
         j["target_modules"] = serde_json::json!("all-linear");
-        let err = parse_peft_adapter_config(&j.to_string()).unwrap_err().to_string();
+        let err = parse_peft_adapter_config(&j.to_string())
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("REJECT(target_modules)"), "{err}");
     }
 
@@ -348,13 +376,27 @@ mod tests {
         for (key, val, tag) in [
             ("use_dora", serde_json::json!(true), "REJECT(use_dora)"),
             ("bias", serde_json::json!("lora_only"), "REJECT(bias)"),
-            ("rank_pattern", serde_json::json!({"k_proj": 8}), "REJECT(rank_pattern)"),
-            ("modules_to_save", serde_json::json!(["lm_head"]), "REJECT(modules_to_save)"),
-            ("peft_type", serde_json::json!("ADALORA"), "REJECT(peft_type)"),
+            (
+                "rank_pattern",
+                serde_json::json!({"k_proj": 8}),
+                "REJECT(rank_pattern)",
+            ),
+            (
+                "modules_to_save",
+                serde_json::json!(["lm_head"]),
+                "REJECT(modules_to_save)",
+            ),
+            (
+                "peft_type",
+                serde_json::json!("ADALORA"),
+                "REJECT(peft_type)",
+            ),
         ] {
             let mut j = base_json();
             j[key] = val;
-            let err = parse_peft_adapter_config(&j.to_string()).unwrap_err().to_string();
+            let err = parse_peft_adapter_config(&j.to_string())
+                .unwrap_err()
+                .to_string();
             assert!(err.contains(tag), "{key}: {err}");
         }
     }

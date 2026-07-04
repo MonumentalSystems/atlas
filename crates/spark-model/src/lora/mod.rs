@@ -191,8 +191,7 @@ pub fn classify_key(key: &str, cfg: &ModelConfig) -> Result<(usize, LoraModule, 
 pub fn lora_eager_env() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
-        std::env::var("ATLAS_LORA_EAGER")
-            .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        std::env::var("ATLAS_LORA_EAGER").is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
     })
 }
 
@@ -363,7 +362,8 @@ pub fn load_lora_adapters_generic(
     //    B repacks row-by-row from stride r to stride max_rank
     //    (d2h → host repack → h2d).
     let slot_bytes = pool_slot_bytes(cfg, max_lora_rank);
-    let mut layers: Vec<Option<LoraLayerWeights>> = (0..cfg.num_hidden_layers).map(|_| None).collect();
+    let mut layers: Vec<Option<LoraLayerWeights>> =
+        (0..cfg.num_hidden_layers).map(|_| None).collect();
     let mut tables = BTreeMap::new();
     let mut off = 0usize; // slot 0 base offset
     for layer_idx in full_attention_layers(cfg) {

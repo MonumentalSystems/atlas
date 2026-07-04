@@ -12,8 +12,8 @@ use spark_runtime::prefix_cache::PrefixCache;
 use spark_runtime::weights::WeightStore;
 
 use super::loader_for_config;
-use super::{DflashBuildArgs, LoraBuildArgs};
 use super::m2_setup::maybe_run_minimax_m2_moe_transpose;
+use super::{DflashBuildArgs, LoraBuildArgs};
 use crate::layers::MtpQuantization;
 use crate::model::TransformerModel;
 use crate::traits::Model;

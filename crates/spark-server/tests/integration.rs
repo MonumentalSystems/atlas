@@ -119,6 +119,7 @@ fn setup_model(
         0,                  // ssm_checkpoint_interval
         None,               // hss_cache_blocks_per_seq
         None,               // dflash_args (no speculative-decoding pairing)
+        None,               // lora_args (no LoRA adapter)
     )?;
 
     Ok((model, config))

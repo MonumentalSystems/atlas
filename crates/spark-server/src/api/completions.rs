@@ -459,8 +459,8 @@ pub async fn get_model(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(model_id): axum::extract::Path<String>,
 ) -> Response {
-    let known = model_id == state.model_name
-        || state.adapter_name.as_deref() == Some(model_id.as_str());
+    let known =
+        model_id == state.model_name || state.adapter_name.as_deref() == Some(model_id.as_str());
     if known {
         Json(serde_json::json!({
             "id": model_id,

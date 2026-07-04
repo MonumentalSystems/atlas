@@ -106,8 +106,8 @@ pub fn apply_lora_delta(
     gpu: &dyn GpuBackend,
     kernels: &LoraKernels,
     pair: &LoraPair,
-    x: DevicePtr,          // [m, pair.k_in] BF16
-    base_out: DevicePtr,   // [m, pair.n_out] BF16, modified in place
+    x: DevicePtr,        // [m, pair.k_in] BF16
+    base_out: DevicePtr, // [m, pair.n_out] BF16, modified in place
     m: u32,
     lora_xa: DevicePtr,    // arena scratch >= m * max_rank BF16
     lora_delta: DevicePtr, // arena scratch >= m * n_out BF16
