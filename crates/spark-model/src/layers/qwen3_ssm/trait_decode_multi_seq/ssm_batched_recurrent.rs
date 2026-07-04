@@ -57,8 +57,13 @@ impl Qwen3SsmLayer {
             };
         }
 
+        // Default-on (opt out with ATLAS_SSM_BATCHED_RECURRENT=0): collapse the
+        // per-seq GDN recurrent scan into one strided cross-seq launch. Safe by
+        // construction — the contiguity check below falls back to per-seq when
+        // SSM slots aren't [0..n) (scheduler sorts by slot in decode_step.rs, so
+        // they normally are). Prereq for multiseq CUDA-graph capture.
         let batched_recurrent = if std::env::var("ATLAS_SSM_BATCHED_RECURRENT").ok().as_deref()
-            == Some("1")
+            != Some("0")
             && self.gdn_f32_strided_k.0 != 0
             && n > 1
         {
@@ -143,7 +148,7 @@ impl Qwen3SsmLayer {
             detail_step!("recurrent_batched_conv");
 
             if self.gdn_f32_strided_norm_k.0 != 0
-                && std::env::var("ATLAS_GDN_FUSED_NORM").ok().as_deref() == Some("1")
+                && std::env::var("ATLAS_GDN_FUSED_NORM").ok().as_deref() != Some("0")
             {
                 let z_base = deinterleaved.offset((key_dim * 2 + value_dim) * bf16);
                 ops::gdn_decode_f32_strided_norm(
@@ -333,7 +338,7 @@ impl Qwen3SsmLayer {
                         rec_gdn_us += t0.elapsed().as_micros();
                     }
                 } else if self.gdn_f32_norm_k.0 != 0
-                    && std::env::var("ATLAS_GDN_FUSED_NORM").ok().as_deref() == Some("1")
+                    && std::env::var("ATLAS_GDN_FUSED_NORM").ok().as_deref() != Some("0")
                 {
                     ops::gdn_decode_f32_norm(
                         ctx.gpu,

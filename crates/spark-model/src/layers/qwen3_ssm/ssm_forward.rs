@@ -297,9 +297,11 @@ impl Qwen3SsmLayer {
         } else {
             self.gdn_k
         };
+        // Default-on (opt out with ATLAS_GDN_FUSED_NORM=0): fold the gated-RMSNorm
+        // into the GDN decode kernel (one launch, writes normed output directly).
         let fused_gdn_norm = use_f32_gdn
             && self.gdn_f32_norm_k.0 != 0
-            && std::env::var("ATLAS_GDN_FUSED_NORM").ok().as_deref() == Some("1");
+            && std::env::var("ATLAS_GDN_FUSED_NORM").ok().as_deref() != Some("0");
         if fused_gdn_norm {
             ops::gdn_decode_f32_norm(
                 ctx.gpu,
