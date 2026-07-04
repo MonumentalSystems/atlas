@@ -573,7 +573,12 @@ impl Qwen3AttentionLayer {
             let cu_bytes = unsafe {
                 std::slice::from_raw_parts(cu.as_ptr() as *const u8, std::mem::size_of_val(&cu))
             };
-            let dev = ctx.gpu.alloc(std::mem::size_of_val(&cu))?;
+            // Persistent arena scratch (no per-call cuMemAlloc/cuMemFree): the
+            // 8-byte [0, flash_seq_len] cu_seqlens for batch=1. The H2D copy and
+            // the FI kernel are enqueued on the same `stream`, so stream-ordering
+            // guarantees this layer's kernel reads its value before the next
+            // layer's copy overwrites it (and the value is identical pass-wide).
+            let dev = ctx.buffers.fi_cu_seqlens();
             ctx.gpu.copy_h2d_async(cu_bytes, dev, stream)?;
             {
                 use std::sync::atomic::{AtomicBool, Ordering};
@@ -604,7 +609,6 @@ impl Qwen3AttentionLayer {
                 true,
                 stream,
             )?;
-            ctx.gpu.free(dev)?;
         } else if hd > 256 && self.prefill_attn_512_k.0 != 0 {
             // HDIM=512: use scalar reference kernel (BR=16, correct for any head_dim)
             // Full-attention layers (this path) always pass sliding_window=0.

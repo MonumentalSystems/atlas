@@ -88,6 +88,10 @@ pub struct BufferArena {
     fp8_act: DevicePtr,
     /// Persistent per-128-block FP32 scales paired with `fp8_act`.
     fp8_act_scale: DevicePtr,
+    /// FlashInfer ragged-prefill cu_seqlens scratch (i32 [0, seq_len] for the
+    /// batch=1 single-stream chunk-0 FI path). Persistent → no per-call
+    /// cuMemAlloc/cuMemFree in the attention hot loop.
+    fi_cu_seqlens: DevicePtr,
     /// Maximum batch tokens this arena was sized for.
     max_batch_tokens: usize,
     /// Sizes in bytes for each buffer (for debug/logging).
@@ -144,6 +148,7 @@ impl BufferArena {
         let token_ids = gpu.alloc(sizes.token_ids)?;
         let fp8_act = gpu.alloc(sizes.fp8_act)?;
         let fp8_act_scale = gpu.alloc(sizes.fp8_act_scale)?;
+        let fi_cu_seqlens = gpu.alloc(sizes.fi_cu_seqlens)?;
 
         tracing::info!(
             "Buffer arena: {} tokens × {:.1} MB total (attn_out={:.1}MB, ssm_deint={:.1}MB, kv_lora_rank={})",
@@ -184,6 +189,7 @@ impl BufferArena {
             token_ids,
             fp8_act,
             fp8_act_scale,
+            fi_cu_seqlens,
             max_batch_tokens,
             sizes,
         })
@@ -282,6 +288,11 @@ impl BufferArena {
     /// Persistent per-128-block FP32 scales paired with `fp8_act`.
     pub fn fp8_act_scale(&self) -> DevicePtr {
         self.fp8_act_scale
+    }
+    /// FlashInfer ragged-prefill cu_seqlens scratch (see field docs). Holds at
+    /// least (max_batch_tokens+1) i32; the batch=1 FI path writes [0, seq_len].
+    pub fn fi_cu_seqlens(&self) -> DevicePtr {
+        self.fi_cu_seqlens
     }
     pub fn splitk_workspace(&self) -> DevicePtr {
         self.splitk_workspace

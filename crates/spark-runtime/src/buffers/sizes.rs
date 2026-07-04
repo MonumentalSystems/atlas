@@ -97,6 +97,12 @@ pub struct BufferSizes {
     pub fp8_act: usize,
     /// Per-128-block FP32 scales paired with `fp8_act` (one f32 per 128 elems).
     pub fp8_act_scale: usize,
+    /// FlashInfer ragged-prefill cu_seqlens scratch (i32). The single-stream
+    /// chunk-0 FI path builds [0, flash_seq_len] on the host and copies it H2D
+    /// each call; persistent so it stops doing a per-call cuMemAlloc + cuMemFree
+    /// on the (attn-layers × chunks × requests) hot path. Sized (m+1) i32 so it
+    /// can also back a per-token qo_indptr; the batch=1 path uses 2 entries.
+    pub fi_cu_seqlens: usize,
 }
 
 impl BufferSizes {
@@ -229,6 +235,9 @@ impl BufferSizes {
         let max_proj_k = h.max(q_heads * hd);
         let fp8_act = m * max_proj_k;
         let fp8_act_scale = m * max_proj_k.div_ceil(128) * 4;
+        // FlashInfer ragged-prefill cu_seqlens scratch: (m+1) i32. Only 2
+        // entries are used by the batch=1 single-stream chunk-0 FI path.
+        let fi_cu_seqlens = (m + 1) * 4;
 
         // GDN FLA chunked-prefill scratch — ONE buffer holding W|U|S|uc back-to-back,
         // sized for the chunked-prefill arena (nt = ceil(max_batch_tokens / CHUNK)).
@@ -371,6 +380,7 @@ impl BufferSizes {
             token_ids: (m * 4).max(256),
             fp8_act,
             fp8_act_scale,
+            fi_cu_seqlens,
         }
     }
 
@@ -403,5 +413,6 @@ impl BufferSizes {
             + self.token_ids
             + self.fp8_act
             + self.fp8_act_scale
+            + self.fi_cu_seqlens
     }
 }
