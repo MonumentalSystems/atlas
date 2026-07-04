@@ -158,6 +158,79 @@ impl Qwen3AttentionLayer {
                 stream,
             )?;
         } else {
+            // FlashInfer PAGED prefill fast path (ATLAS_FLASHINFER_PAGED_PREFILL=1):
+            // single-stream chunk-1+ reads the whole prefix [0, kv_len) from the
+            // paged KV pool. The NHD BF16 pool maps 1:1 onto FI's paged_kv_t
+            // (stride_page=nkv*bs*hd, stride_n=nkv*hd, stride_h=hd) and the layer
+            // block_table IS the paged indices array. BF16 / non-turbo / no-SWA
+            // only; head_dim 256. Replaces the hand-rolled inferspark_prefill_paged
+            // (~8x redundant GQA K/V reads at long context).
+            let (wk, wv) = self.kv_dtype.kv_pair();
+            let fi_paged = seq_len_start > 0
+                && hd == 256
+                && self.kv_dtype == KvCacheDtype::Bf16
+                && !wk.is_wht_rotated()
+                && !wv.is_wht_rotated()
+                && self.sliding_window.unwrap_or(0) == 0
+                && spark_runtime::flashinfer::available()
+                && std::env::var("ATLAS_FLASHINFER_PAGED_PREFILL").ok().as_deref() == Some("1");
+            if fi_paged {
+                // Page geometry for the single request (batch=1): np pages cover
+                // [0, kv_len); the last holds lpl tokens in [1, bs].
+                let np = kv_len.div_ceil(bs_u);
+                let lpl = kv_len - (np - 1) * bs_u;
+                // Stage 5 int32 index words into the persistent arena scratch
+                // (Part 1's fi_cu_seqlens, sized (m+1) i32 >> 5): a chunk is
+                // either 0 OR >0 within a layer, so this never races the chunk-0
+                // cache_skip use of the same buffer; stream-ordering keeps it
+                // safe across the sequential attn layers (identical discipline to
+                // the chunk-0 FI path).
+                //   [0,1]=qo_indptr[0,n]  [2,3]=page_indptr[0,np]  [4]=last_page_len
+                let scratch = ctx.buffers.fi_cu_seqlens();
+                let host: [i32; 5] = [0, n as i32, 0, np as i32, lpl as i32];
+                let host_bytes = unsafe {
+                    std::slice::from_raw_parts(
+                        host.as_ptr() as *const u8,
+                        std::mem::size_of_val(&host),
+                    )
+                };
+                ctx.gpu.copy_h2d_async(host_bytes, scratch, stream)?;
+                {
+                    use std::sync::atomic::{AtomicBool, Ordering};
+                    static LOGGED: AtomicBool = AtomicBool::new(false);
+                    if !LOGGED.swap(true, Ordering::Relaxed) {
+                        tracing::warn!(
+                            "FI_PREFILL_PAGED: seq_len_start={seq_len_start} n={n} \
+                             kv_len={kv_len} np={np} lpl={lpl} bs={bs_u} nq={nq} \
+                             nkv={nkv} hd={hd} sm_scale={inv_sqrt_d}"
+                        );
+                    }
+                }
+                let qo_h: [i32; 2] = [0, n as i32];
+                let page_h: [i32; 2] = [0, np as i32];
+                spark_runtime::flashinfer::paged_prefill_bf16_hd256(
+                    q_contiguous.0,
+                    attn_out.0,
+                    kv_cache.k_pool_ptr(self.attn_layer_idx).0,
+                    kv_cache.v_pool_ptr(self.attn_layer_idx).0,
+                    &qo_h,
+                    &page_h,
+                    scratch.0,               // qo_indptr_d       [0..2)
+                    scratch.offset(2 * 4).0, // kv_page_indptr_d  [2..4)
+                    meta.block_table.0,      // physical block ids == FI paged indices
+                    scratch.offset(4 * 4).0, // kv_last_page_len_d [4..5)
+                    1,
+                    n,
+                    nq,
+                    nkv,
+                    hd,
+                    bs_u,
+                    inv_sqrt_d,
+                    true,
+                    stream,
+                )?;
+                return Ok(PagedAttnOutcome::Continue);
+            }
             let use_br64 = n >= 256;
             let (fp8_k_scale, fp8_v_scale) = self.effective_fp8_scales();
             match (self.kv_dtype, use_br64) {

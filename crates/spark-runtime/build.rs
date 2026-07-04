@@ -97,47 +97,66 @@ fn build_flashinfer_object(fi_home: std::path::PathBuf) {
     let cuda_home = std::env::var("CUDA_HOME").unwrap_or_else(|_| "/usr/local/cuda".to_string());
     let nvcc = std::path::Path::new(&cuda_home).join("bin/nvcc");
 
-    let src = std::path::PathBuf::from("cuda/flashinfer_ragged_prefill.cu");
-    println!("cargo:rerun-if-changed={}", src.display());
     println!("cargo:rustc-cfg=atlas_flashinfer");
 
     let cccl = fi_home.join("3rdparty/cccl");
-    let obj = out_dir.join("flashinfer_ragged_prefill.o");
-    let status = Command::new(&nvcc)
-        .arg("-c")
-        .arg("-O3")
-        .arg("-std=c++17")
-        .arg("--expt-relaxed-constexpr")
-        .arg("-Xcompiler")
-        .arg("-fPIC")
-        .arg(format!("-arch={arch}"))
-        // FlashInfer's pinned CCCL MUST precede the toolkit CCCL.
-        .arg("-isystem")
-        .arg(cccl.join("libcudacxx/include"))
-        .arg("-isystem")
-        .arg(cccl.join("cub"))
-        .arg("-isystem")
-        .arg(cccl.join("thrust"))
-        .arg(format!("-I{}", fi_home.join("include").display()))
-        .arg(&src)
-        .arg("-o")
-        .arg(&obj)
-        .status()
-        .expect("failed to spawn nvcc for FlashInfer wrapper");
-    assert!(
-        status.success(),
-        "nvcc failed while building FlashInfer wrapper"
-    );
+    // One object per wrapper: ragged (fresh contiguous K/V, chunk-0) and paged
+    // (block-table KV pool, chunk-1+). Kept as separate objects so the larger
+    // paged KernelTraits template doesn't inflate the ragged TU.
+    let sources = [
+        std::path::PathBuf::from("cuda/flashinfer_ragged_prefill.cu"),
+        std::path::PathBuf::from("cuda/flashinfer_paged_prefill.cu"),
+    ];
+    let mut objects = Vec::new();
+    for src in &sources {
+        println!("cargo:rerun-if-changed={}", src.display());
+        let obj = out_dir.join(
+            src.file_stem()
+                .expect("fi wrapper stem")
+                .to_string_lossy()
+                .to_string()
+                + ".o",
+        );
+        let status = Command::new(&nvcc)
+            .arg("-c")
+            .arg("-O3")
+            .arg("-std=c++17")
+            .arg("--expt-relaxed-constexpr")
+            .arg("-Xcompiler")
+            .arg("-fPIC")
+            .arg(format!("-arch={arch}"))
+            // FlashInfer's pinned CCCL MUST precede the toolkit CCCL.
+            .arg("-isystem")
+            .arg(cccl.join("libcudacxx/include"))
+            .arg("-isystem")
+            .arg(cccl.join("cub"))
+            .arg("-isystem")
+            .arg(cccl.join("thrust"))
+            .arg(format!("-I{}", fi_home.join("include").display()))
+            .arg(src)
+            .arg("-o")
+            .arg(&obj)
+            .status()
+            .expect("failed to spawn nvcc for FlashInfer wrapper");
+        assert!(
+            status.success(),
+            "nvcc failed while building FlashInfer wrapper {}",
+            src.display()
+        );
+        objects.push(obj);
+    }
 
-    let status = Command::new("ar")
-        .arg("crus")
-        .arg(&lib)
-        .arg(&obj)
+    let mut ar = Command::new("ar");
+    ar.arg("crus").arg(&lib);
+    for obj in &objects {
+        ar.arg(obj);
+    }
+    let status = ar
         .status()
         .expect("failed to spawn ar for FlashInfer wrapper");
     assert!(
         status.success(),
-        "ar failed while archiving FlashInfer wrapper"
+        "ar failed while archiving FlashInfer wrappers"
     );
 
     println!("cargo:rustc-link-search=native={}", out_dir.display());

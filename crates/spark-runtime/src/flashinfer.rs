@@ -61,6 +61,38 @@ unsafe extern "C" {
         stream: *mut c_void,
     ) -> i32;
 
+    // Paged batched prefill (chunk-1+). K/V come from the paged pool via a block
+    // table; `kv_page_indptr_*` are PAGE prefix-sums (not token lengths).
+    #[cfg(atlas_flashinfer)]
+    #[allow(clippy::too_many_arguments)]
+    fn atlas_fi_paged_prefill_bf16_hd256(
+        q: *const c_void,
+        o: *mut c_void,
+        k_pool: *const c_void,
+        v_pool: *const c_void,
+        qo_indptr_h: *const i32,
+        kv_page_indptr_h: *const i32,
+        qo_indptr_d: *const i32,
+        kv_page_indptr_d: *const i32,
+        kv_page_indices_d: *const i32,
+        kv_last_page_len_d: *const i32,
+        batch: u32,
+        total_qo_rows: u32,
+        num_qo_heads: u32,
+        num_kv_heads: u32,
+        head_dim: u32,
+        page_size: u32,
+        sm_scale: f32,
+        causal: i32,
+        float_ws: *mut c_void,
+        float_ws_bytes: usize,
+        int_ws: *mut c_void,
+        int_ws_bytes: usize,
+        pinned_int_ws: *mut c_void,
+        pinned_int_ws_bytes: usize,
+        stream: *mut c_void,
+    ) -> i32;
+
     #[cfg(atlas_flashinfer)]
     fn cuMemAlloc_v2(dptr: *mut u64, bytesize: usize) -> i32;
     #[cfg(atlas_flashinfer)]
@@ -242,6 +274,110 @@ pub fn ragged_prefill_bf16_hd256(
             num_qo_heads,
             num_kv_heads,
             head_dim,
+            sm_scale,
+            causal,
+            stream,
+        );
+        bail!("FlashInfer support was not built; set FLASHINFER_HOME when building")
+    }
+}
+
+/// Paged batched prefill (BF16, head_dim=256, GQA, causal). Reads K/V from the
+/// paged pool via `kv_page_indices_d` (== the Atlas layer block_table). Serves
+/// chunk-1+ prefill where the prefix `[0, kv_len)` lives in the cache.
+///
+/// `q`/`o`: `[total_qo_rows, num_qo_heads, 256]` BF16 device. `k_pool`/`v_pool`:
+/// layer KV pool bases (paged, NHD). `qo_indptr_h` is the query-row prefix sum;
+/// `kv_page_indptr_h` is the per-request **PAGE**-count prefix sum (the plan is
+/// page-native — see the .cu). `kv_page_indptr_d`/`kv_page_indices_d`/
+/// `kv_last_page_len_d` are the device paged-layout arrays; the kernel derives
+/// per-request token `kv_len` from them, so no token-length array is passed.
+#[allow(clippy::too_many_arguments)]
+pub fn paged_prefill_bf16_hd256(
+    q: u64,
+    o: u64,
+    k_pool: u64,
+    v_pool: u64,
+    qo_indptr_h: &[i32],
+    kv_page_indptr_h: &[i32],
+    qo_indptr_d: u64,
+    kv_page_indptr_d: u64,
+    kv_page_indices_d: u64,
+    kv_last_page_len_d: u64,
+    batch: u32,
+    total_qo_rows: u32,
+    num_qo_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    page_size: u32,
+    sm_scale: f32,
+    causal: bool,
+    stream: u64,
+) -> Result<()> {
+    #[cfg(atlas_flashinfer)]
+    {
+        if head_dim != HEAD_DIM {
+            bail!("FI paged wrapper is head_dim=256 only (got {head_dim})");
+        }
+        if qo_indptr_h.len() != (batch + 1) as usize
+            || kv_page_indptr_h.len() != (batch + 1) as usize
+        {
+            bail!("indptr host slices must be batch+1 long");
+        }
+        let ws = workspaces()?;
+        let st = unsafe {
+            atlas_fi_paged_prefill_bf16_hd256(
+                q as *const c_void,
+                o as *mut c_void,
+                k_pool as *const c_void,
+                v_pool as *const c_void,
+                qo_indptr_h.as_ptr(),
+                kv_page_indptr_h.as_ptr(),
+                qo_indptr_d as *const i32,
+                kv_page_indptr_d as *const i32,
+                kv_page_indices_d as *const i32,
+                kv_last_page_len_d as *const i32,
+                batch,
+                total_qo_rows,
+                num_qo_heads,
+                num_kv_heads,
+                head_dim,
+                page_size,
+                sm_scale,
+                if causal { 1 } else { 0 },
+                ws.float_ws as *mut c_void,
+                ws.float_sz,
+                ws.int_ws as *mut c_void,
+                ws.int_sz,
+                ws.pinned_int_ws as *mut c_void,
+                ws.pinned_sz,
+                stream as *mut c_void,
+            )
+        };
+        if st != 0 {
+            bail!("FlashInfer paged prefill failed: status {st} (batch={batch}, qo={total_qo_rows})");
+        }
+        Ok(())
+    }
+    #[cfg(not(atlas_flashinfer))]
+    {
+        let _ = (
+            q,
+            o,
+            k_pool,
+            v_pool,
+            qo_indptr_h,
+            kv_page_indptr_h,
+            qo_indptr_d,
+            kv_page_indptr_d,
+            kv_page_indices_d,
+            kv_last_page_len_d,
+            batch,
+            total_qo_rows,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim,
+            page_size,
             sm_scale,
             causal,
             stream,
