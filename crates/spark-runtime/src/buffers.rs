@@ -96,6 +96,15 @@ pub struct BufferArena {
     fp8_act: DevicePtr,
     /// Persistent per-128-block FP32 scales paired with `fp8_act`.
     fp8_act_scale: DevicePtr,
+    /// LoRA shrink scratch `xa = x@Aᵀ`: [M, adapter_max_rank] BF16.
+    /// NULL when no adapter is configured.
+    lora_xa: DevicePtr,
+    /// LoRA expand scratch `delta = xa@Bᵀ`: [M, max(hidden, intermediate)]
+    /// BF16. NULL when no adapter is configured.
+    lora_delta: DevicePtr,
+    /// LoRA hidden-activation scratch: [M, intermediate_size] BF16 for the
+    /// runtime FFN delta path. NULL when no adapter is configured.
+    lora_hact: DevicePtr,
     /// Maximum batch tokens this arena was sized for.
     max_batch_tokens: usize,
     /// Sizes in bytes for each buffer (for debug/logging).
@@ -169,6 +178,23 @@ impl BufferArena {
         };
         let fp8_act = gpu.alloc(sizes.fp8_act)?;
         let fp8_act_scale = gpu.alloc(sizes.fp8_act_scale)?;
+        // LoRA scratch: only allocate when an adapter is configured
+        // (size 0 → NULL; cuMemAlloc rejects 0-byte allocations).
+        let lora_xa = if sizes.lora_xa > 0 {
+            gpu.alloc(sizes.lora_xa)?
+        } else {
+            DevicePtr::NULL
+        };
+        let lora_delta = if sizes.lora_delta > 0 {
+            gpu.alloc(sizes.lora_delta)?
+        } else {
+            DevicePtr::NULL
+        };
+        let lora_hact = if sizes.lora_hact > 0 {
+            gpu.alloc(sizes.lora_hact)?
+        } else {
+            DevicePtr::NULL
+        };
 
         tracing::info!(
             "Buffer arena: {} tokens × {:.1} MB total (attn_out={:.1}MB, ssm_deint={:.1}MB, kv_lora_rank={})",
@@ -212,6 +238,9 @@ impl BufferArena {
             ffn_act_scale,
             fp8_act,
             fp8_act_scale,
+            lora_xa,
+            lora_delta,
+            lora_hact,
             max_batch_tokens,
             sizes,
         })
@@ -322,6 +351,33 @@ impl BufferArena {
     /// Persistent per-128-block FP32 scales paired with `fp8_act`.
     pub fn fp8_act_scale(&self) -> DevicePtr {
         self.fp8_act_scale
+    }
+    /// LoRA shrink scratch `xa = x@Aᵀ` [M, adapter_max_rank] BF16.
+    /// `DevicePtr::NULL` when no adapter is configured.
+    pub fn lora_xa(&self) -> DevicePtr {
+        self.lora_xa
+    }
+    /// Allocated byte size of `lora_xa` (0 when no adapter).
+    pub fn lora_xa_bytes(&self) -> usize {
+        self.sizes.lora_xa
+    }
+    /// LoRA expand scratch `delta = xa@Bᵀ` [M, max(hidden, intermediate)]
+    /// BF16. `DevicePtr::NULL` when no adapter is configured.
+    pub fn lora_delta(&self) -> DevicePtr {
+        self.lora_delta
+    }
+    /// Allocated byte size of `lora_delta` (0 when no adapter).
+    pub fn lora_delta_bytes(&self) -> usize {
+        self.sizes.lora_delta
+    }
+    /// LoRA hidden-activation scratch [M, intermediate_size] BF16 for the
+    /// runtime FFN delta path. `DevicePtr::NULL` when no adapter.
+    pub fn lora_hact(&self) -> DevicePtr {
+        self.lora_hact
+    }
+    /// Allocated byte size of `lora_hact` (0 when no adapter).
+    pub fn lora_hact_bytes(&self) -> usize {
+        self.sizes.lora_hact
     }
     pub fn splitk_workspace(&self) -> DevicePtr {
         self.splitk_workspace
