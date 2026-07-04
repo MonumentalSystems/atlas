@@ -188,14 +188,17 @@ impl TransformerModel {
                 seq.slot_idx
             );
         }
-        // batch_decode_graphs is keyed by padded_n, not slot — but the captured
-        // graphs DO contain per-slot SSM pointers from the active set at capture
-        // time. Drop them all (they'll be re-captured on next batched decode).
-        for (_, graph) in self.batch_decode_graphs.lock().drain() {
-            if let Err(e) = self.gpu.destroy_graph(graph) {
-                tracing::error!("free_sequence: destroy_graph(batch_decode_graphs entry): {e:#}");
-            }
-        }
+        // batch_decode_graphs is keyed by padded_n and bakes only FIXED
+        // pool-slot/metadata ADDRESSES (pool_base + i*stride), not per-sequence
+        // identity. retire_finished_sequences restores the position-i==slot-i
+        // invariant on every completion (Phase-2 compact + sort by ssm_slot) and
+        // freed slots are zeroed, so a graph captured for padded_n stays valid
+        // across sequence turnover: real positions [0..n) read the survivors;
+        // [n..padded_n) read freed-zeroed/dummy slots (inert, discarded rows).
+        // Do NOT drain here — re-capturing on every finish was destroying the
+        // multi-seq CUDA-graph speedup under staggered completions. The replay
+        // guard (n <= n_cap in decode_a2) covers the one unsafe case: admission
+        // growing n past a graph's captured real-seq count.
         // Verify graphs are now slot-keyed (sibling of decode_graph fix).
         // Drop only this slot's entry to preserve other concurrent seqs' graphs.
         for graph_mutex in [

@@ -164,8 +164,20 @@ impl TransformerModel {
         let hidden = self.buffers.hidden_states();
         let residual = self.buffers.residual();
 
-        // Pad to nearest captured graph size [2, 4, 8]
-        let padded_n = [2, 4, 8].iter().copied().find(|&s| s >= n).unwrap_or(n);
+        // Even buckets up to max_batch_size (16). Measured: per-exact-n padding
+        // increased batch-size-dependent output drift at odd sizes (the batched
+        // decode kernels are numerically bit-clean only at even batch), for no
+        // throughput gain (decode is compute-bound here — CUDA graphs measured a
+        // no-op vs eager, so bucket granularity doesn't affect launch cost).
+        // Even buckets keep every batch on an even-size kernel (pad odd n up by
+        // one lane) AND cover the full 2..16 range (the old [2,4,8] left 9..16
+        // un-bucketed → raw n). Graphs retained across turnover via the
+        // sequence.rs drain fix; n<=n_cap replay guard covers pad-lane admission.
+        let padded_n = [2, 4, 6, 8, 10, 12, 14, 16]
+            .iter()
+            .copied()
+            .find(|&s| s >= n)
+            .unwrap_or(n);
 
         // ── Phase 1: Pre-graph (runs every step, NOT captured) ──
 
@@ -241,9 +253,17 @@ impl TransformerModel {
         };
 
         if let Some(ref graphs) = graphs
-            && let Some(&graph) = graphs.get(&padded_n)
+            && let Some(&(graph, n_cap)) = graphs.get(&padded_n)
+            && n <= n_cap
         {
-            // Graph exists — replay (kernels use updated metadata + SSM pool addresses)
+            // Graph exists AND was captured with at least the current number of
+            // real positions — replay. Guard rationale: a graph captured at
+            // n_cap real seqs bakes dummy_slot into positions [n_cap..padded_n);
+            // replaying at n > n_cap would route a newly-admitted real seq
+            // (slot n_cap..n) through the dummy slot → wrong output + stalled
+            // state. n <= n_cap is safe: the extra captured positions [n..n_cap)
+            // read freed-zeroed/inert slots whose logits rows the scheduler
+            // discards. n > n_cap falls through to re-capture at the larger n.
             if graph.0 != 0 {
                 self.gpu.launch_graph(graph, stream)?;
             }
@@ -465,7 +485,15 @@ impl TransformerModel {
                 if graph.0 != 0 {
                     tracing::info!("Captured CUDA graph for batch size {padded_n}");
                     if let Some(ref mut g) = graphs {
-                        g.insert(padded_n, graph);
+                        // Record n_cap = current real-seq count (replay guard uses
+                        // it). If a stale graph for this bucket exists (smaller
+                        // n_cap, being replaced after admission grew n), destroy it
+                        // so the GPU-side graph isn't leaked.
+                        if let Some((old, _)) = g.insert(padded_n, (graph, n))
+                            && old.0 != 0
+                        {
+                            let _ = self.gpu.destroy_graph(old);
+                        }
                     }
                     self.gpu.launch_graph(graph, stream)?;
                 }

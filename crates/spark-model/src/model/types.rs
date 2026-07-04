@@ -79,7 +79,11 @@ pub struct TransformerModel {
     /// fix in scheduler::step_decode_only), so we keep one graph per slot.
     pub(super) decode_graph: Mutex<std::collections::HashMap<usize, GraphHandle>>,
     /// Cached CUDA graphs for batched decode, keyed by padded batch size.
-    pub(super) batch_decode_graphs: Mutex<HashMap<usize, GraphHandle>>,
+    // Keyed by padded_n. Value = (graph, n_cap) where n_cap is the count of REAL
+    // (non-pad) sequences present at capture; the decode_a2 replay guard requires
+    // current n <= n_cap so a newly-admitted seq can't be routed through a baked
+    // dummy_slot. See decode_a2.rs replay/capture + sequence.rs (no drain-on-free).
+    pub(super) batch_decode_graphs: Mutex<HashMap<usize, (GraphHandle, usize)>>,
     /// Pre-allocated SSM state pool for stable GPU addresses across graph replays.
     /// `Arc` so each `SequenceState` can hold a `SlotGuard` that releases its
     /// claimed slot on drop — guaranteeing the slot returns to the free list on
