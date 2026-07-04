@@ -70,8 +70,45 @@ impl TransformerModel {
         // refs. Trade: cold requests under active caching lose kernel-batched
         // co-dispatch, but with caching on most requests hit and a hit's
         // processed suffix is tiny, so the co-dispatch scaling is moot.
+        // Fix #4 CARVE-OUT: the ONLY hazard is a batch with MIXED
+        // effective_seq_len_start (PHASE A mutates streams in order, then bails
+        // on the mismatch → dirty seqs → per-stream re-run corruption). A batch
+        // is safe under active caching iff every stream is provably FRESH
+        // chunk-0: chunk_start==0 AND no cached prefix. With no prefix match,
+        // PHASE A's prefill_b_prefix_lookup returns matched_tokens==0 →
+        // marconi_skip=false → proc_range cold branch → effective_seq_len_start
+        // ==chunk_start==0 for ALL streams, so the cross-stream check cannot
+        // bail. `peek_matched_tokens` is the read-only radix probe (no ref/LRU/
+        // hit-count side effects) and returns the SAME block-aligned `walk`
+        // count that `lookup` (PHASE A) derives matched_tokens from — session_hash
+        // only affects the SSM snapshot, itself gated behind matched_tokens>0. On
+        // the single-threaded scheduler loop no insert interleaves between this
+        // peek and that lookup (inserts live only in PHASE C finalize/checkpoint
+        // + free_sequence, same thread), so peek==0 ⟹ PHASE-A matched==0
+        // deterministically. Any stream with a prefix (peek>0) or chunk_start>0
+        // keeps the proven per-stream fallback. Kill-switch:
+        // ATLAS_CODISPATCH_UNDER_CACHE=0 restores the unconditional bail.
+        //
+        // EP: the eligibility decision must be IDENTICAL across ranks or they
+        // diverge on the batched-vs-per-stream path (collective mismatch → hang),
+        // and `peek` is head-local (per-rank radix trees differ). So the
+        // carve-out is single-node only; EP keeps the blanket bail (mirrors the
+        // `ep_active ||` short-circuit at prefill_b.rs:105).
         if self.prefix_cache.is_active() {
-            return false;
+            let carve_out = std::env::var("ATLAS_CODISPATCH_UNDER_CACHE")
+                .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+                .unwrap_or(true);
+            let ep_active = self.comm.is_some() && self.config.ep_world_size > 1;
+            let bs = self.kv_cache.lock().block_size();
+            let all_fresh_chunk0 = carve_out
+                && !ep_active
+                && streams.iter().all(|s| {
+                    s.chunk_start == 0
+                        && self.prefix_cache.peek_matched_tokens(s.prompt_tokens, bs) == 0
+                });
+            if !all_fresh_chunk0 {
+                return false;
+            }
         }
         let varlen = varlen_prefill_enabled();
         // FI ragged can co-dispatch chunk-0 with the shipped ATLAS_FLASHINFER_PREFILL
