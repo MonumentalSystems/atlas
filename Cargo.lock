@@ -136,6 +136,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "atlas-expert-pack"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "spark-storage",
+]
+
+[[package]]
 name = "atlas-kernels"
 version = "0.1.1"
 dependencies = [

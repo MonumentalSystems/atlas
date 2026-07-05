@@ -67,8 +67,9 @@ impl Proj {
 ///     (transposed) layout, so `packed_bytes = N * K / 2`.
 ///   * `scale`   — per-group FP8-E4M3 block scales, `[K/16, N]`, so
 ///     `scale_bytes = N * K / group_size`.
-/// plus two scalars carried in the record header (`weight_scale_2`,
-/// `input_scale`), which is why they are absent here.
+///
+/// The two per-projection scalars (`weight_scale_2`, `input_scale`) are carried
+/// in the record header, which is why they are absent here.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ProjBytes {
     pub packed_bytes: u64,
