@@ -34,7 +34,7 @@ impl LoraKernels {
 
 /// One adapted module. A/B are PEFT tensors VERBATIM (host F16->BF16 at load):
 ///   a: [rank, k_in]  row-major BF16  (PEFT lora_A [r, in_features] — already
-///                                     the B-operand [N,K] layout dense_* expect)
+///                                     the B-operand `[N,K]` layout dense_* expect)
 ///   b: [n_out, rank] row-major BF16  (PEFT lora_B [out_features, r] — likewise)
 /// Both are rank-padded to the pool's max_rank (zero rows/cols beyond `rank`),
 /// so kernels may uniformly run at the pool rank — bit-identical to true rank.

@@ -57,8 +57,8 @@ impl LoraModule {
     }
 
     /// (out_dim, in_dim) of the base projection. Holo-3.1-0.8B (verified
-    /// against the checkpoint header): k/v [512,1024], o [1024,2048],
-    /// gate/up [3584,1024], down [1024,3584].
+    /// against the checkpoint header): k/v `[512,1024]`, o `[1024,2048]`,
+    /// gate/up `[3584,1024]`, down `[1024,3584]`.
     pub fn dims(&self, cfg: &ModelConfig) -> (usize, usize) {
         let h = cfg.hidden_size;
         match self {
