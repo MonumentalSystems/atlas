@@ -110,7 +110,9 @@ pub fn load_adapter_safetensors(
     Ok(WeightStore::from_map(weights))
 }
 
-#[cfg(test)]
+// Gated on `feature = "cuda"`: the test constructs a real `AtlasCudaBackend`
+// (a CUDA-only module), so the metal / no-CUDA build must not compile it.
+#[cfg(all(test, feature = "cuda"))]
 mod tests {
     use super::load_adapter_safetensors;
     use crate::cuda_backend::AtlasCudaBackend;
