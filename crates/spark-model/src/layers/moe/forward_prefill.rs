@@ -326,6 +326,12 @@ impl MoeLayer {
         };
         prof_step!("pre_expert_norm");
 
+        // Streaming Experts: patch the transposed pointer tables to point at
+        // the arena-resident records for this layer's local experts (no-op
+        // unless --stream-experts). Blocking fetch (Stage 2), before the GEMM
+        // reads the tables. Outside the profiled body; no sync on the fast path.
+        self.install_streamed_tables(ctx, stream)?;
+
         // 4-6. Routed grouped-GEMM phase (grid sizing → grouped gate+up
         // GEMM → SiLU → grouped down GEMM). Hoisted to forward_prefill_routed.rs
         // to keep this file under the 500 LoC cap; behavior identical.

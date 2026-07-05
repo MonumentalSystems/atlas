@@ -180,6 +180,16 @@ pub(super) fn load_layers(
         );
     }
 
+    // Streaming Experts: open the shared store + arena ring once (no-op unless
+    // --stream-experts). Attached to each MoE layer below with its dense index.
+    let expert_streamer = if config.expert_streaming {
+        Some(std::sync::Arc::new(
+            crate::layers::moe::ExpertStreamerShared::open(config)?,
+        ))
+    } else {
+        None
+    };
+
     for (i, lt) in layer_types.iter().enumerate() {
         let lp = config.layer_prefix(i);
         let input_norm = dense_auto(store, &format!("{lp}.input_layernorm.weight"), gpu)?;
@@ -347,6 +357,14 @@ pub(super) fn load_layers(
                 == Some("1")
         {
             moe_layer.build_cutlass_grouped_sfb(gpu, config, stream)?;
+        }
+
+        // Streaming Experts: attach the shared streamer + this layer's dense MoE
+        // index (the transposed tables now exist and will be patched per prefill).
+        // qwen3.5 has a MoE MLP in every layer, so the dense MoE index == i; a
+        // store/layer mismatch is caught by the record-identity check at fetch.
+        if let Some(es) = &expert_streamer {
+            moe_layer.set_expert_streamer(Some(es.clone()), i as u32);
         }
 
         // ATLAS_FP8_DEQUANT_MOE_TO_BF16: dequant FP8 experts to BF16 at load,

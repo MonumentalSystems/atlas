@@ -309,6 +309,8 @@ impl MoeLayer {
             prefill_stream: gpu.create_stream()?,
             event_a: gpu.create_event()?,
             event_b: gpu.create_event()?,
+            streamer: None,
+            stream_dense_idx: 0,
             moe_expert_gate_up_shared_fp8: gpu.kernel(
                 "moe_shared_expert_fused_fp8",
                 "moe_expert_gate_up_shared_fp8",

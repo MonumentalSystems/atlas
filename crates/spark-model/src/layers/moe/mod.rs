@@ -344,6 +344,12 @@ pub struct MoeLayer {
     // path. Used to test whether the kernel choice is the dominant cause
     // of low DFlash drafter acceptance on FP4/FP8 targets.
     pub is_dflash_capture_layer: bool,
+    /// Streaming Experts: model-wide expert streamer shared across MoE layers.
+    /// `None` unless `--stream-experts` is set. See `streamer.rs`.
+    streamer: Option<std::sync::Arc<streamer::ExpertStreamerShared>>,
+    /// This layer's dense MoE-layer index (skips dense-attention layers), used
+    /// to pick its arena ring slab. 0 unless streaming.
+    stream_dense_idx: u32,
 }
 
 // ── Sub-files (split for ≤500 LoC) ────────────────────────────────────────
@@ -364,9 +370,13 @@ mod forward_token_major;
 mod helpers_a;
 mod helpers_b;
 mod helpers_c;
+mod helpers_stream;
 mod init;
+mod streamer;
 #[cfg(test)]
 mod mod_tests;
+
+pub(crate) use streamer::ExpertStreamerShared;
 
 /// Build a device-side pointer table from pre-transposed QuantizedWeight vec.
 fn build_ptr_table_from_qw(

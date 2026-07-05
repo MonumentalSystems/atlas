@@ -177,6 +177,26 @@ impl ExpertIndex {
         }
     }
 
+    /// Load just the manifest (`manifest.json`) from a store dir — geometry
+    /// only, no file handles. Lets the streamer size its arena before opening a
+    /// tier. Validates the format version.
+    #[cfg(unix)]
+    pub fn load(dir: &std::path::Path) -> Result<Self> {
+        let p = dir.join(Self::MANIFEST_NAME);
+        let json = std::fs::read_to_string(&p)
+            .with_context(|| format!("read {}", p.display()))?;
+        let index: ExpertIndex =
+            serde_json::from_str(&json).with_context(|| format!("parse {}", p.display()))?;
+        if index.version != ExpertRecordHeader::VERSION {
+            bail!(
+                "manifest version {} != supported {}",
+                index.version,
+                ExpertRecordHeader::VERSION
+            );
+        }
+        Ok(index)
+    }
+
     pub fn spec(&self) -> ExpertRecordSpec {
         ExpertRecordSpec::new(self.inter, self.hidden, self.group_size, self.sub_align)
     }
