@@ -364,6 +364,26 @@ pub struct ServeArgs {
     #[arg(long, default_value_t = 3)]
     pub swap_space_gb: usize,
 
+    // ── --stream-experts (over-core MoE: stream cold experts from NVMe) ──
+    // Orthogonal to --high-speed-swap (that streams KV; this streams MoE
+    // expert weights). When set, an over-core NVFP4 checkpoint runs on one
+    // GB10 by streaming cold experts from a resident store built by
+    // `atlas-expert-pack`. Off by default. See docs/streaming-experts/.
+    /// Directory of a resident expert store (built by `atlas-expert-pack`).
+    /// Enables prefill-path MoE expert streaming.
+    #[arg(long)]
+    pub stream_experts: Option<std::path::PathBuf>,
+
+    /// Residency ring depth in MoE layers for `--stream-experts` (0 = all
+    /// resident; a small cap forces eviction to emulate an over-core model).
+    #[arg(long, default_value_t = 0)]
+    pub expert_arena_layers: usize,
+
+    /// Expert fetch tier: "uma" (zero-copy pinned LPDDR arena) | "posix"
+    /// (deterministic bounce oracle, used for bit-identical validation).
+    #[arg(long, default_value = "uma")]
+    pub expert_backend: String,
+
     // ── --high-speed-swap (lossless block-level KV streaming) ──
     // Coexists with --swap-space-gb: the existing flag handles
     // sequence-level admission control (whole-sequence evict/restore),

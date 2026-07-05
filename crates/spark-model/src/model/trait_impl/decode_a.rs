@@ -170,13 +170,19 @@ impl TransformerModel {
         // and remove per-kernel launch overhead. Env-gated so it can be toggled
         // off at deploy time (instant revert) if capture crashes / replay hangs.
         let ep_graphs = std::env::var("ATLAS_EP_GRAPHS").is_ok_and(|v| v == "1" || v == "true");
-        let use_graphs = (self.comm.is_none() || ep_graphs)
-            && !self.profile
-            && !self
-                .suppress_graphs
-                .load(std::sync::atomic::Ordering::Relaxed)
-            && !hss_engaged
-            && !dump_step0;
+        // Invariant F: streaming experts patch the prefill *_ptrs_t tables per
+        // layer, so decode must stay on the eager path (graphs bake pointer
+        // args). `expert_streaming` joins the existing suppressors.
+        let use_graphs = decode_graphs_allowed(
+            self.comm.is_none(),
+            ep_graphs,
+            self.profile,
+            self.suppress_graphs
+                .load(std::sync::atomic::Ordering::Relaxed),
+            hss_engaged,
+            self.config.expert_streaming,
+            dump_step0,
+        );
 
         let ctx = ForwardContext {
             buffers: &self.buffers,
@@ -377,5 +383,67 @@ impl TransformerModel {
         seq.seq_len += 1;
 
         Ok(self.decode_logits_ptr())
+    }
+}
+
+/// Decode CUDA-graph eligibility. Extracted from the `use_graphs` conjunction
+/// so invariant F (streaming experts force the eager decode path) is unit-
+/// testable without a live model. Graphs are allowed only when a communicator
+/// is absent (or EP-graphs is explicitly opted in) AND no suppressor is active;
+/// any engaged suppressor — profiling, an explicit suppress flag, high-speed KV
+/// swap, streaming experts, or a step-0 dump — forces the eager path.
+#[allow(clippy::fn_params_excessive_bools)]
+pub(crate) fn decode_graphs_allowed(
+    comm_none: bool,
+    ep_graphs: bool,
+    profile: bool,
+    suppress: bool,
+    hss_engaged: bool,
+    expert_streaming: bool,
+    dump_step0: bool,
+) -> bool {
+    (comm_none || ep_graphs)
+        && !profile
+        && !suppress
+        && !hss_engaged
+        && !expert_streaming
+        && !dump_step0
+}
+
+#[cfg(test)]
+mod decode_graph_gate_tests {
+    use super::decode_graphs_allowed;
+
+    // Baseline: single-GPU, nothing engaged → graphs on.
+    fn base() -> bool {
+        decode_graphs_allowed(true, false, false, false, false, false, false)
+    }
+
+    #[test]
+    fn baseline_allows_graphs() {
+        assert!(base());
+    }
+
+    #[test]
+    fn streaming_experts_forces_eager() {
+        // Invariant F: expert_streaming=true must disable graphs, all else equal.
+        assert!(!decode_graphs_allowed(true, false, false, false, false, true, false));
+    }
+
+    #[test]
+    fn each_suppressor_disables_graphs() {
+        // profile, suppress, hss, expert_streaming, dump_step0 each gate off.
+        assert!(!decode_graphs_allowed(true, false, true, false, false, false, false));
+        assert!(!decode_graphs_allowed(true, false, false, true, false, false, false));
+        assert!(!decode_graphs_allowed(true, false, false, false, true, false, false));
+        assert!(!decode_graphs_allowed(true, false, false, false, false, true, false));
+        assert!(!decode_graphs_allowed(true, false, false, false, false, false, true));
+    }
+
+    #[test]
+    fn comm_present_needs_ep_graphs_optin() {
+        // With a communicator (comm_none=false) graphs need the ep_graphs opt-in.
+        assert!(!decode_graphs_allowed(false, false, false, false, false, false, false));
+        assert!(decode_graphs_allowed(false, true, false, false, false, false, false));
     }
 }

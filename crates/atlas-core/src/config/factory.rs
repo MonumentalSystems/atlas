@@ -54,6 +54,10 @@ impl ModelConfig {
             weight_prefix: String::new(),
             ep_rank: 0,
             ep_world_size: 1,
+            expert_streaming: false,
+            expert_store_dir: None,
+            expert_arena_layers: 0,
+            expert_backend: "uma".to_string(),
             tp_rank: 0,
             tp_world_size: 1,
             hybrid_override_pattern: String::new(),
@@ -108,5 +112,21 @@ impl ModelConfig {
             rotary_dim: 0,
             dflash_capture_layers: Vec::new(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn streaming_experts_defaults_are_safe_noop() {
+        // Stage 0 contract: a freshly-built config has streaming OFF and the
+        // default tier set, so the resident path is byte-for-byte unchanged.
+        let c = ModelConfig::qwen3_next_80b_nvfp4();
+        assert!(!c.expert_streaming);
+        assert_eq!(c.expert_store_dir, None);
+        assert_eq!(c.expert_arena_layers, 0);
+        assert_eq!(c.expert_backend, "uma");
     }
 }

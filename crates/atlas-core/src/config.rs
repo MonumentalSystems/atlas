@@ -312,6 +312,24 @@ pub struct ModelConfig {
     #[serde(skip)]
     pub ep_world_size: usize,
 
+    // ── Streaming Experts (set at runtime, not from config.json) ──
+    // Over-core MoE: stream cold experts from an on-disk resident store on the
+    // prefill path instead of holding every expert resident. Strictly opt-in;
+    // when false the model is byte-for-byte the resident path. See
+    // docs/streaming-experts/.
+    /// Whether MoE experts are streamed from `expert_store_dir`.
+    #[serde(skip)]
+    pub expert_streaming: bool,
+    /// Directory of the resident expert store (built by `atlas-expert-pack`).
+    #[serde(skip)]
+    pub expert_store_dir: Option<std::path::PathBuf>,
+    /// Residency ring depth in MoE layers (0 = all layers resident).
+    #[serde(skip)]
+    pub expert_arena_layers: usize,
+    /// Fetch tier: "uma" (zero-copy pinned arena) | "posix" (bounce oracle).
+    #[serde(skip)]
+    pub expert_backend: String,
+
     // ── Tensor Parallelism (set at runtime, not from config.json) ──
     /// TP rank within the TP sub-communicator. 0 if `tp_world_size==1`.
     #[serde(skip)]
