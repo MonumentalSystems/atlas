@@ -1,0 +1,21 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+[package]
+name = "atlas-expert-pack"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+description = "Offline builder: checkpoint NVFP4 experts -> resident-layout expert-stream store"
+
+[[bin]]
+name = "atlas-expert-pack"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# Pure format/geometry surface only — no CUDA needed to build the store.
+spark-storage = { path = "../spark-storage", default-features = false }
+
+[lints]
+workspace = true
