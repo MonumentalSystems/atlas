@@ -173,7 +173,10 @@ fn load_expert(ckpt: &Checkpoint, geo: &Geometry, abs_layer: u32, expert: u32) -
         let pname = PROJ_NAMES[p as usize];
         let (n, k) = proj_nk(geo, p);
 
-        // packed [N, K/2] -> [K/2, N]
+        // packed [N, K/2] -> [K/2, N]. All three projections are stored
+        // transposed: the prefill fused K64 gate/up GEMM and the
+        // moe_w4a16_grouped_gemm_ptrtable_n128 down GEMM both read the
+        // transposed *_ptrs_t tables.
         let src_packed = ckpt.read_tensor(&tensor_name(
             &geo.base_prefix,
             abs_layer,

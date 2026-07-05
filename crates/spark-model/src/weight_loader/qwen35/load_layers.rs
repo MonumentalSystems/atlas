@@ -234,6 +234,19 @@ pub(super) fn load_layers(
         // does) rather than the native-FP8 per-expert path.
         let fused_experts = store.contains(&format!("{lp}.mlp.experts.gate_up_proj"));
         let skip_nvfp4_experts = native_fp8 && !force_nvfp4_moe && !fused_experts;
+        // Streaming Experts (WS1): don't materialize resident routed experts —
+        // they are streamed into the pinned arena at runtime. Load them as NULL
+        // (zero GPU bytes); the immortal *_ptrs_t tables are still built (empty)
+        // by transpose_for_prefill below and patched per prefill from the arena.
+        // This is what makes --expert-arena-layers actually free memory / run
+        // an over-core model on one box (prefill/batch; decode stays resident).
+        let skip_routed_load = skip_nvfp4_experts || config.expert_streaming;
+        if config.expert_streaming && i == 0 {
+            tracing::info!(
+                "Streaming experts: skipping resident routed-expert materialization \
+                 (streamed from arena; frees ~expert-weight GPU memory)"
+            );
+        }
         if skip_nvfp4_experts {
             tracing::info!(
                 "FP8: skipping NVFP4 routed experts (FP8 fused MoE batch1/2/3 handles all dispatch)"
@@ -257,7 +270,7 @@ pub(super) fn load_layers(
             absmax_k,
             quantize_k,
             stream,
-            skip_nvfp4_experts,
+            skip_routed_load,
         )?;
         // 2026-05-25 (final): gate stays in BF16 for `native_fp8` —
         // routes through `dense_gemm` BF16 fallback path.
@@ -328,7 +341,7 @@ pub(super) fn load_layers(
             );
         }
         if (!native_fp8 || force_nvfp4_moe)
-            && (!skip_moe_transpose || fast_holo_moe_layer)
+            && (!skip_moe_transpose || fast_holo_moe_layer || config.expert_streaming)
             && !skip_moe_prefill_copies
         {
             match holo_fast_moe_mode {
@@ -343,6 +356,10 @@ pub(super) fn load_layers(
                 }
             }
         }
+        // predequant MUST still run under streaming: it FP8-dequantizes the
+        // ROUTER gate (gate_nvfp4 -> gate_fp8) + the shared expert (both stay
+        // resident, not streamed). Skipping it silently drops the router to the
+        // NVFP4 path -> slightly different routing logits (not bit-identical).
         if (!native_fp8 || force_nvfp4_moe) && !skip_moe_prefill_copies {
             moe_layer.predequant_for_prefill(gpu, config, stream)?;
         }

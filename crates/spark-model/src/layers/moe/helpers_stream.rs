@@ -102,9 +102,10 @@ impl MoeLayer {
         let Some(streamer) = self.streamer.as_ref() else {
             return Ok(());
         };
-        // The default NVFP4 prefill path reads the transposed tables; require
-        // them (the ATLAS_HOLO_MOE_* CUTLASS/untransposed paths read different
-        // buffers and are unsupported while streaming).
+        // The default NVFP4 prefill path reads the transposed tables (fused K64
+        // gate/up + moe_w4a16_grouped_gemm_ptrtable_n128 for down, which reads
+        // down_ptrs_t when it is Some). Patch all three *_ptrs_t; the store holds
+        // gate/up/down all transposed. (ATLAS_HOLO_MOE_* paths are unsupported.)
         let (Some(gt), Some(ut), Some(dt)) = (
             self.gate_ptrs_t.as_ref(),
             self.up_ptrs_t.as_ref(),
