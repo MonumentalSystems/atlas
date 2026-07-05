@@ -8,13 +8,22 @@ redirected by patching the device-resident `ExpertPtrTable`.
 
 ## Status
 
-| Phase | What | State |
+| Stage | What | State |
 |---|---|---|
 | Gate 0(b) | UMA zero-copy + NVMe bandwidth on real GB10 | ✅ **measured, cleared** — [`GATE0.md`](GATE0.md) |
 | Gate 0(a) | Decode router hit-rate simulation | ⬜ not run (gates decode only) |
-| Phase 1 | Expert-record format + offline builder | ✅ **landed + tested** — `spark-storage::expert{,_pack}`, `atlas-expert-pack` |
-| Phase 2 | Prefill streamer (arena, prefetch, ptr-patch) | 📐 **designed, staged for review** — [`PHASE2-PREFILL-STREAMER.md`](PHASE2-PREFILL-STREAMER.md) |
-| Post-MVP | Decode streaming; RDMA weight-tier | 🔬 research — [`RESEARCH-RDMA-TIER.md`](RESEARCH-RDMA-TIER.md) |
+| Stage 0 | Config/CLI contract + invariant-F decode gate | ✅ **landed + tested** (no-op by default) |
+| Stage 1 | ExpertTier + UMA zero-copy arena + Posix oracle | ✅ **landed, GPU-parity validated** |
+| Phase 1 | Expert-record format + offline builder | ✅ **landed + tested** — `atlas-expert-pack` |
+| Stage 2 | Prefill streamer (arena, ptr-patch) | ✅ **BIT-IDENTICAL on real A3B** (resident == uma == posix) |
+| Stage 3 | Async prefetch overlap + deferred-free | ✅ **BIT-IDENTICAL** (capped arena, uma + rdma) |
+| Stage 4 | RDMA weight-tier (TCP-over-CX7) + peer | ✅ **BIT-IDENTICAL** (peer-as-tier, end-to-end) |
+| Stage 4 · Phase B | One-sided RC RDMA_READ (verbs) | 🔬 gated on a cabled peer + CX7 28.45→28.47 FW — [`RESEARCH-RDMA-TIER.md`](RESEARCH-RDMA-TIER.md) |
+| Post-MVP | Decode streaming | 🔬 gated on Gate 0(a) |
+
+**All five residency configs are bit-identical on the real AEON-7 A3B-NVFP4 model
+(GB10):** `resident == uma == posix == rdma`, blocking and async, same final-norm
+hash. Reproduce with `scripts/streaming-experts/verify_logits.sh`.
 
 ## Key results so far
 
@@ -32,11 +41,24 @@ redirected by patching the device-resident `ExpertPtrTable`.
 ## Try it
 
 ```bash
-# Inspect a checkpoint's expert grid without writing anything:
-atlas-expert-pack --checkpoint <hf-snapshot-dir> --dry-run
+# Single-GPU build (skip NCCL) for the A3B target:
+ATLAS_TARGET_MODEL=qwen3.6-35b-a3b \
+  cargo build --release -p spark-server --no-default-features --features cuda
 
-# Build a 1-layer store with round-trip verification:
-atlas-expert-pack --checkpoint <dir> --out ./expert-store --max-layers 1 --verify 16
+# Build the resident expert store from a checkpoint (stage on LOCAL NVMe):
+cargo run --release -p atlas-expert-pack -- \
+  --checkpoint <hf-snapshot-dir> --out /path/on/nvme/expert-store --verify 8
+
+# Serve with streaming experts (uma zero-copy | posix oracle | rdma peer):
+spark serve --model-from-path <ckpt> --stream-experts /path/on/nvme/expert-store \
+  --expert-arena-layers 2 --expert-backend uma   # ~20x over-core emulation
+
+# RDMA peer tier (start the peer, point the server at it):
+atlas-expert-peer --store /path/on/nvme/expert-store --listen 0.0.0.0:9909
+ATLAS_EXPERT_PEER=<peer-host>:9909 spark serve ... --expert-backend rdma
+
+# Prove bit-identity (resident == uma == posix) on any A3B checkpoint:
+BIN=./target/release/spark bash scripts/streaming-experts/verify_logits.sh <ckpt> <store>
 
 # Reproduce the Gate 0(b) measurements on any GB10:
 nvcc -arch=sm_121 -o uma_probe gate0/uma_probe.cu && ./uma_probe
