@@ -42,18 +42,34 @@ impl MoeLayer {
         // preserving Atlas's TPS on the bulk of the network. The 5 capture layers
         // pay ~250 µs each (microbench), totalling ≈1.25 ms per token (negligible
         // at Atlas's ~58 ms/token decode latency).
-        if self.is_dflash_capture_layer
-            && std::env::var("ATLAS_FRANKENSTEIN_DECODE_VIA_PREFILL")
-                .ok()
-                .as_deref()
-                == Some("1")
+        // Streaming Experts: over-core DECODE. The streamed records are
+        // prefill-transposed and patched into the *_ptrs_t tables; the scalar
+        // decode kernels read the UNtransposed gate_ptrs/up_ptrs/down_ptrs which
+        // are NULL under resident-skip. So when streaming, route each decode
+        // token through forward_prefill(M=1) — the grouped-GEMM prefill path that
+        // reads the streamed transposed tables (+ install_streamed_tables). This
+        // makes over-core generation work (slower than the scalar path, but it
+        // runs on one box). Decode graphs are already gated off (invariant F).
+        let stream_decode = self.streamer.is_some();
+        if stream_decode
+            || (self.is_dflash_capture_layer
+                && std::env::var("ATLAS_FRANKENSTEIN_DECODE_VIA_PREFILL")
+                    .ok()
+                    .as_deref()
+                    == Some("1"))
         {
             // One-time per-process log so we can verify the env-gated route is hit.
             static LOGGED: std::sync::atomic::AtomicBool =
                 std::sync::atomic::AtomicBool::new(false);
             if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
                 tracing::info!(
-                    "FRANKENSTEIN: routing DFlash capture-layer MoE decode through forward_prefill(M=1) (one-time log)"
+                    "decode-via-prefill: routing single-token MoE through forward_prefill(M=1) \
+                     ({})",
+                    if stream_decode {
+                        "streaming experts"
+                    } else {
+                        "DFlash capture layer"
+                    }
                 );
             }
             self.forward_prefill(input, 1, ctx, stream)?;
