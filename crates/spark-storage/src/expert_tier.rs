@@ -78,7 +78,7 @@ pub trait ExpertTier: Send {
 /// Turn a record buffer's header + a base device VA into an `ExpertResidency`
 /// using the record spec's sub-offsets. Shared by every tier so they cannot
 /// disagree on layout.
-fn residency_from(
+pub(crate) fn residency_from(
     spec: &ExpertRecordSpec,
     record: &[u8],
     base_dev_va: u64,
@@ -259,7 +259,9 @@ impl ExpertTier for UmaArenaTier {
     }
 }
 
-/// Open the tier named by `backend` ("posix" | "uma") over a built store.
+/// Open the tier named by `backend` ("posix" | "uma" | "rdma") over a built
+/// store. `rdma` connects to a peer at `$ATLAS_EXPERT_PEER` (host:port) instead
+/// of reading `dir` — the peer serves the store's records over the RoCE fabric.
 pub fn open_tier(
     backend: &str,
     dir: &Path,
@@ -269,7 +271,17 @@ pub fn open_tier(
     match backend {
         "posix" => Ok(Box::new(PosixTier::open(dir, num_slabs, slots_per_slab)?)),
         "uma" => Ok(Box::new(UmaArenaTier::open(dir, num_slabs, slots_per_slab)?)),
-        other => bail!("unknown expert backend '{other}' (want posix|uma)"),
+        "rdma" => {
+            let addr = std::env::var("ATLAS_EXPERT_PEER").map_err(|_| {
+                anyhow::anyhow!("--expert-backend rdma needs $ATLAS_EXPERT_PEER=host:port")
+            })?;
+            Ok(Box::new(crate::expert_tier_rdma::RdmaTier::connect(
+                &addr,
+                num_slabs,
+                slots_per_slab,
+            )?))
+        }
+        other => bail!("unknown expert backend '{other}' (want posix|uma|rdma)"),
     }
 }
 

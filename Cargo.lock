@@ -143,6 +143,8 @@ dependencies = [
  "serde",
  "serde_json",
  "spark-storage",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

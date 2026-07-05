@@ -36,6 +36,7 @@ pub mod config;
 pub mod eviction;
 pub mod expert;
 pub mod expert_pack;
+pub mod expert_peer;
 pub mod group;
 pub mod model_dims;
 pub mod predictor_ref;
@@ -67,6 +68,8 @@ pub mod expert_arena;
 #[cfg(feature = "cuda")]
 pub mod expert_tier;
 #[cfg(feature = "cuda")]
+pub mod expert_tier_rdma;
+#[cfg(feature = "cuda")]
 pub mod high_speed_swap;
 #[cfg(feature = "cuda")]
 pub mod predictor;
@@ -85,6 +88,8 @@ pub use expert_arena::ExpertArena;
 pub use expert_tier::{
     ArenaSlot, ExpertResidency, ExpertTier, PosixTier, TierKind, UmaArenaTier, open_tier,
 };
+#[cfg(feature = "cuda")]
+pub use expert_tier_rdma::RdmaTier;
 pub use config::HighSpeedSwapConfig;
 pub use eviction::EvictionPolicy;
 pub use expert::{

@@ -20,6 +20,7 @@ use std::path::PathBuf;
 use spark_storage::cuda_min::CudaCtx;
 use spark_storage::expert::{ExpertKey, Proj};
 use spark_storage::expert_tier::{read_device, ArenaSlot, ExpertTier, PosixTier, UmaArenaTier};
+use spark_storage::expert_tier_rdma::RdmaTier;
 use spark_storage::{ExpertFileWriter, ExpertIndex, ExpertRecordHeader, ProjData};
 
 const LAYERS: u32 = 3;
@@ -188,6 +189,49 @@ fn capped_arena_eviction_parity() {
             assert_matches(&mut posix, key, slot, ctx.stream, exp);
         }
     }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+#[ignore = "requires GPU + O_DIRECT-capable fs"]
+fn rdma_tier_matches_oracle_over_loopback() {
+    // Stage 4 (Phase A): a peer serves the store over TCP; RdmaTier lands records
+    // in the pinned arena and must be byte-identical to the Posix oracle — proving
+    // the peer-as-tier abstraction with zero verbs risk.
+    let ctx = CudaCtx::new(0).expect("cuda ctx");
+    let (dir, expected) = build_store("rdma");
+    let port = 20000 + (std::process::id() % 10000) as u16;
+    let addr = format!("127.0.0.1:{port}");
+
+    // Serve in a background thread (leaks on test exit — fine).
+    let serve_dir = dir.clone();
+    let serve_addr = addr.clone();
+    std::thread::spawn(move || {
+        let _ = spark_storage::expert_peer::serve(&serve_dir, serve_addr.as_str());
+    });
+    // Wait for the listener to come up.
+    let mut connected = None;
+    for _ in 0..50 {
+        if std::net::TcpStream::connect(&addr).is_ok() {
+            connected = Some(());
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    connected.expect("peer never accepted a connection");
+
+    let mut rdma = RdmaTier::connect(&addr, LAYERS, EXPERTS).expect("rdma connect");
+    let mut posix = PosixTier::open(&dir, LAYERS, EXPERTS).expect("posix tier");
+    for layer in 0..LAYERS {
+        for expert in 0..EXPERTS {
+            let key = ExpertKey::new(layer, expert);
+            let slot = ArenaSlot::new(layer, expert);
+            let exp = &expected[&(layer, expert)];
+            assert_matches(&mut rdma, key, slot, ctx.stream, exp);
+            assert_matches(&mut posix, key, slot, ctx.stream, exp);
+        }
+    }
+    assert!(rdma.healthy(), "rdma tier should still be healthy");
     let _ = std::fs::remove_dir_all(&dir);
 }
 

@@ -10,11 +10,17 @@ description = "Offline builder: checkpoint NVFP4 experts -> resident-layout expe
 name = "atlas-expert-pack"
 path = "src/main.rs"
 
+[[bin]]
+name = "atlas-expert-peer"
+path = "src/bin/expert_peer_main.rs"
+
 [dependencies]
 anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-# Pure format/geometry surface only — no CUDA needed to build the store.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+# Pure format/geometry surface only — no CUDA needed to build the store or peer.
 spark-storage = { path = "../spark-storage", default-features = false }
 
 [lints]
