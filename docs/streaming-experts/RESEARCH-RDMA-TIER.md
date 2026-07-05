@@ -104,5 +104,8 @@ Verdict: verbs one-sided RDMA READ delivers ~14 GB/s (2× local NVMe) at the
 expert-record size with the peer CPU completely idle — the intended Phase B win.
 (Both plateau ~112 Gb/s, below the 200 Gb/s line rate — a per-NIC/PCIe ceiling on
 GB10, not a protocol limit.) Reproduce: `gate0/verbs_rdma_read_bw.sh <peer-ip>`.
-Phase B integration (RdmaTier verbs data path) is the remaining code step; the
-TCP RdmaTier already provides a bit-identical peer path today.
+
+**Phase B is now SHIPPED** (`--expert-backend rdma-verbs`, see HANDOFF §6): the
+`RdmaTier` verbs data path is bit-identical to resident and to the TCP tier, and
+lands ~12 GB/s in-app (16.9 GiB cold prefill in 1.45 s) → **1262 prefill tok/s vs
+190 over TCP** (6.6×), peer CPU idle. Reproduce: `scripts/streaming-experts/verify_verbs.sh`.

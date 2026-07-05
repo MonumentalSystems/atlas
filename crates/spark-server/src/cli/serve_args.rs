@@ -380,7 +380,9 @@ pub struct ServeArgs {
     pub expert_arena_layers: usize,
 
     /// Expert fetch tier: "uma" (zero-copy pinned LPDDR arena) | "posix"
-    /// (deterministic bounce oracle, used for bit-identical validation).
+    /// (deterministic bounce oracle, used for bit-identical validation) |
+    /// "rdma" (two-sided TCP peer at $ATLAS_EXPERT_PEER) | "rdma-verbs"
+    /// (one-sided RDMA READ from the peer over RoCE, peer CPU idle).
     #[arg(long, default_value = "uma")]
     pub expert_backend: String,
 

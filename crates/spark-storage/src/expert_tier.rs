@@ -259,29 +259,37 @@ impl ExpertTier for UmaArenaTier {
     }
 }
 
-/// Open the tier named by `backend` ("posix" | "uma" | "rdma") over a built
-/// store. `rdma` connects to a peer at `$ATLAS_EXPERT_PEER` (host:port) instead
-/// of reading `dir` — the peer serves the store's records over the RoCE fabric.
+/// Open the tier named by `backend` over a built store:
+///   * `posix` / `uma` — read `dir` locally (bounce oracle / zero-copy).
+///   * `rdma`          — connect to `$ATLAS_EXPERT_PEER` over TWO-SIDED TCP.
+///   * `rdma-verbs`    — connect to `$ATLAS_EXPERT_PEER` over ONE-SIDED RDMA READ
+///     (verbs); device/GID from `$ATLAS_EXPERT_RDMA_DEV`/`$ATLAS_EXPERT_RDMA_GID`.
+///
+/// Both peer backends serve the store's records over the RoCE fabric.
 pub fn open_tier(
     backend: &str,
     dir: &Path,
     num_slabs: u32,
     slots_per_slab: u32,
 ) -> Result<Box<dyn ExpertTier>> {
+    let rdma = |use_verbs: bool| -> Result<Box<dyn ExpertTier>> {
+        let flag = if use_verbs { "rdma-verbs" } else { "rdma" };
+        let addr = std::env::var("ATLAS_EXPERT_PEER").map_err(|_| {
+            anyhow::anyhow!("--expert-backend {flag} needs $ATLAS_EXPERT_PEER=host:port")
+        })?;
+        Ok(Box::new(crate::expert_tier_rdma::RdmaTier::connect(
+            &addr,
+            num_slabs,
+            slots_per_slab,
+            use_verbs,
+        )?))
+    };
     match backend {
         "posix" => Ok(Box::new(PosixTier::open(dir, num_slabs, slots_per_slab)?)),
         "uma" => Ok(Box::new(UmaArenaTier::open(dir, num_slabs, slots_per_slab)?)),
-        "rdma" => {
-            let addr = std::env::var("ATLAS_EXPERT_PEER").map_err(|_| {
-                anyhow::anyhow!("--expert-backend rdma needs $ATLAS_EXPERT_PEER=host:port")
-            })?;
-            Ok(Box::new(crate::expert_tier_rdma::RdmaTier::connect(
-                &addr,
-                num_slabs,
-                slots_per_slab,
-            )?))
-        }
-        other => bail!("unknown expert backend '{other}' (want posix|uma|rdma)"),
+        "rdma" => rdma(false),
+        "rdma-verbs" => rdma(true),
+        other => bail!("unknown expert backend '{other}' (want posix|uma|rdma|rdma-verbs)"),
     }
 }
 

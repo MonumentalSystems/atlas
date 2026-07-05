@@ -37,6 +37,11 @@ pub mod eviction;
 pub mod expert;
 pub mod expert_pack;
 pub mod expert_peer;
+// One-sided RDMA READ verbs FFI (WS2 Phase B). CUDA-free so BOTH the non-cuda
+// peer server and the cuda client tier can use it. Compiled only where the C
+// shim is (build.rs emits `atlas_rdma_verbs` on Linux + rdma-core).
+#[cfg(atlas_rdma_verbs)]
+pub mod rdma_verbs;
 pub mod group;
 pub mod model_dims;
 pub mod predictor_ref;

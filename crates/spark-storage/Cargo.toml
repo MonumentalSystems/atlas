@@ -35,6 +35,11 @@ libc = "0.2"
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = "0.7"
 
+[build-dependencies]
+# Compiles the one-sided RDMA READ C-shim (rdma_shim.c) — ibv_post_send /
+# ibv_poll_cq are static inlines that must be called from C. Linux only.
+cc = "1"
+
 [dev-dependencies]
 tracing-subscriber = { version = "0.3", features = ["fmt"] }
 

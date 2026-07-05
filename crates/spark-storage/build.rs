@@ -45,6 +45,14 @@ fn main() {
     // symbols resolved at link time even when the kernel registry is
     // an empty stub.
     link_libcuda();
+    // The one-sided RDMA READ verbs shim (WS2 Phase B) is Linux-only and used by
+    // BOTH the cuda client tier and the non-cuda peer server, so compile it
+    // independent of the cuda feature. Skipped under ATLAS_SKIP_BUILD (the same
+    // CPU/CI convention as nvcc) — hosts without rdma-core dev headers.
+    println!("cargo:rustc-check-cfg=cfg(atlas_rdma_verbs)");
+    if !skip_build() {
+        compile_rdma_shim();
+    }
     if skip_build() {
         emit_stub();
         println!("cargo:rerun-if-changed=build.rs");
@@ -52,6 +60,23 @@ fn main() {
     }
     compile_kernels();
     println!("cargo:rerun-if-changed=build.rs");
+}
+
+/// Compile `src/rdma_shim.c` and link libibverbs. Emits `cfg(atlas_rdma_verbs)`
+/// so the Rust `rdma_verbs` FFI module (and the verbs code paths that use it)
+/// only compile where the shim actually exists. Linux only — the macOS arm
+/// returns before this is reached.
+fn compile_rdma_shim() {
+    let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
+    let shim = manifest_dir.join("src/rdma_shim.c");
+    println!("cargo:rerun-if-changed={}", shim.display());
+    cc::Build::new()
+        .file(&shim)
+        .opt_level(2)
+        .warnings(true)
+        .compile("atlas_rdma_shim");
+    println!("cargo:rustc-link-lib=dylib=ibverbs");
+    println!("cargo:rustc-cfg=atlas_rdma_verbs");
 }
 
 fn skip_build() -> bool {

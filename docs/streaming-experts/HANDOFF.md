@@ -26,9 +26,11 @@ streaming cold experts from NVMe/RDMA on the prefill path.
 | **WS3** | **persistent residency (agentic warm prefill)** | ✅ **bit-identical + ~5.6× warm speedup** |
 | — | **over-core generation** (decode-via-prefill) | ✅ **works, output == resident** (26.5 tok/s), see §5 |
 | WS2 | verbs one-sided RDMA READ **bandwidth** | ✅ measured ~14 GB/s (`ib_read_bw`) |
-| **WS2** | **verbs data-path INTEGRATION** | ⬜ **REMAINING** — see §6 |
+| **WS2** | **verbs data-path INTEGRATION** | ✅ **bit-identical + ~12 GB/s in-app, 6.6× TCP prefill** — see §6 |
 
 Over-core now does full **generation** on one box (not just prefill) — see §5.
+The verbs one-sided RDMA READ tier is the last WS — it is now **landed and
+bit-identical**; nothing in the plan remains uncoded.
 
 ---
 
@@ -39,9 +41,18 @@ Over-core now does full **generation** on one box (not just prefill) — see §5
 |---|---|---|
 | pinned host = GPU-addressable | 113 GB/s | zero-copy, same VA (Gate 0b) |
 | local NVMe O_DIRECT (uma tier) | ~7 | QD≥4, 1.7 MB granule |
-| TCP-over-CX7 single-stream (current rdma tier) | ~5.2 | peer CPU busy |
+| TCP-over-CX7 single-stream (rdma tier, TCP) | ~5.2 | peer CPU busy |
 | TCP-over-CX7 8-stream | ~13.9 | peer CPU busy |
-| **verbs one-sided RDMA READ, 1.7 MB records** | **~14** | **peer CPU idle** (`ib_read_bw`) |
+| verbs one-sided RDMA READ, 1.7 MB records | ~14 | peer CPU idle (`ib_read_bw`) |
+| **verbs data path, in-app (rdma-verbs tier)** | **~12** | **peer CPU idle** (16.9 GiB/1.45 s cold prefill) |
+
+**Streaming cold-prefill throughput (1824-token prompt, `--expert-arena-layers 2`,
+each layer re-streamed)** — the app-level view of the tier bandwidth:
+| tier | prefill tok/s | note |
+|---|---|---|
+| rdma-verbs | **1262** | one-sided RDMA READ, peer idle — near compute-bound |
+| uma (local NVMe) | 312 | O_DIRECT ~7 GB/s |
+| rdma TCP | 190 | single-stream, peer pread+socket-write bound |
 
 **Memory (A3B, util 0.85, free after load)**
 - resident: 62 GB free · **streaming (WS1): 80 GB free** → ~18 GB expert weights freed.
@@ -121,8 +132,10 @@ Called from `forward_prefill.rs` before `run_routed_grouped_gemm`;
    0.30 is too low even for the streaming model; 0.85 is fine in isolation.
 6. **O_DIRECT rejects tmpfs.** The UMA tier's O_DIRECT reads need a block-backed
    fs; tests use `CARGO_TARGET_TMPDIR` (under `target/`, ext4), not `/tmp`.
-7. **`rdma-sys` won't build on aarch64** (bindgen `stddef.h` path). Verbs needs a
-   hand-rolled C-shim (§6).
+7. **`rdma-sys` won't build on aarch64** (bindgen `stddef.h` path) — so verbs
+   uses a hand-rolled C-shim (`rdma_shim.c`, built with the `cc` crate). SHIPPED
+   (§6). The shim's access flags are exact: server MR = REMOTE_READ only (never
+   LOCAL_WRITE on the read-only mmap), client arena MR = LOCAL_WRITE only.
 8. **The dump used for the gate is `atlas_final_norm.bin`** (via `ATLAS_NEMO_DUMP`),
    the lm-head input — it isolates the MoE path and is written during PREFILL
    (before decode), so decode garbage/failure doesn't affect the gate.
@@ -154,43 +167,56 @@ Decode router hit-rate work stays behind Gate 0(a).
 
 ---
 
-## 6. WS2 REMAINING: verbs data-path integration
+## 6. WS2 LANDED: verbs one-sided RDMA READ data path ✅
 
-The one uncoded piece. Bandwidth is proven (~14 GB/s, `ib_read_bw`), and the TCP
-`RdmaTier` already gives a bit-identical peer path — so this is a **pure
-bandwidth upgrade (5.2 → 14 GB/s, peer CPU idle)**, not a correctness gap.
+The last uncoded piece is done. `--expert-backend rdma-verbs` pulls each expert
+record straight out of the peer's registered store MR into the pinned arena via
+`IBV_WR_RDMA_READ`, peer CPU idle. **Bit-identical to resident** (and to the TCP
+peer tier) on A3B, and ~6.6× the TCP prefill throughput (§2).
 
-**Cabled setup (live):** dgx-00 (192.168.178.11) ↔ gx10-9959 (192.168.178.12),
-device `roceP2p1s0f1`, RoCEv2 **GID index 3**, 200 Gb/s ACTIVE. (Also `.177` link
-via `rocep1s0f1`.) rdma-core/libibverbs/librdmacm dev headers + perftest installed.
+**Cabled setup (validated):** dgx-00 (192.168.178.11) ↔ gx10-9959
+(192.168.178.12), device `roceP2p1s0f1`, RoCEv2 **GID index 3**, 200 Gb/s ACTIVE.
 
-**Plan (from the fable design workflow, adversarially verified):**
-1. **C-shim** (`spark-storage/src/rdma_shim.c` + `build.rs` `cc` compile, link
-   `libibverbs`/`librdmacm`) exposing simple functions that wrap the inline
-   ibverbs calls (`ibv_post_send`/`ibv_poll_cq` are static inlines — must be
-   called from C, not FFI'd directly): `rs_open(dev, gid_idx)`, `rs_reg_mr(addr,
-   len, remote_read)` → {rkey,lkey}, `rs_local_qp(qpn, gid)`, `rs_connect(remote_qpn,
-   remote_gid, mtu, psn)` (INIT→RTR→RTS), `rs_post_read(local_addr, lkey,
-   remote_addr, rkey, len, wr_id)`, `rs_poll(wr_id)`.
-2. **Peer** (`expert_peer.rs`): `mmap` each `experts_{l:05}.xpr` file + `ibv_reg_mr`
-   with `IBV_ACCESS_REMOTE_READ`; extend the TCP handshake (after the manifest
-   frame) to publish per-layer `{base_addr, rkey}` + the peer QP params.
-   `remote_addr(layer,expert) = layer_base[layer] + expert*record_stride`
-   (identical to `ExpertLayout::file_offset`).
-3. **Client** (`RdmaTier::connect`/`fetch`): `ibv_reg_mr` the arena
-   (`arena.base_ptr()`/`total_bytes()` already exposed) with `LOCAL_WRITE`; RC QP
-   over RoCEv2 (GID idx 3); replace the `read_exact` in `fetch` (lines ~72-91)
-   with `rs_post_read` into `arena.slot_host_ptr(...)` + `rs_poll`. The prefetch
-   worker already owns the tier off the compute thread, so `ibv_poll_cq` blocks
-   there; `residency_from` + the header identity check catch any misplacement.
-4. **Validate:** copy the store to gx10 (`/home/ms/expert-store-a3b`, ~17 GB, or
-   rebuild there); run `atlas-expert-peer` on gx10 bound to `192.168.178.12`; on
-   dgx-00 `ATLAS_EXPERT_PEER=192.168.178.12:9909 ... --expert-backend rdma` (add a
-   flag or reuse the env to select verbs vs TCP); confirm `verify_logits.sh`
-   still PASSES (resident == rdma-verbs) and measure GB/s > TCP.
+**What shipped:**
+1. **C-shim** `spark-storage/src/rdma_shim.c` (compiled by `build.rs` via the `cc`
+   crate, links `libibverbs`; emits `cfg(atlas_rdma_verbs)` so it's Linux+rdma-core
+   only). Wraps the inline ibverbs calls (`ibv_post_send`/`ibv_poll_cq` are static
+   inlines — must be called from C): `rs_create(dev, gid_idx)` (PD/CQ/RC-QP→INIT),
+   `rs_reg_mr(addr, len, remote_read)`→{lkey,rkey}, `rs_qpn`/`rs_gid`,
+   `rs_connect(remote_qpn, remote_psn, local_psn, remote_gid)` (RTR→RTS),
+   `rs_post_read(...)`, `rs_poll`. Rust wrapper: `src/rdma_verbs.rs` (`Verbs`).
+2. **Peer** `expert_peer.rs`: client sends a **transport mode byte** after the
+   manifest (`MODE_TCP`|`MODE_VERBS`); one `atlas-expert-peer` serves both. Verbs
+   branch `mmap`s each `experts_{l:05}.xpr` + `ibv_reg_mr` **REMOTE_READ only**
+   (LOCAL_WRITE on the PROT_READ mapping fails — the one real gotcha), then
+   publishes `VerbsServerParams{qpn,psn,gid, per-layer (base,rkey)}`, reads the
+   client's QP, connects, and goes idle until the client hangs up.
+   `remote_addr(layer,expert) = layer_base[layer] + expert*record_stride`.
+   New peer flags: `--rdma-dev` / `--rdma-gid` (default `roceP2p1s0f1` / 3).
+3. **Client** `expert_tier_rdma.rs`: `RdmaTier` now holds a `Transport::{Tcp,Verbs}`.
+   Verbs registers the arena `LOCAL_WRITE`, exchanges QP params over the TCP
+   control channel, connects the RC QP (RoCEv2, dev/gid from
+   `$ATLAS_EXPERT_RDMA_DEV`/`$ATLAS_EXPERT_RDMA_GID`), and `fetch` posts a READ
+   into `arena.slot_host_ptr(...)` + blocking `poll` on the prefetch worker
+   thread. `residency_from` + the record header identity check still guard every
+   fetch, so the tier cannot change a GEMM byte.
+4. **Gate:** `scripts/streaming-experts/verify_verbs.sh` — resident vs rdma-verbs
+   vs rdma-TCP final-norm compare. **PASS** (all three bit-identical).
 
-RDMA QP bring-up (GID/MTU/PSN/QP-state) usually wants a few live-link debug
-iterations — do it with the link up.
+**Reproduce (link up):**
+```bash
+# peer on gx10 (store already at /home/ms/expert-store-a3b):
+ssh 192.168.178.12 '/home/ms/atlas-expert-peer --store /home/ms/expert-store-a3b \
+  --listen 0.0.0.0:9909 --rdma-dev roceP2p1s0f1 --rdma-gid 3'
+# gate on dgx-00:
+ATLAS_EXPERT_PEER=192.168.178.12:9909 \
+  bash scripts/streaming-experts/verify_verbs.sh "$CKPT" /home/ms/expert-store-a3b
+# (set PEER_HOST=192.168.178.12 to let the script start/stop the peer over ssh)
+```
+
+**Gotchas hit (now fixed):** REMOTE_READ MR must NOT request LOCAL_WRITE on the
+read-only mmap; `memlock` was already unlimited on GB10 (not the culprit). QP
+bring-up worked first try once the access flags were right.
 
 ---
 
@@ -216,9 +242,14 @@ BIN=./target/release/spark bash scripts/streaming-experts/verify_logits.sh "$CKP
   --gpu-memory-utilization 0.55 --stream-experts /home/ms/expert-store-a3b \
   --expert-arena-layers 2 --expert-backend uma        # arena-layers = resident window
 
-# RDMA (TCP) peer tier:
-./target/release/atlas-expert-peer --store /home/ms/expert-store-a3b --listen 0.0.0.0:9909
-ATLAS_EXPERT_PEER=<peer-ip>:9909 ./target/release/spark serve ... --expert-backend rdma
+# RDMA peer tier (one peer binary serves BOTH transports; client picks per-conn):
+./target/release/atlas-expert-peer --store /home/ms/expert-store-a3b --listen 0.0.0.0:9909 \
+  --rdma-dev roceP2p1s0f1 --rdma-gid 3
+ATLAS_EXPERT_PEER=<peer-ip>:9909 ./target/release/spark serve ... --expert-backend rdma        # two-sided TCP
+ATLAS_EXPERT_PEER=<peer-ip>:9909 ./target/release/spark serve ... --expert-backend rdma-verbs  # one-sided RDMA READ
+
+# Verbs bit-identical gate (resident == rdma-verbs == rdma-TCP):
+ATLAS_EXPERT_PEER=<peer-ip>:9909 bash scripts/streaming-experts/verify_verbs.sh "$CKPT" /home/ms/expert-store-a3b
 
 # Bandwidth reproducers:
 nvcc -arch=sm_121 -o uma_probe docs/streaming-experts/gate0/uma_probe.cu && ./uma_probe
@@ -237,7 +268,8 @@ config tests in spark-model/atlas-core.
 - `crates/spark-storage/src/` — `expert.rs` (geometry/header), `expert_pack.rs`
   (format + writer/reader + `ExpertIndex`), `expert_arena.rs` (pinned UMA arena),
   `expert_tier.rs` (trait + Posix/Uma + `open_tier`), `expert_tier_rdma.rs`
-  (TCP `RdmaTier`; verbs goes here), `expert_peer.rs` (peer protocol/server),
+  (`RdmaTier` — `Transport::{Tcp,Verbs}`), `expert_peer.rs` (peer protocol/server
+  + verbs handshake), `rdma_shim.c` + `rdma_verbs.rs` (one-sided RDMA READ FFI),
   `cuda_min.rs`/`cuda_module.rs` (FFI + `CudaEvent`).
 - `crates/atlas-expert-pack/` — offline builder (`build.rs`, `transpose.rs`,
   `safetensors_min.rs`, `checkpoint.rs`) + `atlas-expert-peer` bin.
@@ -262,11 +294,17 @@ config tests in spark-model/atlas-core.
 
 ## 10. Recommended next steps
 
-1. **WS2 verbs integration** (§6) — bandwidth 5.2 → 14 GB/s, peer idle. Link is up.
-2. **122B over-core demo** — build the Sehyo store, run at a capped arena that
-   can't hold resident experts; confirm it serves.
-3. **Skip the ptr-patch on warm hit** — WS3 warm prefill still does the 9-copy
+(WS2 verbs integration — §6 — is now DONE and bit-identical.)
+
+1. **122B over-core demo** — build the Sehyo store, run at a capped arena that
+   can't hold resident experts; confirm it serves (now over verbs too).
+2. **Skip the ptr-patch on warm hit** — WS3 warm prefill still does the 9-copy
    patch per layer (~1.0 s vs resident 0.55 s); skipping when addresses are
    unchanged closes most of that gap.
-4. **Decode-over-core** (§5) via decode-via-prefill, if generation (not just
+3. **Decode-over-core** (§5) via decode-via-prefill, if generation (not just
    prefill/batch) over-core is wanted. Gated on Gate 0(a).
+4. **Verbs polish (perf, not correctness):** the `rs_poll` busy-poll spins the
+   prefetch thread; a batched multi-post (issue a layer's experts as one WR chain
+   then poll once) and/or a completion-channel wait would cut CPU + latency.
+   A persistent peer connection across prefills (currently one per serve) is
+   already the case; multi-client fairness on one peer is untested.
