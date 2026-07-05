@@ -2,46 +2,65 @@
 //
 // Model-wide expert streamer shared by every MoE layer (Arc).
 //
-// Holds one `ExpertTier` (Posix bounce oracle or UMA zero-copy arena) plus the
-// store geometry. Stage 2 uses a BLOCKING fetch (no compute overlap): each MoE
-// layer, just before its routed grouped GEMM, fetches its local experts into
-// the ring slab for that layer and patches the transposed pointer tables to the
-// fetched addresses. The `Mutex` serializes tier access; prefill is
-// single-threaded per model so there is no contention, only Send/Sync hygiene.
+// Stage 3 (async prefetch overlap): a background worker thread fetches the NEXT
+// MoE layer's local experts into its ring slab while the GPU computes the
+// CURRENT layer, so the fetch I/O (NVMe / peer) hides under compute. The main
+// (compute) thread only ever patches pointer tables from residency ADDRESSES —
+// it never touches arena bytes — so there is no CPU/CPU data race; the worker
+// owns the tier exclusively.
+//
+// Deferred-free (invariant C): the arena is a ring of K = expert_arena_layers
+// slabs. When K < num_moe_layers a slab is reused. Before the worker overwrites
+// a slab, the compute thread waits on a per-slab CUDA event recorded AFTER the
+// previous occupant's grouped GEMM — so the GPU has finished reading a slab
+// before the worker refills it. All event record/sync happens on the compute
+// thread; the worker only does CPU I/O.
 
-use std::path::Path;
-use std::sync::Mutex;
+use std::collections::{HashMap, HashSet};
+use std::sync::mpsc::{Sender, channel};
+use std::sync::{Arc, Condvar, Mutex};
 
 use anyhow::{Context, Result, bail};
 use atlas_core::config::ModelConfig;
 
+use spark_storage::CudaEvent;
 use spark_storage::expert::ExpertKey;
-use spark_storage::expert_tier::{ArenaSlot, ExpertResidency, ExpertTier, TierKind, open_tier};
+use spark_storage::expert_tier::{ArenaSlot, ExpertResidency, TierKind, open_tier};
 use spark_storage::ExpertIndex;
 
-// `index`/`slots_per_slab`/`kind` + several accessors are consumed by Stage 3
-// (async prefetch bounds) / Stage 4 (RDMA health + logging); kept as the stable
-// streamer API surface.
-#[allow(dead_code)]
+/// A prefetch job: fetch experts `[lo, hi)` of dense MoE layer `dense`.
+struct Job {
+    dense: u32,
+    lo: u32,
+    hi: u32,
+}
+
+/// dense-layer -> the fetched residencies (indexed by `expert - lo`), or an error.
+type DoneMap = HashMap<u32, std::result::Result<Vec<ExpertResidency>, String>>;
+
 pub struct ExpertStreamerShared {
-    tier: Mutex<Box<dyn ExpertTier>>,
-    index: ExpertIndex,
+    tx: Sender<Job>,
+    done: Arc<(Mutex<DoneMap>, Condvar)>,
+    requested: Mutex<HashSet<u32>>,
+    /// Per-slab consumer events (compute-thread only). `slab_events[s]` marks
+    /// the GEMM of slab `s`'s current occupant complete.
+    slab_events: Vec<CudaEvent>,
     num_slabs: u32,
-    slots_per_slab: u32,
+    num_moe_layers: u32,
     kind: TierKind,
+    // Worker handle kept alive for the streamer's lifetime; dropping the Sender
+    // ends the worker loop.
+    _worker: std::thread::JoinHandle<()>,
 }
 
 impl ExpertStreamerShared {
-    /// Open the store named by `config.expert_store_dir` with the configured
-    /// backend and size the arena ring. `slots_per_slab` = the count of LOCAL
-    /// experts (EP-scoped); `num_slabs` = `expert_arena_layers` (0 => one slab
-    /// per MoE layer, i.e. fully resident ring, no eviction).
+    /// Open the store, size the arena ring, spawn the fetch worker.
     pub fn open(config: &ModelConfig) -> Result<Self> {
-        let dir: &Path = config
+        let dir = config
             .expert_store_dir
-            .as_deref()
+            .clone()
             .context("expert_streaming set but --stream-experts dir is None")?;
-        let index = ExpertIndex::load(dir)?;
+        let index = ExpertIndex::load(&dir)?;
         if index.num_experts as usize != config.num_experts {
             bail!(
                 "expert store has {} experts but model config has {}",
@@ -60,11 +79,14 @@ impl ExpertStreamerShared {
         } else {
             (config.expert_arena_layers as u32).clamp(1, num_moe_layers)
         };
-        let tier = open_tier(&config.expert_backend, dir, num_slabs, slots_per_slab)?;
+        let backend = config.expert_backend.clone();
+
+        // The worker owns the tier (single-threaded tier access).
+        let mut tier = open_tier(&backend, &dir, num_slabs, slots_per_slab)?;
         let kind = tier.kind();
         tracing::info!(
-            "expert streamer: backend={:?} store={} experts={} local={} slabs={} (arena_layers={}) \
-             record_stride={}",
+            "expert streamer: backend={:?} store={} experts={} local={} slabs={} \
+             (arena_layers={}) async-prefetch record_stride={}",
             kind,
             dir.display(),
             index.num_experts,
@@ -73,46 +95,101 @@ impl ExpertStreamerShared {
             config.expert_arena_layers,
             index.record_stride,
         );
+
+        let slab_events = (0..num_slabs)
+            .map(|_| CudaEvent::new())
+            .collect::<Result<Vec<_>>>()?;
+
+        let (tx, rx) = channel::<Job>();
+        let done: Arc<(Mutex<DoneMap>, Condvar)> =
+            Arc::new((Mutex::new(HashMap::new()), Condvar::new()));
+        let worker_done = done.clone();
+        let worker = std::thread::Builder::new()
+            .name("expert-prefetch".into())
+            .spawn(move || {
+                // NULL stream for the worker's tier ops (Posix's copy_h2d syncs
+                // internally; UMA/RDMA ignore the stream — pure CPU I/O).
+                let stream = 0u64;
+                while let Ok(job) = rx.recv() {
+                    let mut out = Vec::with_capacity((job.hi - job.lo) as usize);
+                    let mut err: Option<String> = None;
+                    for e in job.lo..job.hi {
+                        let slot = ArenaSlot::new(job.dense % num_slabs, e - job.lo);
+                        match tier.fetch(ExpertKey::new(job.dense, e), slot, stream) {
+                            Ok(res) => out.push(res),
+                            Err(e2) => {
+                                err = Some(format!("layer {} expert {e}: {e2:#}", job.dense));
+                                break;
+                            }
+                        }
+                    }
+                    let (lock, cv) = &*worker_done;
+                    let mut map = lock.lock().expect("prefetch done mutex");
+                    map.insert(job.dense, err.map_or(Ok(out), Err));
+                    cv.notify_all();
+                }
+            })
+            .context("spawn expert-prefetch worker")?;
+
         Ok(Self {
-            tier: Mutex::new(tier),
-            index,
+            tx,
+            done,
+            requested: Mutex::new(HashSet::new()),
+            slab_events,
             num_slabs,
-            slots_per_slab,
+            num_moe_layers,
             kind,
+            _worker: worker,
         })
     }
 
+    pub fn num_moe_layers(&self) -> u32 {
+        self.num_moe_layers
+    }
     #[allow(dead_code)]
     pub fn num_slabs(&self) -> u32 {
         self.num_slabs
-    }
-    #[allow(dead_code)]
-    pub fn num_moe_layers(&self) -> u32 {
-        self.index.num_moe_layers
-    }
-    #[allow(dead_code)]
-    pub fn slots_per_slab(&self) -> u32 {
-        self.slots_per_slab
     }
     #[allow(dead_code)]
     pub fn kind(&self) -> TierKind {
         self.kind
     }
 
-    /// Fetch `expert` of dense MoE layer `dense_layer` into the ring slab for
-    /// that layer at `local_slot`, returning the six sub-buffer device
-    /// addresses to patch into the pointer tables.
-    pub fn fetch(
-        &self,
-        dense_layer: u32,
-        expert: u32,
-        local_slot: u32,
-        stream: u64,
-    ) -> Result<ExpertResidency> {
-        let slab = dense_layer % self.num_slabs;
-        let slot = ArenaSlot::new(slab, local_slot);
-        let key = ExpertKey::new(dense_layer, expert);
-        let mut tier = self.tier.lock().expect("expert streamer tier mutex poisoned");
-        tier.fetch(key, slot, stream)
+    /// Request a prefetch of dense layer `dense` (idempotent within a prefill).
+    pub fn prefetch(&self, dense: u32, lo: u32, hi: u32) {
+        if dense >= self.num_moe_layers {
+            return;
+        }
+        let mut req = self.requested.lock().expect("requested mutex");
+        if req.insert(dense) {
+            let _ = self.tx.send(Job { dense, lo, hi });
+        }
+    }
+
+    /// Block until dense layer `dense`'s prefetch completes; return its
+    /// residencies and clear it so the next prefill can re-fetch.
+    pub fn take(&self, dense: u32) -> Result<Vec<ExpertResidency>> {
+        let (lock, cv) = &*self.done;
+        let mut map = lock.lock().expect("done mutex");
+        loop {
+            if let Some(entry) = map.remove(&dense) {
+                self.requested.lock().expect("requested mutex").remove(&dense);
+                return entry.map_err(|e| anyhow::anyhow!(e));
+            }
+            map = cv.wait(map).expect("done condvar");
+        }
+    }
+
+    /// Record (on the compute `stream`, after the GEMM) that dense layer
+    /// `dense`'s slab has been consumed by the GPU.
+    pub fn record_consumed(&self, dense: u32, stream: u64) -> Result<()> {
+        self.slab_events[(dense % self.num_slabs) as usize].record(stream)
+    }
+
+    /// Block the compute thread until the slab that dense layer `dense` will
+    /// land in has had its previous occupant's GEMM complete (deferred-free).
+    /// A never-recorded event (first use of a slab) returns immediately.
+    pub fn wait_slab_free(&self, dense: u32) -> Result<()> {
+        self.slab_events[(dense % self.num_slabs) as usize].sync()
     }
 }

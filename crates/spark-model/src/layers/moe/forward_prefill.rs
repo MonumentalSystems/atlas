@@ -350,6 +350,11 @@ impl MoeLayer {
             ctx,
             stream,
         )?;
+
+        // Streaming Experts: record this layer's slab as consumed and prefetch
+        // the next MoE layer's experts so its I/O overlaps upcoming compute
+        // (no-op unless --stream-experts). After the GEMM on `stream`.
+        self.after_streamed_layer(ctx, stream)?;
         let expert_down_out = ctx.buffers.expert_down_out();
 
         // 7. Unpermute + weighted reduce: scatter sorted outputs to token order

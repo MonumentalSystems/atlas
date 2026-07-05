@@ -95,9 +95,10 @@ impl Shadow {
 }
 
 impl MoeLayer {
-    /// Patch this layer's transposed pointer tables from the streamed arena.
-    /// No-op when streaming is disabled. Blocking (Stage 2).
-    pub(super) fn install_streamed_tables(&self, ctx: &ForwardContext, stream: u64) -> Result<()> {
+    /// Patch this layer's transposed pointer tables from the streamed arena,
+    /// consuming the residencies the prefetch worker already fetched (blocking
+    /// only if the fetch hasn't finished). No-op when streaming is disabled.
+    pub(super) fn install_streamed_tables(&self, ctx: &ForwardContext, _stream: u64) -> Result<()> {
         let Some(streamer) = self.streamer.as_ref() else {
             return Ok(());
         };
@@ -119,24 +120,33 @@ impl MoeLayer {
         let (lo, hi) = ctx.config.local_expert_range();
         let dense = self.stream_dense_idx;
 
+        // Ensure this layer is being prefetched (idempotent — layer 0 primes
+        // itself here; later layers were prefetched during the prior layer's
+        // compute), then take the fetched residencies (indexed by expert - lo).
+        streamer.prefetch(dense, lo as u32, hi as u32);
+        let residencies = streamer
+            .take(dense)
+            .with_context(|| format!("stream take layer {dense}"))?;
+        if residencies.len() != hi - lo {
+            bail!(
+                "layer {dense}: got {} residencies, expected {} local experts",
+                residencies.len(),
+                hi - lo
+            );
+        }
+
         // Read current (resident) tables into host shadows (invariant A: we
         // mutate contents, not the allocations).
         let mut g = Shadow::read(gpu, gt, n)?;
         let mut u = Shadow::read(gpu, ut, n)?;
         let mut d = Shadow::read(gpu, dt, n)?;
 
-        // Patch only local experts from the arena (invariant E).
-        for e in lo..hi {
-            if self.weights.experts[e].gate_proj.is_null() {
-                continue; // defensive: remote/absent expert
-            }
-            let local_slot = (e - lo) as u32;
-            let res = streamer
-                .fetch(dense, e as u32, local_slot, stream)
-                .with_context(|| format!("stream fetch layer {dense} expert {e}"))?;
-            let gi = Proj::Gate as usize;
-            let ui = Proj::Up as usize;
-            let di = Proj::Down as usize;
+        // Patch only local experts (invariant E) from the prefetched residencies.
+        let gi = Proj::Gate as usize;
+        let ui = Proj::Up as usize;
+        let di = Proj::Down as usize;
+        for (i, res) in residencies.iter().enumerate() {
+            let e = lo + i;
             g.packed[e] = res.packed_addr[gi];
             g.scale[e] = res.scale_addr[gi];
             g.scale2[e] = res.scale2[gi];
@@ -149,11 +159,32 @@ impl MoeLayer {
         }
 
         // One copy_h2d per array (invariant B): 9 total, independent of expert
-        // count.
+        // count. copy_h2d is synchronous, so the host shadows are safe to drop
+        // and the patched tables are visible to the GEMM that follows on `stream`.
         g.write(gpu, gt)?;
         u.write(gpu, ut)?;
         d.write(gpu, dt)?;
-        gpu.synchronize(stream)?;
+        Ok(())
+    }
+
+    /// After this layer's grouped GEMM: mark its arena slab consumed (invariant
+    /// C) and kick off the prefetch of the next MoE layer so its I/O overlaps
+    /// this layer's compute. No-op when streaming is disabled.
+    pub(super) fn after_streamed_layer(&self, ctx: &ForwardContext, stream: u64) -> Result<()> {
+        let Some(streamer) = self.streamer.as_ref() else {
+            return Ok(());
+        };
+        let dense = self.stream_dense_idx;
+        // Record on `stream` that the GPU has finished reading this layer's slab.
+        streamer.record_consumed(dense, stream)?;
+        let next = dense + 1;
+        if next < streamer.num_moe_layers() {
+            let (lo, hi) = ctx.config.local_expert_range();
+            // Deferred-free: don't let the worker overwrite the next slab until
+            // its previous occupant's GEMM has completed on the GPU.
+            streamer.wait_slab_free(next)?;
+            streamer.prefetch(next, lo as u32, hi as u32);
+        }
         Ok(())
     }
 }

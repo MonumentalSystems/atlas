@@ -69,6 +69,14 @@ pub struct CudaEvent {
     pub handle: u64,
 }
 
+// SAFETY: a `CUevent` handle is a process-global opaque token; `cuEventRecord`
+// and `cuEventSynchronize` are documented thread-safe. The expert streamer
+// shares these events through `Arc` and only records/syncs them from the
+// compute thread (the fetch worker never touches them), so no concurrent misuse
+// occurs. Drop (`cuEventDestroy`) runs once when the last owner releases.
+unsafe impl Send for CudaEvent {}
+unsafe impl Sync for CudaEvent {}
+
 impl CudaEvent {
     pub fn new() -> Result<Self> {
         let mut h = 0u64;
