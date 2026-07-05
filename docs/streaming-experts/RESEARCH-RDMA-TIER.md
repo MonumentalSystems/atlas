@@ -87,3 +87,22 @@ w/ RDMA stub"*) and the Foresight design's *"RDMA-as-faster-tier"* framing — t
 one salvaged idea both adversarial reviewers kept for post-MVP multi-node scale.
 It is explicitly **not** the maximal "stream everything" design they killed;
 it is a bandwidth tier under the same prefill-hides-fetch core.
+
+## Measured on the cabled fabric (2026-07-05, dgx-00 ↔ gx10, CX7 RoCEv2)
+
+Peer cabled: dgx-00 (192.168.178.11) ↔ gx10-9959 (192.168.178.12), `roceP2p1s0f1`
+ACTIVE 200 Gb/s, RoCEv2 GID index 3. Bandwidth (dgx-00 reads from gx10):
+
+| transport | bandwidth | peer CPU |
+|---|---|---|
+| local NVMe O_DIRECT (uma tier) | ~7 GB/s | — |
+| TCP-over-CX7, single stream (current RdmaTier) | 41 Gb/s (~5.2 GB/s) | busy |
+| TCP-over-CX7, 8 streams | 111 Gb/s (~13.9 GB/s) | busy |
+| **one-sided RDMA READ (`ib_read_bw`, 1.7 MB records, 4 QP)** | **112 Gb/s (~14 GB/s)** | **idle** |
+
+Verdict: verbs one-sided RDMA READ delivers ~14 GB/s (2× local NVMe) at the
+expert-record size with the peer CPU completely idle — the intended Phase B win.
+(Both plateau ~112 Gb/s, below the 200 Gb/s line rate — a per-NIC/PCIe ceiling on
+GB10, not a protocol limit.) Reproduce: `gate0/verbs_rdma_read_bw.sh <peer-ip>`.
+Phase B integration (RdmaTier verbs data path) is the remaining code step; the
+TCP RdmaTier already provides a bit-identical peer path today.
