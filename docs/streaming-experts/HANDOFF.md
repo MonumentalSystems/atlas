@@ -24,11 +24,11 @@ streaming cold experts from NVMe/RDMA on the prefill path.
 | Stage 4 | RDMA-peer tier over **TCP** + `atlas-expert-peer` | ✅ **bit-identical**, end-to-end |
 | **WS1** | **resident-skip → real over-core** | ✅ **bit-identical + memory freed + over-core proof** |
 | **WS3** | **persistent residency (agentic warm prefill)** | ✅ **bit-identical + ~5.6× warm speedup** |
+| — | **over-core generation** (decode-via-prefill) | ✅ **works, output == resident** (26.5 tok/s), see §5 |
 | WS2 | verbs one-sided RDMA READ **bandwidth** | ✅ measured ~14 GB/s (`ib_read_bw`) |
 | **WS2** | **verbs data-path INTEGRATION** | ⬜ **REMAINING** — see §6 |
 
-Decode streaming is **out of scope** (records are prefill-transposed; the plan
-always scoped this to prefill/batch). See §5.
+Over-core now does full **generation** on one box (not just prefill) — see §5.
 
 ---
 
@@ -131,16 +131,26 @@ Called from `forward_prefill.rs` before `run_routed_grouped_gemm`;
 
 ---
 
-## 5. Scope: decode is prefill-only
+## 5. Over-core generation (decode-via-prefill) — WORKS ✅
 
-The on-disk record is the **prefill-transposed** layout. After WS1 the
-untransposed decode tables (`gate_ptrs/up_ptrs/down_ptrs`) are NULL, so decode
-would read NULL and produce garbage (the prefill `final_norm` gate still passes —
-it dumps before decode). This matches the original plan ("prefill/batch streamer,
-defer decode"). Over-core **generation** needs one of: (a) route decode through
-the prefill grouped path when streaming (`ATLAS_FRANKENSTEIN_DECODE_VIA_PREFILL` /
-`is_dflash_capture_layer` machinery exists), or (b) a decode-shaped arena +
-per-expert decode residency. Deferred behind Gate 0(a) (router hit-rate, unrun).
+The on-disk record is the **prefill-transposed** layout, so the scalar decode
+kernels (which read the untransposed `gate_ptrs/up_ptrs/down_ptrs`, NULL under
+resident-skip) can't be used. Instead, when streaming, decode routes every single
+token through `forward_prefill(M=1)` — the grouped-GEMM prefill path that reads
+the streamed transposed `*_ptrs_t` tables + `install_streamed_tables` from the
+arena (`forward.rs`, extending the existing DFlash "Frankenstein" route to fire
+whenever `self.streamer.is_some()`).
+
+VALIDATED on A3B (`--expert-arena-layers 40`): full generation over-core, **output
+IDENTICAL to resident**, 40 coherent tokens at **26.5 tok/s** (vs resident 62.4 —
+the grouped GEMM + per-token table patch is ~2.4× the scalar decode path). Experts
+are never held resident. Decode graphs are gated off (invariant F); the WS3
+residency cache prevents per-token re-fetch. So over-core does full **generation**
+on one box, not just prefill/batch — the classic trade (runs vs. needs 4 nodes).
+
+Follow-ups (perf, not correctness): skip the per-token table patch on a warm hit;
+a decode-shaped (untransposed) arena variant to use the faster scalar kernels.
+Decode router hit-rate work stays behind Gate 0(a).
 
 ---
 
