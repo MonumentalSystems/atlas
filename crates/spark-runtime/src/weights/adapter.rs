@@ -74,6 +74,23 @@ pub fn load_adapter_safetensors(
                     .collect();
                 (Cow::Owned(conv), WeightDtype::BF16)
             }
+            safetensors::Dtype::F32 => {
+                // Host-side F32 -> BF16. PEFT's DEFAULT LoRA save dtype is F32
+                // (the trainable adapter params stay fp32), so most real
+                // adapters land here. The pool pack (`lora/mod.rs`, BF16_BYTES)
+                // and `dense_gemv_bf16` assume BF16 unconditionally, so an F32
+                // tensor left as-is is read at half stride = garbage delta
+                // (silent: load succeeds, output corrupts). Convert here,
+                // mirroring the F16 branch. The BF16 fixture never exercised
+                // this path, which is why it hid.
+                let conv: Vec<u8> = data
+                    .chunks_exact(4)
+                    .flat_map(|c| {
+                        bf16::from_f32(f32::from_le_bytes([c[0], c[1], c[2], c[3]])).to_le_bytes()
+                    })
+                    .collect();
+                (Cow::Owned(conv), WeightDtype::BF16)
+            }
             other => (
                 Cow::Borrowed(data),
                 WeightDtype::from_safetensors(other)
