@@ -51,6 +51,10 @@ pub(crate) fn load_weight_store(
                 spark_runtime::fast_weights::FastSafetensorsLoader::new()
             };
             loader.peak_memory_multiplier = mult;
+            // Over-core: skip loading routed experts — they stream from the
+            // store/peer. Without this the fast loader materializes all experts
+            // to GPU and OOMs before construction can skip them.
+            loader.stream_all_experts = config.expert_streaming;
             loader.prefetch_shards = args.fast_load_prefetch_shards
                 || std::env::var("ATLAS_FAST_LOAD_PREFETCH_SHARDS")
                     .ok()
@@ -73,6 +77,7 @@ pub(crate) fn load_weight_store(
             spark_runtime::weights::SafetensorsLoader::new()
         };
         loader.peak_memory_multiplier = mult;
+        loader.stream_all_experts = config.expert_streaming;
         loader
             .load(model_dir, gpu, oom_reserve_bytes)
             .context("Failed to load model weights")?

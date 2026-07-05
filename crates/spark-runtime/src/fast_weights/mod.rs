@@ -38,6 +38,11 @@ pub struct FastSafetensorsLoader {
     pub ep_rank: usize,
     pub ep_world_size: usize,
     pub num_experts: usize,
+    /// Expert streaming: skip loading ALL routed-expert tensors (served on
+    /// demand from the resident store / RDMA peer). Router gate + shared expert
+    /// stay resident. Shrinks the pre-flight byte estimate too, so an over-core
+    /// checkpoint whose experts exceed GPU memory still loads.
+    pub stream_all_experts: bool,
     pub peak_memory_multiplier: Option<f64>,
     /// When true (default), attempt `O_DIRECT`; fall back to buffered reads if
     /// the filesystem rejects it (tmpfs, overlayfs, some FUSE backends).
@@ -75,6 +80,7 @@ impl FastSafetensorsLoader {
             ep_rank: 0,
             ep_world_size: 1,
             num_experts: 0,
+            stream_all_experts: false,
             peak_memory_multiplier: None,
             try_direct_io: true,
             direct_io_tensor_cap: DEFAULT_DIRECT_IO_TENSOR_CAP,
@@ -87,6 +93,7 @@ impl FastSafetensorsLoader {
             ep_rank,
             ep_world_size,
             num_experts,
+            stream_all_experts: false,
             peak_memory_multiplier: None,
             try_direct_io: true,
             direct_io_tensor_cap: DEFAULT_DIRECT_IO_TENSOR_CAP,
@@ -95,10 +102,16 @@ impl FastSafetensorsLoader {
     }
 
     fn should_skip_tensor(&self, name: &str) -> bool {
-        if self.ep_world_size <= 1 {
+        // MTP head experts are small — always replicate, never skip.
+        if name.starts_with("mtp.") {
             return false;
         }
-        if name.starts_with("mtp.") {
+        // Expert streaming: every routed expert is served on demand from the
+        // store/peer, so none is loaded here — router gate + shared expert stay.
+        if self.stream_all_experts && parse_expert_index(name).is_some() {
+            return true;
+        }
+        if self.ep_world_size <= 1 {
             return false;
         }
         if let Some(idx) = parse_expert_index(name) {

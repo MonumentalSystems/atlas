@@ -163,6 +163,11 @@ pub struct SafetensorsLoader {
     pub ep_world_size: usize,
     /// Total number of MoE experts in the model (for EP partitioning).
     pub num_experts: usize,
+    /// Expert streaming: skip loading ALL routed-expert tensors (they are served
+    /// on demand from the resident store / RDMA peer). Router gate + shared
+    /// expert stay resident. This also shrinks the pre-flight byte estimate, so
+    /// an over-core checkpoint whose experts exceed GPU memory still loads.
+    pub stream_all_experts: bool,
     /// Override for the peak memory multiplier in the pre-flight OOM check.
     /// Set from QuantFormat::peak_memory_multiplier() in the caller.
     /// When None, the pre-flight uses its own heuristic (1.3x NVFP4 / 1.5x FP8).
@@ -182,6 +187,7 @@ impl SafetensorsLoader {
             ep_rank: 0,
             ep_world_size: 1,
             num_experts: 0,
+            stream_all_experts: false,
             peak_memory_multiplier: None,
         }
     }
@@ -192,19 +198,27 @@ impl SafetensorsLoader {
             ep_rank,
             ep_world_size,
             num_experts,
+            stream_all_experts: false,
             peak_memory_multiplier: None,
         }
     }
 
-    /// Check if a tensor should be skipped under EP.
-    /// Skips `*.experts.{E}.*` tensors where E is not in local range.
+    /// Check if a tensor should be skipped at load time.
+    /// Under expert streaming, skips ALL routed `*.experts.{E}.*` tensors.
+    /// Under EP, skips `*.experts.{E}.*` tensors where E is not in local range.
     /// MTP head experts are never skipped (small, fully replicated).
     fn should_skip_tensor(&self, name: &str) -> bool {
-        if self.ep_world_size <= 1 {
+        // MTP head experts are small — always replicate, never skip.
+        if name.starts_with("mtp.") {
             return false;
         }
-        // MTP head experts are small — always replicate, never shard.
-        if name.starts_with("mtp.") {
+        // Expert streaming: every routed expert is served on demand from the
+        // store/peer, so none is loaded here — the router gate + shared expert
+        // (no expert index) stay resident.
+        if self.stream_all_experts && parse_expert_index(name).is_some() {
+            return true;
+        }
+        if self.ep_world_size <= 1 {
             return false;
         }
         // Parse expert index from patterns like "*.experts.42.gate_proj*"
@@ -237,3 +251,42 @@ pub(crate) fn parse_expert_index(name: &str) -> Option<usize> {
 mod loader;
 pub mod mlx_int8;
 pub(crate) use loader::{check_oom_guard, estimate_has_fp8, estimate_load_bytes};
+
+#[cfg(test)]
+mod skip_tests {
+    use super::*;
+
+    const GATE: &str = "model.language_model.layers.3.mlp.experts.42.gate_proj.weight_packed";
+    const SHARED: &str = "model.language_model.layers.3.mlp.shared_expert.gate_proj.weight_packed";
+    const ROUTER: &str = "model.language_model.layers.3.mlp.gate.weight";
+    const ATTN: &str = "model.language_model.layers.3.self_attn.q_proj.weight";
+
+    #[test]
+    fn stream_all_experts_skips_only_routed_experts() {
+        let mut l = SafetensorsLoader::new();
+        l.stream_all_experts = true;
+        // Routed experts stream from the store/peer → skipped at load.
+        assert!(l.should_skip_tensor(GATE));
+        // Router gate, shared expert, attention stay resident.
+        assert!(!l.should_skip_tensor(SHARED));
+        assert!(!l.should_skip_tensor(ROUTER));
+        assert!(!l.should_skip_tensor(ATTN));
+        // MTP experts are never skipped (handled separately, small).
+        assert!(!l.should_skip_tensor("mtp.experts.5.gate_proj.weight_packed"));
+    }
+
+    #[test]
+    fn without_streaming_nothing_is_skipped_single_gpu() {
+        let l = SafetensorsLoader::new(); // ep_world_size=1, stream off
+        assert!(!l.should_skip_tensor(GATE));
+        assert!(!l.should_skip_tensor(SHARED));
+    }
+
+    #[test]
+    fn ep_skip_still_works_independently() {
+        // EP skip: rank 0 of 2 owns experts 0..128.
+        let l = SafetensorsLoader::with_ep(0, 2, 256);
+        assert!(l.should_skip_tensor("model.layers.0.mlp.experts.200.gate_proj.weight"));
+        assert!(!l.should_skip_tensor("model.layers.0.mlp.experts.10.gate_proj.weight"));
+    }
+}
