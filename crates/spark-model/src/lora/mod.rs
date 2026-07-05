@@ -265,13 +265,19 @@ pub fn load_lora_adapters_generic(
     max_loras: usize,
     max_lora_rank: usize,
 ) -> Result<LoraWeights> {
-    // 0) family allow-list: v0 validated on qwen3_5 dense (holo) only.
-    //    `is_qwen35_dense()` is the same predicate factory.rs uses to route
-    //    to Qwen35DenseWeightLoader (model_type == "qwen3_5" && num_experts == 0).
-    if !cfg.is_qwen35_dense() {
+    // 0) family allow-list: v0 validated on the Qwen3.5-family attention trunk —
+    //    qwen3_5 DENSE (holo-3.1-0.8b) and holo3_1_moe (holo-3.1-35b-a3b, MoE).
+    //    Both route to Qwen35WeightLoader, so their full-attention layers are
+    //    `Qwen3AttentionLayer` — what the install walk downcasts to. A k/v/o-only
+    //    adapter leaves `ffn_weights=None`, so the MoE-vs-dense FFN path is never
+    //    exercised; the per-tensor `classify_key` + shape audit + full-attention
+    //    gating below still hard-reject q_proj / GDN / MoE-MLP / wrong-layer
+    //    tensors. Other families stay rejected (no validated attention mapping).
+    if !(cfg.is_qwen35_dense() || cfg.model_type == "holo3_1_moe") {
         bail!(
             "REJECT[unvalidated-family]: LoRA v0 is validated on qwen3_5 dense \
-             (holo-3.1-0.8b) only; model_type='{}', num_experts={}",
+             (holo-3.1-0.8b) and holo3_1_moe (holo-3.1-35b-a3b) only; \
+             model_type='{}', num_experts={}",
             cfg.model_type,
             cfg.num_experts
         );

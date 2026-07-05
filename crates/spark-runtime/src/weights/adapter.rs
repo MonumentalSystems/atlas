@@ -109,3 +109,91 @@ pub fn load_adapter_safetensors(
 
     Ok(WeightStore::from_map(weights))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::load_adapter_safetensors;
+    use crate::cuda_backend::AtlasCudaBackend;
+    use crate::gpu::GpuBackend; // brings copy_d2h into scope
+    use crate::weights::WeightDtype;
+    use half::bf16;
+    use safetensors::Dtype;
+    use safetensors::serialize_to_file;
+    use safetensors::tensor::TensorView;
+    use std::collections::HashMap;
+
+    /// Regression test for the PEFT-default-F32 → BF16 fix.
+    ///
+    /// PEFT saves LoRA adapters as F32 by default; before the fix
+    /// `load_adapter_safetensors` left them F32 while the pool pack +
+    /// `dense_gemv_bf16` read at BF16 stride = silent garbage delta. This
+    /// builds a real F32 `adapter_model.safetensors` (two PEFT-style tensors,
+    /// `lora_A` + `lora_B`), loads it on a live CUDA device, and asserts every
+    /// returned tensor is BF16 and round-trips bit-exact.
+    ///
+    /// Gated `#[ignore]` (Atlas convention) because `AtlasCudaBackend::new`
+    /// touches the CUDA driver; a GPU-less `cargo test` skips it. Opt in with
+    /// `-- --ignored`.
+    #[test]
+    #[ignore = "requires a free CUDA device (GB10)"]
+    fn f32_peft_adapter_loads_and_round_trips_as_bf16() {
+        // Values all exactly representable in bf16 (≤8-bit mantissa), so the
+        // F32 → BF16 conversion must round-trip bit-exact.
+        let a_vals: [f32; 8] = [1.0, -2.0, 0.5, 0.25, 3.0, -1.5, 0.0, 8.0];
+        let b_vals: [f32; 8] = [4.0, -0.75, 0.125, 16.0, -6.0, 2.0, 0.0625, -1.0];
+        // lora_A [r=2, in=4]; lora_B [out=4, r=2]. Raw little-endian F32 bytes.
+        let a_shape = vec![2usize, 4usize];
+        let b_shape = vec![4usize, 2usize];
+        let a_bytes: Vec<u8> = a_vals.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let b_bytes: Vec<u8> = b_vals.iter().flat_map(|v| v.to_le_bytes()).collect();
+
+        // Realistic PEFT keys (the loader does not parse names — the layer
+        // allow-list lives downstream in spark-model — but keep them real).
+        let a_key = "base_model.model.model.layers.3.self_attn.k_proj.lora_A.weight";
+        let b_key = "base_model.model.model.layers.3.self_attn.k_proj.lora_B.weight";
+
+        // Unique tempdir with no extra dep (spark-runtime has no tempfile
+        // dev-dep): per-pid + per-thread subdir.
+        let dir = std::env::temp_dir().join(format!(
+            "atlas_adapter_test_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("adapter_model.safetensors");
+
+        let a_view = TensorView::new(Dtype::F32, a_shape.clone(), &a_bytes).unwrap();
+        let b_view = TensorView::new(Dtype::F32, b_shape.clone(), &b_bytes).unwrap();
+        let mut map: HashMap<String, TensorView> = HashMap::new();
+        map.insert(a_key.to_string(), a_view);
+        map.insert(b_key.to_string(), b_view);
+        serialize_to_file(map, None, &path).unwrap();
+
+        // Real GPU backend. The loader only allocs + copies (launches no
+        // kernel), but pass the codegen'd PTX set to mirror prod init.
+        let gpu = AtlasCudaBackend::new(0, &atlas_kernels::ptx_modules()).unwrap();
+
+        let store = load_adapter_safetensors(&dir, &gpu, 0).unwrap();
+
+        // (1) dtype: the F32 adapter must load as BF16 — the core of the fix.
+        for (key, shape, vals) in [(a_key, &a_shape, &a_vals), (b_key, &b_shape, &b_vals)] {
+            let t = store.get(key).unwrap();
+            assert_eq!(
+                t.dtype,
+                WeightDtype::BF16,
+                "F32 adapter tensor must load as BF16"
+            );
+            assert_eq!(&t.shape, shape);
+
+            // (2) values round-trip: read the 2-byte/elem BF16 back off device.
+            let mut back = vec![0u8; vals.len() * 2];
+            gpu.copy_d2h(t.ptr, &mut back).unwrap();
+            for (i, chunk) in back.chunks_exact(2).enumerate() {
+                let got = bf16::from_bits(u16::from_le_bytes([chunk[0], chunk[1]])).to_f32();
+                assert_eq!(got, vals[i], "tensor '{key}' elem {i} F32->BF16 round-trip");
+            }
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
