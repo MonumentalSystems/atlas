@@ -1,0 +1,264 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+//
+// ExpertTier — the residency abstraction the expert streamer fetches through.
+//
+// Sits ABOVE the record layer (`ExpertFileReader` / `ExpertIndex`), not as a
+// `StorageBackend` impl: that trait is GroupKey/KV-tile shaped and synchronizes
+// the stream on return, the wrong shape for pull-on-demand MoE experts. A tier
+// lands one expert record into a slot and returns the six device addresses the
+// fused kernels read (already resident / prefill-transposed layout — nothing is
+// transformed at fetch time, invariant D).
+//
+// Three tiers, one interface (residency order device < UMA-over-NVMe < RDMA):
+//   * `PosixTier`    — deterministic bounce oracle (pread -> copy_h2d into a
+//                      device buffer). The bit-identical acceptance reference.
+//   * `UmaArenaTier` — the zero-copy path: O_DIRECT NVMe fill straight into the
+//                      pinned arena; the ptr table points at the pinned VA, no
+//                      HtoD copy.
+//   * RdmaTier       — Stage 4: one-sided RDMA_READ into the SAME pinned arena.
+//
+// All three feed the identical ptr-table patch, so swapping tiers cannot change
+// a single byte the GEMM reads — which the Tier-1 parity test proves.
+
+use anyhow::{Context, Result, bail};
+use std::fs::OpenOptions;
+use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::Path;
+
+use crate::cuda_min::{DeviceBuffer, copy_h_to_d_async, stream_sync};
+use crate::expert::{ExpertKey, ExpertLayout, ExpertRecordHeader, ExpertRecordSpec, Proj};
+use crate::expert_arena::ExpertArena;
+use crate::expert_pack::{ExpertFileReader, ExpertIndex};
+
+/// The six sub-buffer device addresses (+ scalars) of one resident expert —
+/// exactly what the ptr-table patcher writes into the shadow tables.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ExpertResidency {
+    /// gate/up/down B_packed device VA.
+    pub packed_addr: [u64; 3],
+    /// gate/up/down B_scale device VA.
+    pub scale_addr: [u64; 3],
+    /// gate/up/down per-tensor weight_scale_2.
+    pub scale2: [f32; 3],
+    /// gate/up/down input_scale (None = weight-only W4A16).
+    pub input_scale: [Option<f32>; 3],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TierKind {
+    Posix,
+    Uma,
+    Rdma,
+}
+
+/// A destination slot in the residency ring: which slab, which slot within it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ArenaSlot {
+    pub slab: u32,
+    pub slot: u32,
+}
+
+impl ArenaSlot {
+    pub fn new(slab: u32, slot: u32) -> Self {
+        Self { slab, slot }
+    }
+}
+
+/// Fetch an expert record into a slot; return the addresses to patch.
+pub trait ExpertTier: Send {
+    fn fetch(&mut self, key: ExpertKey, slot: ArenaSlot, stream: u64) -> Result<ExpertResidency>;
+    fn kind(&self) -> TierKind;
+    /// Graceful-degradation probe (RDMA link health at Stage 4). Default: up.
+    fn healthy(&self) -> bool {
+        true
+    }
+}
+
+/// Turn a record buffer's header + a base device VA into an `ExpertResidency`
+/// using the record spec's sub-offsets. Shared by every tier so they cannot
+/// disagree on layout.
+fn residency_from(
+    spec: &ExpertRecordSpec,
+    record: &[u8],
+    base_dev_va: u64,
+) -> Result<ExpertResidency> {
+    let hdr = ExpertRecordHeader::from_bytes(record)
+        .context("expert record header magic/version mismatch")?;
+    let mut packed_addr = [0u64; 3];
+    let mut scale_addr = [0u64; 3];
+    for p in Proj::ALL {
+        packed_addr[p as usize] = base_dev_va + spec.packed_off(p);
+        scale_addr[p as usize] = base_dev_va + spec.scale_off(p);
+    }
+    Ok(ExpertResidency {
+        packed_addr,
+        scale_addr,
+        scale2: hdr.scale2,
+        input_scale: hdr.input_scale,
+    })
+}
+
+/// Deterministic bounce oracle: pread the record (no O_DIRECT) into a host
+/// buffer, `copy_h2d` into a per-slot device buffer, stream-synced. This is the
+/// reference every other tier must match byte-for-byte.
+pub struct PosixTier {
+    reader: ExpertFileReader,
+    spec: ExpertRecordSpec,
+    layout: ExpertLayout,
+    /// One contiguous device buffer holding num_slabs*slots_per_slab records.
+    dev: DeviceBuffer,
+    slots_per_slab: u32,
+    num_slabs: u32,
+}
+
+impl PosixTier {
+    pub fn open(dir: &Path, num_slabs: u32, slots_per_slab: u32) -> Result<Self> {
+        let reader = ExpertFileReader::open(dir)?;
+        let index: &ExpertIndex = reader.index();
+        let spec = index.spec();
+        let layout = index.layout();
+        let stride = layout.record_stride as usize;
+        let total = (num_slabs as usize) * (slots_per_slab as usize) * stride;
+        let dev = DeviceBuffer::new(total)?;
+        Ok(Self {
+            reader,
+            spec,
+            layout,
+            dev,
+            slots_per_slab,
+            num_slabs,
+        })
+    }
+
+    fn slot_dev_va(&self, slot: ArenaSlot) -> Result<u64> {
+        if slot.slab >= self.num_slabs || slot.slot >= self.slots_per_slab {
+            bail!("PosixTier: slot {:?} out of range", slot);
+        }
+        let i = (slot.slab as u64) * (self.slots_per_slab as u64) + (slot.slot as u64);
+        Ok(self.dev.ptr + i * self.layout.record_stride)
+    }
+}
+
+impl ExpertTier for PosixTier {
+    fn fetch(&mut self, key: ExpertKey, slot: ArenaSlot, stream: u64) -> Result<ExpertResidency> {
+        let record = self.reader.read_record_raw(key)?; // host bytes
+        let dev_va = self.slot_dev_va(slot)?;
+        copy_h_to_d_async(dev_va, record.as_ptr() as *const _, record.len(), stream)?;
+        stream_sync(stream)?; // single bounce would be overwritten otherwise
+        residency_from(&self.spec, &record, dev_va)
+    }
+    fn kind(&self) -> TierKind {
+        TierKind::Posix
+    }
+}
+
+/// The zero-copy path: O_DIRECT the record straight into the pinned arena slot;
+/// the returned addresses point INTO the arena (GPU-addressable at the same
+/// VA), no `copy_h2d`.
+pub struct UmaArenaTier {
+    files: Vec<OwnedFd>, // one O_DIRECT fd per MoE layer
+    spec: ExpertRecordSpec,
+    layout: ExpertLayout,
+    arena: ExpertArena,
+}
+
+impl UmaArenaTier {
+    pub fn open(dir: &Path, num_slabs: u32, slots_per_slab: u32) -> Result<Self> {
+        let reader = ExpertFileReader::open(dir)?;
+        let index: &ExpertIndex = reader.index();
+        let spec = index.spec();
+        let layout = index.layout();
+        // Re-open each layer file with O_DIRECT for aligned zero-copy reads.
+        let mut files = Vec::with_capacity(index.num_moe_layers as usize);
+        for l in 0..index.num_moe_layers {
+            let p = dir.join(index.file_name(l));
+            let f = OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_DIRECT)
+                .open(&p)
+                .with_context(|| format!("open O_DIRECT {}", p.display()))?;
+            files.push(f.into());
+        }
+        let arena = ExpertArena::new(num_slabs, slots_per_slab, layout.record_stride as usize)?;
+        Ok(Self {
+            files,
+            spec,
+            layout,
+            arena,
+        })
+    }
+
+    pub fn arena(&self) -> &ExpertArena {
+        &self.arena
+    }
+}
+
+impl ExpertTier for UmaArenaTier {
+    fn fetch(&mut self, key: ExpertKey, slot: ArenaSlot, _stream: u64) -> Result<ExpertResidency> {
+        let stride = self.layout.record_stride as usize;
+        let host = self.arena.slot_host_ptr(slot.slab, slot.slot)?;
+        let fd = self
+            .files
+            .get(key.layer as usize)
+            .with_context(|| format!("UmaArenaTier: no file for layer {}", key.layer))?
+            .as_raw_fd();
+        let off = self.layout.file_offset(key);
+        // O_DIRECT pread of the whole (4 KiB-aligned) record into the pinned,
+        // GPU-addressable slot — this is the "delete the bounce copy" step.
+        let mut done = 0usize;
+        while done < stride {
+            // SAFETY: `host` points at a slot of `stride` bytes inside the pinned
+            // arena; offset/len stay within it. fd is a valid O_DIRECT handle.
+            let n = unsafe {
+                libc::pread(
+                    fd,
+                    host.add(done) as *mut libc::c_void,
+                    stride - done,
+                    (off + done as u64) as libc::off_t,
+                )
+            };
+            if n < 0 {
+                bail!(
+                    "UmaArenaTier pread {:?} at {off}: {}",
+                    key,
+                    std::io::Error::last_os_error()
+                );
+            }
+            if n == 0 {
+                bail!("UmaArenaTier: short read for {:?} ({done}/{stride})", key);
+            }
+            done += n as usize;
+        }
+        // SAFETY: the slot holds `stride` valid bytes just read from disk.
+        let record = unsafe { std::slice::from_raw_parts(host, stride) };
+        let dev_va = self.arena.slot_dev_va(slot.slab, slot.slot)?;
+        residency_from(&self.spec, record, dev_va)
+    }
+    fn kind(&self) -> TierKind {
+        TierKind::Uma
+    }
+}
+
+/// Open the tier named by `backend` ("posix" | "uma") over a built store.
+pub fn open_tier(
+    backend: &str,
+    dir: &Path,
+    num_slabs: u32,
+    slots_per_slab: u32,
+) -> Result<Box<dyn ExpertTier>> {
+    match backend {
+        "posix" => Ok(Box::new(PosixTier::open(dir, num_slabs, slots_per_slab)?)),
+        "uma" => Ok(Box::new(UmaArenaTier::open(dir, num_slabs, slots_per_slab)?)),
+        other => bail!("unknown expert backend '{other}' (want posix|uma)"),
+    }
+}
+
+/// Copy `len` bytes from a device VA to a fresh host `Vec` (test/verify helper).
+pub fn read_device(dev_va: u64, len: usize, stream: u64) -> Result<Vec<u8>> {
+    use crate::cuda_min::copy_d_to_h_async;
+    let mut out = vec![0u8; len];
+    copy_d_to_h_async(out.as_mut_ptr() as *mut _, dev_va, len, stream)?;
+    stream_sync(stream)?;
+    Ok(out)
+}

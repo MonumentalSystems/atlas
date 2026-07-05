@@ -63,6 +63,10 @@ pub mod backend;
 #[cfg(feature = "cuda")]
 pub mod bench;
 #[cfg(feature = "cuda")]
+pub mod expert_arena;
+#[cfg(feature = "cuda")]
+pub mod expert_tier;
+#[cfg(feature = "cuda")]
 pub mod high_speed_swap;
 #[cfg(feature = "cuda")]
 pub mod predictor;
@@ -75,6 +79,12 @@ pub mod tiled_attention;
 
 #[cfg(feature = "cuda")]
 pub use backend::{IoUringBackend, PosixBackend, ReadRequest, StorageBackend};
+#[cfg(feature = "cuda")]
+pub use expert_arena::ExpertArena;
+#[cfg(feature = "cuda")]
+pub use expert_tier::{
+    ArenaSlot, ExpertResidency, ExpertTier, PosixTier, TierKind, UmaArenaTier, open_tier,
+};
 pub use config::HighSpeedSwapConfig;
 pub use eviction::EvictionPolicy;
 pub use expert::{
