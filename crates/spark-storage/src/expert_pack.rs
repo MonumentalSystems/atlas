@@ -339,6 +339,15 @@ mod fs_impl {
 
         /// Read one record's raw `record_stride` bytes into a fresh buffer.
         pub fn read_record_raw(&self, key: ExpertKey) -> Result<Vec<u8>> {
+            // Graceful Err on a bad layer (a direct Vec index would panic —
+            // the sibling UmaArenaTier bounds-checks, so match it).
+            if key.layer as usize >= self.files.len() {
+                bail!(
+                    "ExpertFileReader: layer {} out of range ({} layer files)",
+                    key.layer,
+                    self.files.len()
+                );
+            }
             let mut buf = vec![0u8; self.layout.record_stride as usize];
             let off = self.layout.file_offset(key);
             self.files[key.layer as usize]
@@ -489,6 +498,18 @@ mod fs_impl {
             ];
             let err = pack_record(&spec, index.record_stride, &header, &projs);
             assert!(err.is_err(), "short packed buffer must error");
+        }
+
+        #[test]
+        fn read_record_raw_rejects_out_of_range_layer() {
+            let dir = tmpdir("oob");
+            let index = synth_index(); // 2 MoE layers
+            ExpertFileWriter::create(&dir, index).unwrap().finish().unwrap();
+            let r = ExpertFileReader::open(&dir).unwrap();
+            // Valid layer is fine; an out-of-range layer is a graceful Err, not a panic.
+            assert!(r.read_record_raw(ExpertKey::new(0, 0)).is_ok());
+            assert!(r.read_record_raw(ExpertKey::new(99, 0)).is_err());
+            std::fs::remove_dir_all(&dir).ok();
         }
 
         #[test]

@@ -82,9 +82,20 @@ fn residency_from(
     spec: &ExpertRecordSpec,
     record: &[u8],
     base_dev_va: u64,
+    key: ExpertKey,
 ) -> Result<ExpertResidency> {
     let hdr = ExpertRecordHeader::from_bytes(record)
         .context("expert record header magic/version mismatch")?;
+    // Invariant D at fetch time: the header carries identity precisely so a
+    // misplaced/corrupt record is caught here, not served silently.
+    if hdr.layer != key.layer || hdr.expert != key.expert {
+        bail!(
+            "expert record identity mismatch: header ({},{}) != requested {:?}",
+            hdr.layer,
+            hdr.expert,
+            key
+        );
+    }
     let mut packed_addr = [0u64; 3];
     let mut scale_addr = [0u64; 3];
     for p in Proj::ALL {
@@ -118,8 +129,16 @@ impl PosixTier {
         let index: &ExpertIndex = reader.index();
         let spec = index.spec();
         let layout = index.layout();
+        if num_slabs == 0 || slots_per_slab == 0 {
+            bail!("PosixTier: zero geometry ({num_slabs},{slots_per_slab})");
+        }
         let stride = layout.record_stride as usize;
-        let total = (num_slabs as usize) * (slots_per_slab as usize) * stride;
+        // Checked like the sibling ExpertArena ctor — a wrapped product must
+        // never yield a small alloc that slot_dev_va then addresses past.
+        let total = (num_slabs as usize)
+            .checked_mul(slots_per_slab as usize)
+            .and_then(|v| v.checked_mul(stride))
+            .context("PosixTier: arena size overflow")?;
         let dev = DeviceBuffer::new(total)?;
         Ok(Self {
             reader,
@@ -146,7 +165,7 @@ impl ExpertTier for PosixTier {
         let dev_va = self.slot_dev_va(slot)?;
         copy_h_to_d_async(dev_va, record.as_ptr() as *const _, record.len(), stream)?;
         stream_sync(stream)?; // single bounce would be overwritten otherwise
-        residency_from(&self.spec, &record, dev_va)
+        residency_from(&self.spec, &record, dev_va, key)
     }
     fn kind(&self) -> TierKind {
         TierKind::Posix
@@ -233,7 +252,7 @@ impl ExpertTier for UmaArenaTier {
         // SAFETY: the slot holds `stride` valid bytes just read from disk.
         let record = unsafe { std::slice::from_raw_parts(host, stride) };
         let dev_va = self.arena.slot_dev_va(slot.slab, slot.slot)?;
-        residency_from(&self.spec, record, dev_va)
+        residency_from(&self.spec, record, dev_va, key)
     }
     fn kind(&self) -> TierKind {
         TierKind::Uma
