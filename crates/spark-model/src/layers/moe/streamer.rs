@@ -42,6 +42,14 @@ pub struct ExpertStreamerShared {
     tx: Sender<Job>,
     done: Arc<(Mutex<DoneMap>, Condvar)>,
     requested: Mutex<HashSet<u32>>,
+    /// WS3 persistent residency: dense-layer -> its cached arena residencies.
+    /// A layer stays here across prefills until its slab is reused by another
+    /// layer. When the working set fits (num_slabs >= num_moe_layers), warm
+    /// prefills are pure cache hits — zero expert I/O.
+    resident_cache: Mutex<HashMap<u32, Vec<ExpertResidency>>>,
+    /// Which dense layer currently owns each slab (arena occupancy). A cached
+    /// layer's arena bytes are valid iff it still owns its slab.
+    slab_occupant: Mutex<Vec<Option<u32>>>,
     /// Per-slab consumer events (compute-thread only). `slab_events[s]` marks
     /// the GEMM of slab `s`'s current occupant complete.
     slab_events: Vec<CudaEvent>,
@@ -135,6 +143,8 @@ impl ExpertStreamerShared {
             tx,
             done,
             requested: Mutex::new(HashSet::new()),
+            resident_cache: Mutex::new(HashMap::new()),
+            slab_occupant: Mutex::new(vec![None; num_slabs as usize]),
             slab_events,
             num_slabs,
             num_moe_layers,
@@ -155,26 +165,64 @@ impl ExpertStreamerShared {
         self.kind
     }
 
-    /// Request a prefetch of dense layer `dense` (idempotent within a prefill).
+    /// Request a prefetch of dense layer `dense`. WS3: a cache hit (the layer is
+    /// still resident in its slab) enqueues NO fetch — only a miss/eviction does.
     pub fn prefetch(&self, dense: u32, lo: u32, hi: u32) {
         if dense >= self.num_moe_layers {
             return;
         }
+        let slab = (dense % self.num_slabs) as usize;
+        let mut occ = self.slab_occupant.lock().expect("occupant mutex");
+        let cache = self.resident_cache.lock().expect("cache mutex");
+        // Resident hit: still owns its slab and cached → arena bytes are valid,
+        // no I/O needed.
+        if occ[slab] == Some(dense) && cache.contains_key(&dense) {
+            return;
+        }
+        drop(cache);
+        // Miss/eviction: evict the current occupant's cache entry (its arena
+        // bytes are about to be overwritten) and claim the slab.
+        if let Some(old) = occ[slab]
+            && old != dense
+        {
+            self.resident_cache
+                .lock()
+                .expect("cache mutex")
+                .remove(&old);
+        }
+        occ[slab] = Some(dense);
+        drop(occ);
         let mut req = self.requested.lock().expect("requested mutex");
         if req.insert(dense) {
             let _ = self.tx.send(Job { dense, lo, hi });
         }
     }
 
-    /// Block until dense layer `dense`'s prefetch completes; return its
-    /// residencies and clear it so the next prefill can re-fetch.
+    /// Return dense layer `dense`'s residencies. WS3: a resident cache hit
+    /// returns immediately; otherwise block on the worker fetch and promote the
+    /// result into the persistent cache.
     pub fn take(&self, dense: u32) -> Result<Vec<ExpertResidency>> {
+        // Fast path: resident in cache.
+        if let Some(res) = self
+            .resident_cache
+            .lock()
+            .expect("cache mutex")
+            .get(&dense)
+        {
+            return Ok(res.clone());
+        }
+        // Slow path: wait for the worker fetch, then cache it.
         let (lock, cv) = &*self.done;
         let mut map = lock.lock().expect("done mutex");
         loop {
             if let Some(entry) = map.remove(&dense) {
                 self.requested.lock().expect("requested mutex").remove(&dense);
-                return entry.map_err(|e| anyhow::anyhow!(e));
+                let res = entry.map_err(|e| anyhow::anyhow!(e))?;
+                self.resident_cache
+                    .lock()
+                    .expect("cache mutex")
+                    .insert(dense, res.clone());
+                return Ok(res);
             }
             map = cv.wait(map).expect("done condvar");
         }
