@@ -129,6 +129,17 @@ impl TransformerModel {
         self.gpu
             .copy_h2d_async(&token.to_le_bytes(), self.buffers.token_ids(), stream)?;
 
+        // ── M2 request-scoped LoRA routing (single-seq decode). Upload this
+        // request's 1-elem adapter-slot buffer to the free +128 gap (positions
+        // @+0..+4, slot @+8..+16, seq_len @+16..+20, block_table @+256 — +128
+        // is clear). Fixed address + per-step contents = graph-safe (same
+        // phasing as positions), uploaded pre-`begin_capture`. `DevicePtr(0)`
+        // when no adapter pool is resident → the K/V/O apply sites take the
+        // byte-identical installed-pair path. `seq.adapter_slot == -1` (no
+        // per-request `adapter` field) resolves to the active slot.
+        let seq_slot =
+            self.upload_seq_slot_uniform(seq.adapter_slot, 1, meta_base.offset(128), stream)?;
+
         let attn_metadata = AttnMetadataDev {
             positions: meta_base,
             positions_h: meta_base,
@@ -138,7 +149,7 @@ impl TransformerModel {
             block_table: meta_base.offset(256),
             max_blocks_per_seq: max_blocks,
             num_seqs: 1,
-            seq_slot: spark_runtime::gpu::DevicePtr(0),
+            seq_slot,
         };
 
         // CUDA graphs cannot capture NCCL all-reduce (it runs on a separate

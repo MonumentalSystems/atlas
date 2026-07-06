@@ -155,6 +155,50 @@ impl TransformerModel {
         Ok(dst)
     }
 
+    /// Upload a UNIFORM `[count]` i32 adapter-slot buffer where every row =
+    /// `resolve(adapter_slot, active)` (`-1` → active). Used by the
+    /// single-request paths (single-seq decode, one-request prefill, and
+    /// spec-verify of one sequence): those all carry a single `adapter_slot`,
+    /// applied to `count` rows (`count == 1` for decode/verify, `count == m`
+    /// for prefill). Returns `dst` when an adapter pool is resident (so the
+    /// routed bgmv reads it) or `DevicePtr(0)` when there is no LoRA (apply
+    /// sites then take the byte-identical installed-pair fallback). Resolution
+    /// + `count`-fill go through the unit-tested
+    /// [`crate::lora::build_seq_slot_host`].
+    pub(crate) fn upload_seq_slot_uniform(
+        &self,
+        adapter_slot: i32,
+        count: usize,
+        dst: DevicePtr,
+        stream: u64,
+    ) -> Result<DevicePtr> {
+        let active = match self.lora.as_ref() {
+            Some(lw) => lw.active as i32,
+            None => return Ok(DevicePtr(0)),
+        };
+        // Byte-identity guard: a request whose EFFECTIVE adapter is the active one
+        // (no per-request `adapter` field -> adapter_slot=-1 -> active, OR it named
+        // the active adapter) must keep the INSTALLED-pair path (apply_lora_delta:
+        // dense_gemm_tc for prefill, gemv for m=1 decode) — NOT the bgmv, whose
+        // per-row gemv would perturb prefill numerics vs today. Return the null
+        // buffer so the apply site is untouched. ONLY a request routing to a
+        // DIFFERENT (non-active) adapter uploads a slot buffer and takes the bgmv
+        // (a NEW routed path — no prior byte-identity baseline to preserve).
+        let resolved = if adapter_slot >= 0 {
+            adapter_slot
+        } else {
+            active
+        };
+        if resolved == active {
+            return Ok(DevicePtr(0));
+        }
+        let slots = vec![adapter_slot; count];
+        let host = crate::lora::build_seq_slot_host(&slots, count, active);
+        let bytes: Vec<u8> = host.iter().flat_map(|v| v.to_le_bytes()).collect();
+        self.gpu.copy_h2d_async(&bytes, dst, stream)?;
+        Ok(dst)
+    }
+
     /// Upload batch metadata to a caller-specified device address.
     ///
     /// Same layout as `upload_batch_metadata_fixed` (positions at +0, slots
@@ -470,6 +514,14 @@ impl TransformerModel {
         self.gpu
             .copy_h2d_async(bt_bytes, meta_base.offset(256), stream)?;
 
+        // Request-scoped LoRA routing for the draft pass (same 1-elem +128-gap
+        // layout as decode_a). Without it, self-speculative drafts would be
+        // proposed with the global active adapter and mostly rejected by a
+        // correctly-routed verify — a pure acceptance-rate loss, not a
+        // correctness one, but cheap to avoid.
+        let seq_slot =
+            self.upload_seq_slot_uniform(seq.adapter_slot, 1, meta_base.offset(128), stream)?;
+
         let attn_metadata = AttnMetadataDev {
             positions: meta_base,
             positions_h: meta_base,
@@ -479,7 +531,7 @@ impl TransformerModel {
             block_table: meta_base.offset(256),
             max_blocks_per_seq: max_blocks,
             num_seqs: 1,
-            seq_slot: DevicePtr(0),
+            seq_slot,
         };
 
         let ctx = ForwardContext {

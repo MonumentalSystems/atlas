@@ -391,6 +391,17 @@ impl TransformerModel {
             (DevicePtr::NULL, DevicePtr::NULL)
         };
 
+        // Request-scoped LoRA routing (two-phase prefill) — same dedicated
+        // arena buffer + m-element uniform slot array as prefill_a. See
+        // prefill_a.rs for the placement rationale. `DevicePtr(0)` (no pool)
+        // → installed-pair fallback; `-1` resolves to active.
+        let seq_slot = self.upload_seq_slot_uniform(
+            seq.adapter_slot,
+            proc_count,
+            self.buffers.lora_seq_slot(),
+            stream,
+        )?;
+
         let attn_metadata = AttnMetadataDev {
             positions: meta_base,
             positions_h: meta_base,
@@ -400,7 +411,7 @@ impl TransformerModel {
             block_table: block_table_dev,
             max_blocks_per_seq: seq.block_table.len() as u32,
             num_seqs: 1,
-            seq_slot: spark_runtime::gpu::DevicePtr(0),
+            seq_slot,
         };
 
         let ctx = ForwardContext {

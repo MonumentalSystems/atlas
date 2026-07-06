@@ -323,6 +323,24 @@ impl TransformerModel {
             devs
         };
 
+        // ── M2 request-scoped LoRA routing (prefill). Every one of the
+        // `proc_count` prompt tokens carries THIS request's adapter — the
+        // headline fix (prefill previously always applied the global active
+        // adapter, contaminating a routed request's prompt KV). A dedicated
+        // arena buffer (`lora_seq_slot`, sized max_batch_tokens) holds the
+        // m-element slot array; the packed meta gap is unsafe here because
+        // positions span `proc_count*4` bytes from meta_base+0. Prefill is
+        // eager (graph_capture:false) + this H2D precedes the layer loop, so
+        // it rides the existing metadata phasing. `DevicePtr(0)` (no pool) →
+        // the K/V/O apply sites take the byte-identical installed-pair path.
+        // `seq.adapter_slot == -1` (no `adapter` field) resolves to active.
+        let seq_slot = self.upload_seq_slot_uniform(
+            seq.adapter_slot,
+            proc_count,
+            self.buffers.lora_seq_slot(),
+            stream,
+        )?;
+
         let attn_metadata = AttnMetadataDev {
             positions: meta_base,
             positions_h: meta_base,
@@ -332,7 +350,7 @@ impl TransformerModel {
             block_table: block_table_dev,
             max_blocks_per_seq: seq.block_table.len() as u32,
             num_seqs: 1,
-            seq_slot: spark_runtime::gpu::DevicePtr(0),
+            seq_slot,
         };
 
         let ctx = ForwardContext {

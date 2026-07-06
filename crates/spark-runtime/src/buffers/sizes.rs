@@ -118,6 +118,13 @@ pub struct BufferSizes {
     /// LoRA hidden-activation scratch [m, intermediate_size] BF16 for the
     /// runtime delta path on FFN projections. 0 (→ NULL) when no adapter.
     pub lora_hact: usize,
+    /// LoRA per-request routing slots `[m]` i32 — one adapter SLOT index per
+    /// prefilling token (all equal for a single-request prefill; resolves
+    /// `-1`→active before upload). Dedicated buffer (not a packed meta offset)
+    /// so the m-element prefill slot array never collides with the per-path
+    /// positions/slots/block_table region. 0 (→ NULL) when no adapter
+    /// (adapter_max_rank == 0).
+    pub lora_seq_slot: usize,
 }
 
 impl BufferSizes {
@@ -254,15 +261,16 @@ impl BufferSizes {
         // set programmatically pre-build). Widest v0 target n_out =
         // max(hidden, intermediate): covers k/v, o/down (hidden) and gate/up
         // (intermediate); q_proj (2*q_heads*head_dim) is excluded in v0.
-        let (lora_xa, lora_delta, lora_hact) = if config.adapter_max_rank > 0 {
+        let (lora_xa, lora_delta, lora_hact, lora_seq_slot) = if config.adapter_max_rank > 0 {
             let max_n = h.max(config.intermediate_size);
             (
                 m * config.adapter_max_rank * bf16,
                 m * max_n * bf16,
                 m * config.intermediate_size * bf16,
+                m * 4, // [m] i32 per-request routing slots (prefill path)
             )
         } else {
-            (0, 0, 0)
+            (0, 0, 0, 0)
         };
 
         // GDN FLA chunked-prefill scratch — ONE buffer holding W|U|S|uc back-to-back,
@@ -428,6 +436,7 @@ impl BufferSizes {
             lora_xa,
             lora_delta,
             lora_hact,
+            lora_seq_slot,
         }
     }
 
@@ -466,5 +475,6 @@ impl BufferSizes {
             + self.lora_xa
             + self.lora_delta
             + self.lora_hact
+            + self.lora_seq_slot
     }
 }

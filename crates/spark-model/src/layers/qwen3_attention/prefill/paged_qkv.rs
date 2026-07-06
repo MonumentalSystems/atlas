@@ -316,25 +316,56 @@ impl Qwen3AttentionLayer {
         // Runs before the caller's ATLAS_OP_DUMP, so dumps show ADAPTED
         // outputs (what an HF+PEFT forward hook shows).
         if let Some(ref lw) = self.lora {
-            let pair = match proj {
-                Proj::Q => None,
-                Proj::K => lw.k.as_ref(),
-                Proj::V => lw.v.as_ref(),
+            // Q has neither a pair nor a route (rejected at load) — keep it None
+            // for BOTH so a route deref can never fire on Q.
+            let (pair, route) = match proj {
+                Proj::Q => (None, None),
+                Proj::K => (lw.k.as_ref(), lw.k_route.as_ref()),
+                Proj::V => (lw.v.as_ref(), lw.v_route.as_ref()),
             };
             if let Some(pair) = pair {
                 debug_assert_eq!(pair.k_in, h);
                 debug_assert_eq!(pair.n_out, out_dim);
-                ops::lora_delta::apply_lora_delta(
-                    ctx.gpu,
-                    &lw.kernels,
-                    pair,
-                    normed,
-                    out,
-                    n,
-                    ctx.buffers.lora_xa(),
-                    ctx.buffers.lora_delta(),
-                    stream,
-                )?;
+                // Request-scoped routing: fold THIS request's adapter delta over
+                // all `n` prompt tokens via the bgmv when the prefill uploaded a
+                // per-request slot buffer (`seq_slot != 0`) and the module has a
+                // route. `normed` is contiguous [n, h] and `out` is contiguous
+                // [n, out_dim], so the bgmv (all rows = same slot) is
+                // byte-identical to `n` single-row `apply_lora_delta`. No pool /
+                // no route → the installed-active-pair path (pre-M2 behaviour).
+                let seq_slot = ctx
+                    .attn_metadata
+                    .map(|m| m.seq_slot)
+                    .unwrap_or(DevicePtr(0));
+                if seq_slot.0 != 0
+                    && let Some(route) = route
+                {
+                    ops::lora_delta::apply_lora_bgmv(
+                        ctx.gpu,
+                        &lw.kernels,
+                        route,
+                        normed,
+                        out,
+                        seq_slot,
+                        n,
+                        pair.k_in,
+                        pair.n_out,
+                        ctx.buffers.lora_xa(),
+                        stream,
+                    )?;
+                } else {
+                    ops::lora_delta::apply_lora_delta(
+                        ctx.gpu,
+                        &lw.kernels,
+                        pair,
+                        normed,
+                        out,
+                        n,
+                        ctx.buffers.lora_xa(),
+                        ctx.buffers.lora_delta(),
+                        stream,
+                    )?;
+                }
             }
         }
         Ok(())

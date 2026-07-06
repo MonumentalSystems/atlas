@@ -143,6 +143,12 @@ impl BufferArena {
     pub fn lora_hact_bytes(&self) -> usize {
         self.sizes.lora_hact
     }
+    /// LoRA per-request routing slots `[max_batch_tokens]` i32 for the prefill
+    /// path — one adapter SLOT index per prefilling token (all equal for a
+    /// single-request prefill). `DevicePtr::NULL` when no adapter is configured.
+    pub fn lora_seq_slot(&self) -> DevicePtr {
+        self.lora_seq_slot
+    }
     pub fn splitk_workspace(&self) -> DevicePtr {
         self.splitk_workspace
     }

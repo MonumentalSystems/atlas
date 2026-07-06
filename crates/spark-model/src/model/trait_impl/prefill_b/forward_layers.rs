@@ -54,6 +54,18 @@ impl TransformerModel {
         } else {
             (meta_base, meta_base)
         };
+
+        // Request-scoped LoRA routing (chunked prefill) — dedicated arena buffer
+        // holding `proc_count` uniform slots (see prefill_a.rs). Covers both the
+        // paged-prefill layer path and the warm-prefix `use_decode_path` fork
+        // (proc_count==1): the single-seq decode apply reads slot[0], correct
+        // for the uniform buffer. `DevicePtr(0)` (no pool) → installed-pair path.
+        let seq_slot = self.upload_seq_slot_uniform(
+            seq.adapter_slot,
+            proc_count,
+            self.buffers.lora_seq_slot(),
+            stream,
+        )?;
         let attn_metadata = AttnMetadataDev {
             positions: meta_base,
             positions_h: positions_h_dev,
@@ -63,7 +75,7 @@ impl TransformerModel {
             block_table: block_table_dev,
             max_blocks_per_seq: seq.block_table.len() as u32,
             num_seqs: 1,
-            seq_slot: spark_runtime::gpu::DevicePtr(0),
+            seq_slot,
         };
 
         // Consume the one-shot ATLAS_PROFILE_FIRST flag (additive).

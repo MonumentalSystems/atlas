@@ -242,17 +242,43 @@ impl Qwen3AttentionLayer {
         {
             debug_assert_eq!(pair.k_in, nq * hd);
             debug_assert_eq!(pair.n_out, h);
-            ops::lora_delta::apply_lora_delta(
-                ctx.gpu,
-                &lw.kernels,
-                pair,
-                attn_out,
-                o_out,
-                n,
-                ctx.buffers.lora_xa(),
-                ctx.buffers.lora_delta(),
-                stream,
-            )?;
+            // Request-scoped routing (see paged_qkv.rs). attn_out is contiguous
+            // [n, nq*hd] and o_out is contiguous [n, h], so the routed bgmv is
+            // byte-identical to `n` single-row `apply_lora_delta`. No pool / no
+            // route → installed-active-pair path (pre-M2 behaviour).
+            let seq_slot = ctx
+                .attn_metadata
+                .map(|m| m.seq_slot)
+                .unwrap_or(DevicePtr(0));
+            if seq_slot.0 != 0
+                && let Some(ref route) = lw.o_route
+            {
+                ops::lora_delta::apply_lora_bgmv(
+                    ctx.gpu,
+                    &lw.kernels,
+                    route,
+                    attn_out,
+                    o_out,
+                    seq_slot,
+                    n,
+                    pair.k_in,
+                    pair.n_out,
+                    ctx.buffers.lora_xa(),
+                    stream,
+                )?;
+            } else {
+                ops::lora_delta::apply_lora_delta(
+                    ctx.gpu,
+                    &lw.kernels,
+                    pair,
+                    attn_out,
+                    o_out,
+                    n,
+                    ctx.buffers.lora_xa(),
+                    ctx.buffers.lora_delta(),
+                    stream,
+                )?;
+            }
         }
         // ATLAS_OP_DUMP hook: post-O-projection — this is the FULL attention
         // block output (Q*K^T*V * O_proj). Compares 1:1 against the HF

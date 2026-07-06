@@ -106,6 +106,9 @@ pub struct BufferArena {
     /// LoRA hidden-activation scratch: [M, intermediate_size] BF16 for the
     /// runtime FFN delta path. NULL when no adapter is configured.
     lora_hact: DevicePtr,
+    /// LoRA per-request routing slots `[M]` i32 for the prefill path (one
+    /// adapter SLOT index per prefilling token). NULL when no adapter.
+    lora_seq_slot: DevicePtr,
     /// Maximum batch tokens this arena was sized for.
     max_batch_tokens: usize,
     /// Sizes in bytes for each buffer (for debug/logging).
@@ -196,6 +199,11 @@ impl BufferArena {
         } else {
             DevicePtr::NULL
         };
+        let lora_seq_slot = if sizes.lora_seq_slot > 0 {
+            gpu.alloc(sizes.lora_seq_slot)?
+        } else {
+            DevicePtr::NULL
+        };
 
         tracing::info!(
             "Buffer arena: {} tokens × {:.1} MB total (attn_out={:.1}MB, ssm_deint={:.1}MB, kv_lora_rank={})",
@@ -242,6 +250,7 @@ impl BufferArena {
             lora_xa,
             lora_delta,
             lora_hact,
+            lora_seq_slot,
             max_batch_tokens,
             sizes,
         })

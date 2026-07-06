@@ -127,6 +127,14 @@ impl TransformerModel {
         self.gpu
             .copy_h2d_async(bt_bytes, meta_base.offset(768), stream)?;
 
+        // Request-scoped LoRA routing (graphed γ-verify) — see verify_b.rs. One
+        // sequence → one adapter; [K]-all-equal buffer at the +128 gap, uploaded
+        // pre-`begin_capture`. γ spec depth MUST stay ≤ 32 or +128+K*4 would
+        // overrun slot@+256. `DevicePtr(0)` (no pool) → installed-pair path.
+        debug_assert!(k <= 32, "γ verify seq_slot +128 gap holds K ≤ 32");
+        let seq_slot =
+            self.upload_seq_slot_uniform(seq.adapter_slot, k, meta_base.offset(128), stream)?;
+
         let metadata = AttnMetadataDev {
             positions: meta_base,
             positions_h: meta_base,
@@ -136,7 +144,7 @@ impl TransformerModel {
             block_table: meta_base.offset(768),
             max_blocks_per_seq: max_blocks,
             num_seqs: k as u32,
-            seq_slot: spark_runtime::gpu::DevicePtr(0),
+            seq_slot,
         };
 
         // Phase 6.2.c — HSS host I/O is illegal under CUDA graph capture.

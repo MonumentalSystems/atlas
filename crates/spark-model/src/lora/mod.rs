@@ -955,4 +955,59 @@ mod tests {
         let slots = [3i32, 1];
         assert_eq!(build_seq_slot_host(&slots, 2, 0), vec![3, 1]);
     }
+
+    #[test]
+    fn seq_slot_uniform_prefill_fills_and_resolves() {
+        // Pure core of `TransformerModel::upload_seq_slot_uniform`
+        // (single-seq decode count=1, verify count=K, prefill count=m): every
+        // row = resolve(adapter_slot, active). Covered across representative
+        // counts {1, 4, 32}.
+        for &count in &[1usize, 4, 32] {
+            // Explicit slot ≥ 0 → every row is that slot (no active fallback).
+            let v = build_seq_slot_host(&vec![3i32; count], count, 7);
+            assert_eq!(v, vec![3i32; count], "count={count} explicit slot B");
+            // Deferred (-1, request has no `adapter` field) → resolves to active,
+            // so a single-adapter / no-field run applies the active slot on
+            // every row — byte-identical delta to the installed-pair path.
+            let v = build_seq_slot_host(&vec![-1i32; count], count, 5);
+            assert_eq!(v, vec![5i32; count], "count={count} deferred → active");
+            // Explicit slot 0 (naming the active adapter) stays 0.
+            let v = build_seq_slot_host(&vec![0i32; count], count, 2);
+            assert_eq!(v, vec![0i32; count], "count={count} slot 0");
+        }
+    }
+
+    #[test]
+    fn seq_slot_meta_offset_gaps_do_not_collide() {
+        // The small fixed-layout paths (single-seq decode, eager verify_a, and
+        // the graphed verify_b/c/c2/d) place the seq_slot buffer at meta_base
+        // +128. Assert that gap never overlaps the positions/slot/seq_len/
+        // block_table regions those builders write. Byte offsets mirror the
+        // AttnMetadataDev construction in decode_a.rs / verify_*.rs.
+        const SEQ_SLOT_OFF: usize = 128;
+
+        // Single-seq decode + eager verify_a: positions@0 (4B, ends @4),
+        // slot@8 (i64, ends @16), seq_len@16 (i32, ends @20), block_table@256.
+        // A 1-elem i32 seq_slot@128 sits clear of all four.
+        assert!(SEQ_SLOT_OFF >= 20, "seq_slot starts after seq_len region");
+        assert!(
+            SEQ_SLOT_OFF + 4 <= 256,
+            "1-elem seq_slot ends before block_table@256"
+        );
+
+        // Graphed verify (multi-seq layout): slot@256, seq_len@512, bt@768. A
+        // [K] i32 seq_slot@128 must not reach slot@256 → K ≤ 32 (the
+        // debug_assert!(k <= 32) guard in verify_b/c/c2/d).
+        for k in [2usize, 3, 4, 32] {
+            assert!(
+                SEQ_SLOT_OFF + k * 4 <= 256,
+                "K={k}: [K] seq_slot ends before slot@256"
+            );
+        }
+        // K = 33 would overrun the slot region — documents why the guard caps K.
+        assert!(
+            SEQ_SLOT_OFF + 33 * 4 > 256,
+            "K=33 overruns — guard required"
+        );
+    }
 }
