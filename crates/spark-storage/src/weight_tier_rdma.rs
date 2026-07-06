@@ -145,10 +145,10 @@ impl RdmaWeightLoader {
 #[cfg(atlas_rdma_verbs)]
 fn env_str(keys: &[&str], default: &str) -> String {
     for k in keys {
-        if let Ok(v) = std::env::var(k) {
-            if !v.is_empty() {
-                return v;
-            }
+        if let Ok(v) = std::env::var(k)
+            && !v.is_empty()
+        {
+            return v;
         }
     }
     default.to_string()

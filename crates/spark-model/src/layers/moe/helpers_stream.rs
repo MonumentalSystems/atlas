@@ -171,10 +171,10 @@ impl MoeLayer {
     ///
     /// `active`:
     ///   * `None`      → DENSE path: fetch/patch the whole local range `[lo, hi)`
-    ///                   (worker prefetched it during the prior layer's compute).
+    ///     (worker prefetched it during the prior layer's compute).
     ///   * `Some(ids)` → REACTIVE path: just-in-time fetch/patch ONLY `ids` (the
-    ///                   count>0 experts). Inactive table entries keep their prior
-    ///                   value; the grouped GEMM never dereferences them.
+    ///     count>0 experts). Inactive table entries keep their prior value; the
+    ///     grouped GEMM never dereferences them.
     pub(super) fn install_streamed_tables(
         &self,
         ctx: &ForwardContext,

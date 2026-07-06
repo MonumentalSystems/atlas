@@ -560,10 +560,15 @@ mod server_impl {
         Ok((shard_paths, manifest))
     }
 
+    /// Resolved shard set: the shard file paths (shard-index order) plus the
+    /// index `weight_map` (tensor name -> shard file) when an index exists, or
+    /// `None` for a single-file / glob checkpoint (keep every header tensor).
+    type ShardResolution = (Vec<PathBuf>, Option<HashMap<String, String>>);
+
     /// Shard discovery, resolution order identical to the disk loaders:
     /// (1) model.safetensors.index.json, else consolidated.safetensors.index.json;
     /// (2) single model.safetensors; (3) glob model.safetensors-* / consolidated-*.
-    fn resolve_shards(dir: &Path) -> Result<(Vec<PathBuf>, Option<HashMap<String, String>>)> {
+    fn resolve_shards(dir: &Path) -> Result<ShardResolution> {
         let index = dir.join("model.safetensors.index.json");
         let consolidated = dir.join("consolidated.safetensors.index.json");
         let actual = if index.exists() {
@@ -660,10 +665,10 @@ mod server_impl {
             }
             // Skip header tensors the index doesn't route (orphan/tied/aux) so the
             // published set matches the disk loaders' weight_map iteration exactly.
-            if let Some(map) = weight_map {
-                if !map.contains_key(name) {
-                    continue;
-                }
+            if let Some(map) = weight_map
+                && !map.contains_key(name)
+            {
+                continue;
             }
             let dtype = info["dtype"].as_str().unwrap_or("BF16").to_string();
             validate_dtype(&dtype, name)?;
