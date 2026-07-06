@@ -18,11 +18,23 @@ pub struct AppState {
     pub tokenizer: ChatTokenizer,
     pub model_name: String,
     /// Startup LoRA adapter name (`--lora-adapter NAME=…`). `None` = no
-    /// adapter (every existing deployment byte-identical). v0: one adapter,
-    /// always-on; advertised by /v1/models and matched by /v1/models/{id}.
+    /// adapter (every existing deployment byte-identical). This is the DEFAULT
+    /// route (slot 0) advertised first and matched by /v1/models/{id}.
     pub adapter_name: Option<String>,
+    /// All resident LoRA adapter names (one per `--lora-adapter`, slot order).
+    /// Advertised by /v1/models; a name here is a valid `POST /v1/lora/active`
+    /// target. Empty when no adapter is loaded.
+    pub adapter_names: Vec<String>,
+    /// The currently-active adapter (updated by `POST /v1/lora/active`). Starts
+    /// at slot 0. Purely for status/advertise; the scheduler's model owns the
+    /// authoritative active slot.
+    pub active_adapter: std::sync::Arc<std::sync::Mutex<Option<String>>>,
     pub max_seq_len: usize,
     pub request_tx: mpsc::Sender<InferenceRequest>,
+    /// LoRA adapter-rotation control channel (`POST /v1/lora/active`). `None`
+    /// when no adapter is loaded. Carries `(adapter_name, ack)` to the
+    /// scheduler, which applies the rotation at a quiescent point.
+    pub rotation_tx: Option<mpsc::Sender<crate::scheduler::LoraRotation>>,
     /// Vision config for VL models — None for text-only models.
     pub vision_config: Option<atlas_core::config::VisionConfig>,
     /// Optional vLLM-style image area cap applied before vision patching.

@@ -179,6 +179,12 @@ impl TransformerModel {
         // the verify eagerly. Zero production impact — only when K2_DIAG is set
         // (mirrors ATLAS_DFLASH_DEBUG_NO_GRAPH for the DFlash verify path).
         let k2_diag_eager = std::env::var("ATLAS_K2_DIAG").ok().as_deref() == Some("1");
+        // LoRA rotation (eager-on-rotate): when an adapter is loaded and rotation
+        // is armed, the slot pointers may be re-pointed at runtime, so the spec
+        // verify path must stay eager too (its graphs bake slot pointers exactly
+        // like decode). Collapses to the M1 gate when rotation isn't armed.
+        let lora_eager =
+            self.lora.is_some() && (crate::lora::lora_eager_env() || self.lora_rotatable);
         let use_graphs = self.comm.is_none()
             && !self
                 .suppress_graphs
@@ -186,7 +192,8 @@ impl TransformerModel {
             // Phase 6.2.c — see decode() for rationale: HSS path's host I/O is
             // illegal under CUDA graph capture.
             && !hss_engaged
-            && !k2_diag_eager;
+            && !k2_diag_eager
+            && !lora_eager;
 
         // DeepSeek-V4 hash-MoE (first `num_hash_layers`) routes experts by token
         // id via the static tid2eid table, so the verify forward needs the 2

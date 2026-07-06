@@ -332,25 +332,32 @@ pub(crate) async fn serve(mut args: cli::ServeArgs) -> Result<()> {
         }
     }
     let dflash_drafter_state = serve_phases::load_dflash_drafter(&args, &ptx_set, gpu.as_ref())?;
-    // LoRA adapter: resolve + load BEFORE `gpu` is moved into build_model.
-    // `lora_state` must outlive build_model (lora_args borrows &l.store) and
-    // stays alive until after AppState construction (adapter_name clone).
-    let lora_state = serve_phases::load_lora_adapter(&args, gpu.as_ref())?;
-    if lora_state.is_some() && world_size > 1 {
+    // LoRA adapters: resolve + load BEFORE `gpu` is moved into build_model.
+    // `lora_states` must outlive build_model (lora_args borrows &l.store) and
+    // stays alive until after AppState construction (adapter name clones).
+    let lora_states = serve_phases::load_lora_adapters(&args, gpu.as_ref())?;
+    if !lora_states.is_empty() && world_size > 1 {
         anyhow::bail!(
             "--lora-adapter requires world_size=1 in v0 (got {world_size}); \
              TP adapter sharding is M3"
         );
     }
-    let lora_args = lora_state
-        .as_ref()
-        .map(|l| spark_model::factory::LoraBuildArgs {
-            adapter_store: &l.store,
-            peft_config: l.peft_config.clone(),
-            adapter_name: l.name.clone(),
+    let lora_args = if lora_states.is_empty() {
+        None
+    } else {
+        Some(spark_model::factory::LoraBuildArgs {
+            adapters: lora_states
+                .iter()
+                .map(|l| spark_model::lora::LoraAdapterInput {
+                    name: l.name.clone(),
+                    store: &l.store,
+                    peft: l.peft_config.clone(),
+                })
+                .collect(),
             max_lora_rank: args.max_lora_rank,
             max_loras: args.max_loras,
-        });
+        })
+    };
     let dflash_args =
         dflash_drafter_state
             .as_ref()
@@ -472,6 +479,9 @@ pub(crate) async fn serve(mut args: cli::ServeArgs) -> Result<()> {
 
     // 7. Create scheduler channel + spawn scheduler
     let (request_tx, request_rx) = mpsc::channel::<InferenceRequest>(args.max_num_seqs);
+    // LoRA adapter-rotation control channel (POST /v1/lora/active). Small: it
+    // carries only control messages, applied one-at-a-time at quiescence.
+    let (rotation_tx, rotation_rx) = mpsc::channel::<scheduler::LoraRotation>(8);
 
     let model_name = serve_phases::resolve_model_name(&args, &config_json, &model_dir);
 
@@ -585,6 +595,7 @@ pub(crate) async fn serve(mut args: cli::ServeArgs) -> Result<()> {
         scheduler::run(
             scheduler_model,
             request_rx,
+            rotation_rx,
             scheduler_eos,
             max_batch_size,
             use_speculative,
@@ -627,9 +638,18 @@ pub(crate) async fn serve(mut args: cli::ServeArgs) -> Result<()> {
     let state = Arc::new(AppState {
         tokenizer,
         model_name,
-        adapter_name: lora_state.as_ref().map(|l| l.name.clone()),
+        adapter_name: lora_states.first().map(|l| l.name.clone()),
+        adapter_names: lora_states.iter().map(|l| l.name.clone()).collect(),
+        active_adapter: std::sync::Arc::new(std::sync::Mutex::new(
+            lora_states.first().map(|l| l.name.clone()),
+        )),
         max_seq_len: args.max_seq_len,
         request_tx,
+        rotation_tx: if lora_states.is_empty() {
+            None
+        } else {
+            Some(rotation_tx)
+        },
         vision_config: config.vision.clone(),
         vision_max_pixels,
         default_temperature,

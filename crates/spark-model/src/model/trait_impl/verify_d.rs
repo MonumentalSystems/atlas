@@ -144,12 +144,17 @@ impl TransformerModel {
         // CUDA_LAUNCH_BLOCKING=1 reports the exact failing kernel — used
         // to localize K=γ illegal-address crashes downstream of SSM.
         let force_eager = std::env::var("ATLAS_DFLASH_DEBUG_NO_GRAPH").ok().as_deref() == Some("1");
+        // LoRA rotation (eager-on-rotate): stay eager when adapter rotation is
+        // armed so the spec verify graphs never replay stale slot pointers.
+        let lora_eager =
+            self.lora.is_some() && (crate::lora::lora_eager_env() || self.lora_rotatable);
         let use_graphs = self.comm.is_none()
             && !self
                 .suppress_graphs
                 .load(std::sync::atomic::Ordering::Relaxed)
             && !hss_engaged
-            && !force_eager;
+            && !force_eager
+            && !lora_eager;
 
         let ctx = ForwardContext {
             buffers: &self.buffers,

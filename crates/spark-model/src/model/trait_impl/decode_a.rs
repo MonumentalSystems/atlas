@@ -179,7 +179,12 @@ impl TransformerModel {
         // Default (unset) keeps graphs ON — the LoRA delta launches are
         // capture-safe (pool weights / arena scratch / f32 scale are all
         // load-time-fixed). Folded in as one more suppressor.
-        let lora_eager = self.lora.is_some() && crate::lora::lora_eager_env();
+        // eager-on-rotate: an armed rotatable adapter also forces eager (so a
+        // runtime `set_active_lora` re-point is immediately live, never a stale
+        // graph replay). Single startup adapter + no rotation env ⇒ false ⇒
+        // graphs captured exactly as before.
+        let lora_eager =
+            self.lora.is_some() && (crate::lora::lora_eager_env() || self.lora_rotatable);
         let use_graphs = decode_graphs_allowed(
             self.comm.is_none(),
             ep_graphs,

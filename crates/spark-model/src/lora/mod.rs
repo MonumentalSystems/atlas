@@ -22,6 +22,8 @@ use spark_runtime::weights::WeightStore;
 use crate::layers::ops::lora_delta::LoraPair;
 use crate::weight_map::DenseWeight;
 
+pub mod rdma_stage;
+
 const BF16_BYTES: usize = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -79,6 +81,10 @@ pub enum AdapterAb {
 /// One full-attention layer's adapted modules. `None` = module not adapted.
 /// Pairs are the CANONICAL [`LoraPair`] from `layers::ops::lora_delta`
 /// (Copy — installed by copy into the layer structs at model build).
+///
+/// `Clone` (LoraPair is Copy) so a slot's layers can be re-installed onto the
+/// layer structs on a runtime rotation (`set_active_lora`).
+#[derive(Clone)]
 pub struct LoraLayerWeights {
     pub layer_idx: usize,
     pub k_proj: Option<LoraPair>,
@@ -89,25 +95,70 @@ pub struct LoraLayerWeights {
     pub down_proj: Option<LoraPair>,
 }
 
-/// The loaded adapter: one fixed-address rank-padded pool, per-layer pairs,
-/// and per-module `[max_loras]` device u64 pointer tables (the frozen M2
-/// BGMV contract — v0 fills slot 0, slots 1.. are NULL = base-only).
-pub struct LoraWeights {
-    /// Adapter name from `--lora-adapter NAME=PATH` (stamped by the caller).
+/// One packed pool slot: a resident adapter's own name/config + its per-layer
+/// pairs (a/b DevicePtrs into that slot's byte sub-region of the shared pool).
+/// `layers` is GLOBAL-layer-indexed (len = num_hidden_layers), the same index
+/// the install walk uses.
+#[derive(Clone)]
+pub struct AdapterSlot {
     pub name: String,
+    pub adapter_config: PeftAdapterConfig,
+    pub layers: Vec<Option<LoraLayerWeights>>,
+}
+
+/// One adapter to pack, for the multi-adapter entry point. `store` is the
+/// adapter's on-device BF16 `WeightStore` (host F16/F32→BF16 already done by
+/// `spark_runtime::weights::adapter::load_adapter_safetensors`).
+pub struct LoraAdapterInput<'a> {
+    pub name: String,
+    pub store: &'a WeightStore,
+    pub peft: PeftAdapterConfig,
+}
+
+/// The loaded adapter set: one fixed-address rank-padded pool holding up to
+/// `max_loras` equal-size slots, one [`AdapterSlot`] per resident adapter, and
+/// per-module `[max_loras]` device u64 pointer tables (the frozen M2 BGMV
+/// contract — filled index k for each packed slot, NULL for the rest).
+///
+/// Single-adapter runs pack exactly one slot (`slots.len() == 1`, `active == 0`)
+/// — byte-identical to the pre-multi-adapter path. `name`/`adapter_config` mirror
+/// the ACTIVE slot for logs/status; the install walk reads [`Self::active_layers`].
+pub struct LoraWeights {
+    /// Name of the ACTIVE adapter (mirrors `slots[active].name`).
+    pub name: String,
+    /// Config of the ACTIVE adapter (mirrors `slots[active].adapter_config`).
     pub adapter_config: PeftAdapterConfig,
     pub max_rank: usize,
     pub max_loras: usize,
     /// One fixed-address allocation holding every padded A/B for every slot.
     pub pool: DevicePtr,
     pub pool_bytes: usize,
-    /// Indexed by GLOBAL layer index (len = num_hidden_layers). `None` on
-    /// GDN layers and on full-attention layers with no adapted module. The
-    /// install walk iterates model layers by this same global index.
-    pub layers: Vec<Option<LoraLayerWeights>>,
+    /// The resident adapters, slot-indexed (`slots[k]` lives at pool byte
+    /// offset `k * pool_slot_bytes`). `len() <= max_loras`.
+    pub slots: Vec<AdapterSlot>,
+    /// Index into `slots` of the currently-active adapter (0 at load).
+    pub active: usize,
     /// key = (global_layer_idx, module) → (a_table, b_table); each table is
     /// a device `[max_loras]` u64 array, NULL (0) = base-only slot.
     pub tables: BTreeMap<(usize, LoraModule), (DevicePtr, DevicePtr)>,
+}
+
+impl LoraWeights {
+    /// The active slot's per-layer pairs (GLOBAL-layer-indexed) — what the
+    /// install walk copies onto the layer structs.
+    pub fn active_layers(&self) -> &[Option<LoraLayerWeights>] {
+        &self.slots[self.active].layers
+    }
+
+    /// Resolve an adapter NAME to its slot index (for runtime rotation).
+    pub fn slot_of(&self, name: &str) -> Option<usize> {
+        self.slots.iter().position(|s| s.name == name)
+    }
+
+    /// All resident adapter names in slot order (for `/v1/models`).
+    pub fn adapter_names(&self) -> Vec<String> {
+        self.slots.iter().map(|s| s.name.clone()).collect()
+    }
 }
 
 /// PEFT key → (layer, module, A|B). Every unsupported shape is a NAMED
@@ -195,6 +246,31 @@ pub fn lora_eager_env() -> bool {
     })
 }
 
+/// `ATLAS_LORA_ROTATE=1` (or `true`) ARMS runtime adapter rotation: it forces
+/// eager decode (no CUDA-graph capture) so a `set_active_lora` re-point is
+/// immediately live (eager-on-rotate — the graph would otherwise replay the
+/// previously-captured slot pointers). A pool with >1 resident adapter arms
+/// this automatically (see `TransformerModel::lora_rotatable`), so this env is
+/// only needed to arm rotation on a SINGLE resident adapter (e.g. RDMA
+/// slot-swap-in-place). Unset + a single startup adapter = today's behaviour
+/// exactly (graphs ON, slot-0 pointers baked).
+pub fn lora_rotate_env() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("ATLAS_LORA_ROTATE").is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+    })
+}
+
+/// `$ATLAS_LORA_PEER` (host:port of an `atlas-weight-peer` staging a rotation
+/// set) — when set, arms rotation (eager decode) even for a single resident
+/// slot, because an RDMA swap re-points that slot in place. Unset = disk path
+/// only, byte-identical to today.
+pub fn lora_peer_env() -> Option<String> {
+    std::env::var("ATLAS_LORA_PEER")
+        .ok()
+        .filter(|s| !s.is_empty())
+}
+
 pub fn full_attention_layers(cfg: &ModelConfig) -> Vec<usize> {
     (0..cfg.num_hidden_layers)
         .filter(|&i| cfg.layer_type(i) == LayerType::FullAttention)
@@ -233,7 +309,7 @@ pub fn validate_peft_config(peft: &PeftAdapterConfig, max_lora_rank: usize) -> R
 /// Padded per-slot bytes: Σ over (full-attn layers × 6 modules) of
 /// (max_rank·in + out·max_rank)·2. Holo @ max_rank=64: ≈ 2.44 MiB/layer
 /// × 6 = ~14.6 MiB/slot; × max_loras=8 ≈ 117 MiB total.
-fn pool_slot_bytes(cfg: &ModelConfig, max_rank: usize) -> usize {
+pub(crate) fn pool_slot_bytes(cfg: &ModelConfig, max_rank: usize) -> usize {
     full_attention_layers(cfg)
         .iter()
         .map(|_| {
@@ -248,31 +324,45 @@ fn pool_slot_bytes(cfg: &ModelConfig, max_rank: usize) -> usize {
         .sum()
 }
 
-/// Model-agnostic PEFT adapter load: classify EVERY tensor (unconsumed =
-/// fatal), audit pairs + shapes bidirectionally against `target_modules`,
-/// VRAM-preflight, then pack slot 0 of the fixed-address rank-padded pool
-/// and build the per-module `[max_loras]` pointer tables.
-///
-/// Called (via the `ModelWeightLoader::load_lora_adapters` hook) from
-/// `build_model` BEFORE `BufferArena::new` and the free-memory snapshot, so
-/// the pool bytes land in `used_so_far` and the KV budget shrinks
-/// automatically. Do NOT move the call later.
-pub fn load_lora_adapters_generic(
-    adapter_store: &WeightStore,
-    peft: &PeftAdapterConfig,
+/// Byte offset of slot `k`'s base within the pool. Slots are equal fixed size,
+/// so slot `k` starts at `k * pool_slot_bytes`. Slot 0 → 0 (byte-identical to
+/// the single-adapter path).
+pub(crate) fn slot_base_offset(slot: usize, cfg: &ModelConfig, max_rank: usize) -> usize {
+    slot * pool_slot_bytes(cfg, max_rank)
+}
+
+/// The (a_off, b_off) of a given (layer, module) WITHIN a slot — the exact
+/// running offsets the pack loop computes (layer asc × [`LoraModule::ALL`] ×
+/// A-then-B). `None` if `target_layer` is not a full-attention layer. Used by
+/// the pack loop, the RDMA landing path, and the offset unit tests so all three
+/// agree on the one frozen layout.
+pub(crate) fn module_slot_offsets(
     cfg: &ModelConfig,
-    gpu: &dyn GpuBackend,
-    max_loras: usize,
-    max_lora_rank: usize,
-) -> Result<LoraWeights> {
-    // 0) family allow-list: v0 validated on the Qwen3.5-family attention trunk —
-    //    qwen3_5 DENSE (holo-3.1-0.8b) and holo3_1_moe (holo-3.1-35b-a3b, MoE).
-    //    Both route to Qwen35WeightLoader, so their full-attention layers are
-    //    `Qwen3AttentionLayer` — what the install walk downcasts to. A k/v/o-only
-    //    adapter leaves `ffn_weights=None`, so the MoE-vs-dense FFN path is never
-    //    exercised; the per-tensor `classify_key` + shape audit + full-attention
-    //    gating below still hard-reject q_proj / GDN / MoE-MLP / wrong-layer
-    //    tensors. Other families stay rejected (no validated attention mapping).
+    max_rank: usize,
+    target_layer: usize,
+    target_module: LoraModule,
+) -> Option<(usize, usize)> {
+    let mut off = 0usize;
+    for layer_idx in full_attention_layers(cfg) {
+        for module in LoraModule::ALL {
+            let (out_dim, in_dim) = module.dims(cfg);
+            let a_off = off;
+            let b_off = off + max_rank * in_dim * BF16_BYTES;
+            off = b_off + out_dim * max_rank * BF16_BYTES;
+            if layer_idx == target_layer && module == target_module {
+                return Some((a_off, b_off));
+            }
+        }
+    }
+    None
+}
+
+/// The v0 family allow-list, checked once per load. v0 is validated on the
+/// Qwen3.5-family attention trunk — qwen3_5 DENSE (holo-3.1-0.8b) and
+/// holo3_1_moe (holo-3.1-35b-a3b, MoE). Both route to `Qwen35WeightLoader`, so
+/// their full-attention layers are `Qwen3AttentionLayer` — what the install
+/// walk downcasts to. Other families stay rejected (no validated mapping).
+fn check_family(cfg: &ModelConfig) -> Result<()> {
     if !(cfg.is_qwen35_dense() || cfg.model_type == "holo3_1_moe") {
         bail!(
             "REJECT[unvalidated-family]: LoRA v0 is validated on qwen3_5 dense \
@@ -282,8 +372,19 @@ pub fn load_lora_adapters_generic(
             cfg.num_experts
         );
     }
+    Ok(())
+}
+
+/// Classify + audit one adapter's tensors (unconsumed key = fatal; pair
+/// completeness; A=[r,in]/B=[out,r] shapes; every `target_modules` entry
+/// matched). Returns the (layer, module) → [a_key, b_key] map used to pack.
+fn audit_adapter(
+    adapter_store: &WeightStore,
+    peft: &PeftAdapterConfig,
+    cfg: &ModelConfig,
+    max_lora_rank: usize,
+) -> Result<BTreeMap<(usize, LoraModule), [Option<String>; 2]>> {
     validate_peft_config(peft, max_lora_rank)?;
-    let scale = peft.scaling();
 
     // 1) classify EVERY adapter tensor — any unclassifiable/unsupported key
     //    is a hard error, which IS the "unconsumed adapter tensors fatal"
@@ -346,32 +447,37 @@ pub fn load_lora_adapters_generic(
             );
         }
     }
+    Ok(found)
+}
 
-    // 4) VRAM preflight, then one fixed-address pool alloc, zeroed.
-    let pool_bytes = pool_slot_bytes(cfg, max_lora_rank) * max_loras;
-    let free = gpu.free_memory()?;
-    if pool_bytes * 2 > free {
-        bail!(
-            "OOM pre-flight (LoRA pool): {:.1} MiB pool ({} slots × padded A/B) \
-             would leave < 1× headroom of {:.1} MiB free; every pool byte comes \
-             directly out of the KV-cache budget on GB10 unified memory",
-            pool_bytes as f64 / (1024.0 * 1024.0),
-            max_loras,
-            free as f64 / (1024.0 * 1024.0),
-        );
-    }
-    let pool = gpu.alloc(pool_bytes)?;
-    gpu.memset(pool, 0, pool_bytes)?; // zero pad rows/cols = padded-K correctness
-
-    // 5) pack slot 0. Fixed layout order: layer asc × LoraModule::ALL × (A,B).
-    //    A copies contiguously (r·in real bytes; pad rows trail, already 0).
-    //    B repacks row-by-row from stride r to stride max_rank
-    //    (d2h → host repack → h2d).
+/// Pack one already-audited adapter into pool `slot` (byte sub-region at base
+/// `slot * pool_slot_bytes`). The intra-slot walk (layer asc ×
+/// [`LoraModule::ALL`] × A-then-B, A contiguous, B row-repacked stride r →
+/// max_rank) is IDENTICAL for every slot — slot 0 is byte-for-byte the
+/// pre-multi-adapter path. Returns this slot's GLOBAL-layer-indexed pairs and,
+/// per (layer, module), the packed (a_ptr, b_ptr) as raw u64 ((0,0) where the
+/// adapter omits the module) for the post-pass pointer-table build.
+#[allow(clippy::type_complexity)]
+fn pack_slot(
+    slot: usize,
+    name: &str,
+    adapter_store: &WeightStore,
+    peft: &PeftAdapterConfig,
+    found: &BTreeMap<(usize, LoraModule), [Option<String>; 2]>,
+    cfg: &ModelConfig,
+    gpu: &dyn GpuBackend,
+    pool: DevicePtr,
+    max_lora_rank: usize,
+) -> Result<(
+    Vec<Option<LoraLayerWeights>>,
+    BTreeMap<(usize, LoraModule), (u64, u64)>,
+)> {
+    let scale = peft.scaling();
     let slot_bytes = pool_slot_bytes(cfg, max_lora_rank);
     let mut layers: Vec<Option<LoraLayerWeights>> =
         (0..cfg.num_hidden_layers).map(|_| None).collect();
-    let mut tables = BTreeMap::new();
-    let mut off = 0usize; // slot 0 base offset
+    let mut slot_ptrs: BTreeMap<(usize, LoraModule), (u64, u64)> = BTreeMap::new();
+    let mut off = slot * slot_bytes; // slot base offset
     for layer_idx in full_attention_layers(cfg) {
         let mut lw = LoraLayerWeights {
             layer_idx,
@@ -391,7 +497,7 @@ pub fn load_lora_adapters_generic(
             let a_ptr = DevicePtr(pool.0 + a_off as u64);
             let b_ptr = DevicePtr(pool.0 + b_off as u64);
 
-            let mut slot0 = (0u64, 0u64); // NULL = base-only
+            let mut this = (0u64, 0u64); // NULL = base-only
             if let Some([Some(a_key), Some(b_key)]) = found.get(&(layer_idx, module)) {
                 // A: contiguous [r, in] → head of the padded [max_rank, in] region.
                 let a_t = adapter_store.get(a_key)?;
@@ -423,8 +529,8 @@ pub fn load_lora_adapters_generic(
                     max_rank: max_lora_rank as u32,
                 };
                 tracing::info!(
-                    "LoRA: layer {layer_idx} {module:?} r={} scale={:.6} \
-                     A=[{},{}] B=[{},{}] (padded to max_rank={})",
+                    "LoRA: slot {slot} '{name}' layer {layer_idx} {module:?} r={} \
+                     scale={:.6} A=[{},{}] B=[{},{}] (padded to max_rank={})",
                     peft.r,
                     scale,
                     peft.r,
@@ -441,37 +547,255 @@ pub fn load_lora_adapters_generic(
                     LoraModule::UpProj => lw.up_proj = Some(pair),
                     LoraModule::DownProj => lw.down_proj = Some(pair),
                 }
-                slot0 = (a_ptr.0, b_ptr.0);
+                this = (a_ptr.0, b_ptr.0);
                 any = true;
             }
-            // Frozen v1 contract: per-module [max_loras] u64 tables, slot 0
-            // filled (or NULL), slots 1.. NULL. build_ptr_table pattern
-            // (nemotron_moe.rs:414): pack le bytes → alloc → copy_h2d.
-            let mut a_tab = vec![0u64; max_loras];
-            let mut b_tab = vec![0u64; max_loras];
-            (a_tab[0], b_tab[0]) = slot0;
-            let mk = |tab: &[u64]| -> Result<DevicePtr> {
-                let bytes: Vec<u8> = tab.iter().flat_map(|p| p.to_le_bytes()).collect();
-                let d = gpu.alloc(bytes.len())?;
-                gpu.copy_h2d(&bytes, d)?;
-                Ok(d)
-            };
-            tables.insert((layer_idx, module), (mk(&a_tab)?, mk(&b_tab)?));
+            slot_ptrs.insert((layer_idx, module), this);
         }
         if any {
             layers[layer_idx] = Some(lw);
         }
     }
-    debug_assert_eq!(off, slot_bytes); // slot-0 layout fills exactly one slot
+    debug_assert_eq!(off, (slot + 1) * slot_bytes); // one slot filled exactly
+    Ok((layers, slot_ptrs))
+}
+
+/// Model-agnostic MULTI-adapter PEFT load: audit every adapter, VRAM-preflight
+/// the N-slot pool, pack each adapter into its slot (0..N-1), and build the
+/// per-module `[max_loras]` pointer tables (index k filled per packed slot,
+/// rest NULL). One resident adapter is byte-identical to the single-adapter
+/// path (slot 0, `off` starts at 0).
+///
+/// Called (via the `ModelWeightLoader::load_lora_adapters` hook) from
+/// `build_model` BEFORE `BufferArena::new` and the free-memory snapshot, so
+/// the pool bytes land in `used_so_far` and the KV budget shrinks
+/// automatically. Do NOT move the call later.
+pub fn load_lora_adapters_multi(
+    adapters: &[LoraAdapterInput<'_>],
+    cfg: &ModelConfig,
+    gpu: &dyn GpuBackend,
+    max_loras: usize,
+    max_lora_rank: usize,
+) -> Result<LoraWeights> {
+    check_family(cfg)?;
+    if adapters.is_empty() {
+        bail!("REJECT[no-adapters]: load_lora_adapters_multi called with an empty set");
+    }
+    if adapters.len() > max_loras {
+        bail!(
+            "REJECT[too-many-adapters]: {} --lora-adapter given but --max-loras={} \
+             (pool has {} slots); raise --max-loras or stage the extras on an \
+             $ATLAS_LORA_PEER for on-demand RDMA swap",
+            adapters.len(),
+            max_loras,
+            max_loras
+        );
+    }
+
+    // Audit every adapter up front (each gets its own classify/shape/target
+    // audit + rank<=max_lora_rank check) before touching VRAM.
+    let mut audited: Vec<BTreeMap<(usize, LoraModule), [Option<String>; 2]>> =
+        Vec::with_capacity(adapters.len());
+    for a in adapters {
+        audited.push(audit_adapter(a.store, &a.peft, cfg, max_lora_rank)?);
+    }
+
+    // VRAM preflight, then one fixed-address pool alloc for ALL slots, zeroed
+    // once (pad rows/cols and unpacked slots stay 0 = padded-K correctness).
+    let pool_bytes = pool_slot_bytes(cfg, max_lora_rank) * max_loras;
+    let free = gpu.free_memory()?;
+    if pool_bytes * 2 > free {
+        bail!(
+            "OOM pre-flight (LoRA pool): {:.1} MiB pool ({} slots × padded A/B) \
+             would leave < 1× headroom of {:.1} MiB free; every pool byte comes \
+             directly out of the KV-cache budget on GB10 unified memory",
+            pool_bytes as f64 / (1024.0 * 1024.0),
+            max_loras,
+            free as f64 / (1024.0 * 1024.0),
+        );
+    }
+    let pool = gpu.alloc(pool_bytes)?;
+    gpu.memset(pool, 0, pool_bytes)?;
+
+    // Pack each adapter into its slot; accumulate per-(layer,module) [max_loras]
+    // pointer arrays for the post-pass table build.
+    let mut slots: Vec<AdapterSlot> = Vec::with_capacity(adapters.len());
+    let mut a_tabs: BTreeMap<(usize, LoraModule), Vec<u64>> = BTreeMap::new();
+    let mut b_tabs: BTreeMap<(usize, LoraModule), Vec<u64>> = BTreeMap::new();
+    for (k, a) in adapters.iter().enumerate() {
+        let (layers, slot_ptrs) = pack_slot(
+            k,
+            &a.name,
+            a.store,
+            &a.peft,
+            &audited[k],
+            cfg,
+            gpu,
+            pool,
+            max_lora_rank,
+        )?;
+        for ((layer, module), (a_ptr, b_ptr)) in slot_ptrs {
+            a_tabs
+                .entry((layer, module))
+                .or_insert_with(|| vec![0u64; max_loras])[k] = a_ptr;
+            b_tabs
+                .entry((layer, module))
+                .or_insert_with(|| vec![0u64; max_loras])[k] = b_ptr;
+        }
+        slots.push(AdapterSlot {
+            name: a.name.clone(),
+            adapter_config: a.peft.clone(),
+            layers,
+        });
+    }
+
+    // Post-pass: materialize the per-module [max_loras] u64 pointer tables (the
+    // frozen M2 BGMV contract; currently dormant — no compute site reads them).
+    // build_ptr_table pattern (nemotron_moe.rs:414): pack le bytes → alloc → h2d.
+    let mk = |tab: &[u64]| -> Result<DevicePtr> {
+        let bytes: Vec<u8> = tab.iter().flat_map(|p| p.to_le_bytes()).collect();
+        let d = gpu.alloc(bytes.len())?;
+        gpu.copy_h2d(&bytes, d)?;
+        Ok(d)
+    };
+    let mut tables = BTreeMap::new();
+    for (key, a_tab) in &a_tabs {
+        let b_tab = &b_tabs[key];
+        tables.insert(*key, (mk(a_tab)?, mk(b_tab)?));
+    }
 
     Ok(LoraWeights {
-        name: String::new(), // caller stamps the --lora-adapter NAME
-        adapter_config: peft.clone(),
+        name: slots[0].name.clone(),
+        adapter_config: slots[0].adapter_config.clone(),
         max_rank: max_lora_rank,
         max_loras,
         pool,
         pool_bytes,
-        layers,
+        slots,
+        active: 0,
         tables,
     })
+}
+
+/// Single-adapter convenience wrapper (packs slot 0 only) — byte-identical to
+/// the pre-multi-adapter path. Kept for the unit tests and any single-adapter
+/// caller. The `name` is stamped onto the sole slot.
+pub fn load_lora_adapters_generic(
+    adapter_store: &WeightStore,
+    peft: &PeftAdapterConfig,
+    cfg: &ModelConfig,
+    gpu: &dyn GpuBackend,
+    max_loras: usize,
+    max_lora_rank: usize,
+) -> Result<LoraWeights> {
+    let inputs = [LoraAdapterInput {
+        name: String::new(),
+        store: adapter_store,
+        peft: peft.clone(),
+    }];
+    load_lora_adapters_multi(&inputs, cfg, gpu, max_loras, max_lora_rank)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use atlas_core::config::{LayerType, ModelConfig};
+
+    // Real factory config: layers 3,7,…,47 are FullAttention. The pack offset
+    // math depends only on layer_type + projection dims.
+    fn cfg() -> ModelConfig {
+        ModelConfig::qwen3_next_80b_nvfp4()
+    }
+
+    #[test]
+    fn slot_base_is_k_times_slot_bytes() {
+        let cfg = cfg();
+        let mr = 16;
+        let sb = pool_slot_bytes(&cfg, mr);
+        for k in 0..8 {
+            assert_eq!(slot_base_offset(k, &cfg, mr), k * sb);
+        }
+    }
+
+    #[test]
+    fn module_offsets_walk_matches_pack_loop_and_fill_exactly_one_slot() {
+        // Reproduce the pack loop's cumulative A-then-B walk (the frozen
+        // layout) and assert module_slot_offsets agrees at every step, and the
+        // running end lands exactly on pool_slot_bytes (one full slot).
+        let cfg = cfg();
+        let mr = 16;
+        let mut off = 0usize;
+        for layer in full_attention_layers(&cfg) {
+            for module in LoraModule::ALL {
+                let (out, inp) = module.dims(&cfg);
+                let a_off = off;
+                let b_off = off + mr * inp * BF16_BYTES;
+                off = b_off + out * mr * BF16_BYTES;
+                assert_eq!(
+                    module_slot_offsets(&cfg, mr, layer, module),
+                    Some((a_off, b_off)),
+                    "layer {layer} {module:?}"
+                );
+                assert!(a_off < b_off, "A precedes B within a module region");
+            }
+        }
+        assert_eq!(
+            off,
+            pool_slot_bytes(&cfg, mr),
+            "one pass fills exactly one slot"
+        );
+    }
+
+    #[test]
+    fn module_offsets_none_for_non_full_attention_layer() {
+        let cfg = cfg();
+        assert_eq!(cfg.layer_type(0), LayerType::LinearAttention);
+        assert_eq!(module_slot_offsets(&cfg, 16, 0, LoraModule::KProj), None);
+    }
+
+    #[test]
+    fn slot_boundaries_do_not_overlap() {
+        let cfg = cfg();
+        let mr = 16;
+        let sb = pool_slot_bytes(&cfg, mr);
+        // Last module (down_proj on the last full-attn layer) ends exactly at
+        // slot_bytes, i.e. flush against slot 1's base.
+        let last = *full_attention_layers(&cfg).last().unwrap();
+        let (_, b_off) = module_slot_offsets(&cfg, mr, last, LoraModule::DownProj).unwrap();
+        let (out, _) = LoraModule::DownProj.dims(&cfg);
+        assert_eq!(b_off + out * mr * BF16_BYTES, sb);
+        assert_eq!(slot_base_offset(1, &cfg, mr), sb);
+    }
+
+    #[test]
+    fn adapter_names_and_slot_resolve() {
+        // A hand-built LoraWeights (no GPU) exercising the name→slot resolver
+        // and the active-slot mirror the rotation control path relies on.
+        let peft = PeftAdapterConfig {
+            r: 4,
+            lora_alpha: 8.0,
+            target_modules: vec!["k_proj".into()],
+            use_rslora: false,
+            layers_to_transform: None,
+        };
+        let mk_slot = |name: &str| AdapterSlot {
+            name: name.to_string(),
+            adapter_config: peft.clone(),
+            layers: Vec::new(),
+        };
+        let lw = LoraWeights {
+            name: "alpha".into(),
+            adapter_config: peft.clone(),
+            max_rank: 4,
+            max_loras: 8,
+            pool: DevicePtr(0),
+            pool_bytes: 0,
+            slots: vec![mk_slot("alpha"), mk_slot("beta")],
+            active: 0,
+            tables: BTreeMap::new(),
+        };
+        assert_eq!(lw.adapter_names(), vec!["alpha", "beta"]);
+        assert_eq!(lw.slot_of("beta"), Some(1));
+        assert_eq!(lw.slot_of("missing"), None);
+    }
 }

@@ -21,6 +21,10 @@ use crate::openai::RepetitionDetectionParams;
 pub(super) struct PendingQueue {
     pub requests: Vec<InferenceRequest>,
     pub closed: bool,
+    /// Pending LoRA adapter-rotation control requests, applied by the scheduler
+    /// at a quiescent point (see [`super::LoraRotation`]). Kept OUT of
+    /// `requests` so the sequence machinery never sees a control message.
+    pub rotations: Vec<super::LoraRotation>,
 }
 
 /// Per-request slice of a co-dispatched batched-ViT encode. When >=2 image

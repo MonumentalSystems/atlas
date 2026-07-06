@@ -105,11 +105,19 @@ use crate::grammar::{GrammarEngine, GrammarState};
 use crate::ngram::NgramProposer;
 use crate::scheduling_policy::SchedulingPolicy;
 
+/// A runtime LoRA adapter-rotation request: the target adapter NAME and a
+/// oneshot ack the HTTP handler awaits (`Ok(())` on success, `Err(reason)` on
+/// unknown adapter / rotation not armed). Applied by the scheduler at a
+/// QUIESCENT point (no in-flight decode) so the re-point never races a graph
+/// replay or a live delta read.
+pub type LoraRotation = (String, tokio::sync::oneshot::Sender<Result<(), String>>);
+
 /// Run the scheduler loop on the current thread.
 #[allow(clippy::too_many_arguments)]
 pub fn run(
-    model: Box<dyn Model>,
+    mut model: Box<dyn Model>,
     request_rx: tokio::sync::mpsc::Receiver<InferenceRequest>,
+    rotation_rx: tokio::sync::mpsc::Receiver<LoraRotation>,
     eos_tokens: Vec<u32>,
     max_batch_size: usize,
     use_speculative: bool,
@@ -188,6 +196,7 @@ pub fn run(
         Mutex::new(PendingQueue {
             requests: Vec::new(),
             closed: false,
+            rotations: Vec::new(),
         }),
         Condvar::new(),
     ));
@@ -202,6 +211,18 @@ pub fn run(
         }
         p.0.lock().closed = true;
         p.1.notify_one();
+    });
+
+    // Rotation receiver thread: LoRA adapter-rotation control requests land in
+    // `pending.rotations` (never the sequence queue) and wake the scheduler via
+    // the SAME condvar. The scheduler applies them at a quiescent point.
+    let pr = Arc::clone(&pending);
+    std::thread::spawn(move || {
+        let mut rx = rotation_rx;
+        while let Some(rot) = rx.blocking_recv() {
+            pr.0.lock().rotations.push(rot);
+            pr.1.notify_one();
+        }
     });
 
     // Dedicated CUDA stream + event for prefill compute-copy overlap.
@@ -237,6 +258,22 @@ pub fn run(
         // ── Drain pending → start prefill (chunked or full) ──
         let new_reqs =
             drain_pending_requests(&pending, &active, &prefilling, &*policy, max_batch_size);
+
+        // ── Apply queued LoRA adapter rotations at a QUIESCENT point ──
+        // Only when nothing is in flight (no active decode, no in-progress
+        // prefill, no just-drained request) so the re-point never races a
+        // live delta read or a graph replay. Otherwise the rotations stay
+        // queued and are retried once the batch drains.
+        if active.is_empty() && prefilling.is_empty() && new_reqs.is_empty() {
+            let rotations = std::mem::take(&mut pending.0.lock().rotations);
+            for (name, ack) in rotations {
+                let res = model.set_active_lora(&name).map_err(|e| format!("{e:#}"));
+                if let Err(ref e) = res {
+                    tracing::warn!("LoRA rotation to '{name}' failed: {e}");
+                }
+                let _ = ack.send(res);
+            }
+        }
         if new_reqs.is_empty() && active.is_empty() && prefilling.is_empty() {
             // Receiver thread was closed (shutdown).
             let pending_closed = pending.0.lock().closed;

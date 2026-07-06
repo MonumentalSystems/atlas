@@ -47,6 +47,12 @@ pub struct TransformerModel {
     /// layer structs; kept here as the owner of the pool/tables and for
     /// status introspection. M0: stored only — compute reads land in M1.
     pub(super) lora: Option<crate::lora::LoraWeights>,
+    /// True when runtime adapter rotation is ARMED: >1 resident adapter, or
+    /// `ATLAS_LORA_ROTATE=1`, or `$ATLAS_LORA_PEER` set. Armed ⇒ decode runs
+    /// eager (no CUDA-graph capture) so a `set_active_lora` re-point is
+    /// immediately live (eager-on-rotate). `false` (single startup adapter,
+    /// no rotation env) keeps the decode-graph path byte-identical to today.
+    pub(super) lora_rotatable: bool,
     pub(super) kv_cache: Mutex<PagedKvCache>,
     pub(super) gpu: Box<dyn GpuBackend>,
     pub(super) rms_norm_kernel: KernelHandle,

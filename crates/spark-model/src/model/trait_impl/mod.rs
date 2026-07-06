@@ -152,6 +152,9 @@ impl Model for TransformerModel {
     fn vocab_size(&self) -> usize {
         self.vocab_size_dispatch()
     }
+    fn set_active_lora(&mut self, name: &str) -> Result<()> {
+        self.rotate_lora_to(name)
+    }
     fn high_speed_swap_dims(&self) -> Option<spark_storage::ModelDims> {
         self.high_speed_swap_dims_dispatch()
     }

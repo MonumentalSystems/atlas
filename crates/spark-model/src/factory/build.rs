@@ -64,19 +64,13 @@ pub fn build_model(
     // lora_xa/lora_delta/lora_hact scratch.
     let lora_weights: Option<crate::lora::LoraWeights> = if let Some(ref la) = lora_args {
         config.adapter_max_rank = la.max_lora_rank;
-        loader
-            .load_lora_adapters(
-                la.adapter_store,
-                &la.peft_config,
-                &config,
-                gpu.as_ref(),
-                la.max_loras,
-                la.max_lora_rank,
-            )?
-            .map(|mut w| {
-                w.name = la.adapter_name.clone();
-                w
-            })
+        loader.load_lora_adapters(
+            &la.adapters,
+            &config,
+            gpu.as_ref(),
+            la.max_loras,
+            la.max_lora_rank,
+        )?
     } else {
         None
     };

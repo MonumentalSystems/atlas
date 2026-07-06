@@ -431,10 +431,10 @@ pub(super) async fn completions_stream(
 
 /// GET /v1/models
 pub async fn list_models(State(state): State<Arc<AppState>>) -> Json<ModelListResponse> {
-    let mut data = Vec::with_capacity(2);
-    // v0: the adapter IS the served model — advertise it first so clients
-    // that pick data[0] route to the fine-tune by default.
-    if let Some(ref adapter) = state.adapter_name {
+    let mut data = Vec::with_capacity(state.adapter_names.len() + 1);
+    // The resident adapters ARE served models — advertise them first (slot
+    // order; data[0] is the default route) so clients can pick a fine-tune.
+    for adapter in &state.adapter_names {
         data.push(ModelInfo {
             id: adapter.clone(),
             object: "model".to_string(),

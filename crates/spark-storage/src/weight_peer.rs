@@ -607,6 +607,14 @@ mod server_impl {
             return Ok((vec![single], None));
         }
 
+        // PEFT adapter dir: a single `adapter_model.safetensors` (its keys are
+        // the lora_A/lora_B tensors, classified client-side). Staged for LoRA
+        // rotation over the RDMA tier (`weight_lora_rdma`).
+        let adapter = dir.join("adapter_model.safetensors");
+        if adapter.exists() {
+            return Ok((vec![adapter], None));
+        }
+
         let mut shards: Vec<PathBuf> = std::fs::read_dir(dir)?
             .filter_map(|e| e.ok())
             .map(|e| e.path())
@@ -699,7 +707,11 @@ mod server_impl {
     /// unsupported rather than shipping a bad manifest.
     fn validate_dtype(dtype: &str, tensor: &str) -> Result<()> {
         match dtype {
-            "F32" | "BF16" | "U8" | "I8" | "F8_E4M3" | "F8_E8M0" | "I64" => Ok(()),
+            // F16 is accepted for PEFT LoRA adapter shards (default PEFT save
+            // is F32, some export F16); the `weight_lora_rdma` client converts
+            // F16/F32 → BF16 host-side before landing. The base-weight disk
+            // loaders never see F16 (they load model.safetensors, not adapters).
+            "F32" | "F16" | "BF16" | "U8" | "I8" | "F8_E4M3" | "F8_E8M0" | "I64" => Ok(()),
             other => bail!("unsupported safetensors dtype '{other}' for tensor {tensor}"),
         }
     }

@@ -98,6 +98,11 @@ pub mod expert_tier_rdma;
 // precedent. Builds a WeightStore byte-identical to the disk loaders.
 #[cfg(feature = "cuda")]
 pub mod weight_tier_rdma;
+// RDMA LoRA staging: land a named adapter's A/B into a resident pool SLOT for
+// fast rotation. Same weight_peer wire + verbs stack as weight_tier_rdma;
+// landing byte-identical to the disk pack (convert + B row-repack).
+#[cfg(feature = "cuda")]
+pub mod weight_lora_rdma;
 // KV overflow tier (StorageBackend over RDMA). Needs both cuda (pinned bounce +
 // copy_h2d) and the verbs shim.
 #[cfg(all(feature = "cuda", atlas_rdma_verbs))]
@@ -138,6 +143,8 @@ pub use expert_tier_rdma::RdmaTier;
 pub use high_speed_swap::{HighSpeedSwap, install_local, local_installed, with_local};
 #[cfg(all(feature = "cuda", atlas_rdma_verbs))]
 pub use rdma_kv_backend::RdmaKvBackend;
+#[cfg(feature = "cuda")]
+pub use weight_lora_rdma::{LoraAbKind, LoraLandTarget, RdmaLoraLoader};
 pub use weight_peer::{WeightManifest, WeightTensorRecord};
 #[cfg(feature = "cuda")]
 pub use weight_tier_rdma::RdmaWeightLoader;

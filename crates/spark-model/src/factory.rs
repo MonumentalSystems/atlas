@@ -44,11 +44,11 @@ pub struct DflashBuildArgs<'a> {
 /// the TOP of `build_model` — before the buffer arena and the free-memory
 /// snapshot — so its bytes are automatically debited from the KV budget.
 pub struct LoraBuildArgs<'a> {
-    pub adapter_store: &'a WeightStore,
-    pub peft_config: atlas_core::config::PeftAdapterConfig,
-    /// Adapter name (the NAME half of `--lora-adapter NAME=PATH`), stamped
-    /// onto the loaded `LoraWeights` for logs/status.
-    pub adapter_name: String,
+    /// One or more adapters to pack (repeated `--lora-adapter NAME=PATH`),
+    /// each carrying its NAME, its on-device `WeightStore`, and its parsed
+    /// `adapter_config.json`. Slot k = `adapters[k]`. A single element is
+    /// byte-identical to the pre-multi-adapter path.
+    pub adapters: Vec<crate::lora::LoraAdapterInput<'a>>,
     pub max_lora_rank: usize,
     pub max_loras: usize,
 }

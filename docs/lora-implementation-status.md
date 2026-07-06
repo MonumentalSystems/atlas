@@ -61,6 +61,60 @@ The test fixture (`test_data/lora-holo-tiny/`) is a **generated** PEFT adapter, 
 strong so its effect is unambiguous — no community adapter exists for Atlas's custom
 NVFP4-packed bases, so a controllable fixture also exercises the reject/parity paths exactly.
 
+## M2 — multi-adapter rotation over the RDMA weight tier (staged on this branch)
+
+**Load MULTIPLE adapters and HOT-SWAP the active one at runtime**, plus RDMA
+slot-staging so a rotation set larger than the resident slots can swap in from a
+peer's RAM. Every new path is a **no-op when its flag/env is unset** — a single
+startup adapter with no rotation env is byte-identical to M1.
+
+- **Multi-adapter pack** (`lora/mod.rs`): `--lora-adapter` (already repeatable)
+  now packs slots `0..N-1` via `load_lora_adapters_multi`. The per-adapter audit
+  (classify / shape / target / `r<=max_rank`) and the frozen intra-slot layout
+  (A contiguous into `[max_rank,in]`, B row-repacked `r→max_rank`) are UNCHANGED;
+  slot `k` is the same walk at `off = k*pool_slot_bytes`. The `[max_loras]`
+  pointer tables are now filled index-`k`-per-slot in a post-pass (still dormant).
+  Per-adapter scale from each adapter's own `peft.scaling()`. Bails if
+  `#adapters > --max-loras`. `load_lora_adapters_generic` stays as the
+  single-adapter wrapper (slot 0, byte-identical).
+- **Runtime rotation (eager-on-rotate)** (`impl_b3.rs`, `decode_a{,2}.rs`): a
+  new `TransformerModel::lora_rotatable` (true when `slots>1` /
+  `ATLAS_LORA_ROTATE=1` / `$ATLAS_LORA_PEER`) folds into the existing
+  `lora_eager` gate, so an armed rotation runs decode **eager** — a
+  `set_active_lora(name)` re-point is immediately live, never a stale graph
+  replay. `Model::set_active_lora` (trait default: unsupported) re-installs the
+  named slot's pairs and clears the decode-graph caches defensively. Rotation is
+  applied by the scheduler at a **quiescent point** (no in-flight decode).
+- **Control plane**: `POST /v1/lora/active {"adapter":"NAME"}` → a dedicated
+  scheduler rotation channel (`scheduler::LoraRotation`, kept OUT of the sequence
+  queue) → applied when `active`/`prefilling`/new-requests are all empty. All
+  resident adapters are advertised by `/v1/models` (slot order, `data[0]` =
+  default route).
+- **RDMA slot-staging** (`spark-storage/weight_lora_rdma.rs` +
+  `spark-model/lora/rdma_stage.rs`, gated `$ATLAS_LORA_PEER`): stage adapter dirs
+  on `atlas-weight-peer` and RDMA-load a named adapter's A/B straight into a pool
+  SLOT — landing byte-identical to the disk pack (same F16/F32→BF16 host convert
+  as the disk adapter loader, same B row-repack). `TransformerModel::
+  swap_lora_slot_from_peer` re-zeroes the slot, lands via
+  `RdmaLoraLoader::stage_into_slot`, rebuilds the slot's pairs with the new
+  r/scale, and re-installs if active. Peer fixes: `resolve_shards` now matches
+  `adapter_model.safetensors`; `validate_dtype` now accepts `F16`.
+- **Tests** (CPU, no GPU): slot-offset math (`slot k base == k*slot_bytes`;
+  `module_slot_offsets` reproduces the pack walk and fills exactly one slot;
+  non-full-attn → `None`), name→slot resolve, F32/F16/BF16→BF16 convert (matches
+  `half::bf16::from_f32`), B repack pad-zeroing, land-target slot addressing, and
+  slot-layer rebuild rank/pointers.
+
+### M2 cut lines (honest)
+- Batch-1 still holds: rotation is applied between batches (a rotation waits
+  while decode is active), and multi-adapter does NOT imply batched multi-adapter
+  BGMV (the dormant tables' direction). No per-request adapter auto-routing yet —
+  `/v1/lora/active` sets ONE global active adapter; request `model` still routes
+  by name for advertise, not per-request delta selection.
+- The RDMA verbs data path is gated on `atlas_rdma_verbs` (rdma-core); without it
+  `stage_into_slot` bails clearly. The pure convert/repack/offset logic is
+  un-gated and unit-tested.
+
 ## Deferred (documented cut lines)
 - **Dense-FFN delta** (gate/up/down): types + install are in place; the compute insertion in
   `dense_ffn.rs` is not wired. The fixture targets FFN too, so enabling it is additive.

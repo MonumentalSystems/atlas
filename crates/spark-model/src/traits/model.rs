@@ -204,6 +204,14 @@ pub trait Model: Send + Sync {
     /// Vocab size (for sampler allocation).
     fn vocab_size(&self) -> usize;
 
+    /// Runtime LoRA adapter rotation: select the resident adapter named `name`
+    /// as active (re-points the delta pool pointers). MUST be called at a
+    /// scheduler quiescent point (no in-flight decode). Graph-safety is via the
+    /// eager-on-rotate gate. Default: unsupported (non-LoRA or non-rotatable).
+    fn set_active_lora(&mut self, _name: &str) -> Result<()> {
+        bail!("this model does not support LoRA adapter rotation")
+    }
+
     /// Dims for the `--high-speed-swap` orchestrator (installed thread-local
     /// after `bind_gpu_to_thread`). `None` for legacy/non-attention models.
     fn high_speed_swap_dims(&self) -> Option<spark_storage::ModelDims> {

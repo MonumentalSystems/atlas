@@ -37,6 +37,7 @@ pub mod completions;
 pub mod conversations;
 pub mod inference_impl;
 pub mod inference_types;
+pub mod lora_control;
 pub mod misc_handlers;
 pub mod responses;
 pub mod responses_stream;
@@ -70,6 +71,7 @@ pub use conversations::{
 pub use inference_types::{
     GrammarSpec, InferenceRequest, InferenceResponse, StreamEvent, TokenLogprobs,
 };
+pub use lora_control::set_active_lora;
 #[allow(unused_imports)]
 pub use misc_handlers::{
     DetokenizeRequest, cancel_response, detokenize, health, health_live, metrics_handler, tokenize,

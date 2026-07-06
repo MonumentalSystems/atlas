@@ -87,11 +87,17 @@ pub(super) fn drain_pending_requests(
     let (ref mtx, ref cv) = **pending;
     let mut g = mtx.lock();
     if active.is_empty() && prefilling.is_empty() {
-        // Block until signalled (no busy-wait, no polling).
-        while g.requests.is_empty() && !g.closed {
+        // Block until signalled (no busy-wait, no polling). A queued adapter
+        // rotation also wakes us (it is applied by the caller at this quiescent
+        // point, then we re-block if no real requests arrived).
+        while g.requests.is_empty() && g.rotations.is_empty() && !g.closed {
             cv.wait(&mut g);
         }
-        if g.closed && g.requests.is_empty() {
+        if g.rotations.is_empty() && g.closed && g.requests.is_empty() {
+            return Vec::new();
+        }
+        if g.requests.is_empty() {
+            // Only a rotation is pending — return empty so the caller applies it.
             return Vec::new();
         }
         // Co-dispatch micro-batch window (ATLAS_PREFILL_CODISPATCH=1): when idle,

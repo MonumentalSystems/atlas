@@ -153,7 +153,11 @@ impl TransformerModel {
 
         // Phase 6.2.c — HSS host I/O is illegal under CUDA graph capture.
         let hss_engaged = kv_cache.config().cache_blocks_per_seq.is_some();
-        let use_graphs = self.comm.is_none() && !hss_engaged;
+        // LoRA rotation (eager-on-rotate): stay eager when adapter rotation is
+        // armed so the spec verify graphs never replay stale slot pointers.
+        let lora_eager =
+            self.lora.is_some() && (crate::lora::lora_eager_env() || self.lora_rotatable);
+        let use_graphs = self.comm.is_none() && !hss_engaged && !lora_eager;
 
         let ctx = ForwardContext {
             buffers: &self.buffers,
