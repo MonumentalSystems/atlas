@@ -1,0 +1,75 @@
+# KV overflow tier — concurrency / agentic-load A/B (2026-07-06)
+
+First A/B of the KV backends under **concurrent** load: normal HBM KV vs
+`--high-speed-swap` overflow to {local NVMe, RDMA peer}. Ran on **dgx-00** (GB10)
+↔ **gx10** kv-peer over a single ConnectX-7 rail (the proven live-serving bounce
+path; zero-copy/dual-rail are not yet in the serving path — see `RDMA-KV-TIER.md` §6).
+
+**Vehicle:** `holo-3.1-0.8b`. Deliberately small — model compute is trivial, so the
+KV-tier restore latency is **worst-case exposed** (no compute to hide it). A big
+model shows a *smaller* relative penalty. KV overflow is forced with a ~2500-token
+prompt (a tagged secret `TANGERINE-7742` at the top → the model must attend across
+the whole, RDMA-resident context) and a small HBM cap. Greedy (temp 0), 48-tok gens.
+Harness: `bench_client.py` + `kv_sweep.sh` in this dir.
+
+## Headline
+
+- **Normal HBM KV scales cleanly** to C=8 (274 tok/s aggregate, correct recall).
+- **The KV-overflow tier (RDMA *and* NVMe) is single-sequence-only today.** Correct
+  at **C=1**; recall **degrades at C=2**; **hard-fails at C≥4**.
+- The failure is **upstream of the backend** — NVMe and RDMA fail *identically* — so
+  it is **not** an RDMA problem and **not** a budget knob (raising `--high-speed-swap-gb`
+  8→48 did not change it).
+
+## Root cause (not RDMA)
+
+The disk-block-id allocator is capped at **`max_blocks_per_layer` — one sequence's
+worth** of blocks (`crates/spark-storage/src/high_speed_swap.rs:239`, comment:
+"Capacity == max_blocks_per_layer"; error raised at
+`crates/spark-model/src/model/block_mgmt.rs:298`). Concurrent sequences share that
+single-sequence id namespace:
+- **C=2**: ids collide → the restored KV is mis-mapped → **wrong recall**
+  (`"vault_access_code"` / `"vault-123456"` instead of `TANGERINE-7742`).
+- **C≥4**: namespace exhausts → `disk-block-id pool exhausted` → NULL logits →
+  **empty output** for every stream.
+
+Enabling concurrency is a real feature (size the id pool **and** the backend arena
+for `max_batch_size` sequences, then validate concurrent restore correctness) — not
+a benchmark-time tweak.
+
+## Measured — C=1 (the regime that works)
+
+| KV backend | HBM cap | TTFT (prefill) | decode tok/s | recall |
+|---|---|---|---|---|
+| **normal HBM** | full | **297 ms** | **184.5** | ✅ |
+| RDMA peer, partial (cap=64) | 1024 tok | 587 ms | 38.7 | ✅ |
+| RDMA peer, full (cap=8) | 128 tok | 894 ms | 40.2 | ✅ |
+| local NVMe, full (cap=8) | 128 tok | 977 ms | 39.2 | ✅ |
+
+**Insights:**
+- Overflowing KV to *any* tier costs **~4.7× decode** vs HBM at C=1 (184→~40 tok/s)
+  **for this tiny model** — the worst case; a big model hides most of it behind compute.
+- **RDMA ≈ NVMe here.** At 0.8b the KV granule is ~16 KiB and the tier is
+  *latency-bound*, so RDMA's 24 GB/s bandwidth advantage doesn't show. RDMA's win
+  needs **large KV granules** (big model) — cf. the 35B-A3B result in `RDMA-KV-TIER.md`
+  (57% of local-KV, bandwidth-bound). This benchmark is the small-model floor.
+- Partial overflow (cap=64) beats full (cap=8) on **prefill** (587 vs 894 ms — more
+  KV stays HBM) at equal decode.
+
+## Measured — concurrency (normal HBM only; overflow tiers fail)
+
+| C | normal HBM: TTFT | decode/req | agg decode | req/s | overflow tiers |
+|---|---|---|---|---|---|
+| 1 | 297 ms | 184.5 | 184.5 | 2.0 | ✅ correct (table above) |
+| 2 | 604 ms | 85.6 | 171 | 1.9 | ⚠️ wrong recall (id collision) |
+| 4 | 1143 ms | 56.1 | 224 | 2.2 | ❌ empty (pool exhausted) |
+| 8 | 2242 ms | 34.2 | 274 | 2.4 | ❌ empty (pool exhausted) |
+
+## Follow-up to unlock agentic concurrency on the RDMA KV tier
+
+1. Scope the disk-block-id namespace **per sequence** (or size it
+   `max_blocks_per_layer × max_batch_size`) + grow the peer/NVMe arena to match.
+2. Validate concurrent **restore correctness** (the C=2 mis-recall must be gone).
+3. Re-run this sweep on a **big model** (35B-A3B) where RDMA's bandwidth beats NVMe,
+   and land the zero-copy + dual-rail serving path (`RDMA-KV-TIER.md` §6/§7) so the
+   21 GB/s restore reaches live inference.

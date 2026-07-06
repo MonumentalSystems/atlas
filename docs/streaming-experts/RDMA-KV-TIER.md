@@ -52,6 +52,14 @@ checkpoints don't OOM mid-load); `fa66a42` compile-without-rdma-core fix.
   a UMA destination — no bounce, no copy, no `stream_sync` (completion == bytes
   GPU-visible). The expert-arena trick applied to KV.
 
+**Concurrency A/B (2026-07-06, holo-0.8b):** first sweep of the tier under
+*concurrent* load — see `kv-bench/CONCURRENCY-FINDINGS.md`. Finding: the overflow
+tier (RDMA **and** NVMe alike) is **single-sequence-only** today — correct at C=1,
+wrong recall at C=2, hard-fail at C≥4 — because the disk-block-id namespace is sized
+for one sequence (`high_speed_swap.rs:239`). Not an RDMA fault; the fix is to scope
+the id pool per-seq + grow the arena. At 0.8b the granule is latency-bound so
+RDMA≈NVMe; RDMA's bandwidth win needs the big-model granule (the A3B number below).
+
 **Agentic end-to-end (5-turn, A3B, identical task):**
 - Local KV (all HBM): **65.5 tok/s** aggregate.
 - RDMA remote KV (`cap=8` blocks = 128 tok HBM, ~entire cache remote): **37.6 tok/s**
