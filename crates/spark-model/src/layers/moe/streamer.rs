@@ -28,11 +28,17 @@ use spark_storage::expert::ExpertKey;
 use spark_storage::expert_tier::{ArenaSlot, ExpertResidency, TierKind, open_tier};
 use spark_storage::ExpertIndex;
 
-/// A prefetch job: fetch experts `[lo, hi)` of dense MoE layer `dense`.
+/// A prefetch job for dense MoE layer `dense`.
+///
+/// `experts == None` is the DENSE job: fetch the whole local range `[lo, hi)`
+/// (the layer-ahead overlap path). `experts == Some(ids)` is the REACTIVE
+/// (expert-granular) job: fetch ONLY those global expert ids, each into its
+/// identity slot `slot = e - lo` (invariant E: every id must lie in `[lo, hi)`).
 struct Job {
     dense: u32,
     lo: u32,
     hi: u32,
+    experts: Option<Vec<u32>>,
 }
 
 /// dense-layer -> the fetched residencies (indexed by `expert - lo`), or an error.
@@ -119,9 +125,16 @@ impl ExpertStreamerShared {
                 // internally; UMA/RDMA ignore the stream — pure CPU I/O).
                 let stream = 0u64;
                 while let Ok(job) = rx.recv() {
-                    let mut out = Vec::with_capacity((job.hi - job.lo) as usize);
+                    // Dense job → the whole local range; reactive job → exactly the
+                    // active ids (same order the caller passed, so `take_active`'s
+                    // residency vec zips positionally with that id list).
+                    let ids: Vec<u32> = match &job.experts {
+                        Some(v) => v.clone(),
+                        None => (job.lo..job.hi).collect(),
+                    };
+                    let mut out = Vec::with_capacity(ids.len());
                     let mut err: Option<String> = None;
-                    for e in job.lo..job.hi {
+                    for &e in &ids {
                         let slot = ArenaSlot::new(job.dense % num_slabs, e - job.lo);
                         match tier.fetch(ExpertKey::new(job.dense, e), slot, stream) {
                             Ok(res) => out.push(res),
@@ -194,7 +207,70 @@ impl ExpertStreamerShared {
         drop(occ);
         let mut req = self.requested.lock().expect("requested mutex");
         if req.insert(dense) {
-            let _ = self.tx.send(Job { dense, lo, hi });
+            let _ = self.tx.send(Job {
+                dense,
+                lo,
+                hi,
+                experts: None,
+            });
+        }
+    }
+
+    /// REACTIVE (expert-granular) fetch: enqueue a fetch of ONLY `active` (the
+    /// global expert ids with routed token count > 0) for dense layer `dense`.
+    /// Each id lands in its identity slot `slot = e - lo`; inactive slots keep
+    /// their prior bytes (the grouped GEMM never indexes a count==0 expert).
+    ///
+    /// This BYPASSES the WS3 resident_cache (per-token active sets vary) and
+    /// INVALIDATES it: the arena slab is about to be partially overwritten, so
+    /// any later DENSE prefetch of this layer must re-fetch the full range.
+    /// Correctness: the caller must `wait_slab_free(dense)` before this (the
+    /// prior GEMM reading this slab must complete) and pair each reactive
+    /// install with a `take_active(dense)`.
+    pub fn prefetch_sparse(&self, dense: u32, active: &[u32], lo: u32, hi: u32) {
+        if dense >= self.num_moe_layers {
+            return;
+        }
+        let slab = (dense % self.num_slabs) as usize;
+        // Invalidate WS3 state for this slab. The sparse write is about to
+        // overwrite the arena bytes of WHATEVER layer currently occupies this
+        // slab — which, when num_slabs < num_moe_layers, is a DIFFERENT layer
+        // than `dense`. Clear the occupant unconditionally and drop the cached
+        // full-layer residency of BOTH that prior occupant and `dense`; else a
+        // later dense prefetch of the evicted layer would see occ[slab]==Some(it)
+        // + a cache hit and skip the re-fetch, reading the overwritten bytes.
+        let prev = {
+            let mut occ = self.slab_occupant.lock().expect("occupant mutex");
+            occ[slab].take()
+        };
+        {
+            let mut cache = self.resident_cache.lock().expect("cache mutex");
+            if let Some(p) = prev {
+                cache.remove(&p);
+            }
+            cache.remove(&dense);
+        }
+        // Direct send (no `requested` dedup): reactive fetches are per-forward
+        // and consumed immediately by `take_active`, which clears DoneMap[dense].
+        let _ = self.tx.send(Job {
+            dense,
+            lo,
+            hi,
+            experts: Some(active.to_vec()),
+        });
+    }
+
+    /// Block until the reactive fetch for `dense` lands; return its residencies
+    /// in the SAME order as the `active` id slice passed to `prefetch_sparse`.
+    /// Unlike `take`, this never consults / promotes the resident_cache.
+    pub fn take_active(&self, dense: u32) -> Result<Vec<ExpertResidency>> {
+        let (lock, cv) = &*self.done;
+        let mut map = lock.lock().expect("done mutex");
+        loop {
+            if let Some(entry) = map.remove(&dense) {
+                return entry.map_err(|e| anyhow::anyhow!(e));
+            }
+            map = cv.wait(map).expect("done condvar");
         }
     }
 

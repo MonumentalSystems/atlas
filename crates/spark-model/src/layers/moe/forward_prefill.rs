@@ -330,7 +330,15 @@ impl MoeLayer {
         // the arena-resident records for this layer's local experts (no-op
         // unless --stream-experts). Blocking fetch (Stage 2), before the GEMM
         // reads the tables. Outside the profiled body; no sync on the fast path.
-        self.install_streamed_tables(ctx, stream)?;
+        //
+        // REACTIVE (expert-granular) mode for small M (decode-via-prefill runs
+        // M=1): read back the active expert set (count>0) that `moe_sort_by_expert`
+        // just produced and fetch/patch ONLY those experts (~top_k of num_experts
+        // instead of all). `None` → the dense layer-ahead path, byte-identical to
+        // pre-reactive behavior. The readback is legal here (graphs off).
+        let reactive_active =
+            self.compute_reactive_active(ctx, expert_offsets, ne, num_tokens, stream)?;
+        self.install_streamed_tables(ctx, stream, reactive_active.as_deref())?;
 
         // 4-6. Routed grouped-GEMM phase (grid sizing → grouped gate+up
         // GEMM → SiLU → grouped down GEMM). Hoisted to forward_prefill_routed.rs
@@ -351,10 +359,11 @@ impl MoeLayer {
             stream,
         )?;
 
-        // Streaming Experts: record this layer's slab as consumed and prefetch
-        // the next MoE layer's experts so its I/O overlaps upcoming compute
-        // (no-op unless --stream-experts). After the GEMM on `stream`.
-        self.after_streamed_layer(ctx, stream)?;
+        // Streaming Experts: record this layer's slab as consumed and (dense
+        // path only) prefetch the next MoE layer's experts so its I/O overlaps
+        // upcoming compute (no-op unless --stream-experts). After the GEMM on
+        // `stream`. Reactive mode skips the layer-ahead prefetch.
+        self.after_streamed_layer(ctx, stream, reactive_active.is_some())?;
         let expert_down_out = ctx.buffers.expert_down_out();
 
         // 7. Unpermute + weighted reduce: scatter sorted outputs to token order
