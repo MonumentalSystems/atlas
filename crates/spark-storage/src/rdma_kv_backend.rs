@@ -7,19 +7,25 @@
 // RoCE instead of a local file:
 //   * `write_from_host` (offload a cold group) -> `IBV_WR_RDMA_WRITE` the group
 //     into the peer at `base + group_id * group_stride`.
-//   * `read` (restore a group)                 -> `IBV_WR_RDMA_READ` it back
-//     into a pinned bounce, then `copy_h2d` to the HBM destination.
+//   * `read` (restore groups)                  -> `IBV_WR_RDMA_READ` them back
+//     into pinned bounces, then `copy_h2d` to the HBM destinations.
 //
-// This is the "faster than the SSD" tier: peer RAM at ~12 GB/s over CX7 vs the
-// ~2 GB/s USB SSD. Structurally identical to `PosixBackend` (single pinned
-// bounce, serialize per request) — only the transport differs, so the existing
-// scratch-pool / predictor / eviction machinery above it is unchanged. The peer
-// CPU is idle (one-sided); each group belongs to one client, so there is no
-// coherence protocol — the client is the sole owner of the blade's contents.
+// PIPELINED: a ring of `depth` registered bounce buffers (default 16, env
+// `ATLAS_KV_PIPELINE_DEPTH`) keeps up to `depth` RDMA ops in flight so per-op
+// latency overlaps across a batch, and RDMA READs overlap the `copy_h2d` — the
+// serial single-bounce version was latency-bound at KV group sizes. `read` posts
+// the whole batch through the ring and does one `stream_sync`; `write_from_host`
+// posts async and reaps completions lazily (writes are drained before any read,
+// so a restore always sees prior offloads, and on drop for durability).
+//
+// This is the "faster than the SSD" tier: peer RAM at (up to) ~12 GB/s over CX7
+// vs the ~2 GB/s USB SSD. Peer CPU is idle (one-sided); each group belongs to
+// one client, so there is no coherence protocol — the client owns the blade.
 //
 // Device/GID from `$ATLAS_EXPERT_RDMA_DEV` / `$ATLAS_EXPERT_RDMA_GID` (the same
 // cabled CX7 link the expert tier uses), peer at `$ATLAS_KV_PEER=host:port`.
 
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 
@@ -32,12 +38,30 @@ use crate::group::{GroupKey, GroupLayout};
 use crate::kv_peer::KvServerParams;
 use crate::rdma_verbs::Verbs;
 
+/// One registered pinned bounce in the pipeline ring.
+struct Bounce {
+    buf: PinnedBuffer,
+    lkey: u32,
+}
+
+/// An in-flight RDMA op, keyed by its `wr_id`, so a completion can be dispatched.
+enum InFlight {
+    /// A restore: after the READ lands, copy the bounce to this HBM dest.
+    Read { bounce: usize, dst: u64 },
+    /// An offload: the WRITE from this bounce; just free it on completion.
+    Write { bounce: usize },
+}
+
 pub struct RdmaKvBackend {
     verbs: Verbs,
     layout: GroupLayout,
-    /// Single pinned bounce (group_stride bytes), registered LOCAL_WRITE.
-    bounce: PinnedBuffer,
-    bounce_lkey: u32,
+    /// Registered bounce ring (pipeline depth).
+    bounces: Vec<Bounce>,
+    /// Indices of bounces not currently holding an in-flight op.
+    free: Vec<usize>,
+    /// wr_id -> the op occupying a bounce.
+    inflight: HashMap<u64, InFlight>,
+    next_wr: u64,
     remote_base: u64,
     remote_rkey: u32,
     _stream: TcpStream, // hold the control channel open; drop => peer tears down
@@ -52,12 +76,10 @@ unsafe impl Sync for RdmaKvBackend {}
 
 impl RdmaKvBackend {
     /// Connect to a KV blade at `addr`, size + register the peer arena for this
-    /// `layout`, and bring up the RC QP. The peer allocates exactly the flat
-    /// group-id address space this layout spans.
+    /// `layout`, allocate the bounce ring, and bring up the RC QP.
     pub fn connect(addr: &str, layout: GroupLayout) -> Result<Self> {
         let group_bytes = layout.group_bytes() as usize;
-        // Flat group-id space: (max group_id + 1) * stride == num_layers layers'
-        // worth of (K+V × blocks × kv_heads) groups.
+        // Flat group-id space: (max group_id + 1) * stride.
         let num_groups = (layout.num_layers as u64)
             * 2
             * (layout.num_blocks as u64)
@@ -67,7 +89,6 @@ impl RdmaKvBackend {
         let mut stream =
             TcpStream::connect(addr).with_context(|| format!("connect kv peer {addr}"))?;
         stream.set_nodelay(true).ok();
-        // 1. Tell the peer how much RAM to register.
         stream
             .write_all(&total_bytes.to_le_bytes())
             .context("send kv total_bytes")?;
@@ -77,16 +98,28 @@ impl RdmaKvBackend {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(3u32);
+        let depth: usize = std::env::var("ATLAS_KV_PIPELINE_DEPTH")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(16)
+            .clamp(1, 128);
         let psn = rand::random::<u32>() & 0xff_ffff;
         let mut verbs = Verbs::create(&dev, gid_idx, psn)?;
 
-        // The bounce is both the RDMA-READ landing buffer and the RDMA-WRITE
-        // source; LOCAL_WRITE suffices for both.
-        let bounce = PinnedBuffer::new(group_bytes).context("alloc pinned kv bounce")?;
-        // SAFETY: bounce lives as long as self (and thus the MR).
-        let bkeys = unsafe { verbs.reg_mr(bounce.ptr, group_bytes, false)? };
+        // The bounce ring: each is both a RDMA-READ landing buffer and a
+        // RDMA-WRITE source; LOCAL_WRITE suffices for both.
+        let mut bounces = Vec::with_capacity(depth);
+        for _ in 0..depth {
+            let buf = PinnedBuffer::new(group_bytes).context("alloc pinned kv bounce")?;
+            // SAFETY: buf lives as long as self (and thus the MR).
+            let keys = unsafe { verbs.reg_mr(buf.ptr, group_bytes, false)? };
+            bounces.push(Bounce {
+                buf,
+                lkey: keys.lkey,
+            });
+        }
+        let free = (0..depth).collect();
 
-        // 2-4. Exchange QP params, connect, ack.
         let sp = KvServerParams::read_from(&mut stream).context("read kv server params")?;
         VerbsClientParams {
             qpn: verbs.qpn(),
@@ -102,15 +135,17 @@ impl RdmaKvBackend {
             bail!("kv peer refused connection (ack {})", ack[0]);
         }
         tracing::info!(
-            "RdmaKvBackend connected to {addr}: {:.1} GiB blade, group_stride {}",
+            "RdmaKvBackend connected to {addr}: {:.1} GiB blade, group_stride {}, pipeline depth {depth}",
             total_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
             layout.group_stride,
         );
         Ok(Self {
             verbs,
             layout,
-            bounce,
-            bounce_lkey: bkeys.lkey,
+            bounces,
+            free,
+            inflight: HashMap::new(),
+            next_wr: 0,
             remote_base: sp.base_addr,
             remote_rkey: sp.rkey,
             _stream: stream,
@@ -121,36 +156,89 @@ impl RdmaKvBackend {
     fn remote_addr(&self, key: GroupKey) -> u64 {
         self.remote_base + self.layout.group_id(key).0 * self.layout.group_stride
     }
+
+    #[inline]
+    fn fresh_wr(&mut self) -> u64 {
+        let w = self.next_wr;
+        self.next_wr = self.next_wr.wrapping_add(1);
+        w
+    }
+
+    /// Reap exactly one completion, freeing its bounce. For a READ, first
+    /// `copy_h2d` the landed bytes to its HBM dest on `stream`. Returns the freed
+    /// bounce index.
+    fn reap_one(&mut self, stream: u64) -> Result<usize> {
+        let wr = self.verbs.poll()?;
+        let op = self
+            .inflight
+            .remove(&wr)
+            .with_context(|| format!("kv: completion for unknown wr_id {wr:#x}"))?;
+        let bounce = match op {
+            InFlight::Read { bounce, dst } => {
+                let bytes = self.layout.group_bytes() as usize;
+                copy_h_to_d_async(dst, self.bounces[bounce].buf.ptr as *const _, bytes, stream)?;
+                bounce
+            }
+            InFlight::Write { bounce } => bounce,
+        };
+        self.free.push(bounce);
+        Ok(bounce)
+    }
+
+    /// Drain all in-flight ops (used before a read so it sees prior writes, and
+    /// on drop for durability). Reads land + copy on `stream`.
+    fn drain(&mut self, stream: u64) -> Result<()> {
+        while !self.inflight.is_empty() {
+            self.reap_one(stream)?;
+        }
+        Ok(())
+    }
 }
 
 impl StorageBackend for RdmaKvBackend {
     fn read(&mut self, requests: &[ReadRequest], stream: u64) -> Result<()> {
+        // Ensure any pending offloads land first, so a restore sees them.
+        self.drain(stream)?;
         let bytes = self.layout.group_bytes() as usize;
-        let bounce_ptr = self.bounce.ptr;
-        for req in requests {
-            let raddr = self.remote_addr(req.group);
-            let wr = self.layout.group_id(req.group).0;
-            // SAFETY: bounce is a `bytes`-sized MR (bounce_lkey); raddr/rkey
-            // address the peer's RW blade at this group's flat offset.
-            unsafe {
-                self.verbs.post_read(
-                    bounce_ptr,
-                    self.bounce_lkey,
-                    raddr,
-                    self.remote_rkey,
-                    bytes as u32,
+        let mut it = requests.iter();
+        let mut done = false;
+        loop {
+            // Fill free bounces with new READs (keep the pipeline full).
+            while let Some(&b) = self.free.last() {
+                let Some(req) = it.next() else {
+                    done = true;
+                    break;
+                };
+                self.free.pop();
+                let raddr = self.remote_addr(req.group);
+                let wr = self.fresh_wr();
+                // SAFETY: bounce b is a `bytes`-sized MR; raddr/rkey are the blade.
+                unsafe {
+                    self.verbs.post_read(
+                        self.bounces[b].buf.ptr,
+                        self.bounces[b].lkey,
+                        raddr,
+                        self.remote_rkey,
+                        bytes as u32,
+                        wr,
+                    )?;
+                }
+                self.inflight.insert(
                     wr,
-                )?;
+                    InFlight::Read {
+                        bounce: b,
+                        dst: req.dst_dev_ptr,
+                    },
+                );
             }
-            let got = self.verbs.poll()?;
-            if got != wr {
-                bail!("kv read completion wr_id {got:#x} != expected {wr:#x}");
+            if self.inflight.is_empty() && done {
+                break;
             }
-            // Land into HBM; sync before the next request reuses the bounce
-            // (single-bounce serialization, exactly like PosixBackend).
-            copy_h_to_d_async(req.dst_dev_ptr, bounce_ptr as *const _, bytes, stream)?;
-            stream_sync(stream)?;
+            // Reap one (READ -> copy_h2d), freeing a bounce to refill above.
+            self.reap_one(stream)?;
         }
+        // One sync for all the copies issued on `stream`.
+        stream_sync(stream)?;
         Ok(())
     }
 
@@ -159,28 +247,40 @@ impl StorageBackend for RdmaKvBackend {
         if src.len() != bytes {
             bail!("write_from_host: src len {} != group bytes {bytes}", src.len());
         }
-        // SAFETY: bounce holds `bytes`; copy the group in, then RDMA-WRITE it.
+        // Acquire a free bounce, reaping a completion if the ring is full.
+        if self.free.is_empty() {
+            // No reads should be outstanding here (reads fully drain), so this
+            // reaps a write; NULL stream is fine (writes issue no copy_h2d).
+            self.reap_one(0)?;
+        }
+        let b = self.free.pop().expect("free bounce after reap");
+        // SAFETY: bounce b holds `bytes`; copy the group in, then RDMA-WRITE it.
         unsafe {
-            std::ptr::copy_nonoverlapping(src.as_ptr(), self.bounce.ptr as *mut u8, bytes);
+            std::ptr::copy_nonoverlapping(src.as_ptr(), self.bounces[b].buf.ptr as *mut u8, bytes);
         }
         let raddr = self.remote_addr(key);
-        let wr = self.layout.group_id(key).0;
-        // SAFETY: bounce is a live `bytes`-sized MR; raddr/rkey are the blade.
+        let wr = self.fresh_wr();
+        // SAFETY: bounce b is a live `bytes`-sized MR; raddr/rkey are the blade.
         unsafe {
             self.verbs.post_write(
-                self.bounce.ptr,
-                self.bounce_lkey,
+                self.bounces[b].buf.ptr,
+                self.bounces[b].lkey,
                 raddr,
                 self.remote_rkey,
                 bytes as u32,
                 wr,
             )?;
         }
-        let got = self.verbs.poll()?;
-        if got != wr {
-            bail!("kv write completion wr_id {got:#x} != expected {wr:#x}");
-        }
-        Ok(())
+        self.inflight.insert(wr, InFlight::Write { bounce: b });
+        Ok(()) // async — reaped lazily / drained before the next read
+    }
+}
+
+impl Drop for RdmaKvBackend {
+    fn drop(&mut self) {
+        // Drain in-flight writes so the blade holds all offloaded bytes before
+        // the connection closes (best-effort; ignore poll errors on teardown).
+        let _ = self.drain(0);
     }
 }
 
@@ -190,17 +290,14 @@ mod tests {
     use crate::cuda_min::{CudaCtx, DeviceBuffer, copy_d_to_h_async};
     use crate::group::KvKind;
 
-    // Bit-identical KV round-trip over RDMA: offload a set of distinct groups to
-    // the peer blade, restore each into a fresh device buffer, and confirm the
-    // bytes survive WRITE -> peer RAM -> READ -> HBM unchanged. Proves the
-    // overflow tier is a lossless StorageBackend. Needs a GPU and a live
-    // atlas-kv-peer at $ATLAS_KV_PEER.
+    // Bit-identical KV round-trip over RDMA through the pipeline: offload a set
+    // of distinct groups, restore each, confirm bytes survive WRITE -> peer RAM
+    // -> READ -> HBM unchanged. Needs a GPU and a live atlas-kv-peer.
     #[test]
     #[ignore = "requires GPU + live kv-peer at $ATLAS_KV_PEER"]
     fn rdma_kv_round_trip() {
         let ctx = CudaCtx::new(0).expect("cuda init");
         let peer = std::env::var("ATLAS_KV_PEER").expect("set ATLAS_KV_PEER=host:port");
-        // Small flat space: 2 layers × 4 blocks × 2 kv_heads, K+V.
         let layout = GroupLayout::new(2, 4, 2, 16, 128, 2, 4096);
         let bytes = layout.group_bytes() as usize;
         let mut be = RdmaKvBackend::connect(&peer, layout).expect("connect kv peer");
@@ -211,44 +308,36 @@ mod tests {
             GroupKey::new(1, 2, 0, KvKind::V),
             GroupKey::new(1, 0, 1, KvKind::K),
         ];
-        let pat = |i: usize| -> Vec<u8> {
-            (0..bytes).map(|b| ((b + i * 37) & 0xFF) as u8).collect()
-        };
-
-        // Offload each group (RDMA WRITE to the blade).
+        let pat = |i: usize| -> Vec<u8> { (0..bytes).map(|b| ((b + i * 37) & 0xFF) as u8).collect() };
         for (i, k) in keys.iter().enumerate() {
             be.write_from_host(*k, &pat(i)).expect("write_from_host");
         }
-        // Restore each into a fresh device buffer (RDMA READ + copy_h2d) and cmp.
-        for (i, k) in keys.iter().enumerate() {
-            let dev = DeviceBuffer::new(bytes).unwrap();
-            be.read(
-                &[ReadRequest {
-                    group: *k,
-                    dst_dev_ptr: dev.ptr,
-                }],
-                ctx.stream,
-            )
-            .expect("read");
+        // Restore all in ONE batched read (exercises the pipeline).
+        let devs: Vec<_> = keys.iter().map(|_| DeviceBuffer::new(bytes).unwrap()).collect();
+        let reqs: Vec<_> = keys
+            .iter()
+            .zip(&devs)
+            .map(|(k, d)| ReadRequest {
+                group: *k,
+                dst_dev_ptr: d.ptr,
+            })
+            .collect();
+        be.read(&reqs, ctx.stream).expect("read");
+        for (i, d) in devs.iter().enumerate() {
             let mut back = vec![0u8; bytes];
-            copy_d_to_h_async(back.as_mut_ptr() as *mut _, dev.ptr, bytes, ctx.stream).unwrap();
+            copy_d_to_h_async(back.as_mut_ptr() as *mut _, d.ptr, bytes, ctx.stream).unwrap();
             stream_sync(ctx.stream).unwrap();
-            assert_eq!(back, pat(i), "group {k:?} corrupted through the RDMA blade");
+            assert_eq!(back, pat(i), "group {:?} corrupted through the RDMA blade", keys[i]);
         }
     }
 
-    // Throughput of the KV overflow tier: offload (RDMA WRITE) then restore
-    // (RDMA READ + copy_h2d) a large group set, reporting GB/s each way. Serial
-    // single-bounce (like PosixBackend), so this is the honest per-group rate at
-    // the given group size — the pipelined multi-bounce version is a follow-on.
-    // Needs a GPU and a live atlas-kv-peer at $ATLAS_KV_PEER.
+    // Throughput of the pipelined KV overflow tier: offload then restore a large
+    // group set, reporting GB/s each way. Needs a GPU and a live atlas-kv-peer.
     #[test]
     #[ignore = "requires GPU + live kv-peer at $ATLAS_KV_PEER"]
     fn rdma_kv_bandwidth() {
         let ctx = CudaCtx::new(0).expect("cuda init");
         let peer = std::env::var("ATLAS_KV_PEER").expect("set ATLAS_KV_PEER=host:port");
-        // 16 KiB groups (block 64 × head_dim 128 × bf16), 16 layers × 64 blocks
-        // × 8 kv-heads × (K+V) = 16384 groups ≈ 256 MiB total.
         let layout = GroupLayout::new(16, 64, 8, 64, 128, 2, 4096);
         let gbytes = layout.group_bytes() as usize;
         let mut be = RdmaKvBackend::connect(&peer, layout).expect("connect kv peer");
@@ -273,30 +362,30 @@ mod tests {
         let src = vec![0xABu8; gbytes];
         let dev = DeviceBuffer::new(gbytes).unwrap();
 
-        // Offload: RDMA WRITE every group to the blade.
         let t0 = std::time::Instant::now();
         for k in &keys {
             be.write_from_host(*k, &src).expect("write");
         }
+        // Drain the async write pipeline so the timing includes durability.
+        be.drain(0).expect("drain writes");
         let wdt = t0.elapsed().as_secs_f64();
 
-        // Restore: RDMA READ every group back into HBM.
+        // Restore all groups in one batched, pipelined read (reuse one dst — we
+        // measure transport, not distinct destinations).
+        let reqs: Vec<_> = keys
+            .iter()
+            .map(|k| ReadRequest {
+                group: *k,
+                dst_dev_ptr: dev.ptr,
+            })
+            .collect();
         let t1 = std::time::Instant::now();
-        for k in &keys {
-            be.read(
-                &[ReadRequest {
-                    group: *k,
-                    dst_dev_ptr: dev.ptr,
-                }],
-                ctx.stream,
-            )
-            .expect("read");
-        }
+        be.read(&reqs, ctx.stream).expect("read");
         let rdt = t1.elapsed().as_secs_f64();
 
         let gbps = |dt: f64| (total as f64) / dt / 1e9;
         println!(
-            "\nRDMA KV tier: {} groups × {} B = {:.0} MiB\n  \
+            "\nRDMA KV tier (pipelined): {} groups × {} B = {:.0} MiB\n  \
              OFFLOAD (RDMA WRITE): {:.3}s => {:.2} GB/s ({:.1} us/group)\n  \
              RESTORE (RDMA READ + h2d): {:.3}s => {:.2} GB/s ({:.1} us/group)",
             ngroups,
