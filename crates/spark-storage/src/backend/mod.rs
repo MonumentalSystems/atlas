@@ -36,4 +36,14 @@ pub trait StorageBackend: Send + Sync {
     /// One-shot sequential write — used at offload time to populate disk
     /// from a host-side K/V buffer.
     fn write_from_host(&mut self, key: GroupKey, src: &[u8]) -> Result<()>;
+
+    /// Optionally pre-register `[base, base+len)` as the read-landing region.
+    /// The RDMA backend registers it as ONE MR (per rail) so zero-copy restore
+    /// reuses that lkey for every slot within it — registering per-slot
+    /// sub-regions of a CUDA-pinned pool fails on GB10, but the whole-allocation
+    /// registration from its base succeeds. No-op for the file backends.
+    fn register_landing_region(&mut self, base: u64, len: usize) -> Result<()> {
+        let _ = (base, len);
+        Ok(())
+    }
 }

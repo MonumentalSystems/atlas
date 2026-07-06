@@ -68,6 +68,10 @@ struct Rail {
     /// dst is GPU-addressable, so RDMA lands there directly — no bounce, no
     /// copy_h2d). Cached by dst address; KV scratch slots are reused.
     dst_lkeys: HashMap<u64, u32>,
+    /// Pre-registered whole landing region `(base, len, lkey)`: one MR covering
+    /// the entire (UMA) scratch pool. Any dst inside it reuses this lkey, so we
+    /// never register per-slot sub-regions (which fail on GB10).
+    region: Option<(u64, u64, u32)>,
     /// In-flight direct (zero-copy) reads on this rail — no bounce to free.
     direct_inflight: usize,
 }
@@ -84,7 +88,26 @@ impl Rail {
     /// zero-copy RDMA READ landing. On GB10 UMA the dst is GPU-addressable pinned
     /// host memory, so `ibv_reg_mr` on its VA succeeds and the GPU reads the
     /// landed bytes at the same address — no `copy_h2d`.
+    /// Register `[base, base+len)` as ONE landing MR on this rail (the whole UMA
+    /// scratch pool). Called once, before any restore.
+    fn register_region(&mut self, base: u64, len: usize) -> Result<()> {
+        // SAFETY: base/len describe the pool's live UMA (pinned) allocation,
+        // which outlives every rail (deregistered on drop before the pool frees).
+        let keys = unsafe { self.verbs.reg_mr(base as *mut c_void, len, false) }
+            .context("register UMA landing region")?;
+        self.region = Some((base, len as u64, keys.lkey));
+        Ok(())
+    }
+
     fn reg_dst(&mut self, addr: u64, bytes: usize) -> Result<u32> {
+        // Whole-region fast path: any dst inside the pre-registered pool reuses
+        // its single lkey (no per-slot registration — that fails on GB10).
+        if let Some((base, len, lkey)) = self.region
+            && addr >= base
+            && addr + bytes as u64 <= base + len
+        {
+            return Ok(lkey);
+        }
         if let Some(&lk) = self.dst_lkeys.get(&addr) {
             return Ok(lk);
         }
@@ -230,6 +253,7 @@ impl RdmaKvBackend {
                 inflight: HashMap::new(),
                 next_wr: 0,
                 dst_lkeys: HashMap::new(),
+                region: None,
                 direct_inflight: 0,
             });
         }
@@ -419,6 +443,20 @@ impl StorageBackend for RdmaKvBackend {
             }
         }
         stream_sync(stream)?;
+        Ok(())
+    }
+
+    fn register_landing_region(&mut self, base: u64, len: usize) -> Result<()> {
+        // Register the whole (UMA) scratch pool as one MR per rail so zero-copy
+        // restore reuses that lkey for every slot — no per-slot registration.
+        for rail in &mut self.rails {
+            rail.register_region(base, len)?;
+        }
+        tracing::info!(
+            "RdmaKvBackend: registered UMA landing region {:.1} MiB on {} rail(s) — zero-copy restore live",
+            len as f64 / (1024.0 * 1024.0),
+            self.rails.len(),
+        );
         Ok(())
     }
 

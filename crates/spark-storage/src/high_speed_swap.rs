@@ -92,7 +92,7 @@ impl HighSpeedSwap {
         // KV overflow tier selection: RDMA RAM blade when $ATLAS_KV_PEER is set,
         // else the local NVMe io_uring backend (default, unchanged).
         let kv_peer = std::env::var("ATLAS_KV_PEER").ok();
-        let backend: Box<dyn crate::backend::StorageBackend> = {
+        let mut backend: Box<dyn crate::backend::StorageBackend> = {
             #[cfg(atlas_rdma_verbs)]
             {
                 if let Some(peer) = kv_peer {
@@ -136,6 +136,19 @@ impl HighSpeedSwap {
                 pool.is_uma(),
                 if pool.is_uma() { "enabled" } else { "unavailable — using bounce" },
             );
+            // Register the whole UMA pool as one landing MR so zero-copy restore
+            // reuses that lkey per slot (per-slot registration fails on GB10).
+            // No-op for the file backends. On failure the backend degrades to
+            // the bounce path at read() time, so this is best-effort.
+            if pool.is_uma()
+                && let Err(e) =
+                    backend.register_landing_region(pool.pool_dev_ptr(), pool.dims().pool_bytes())
+            {
+                tracing::warn!(
+                    "high-speed-swap: UMA landing-region registration failed ({e:#}); \
+                     restore will use the bounce path"
+                );
+            }
         }
         let predictor = Predictor::new_on_stream(
             stream,
