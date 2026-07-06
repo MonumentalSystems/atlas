@@ -216,8 +216,10 @@ impl TransformerModel {
         let ms_profile = std::env::var("ATLAS_MS_PROFILE").ok().as_deref() == Some("1");
         // ATLAS_MS_PROFILE forces eager (graphs off) so per-phase syncs are legal.
         // ATLAS_LORA_EAGER: same LoRA graph-vs-eager debugging hatch as decode_a.
-        let lora_eager =
-            self.lora.is_some() && (crate::lora::lora_eager_env() || self.lora_rotatable);
+        // Task #28: a swappable pool no longer forces eager — the batched graph is
+        // keyed by the ACTIVE adapter id (only the installed-active pair is baked;
+        // bgmv-routed seqs are content-driven), so a rotate/swap re-keys.
+        let lora_eager = self.lora.is_some() && crate::lora::lora_eager_env();
         let use_graphs = !ms_profile
             && !lora_eager
             && std::env::var("ATLAS_DECODE_GRAPHS_MULTISEQ")
@@ -238,6 +240,9 @@ impl TransformerModel {
         };
 
         // ── Phase 2: CUDA graph lookup / capture ──
+        // Task #28: ACTIVE adapter id (0 = base) folded into the batched graph key;
+        // bound once and reused for lookup + insert (see decode_a).
+        let active_id = self.adapter_id_for_slot(-1);
         let mut graphs = if use_graphs {
             Some(self.batch_decode_graphs.lock())
         } else {
@@ -245,7 +250,7 @@ impl TransformerModel {
         };
 
         if let Some(ref graphs) = graphs
-            && let Some(&graph) = graphs.get(&padded_n)
+            && let Some(&graph) = graphs.get(&(padded_n, active_id))
         {
             // Graph exists — replay (kernels use updated metadata + SSM pool addresses)
             if graph.0 != 0 {
@@ -469,7 +474,7 @@ impl TransformerModel {
                 if graph.0 != 0 {
                     tracing::info!("Captured CUDA graph for batch size {padded_n}");
                     if let Some(ref mut g) = graphs {
-                        g.insert(padded_n, graph);
+                        g.insert((padded_n, active_id), graph);
                     }
                     self.gpu.launch_graph(graph, stream)?;
                 }

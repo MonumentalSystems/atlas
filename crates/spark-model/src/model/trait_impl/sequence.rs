@@ -193,16 +193,28 @@ impl TransformerModel {
         // Invalidate cached CUDA graphs that reference this sequence's slot
         // — the graph was captured with this slot's KV/SSM pointers baked in,
         // and replaying after the slot is freed would read stale data.
-        // decode_graph is keyed by slot, so drop only this slot's entry.
+        // decode_graph is keyed by `(slot, active_id)` (Task #28), so drop EVERY
+        // entry whose slot matches — a single sequence's lifetime can accumulate
+        // several graphs under one slot across adapter rotates/swaps.
         // (parking_lot::Mutex::lock() never poisons, so the previous `if let
         // Ok(...) = .lock()` graceful-recovery branch is unreachable.)
-        if let Some(graph) = self.decode_graph.lock().remove(&seq.slot_idx)
-            && let Err(e) = self.gpu.destroy_graph(graph)
         {
-            tracing::error!(
-                "free_sequence: destroy_graph(decode_graph[{}]): {e:#}",
-                seq.slot_idx
-            );
+            let mut cache = self.decode_graph.lock();
+            let stale: Vec<_> = cache
+                .keys()
+                .filter(|k| k.0 == seq.slot_idx)
+                .copied()
+                .collect();
+            for key in stale {
+                if let Some(graph) = cache.remove(&key)
+                    && let Err(e) = self.gpu.destroy_graph(graph)
+                {
+                    tracing::error!(
+                        "free_sequence: destroy_graph(decode_graph[{}]): {e:#}",
+                        seq.slot_idx
+                    );
+                }
+            }
         }
         // batch_decode_graphs is keyed by padded_n, not slot — but the captured
         // graphs DO contain per-slot SSM pointers from the active set at capture
@@ -212,20 +224,51 @@ impl TransformerModel {
                 tracing::error!("free_sequence: destroy_graph(batch_decode_graphs entry): {e:#}");
             }
         }
-        // Verify graphs are now slot-keyed (sibling of decode_graph fix).
-        // Drop only this slot's entry to preserve other concurrent seqs' graphs.
+        // Verify graphs are keyed by `(slot, active_id)` (Task #28). Drop EVERY
+        // entry whose slot matches (a slot may hold several graphs across adapter
+        // rotates) to preserve other concurrent seqs' graphs. verify2/3/4 are the
+        // fixed-K caches; verify_kgamma is the SOLE guard for the K=γ path, so it
+        // MUST be cleaned here too (nothing else ever invalidates it).
         for graph_mutex in [
             &self.verify2_graph,
             &self.verify3_graph,
             &self.verify4_graph,
         ] {
-            if let Some(graph) = graph_mutex.lock().remove(&seq.slot_idx)
-                && let Err(e) = self.gpu.destroy_graph(graph)
-            {
-                tracing::error!(
-                    "free_sequence: destroy_graph(verify[{}]): {e:#}",
-                    seq.slot_idx
-                );
+            let mut cache = graph_mutex.lock();
+            let stale: Vec<_> = cache
+                .keys()
+                .filter(|k| k.0 == seq.slot_idx)
+                .copied()
+                .collect();
+            for key in stale {
+                if let Some(graph) = cache.remove(&key)
+                    && let Err(e) = self.gpu.destroy_graph(graph)
+                {
+                    tracing::error!(
+                        "free_sequence: destroy_graph(verify[{}]): {e:#}",
+                        seq.slot_idx
+                    );
+                }
+            }
+        }
+        // verify_kgamma_graph is keyed by `(slot, K, active_id)` — same slot-scoped
+        // retain (key.0 is the slot).
+        {
+            let mut cache = self.verify_kgamma_graph.lock();
+            let stale: Vec<_> = cache
+                .keys()
+                .filter(|k| k.0 == seq.slot_idx)
+                .copied()
+                .collect();
+            for key in stale {
+                if let Some(graph) = cache.remove(&key)
+                    && let Err(e) = self.gpu.destroy_graph(graph)
+                {
+                    tracing::error!(
+                        "free_sequence: destroy_graph(verify_kgamma[{}]): {e:#}",
+                        seq.slot_idx
+                    );
+                }
             }
         }
 

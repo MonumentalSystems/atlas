@@ -298,6 +298,30 @@ impl TransformerModel {
         Ok(installed)
     }
 
+    /// #28: drain + DESTROY the decode graph caches (`decode_graph` +
+    /// `batch_decode_graphs`) on a rotate/swap. `GraphHandle` has no `Drop`, so a
+    /// bare `.clear()` would LEAK the CUDA graphs — and now that a swappable pool
+    /// decodes GRAPHED (not forced-eager, #28) these caches actually hold graphs.
+    /// The compound `(slot, active_id)` key already makes replay safe, so this is
+    /// belt-and-suspenders — but it must DESTROY, not just drop. Runs at scheduler
+    /// quiescence on the CUDA-bound model thread (like `free_sequence`'s destroys).
+    fn destroy_lora_decode_graphs(&self) {
+        for (_, g) in self.decode_graph.lock().drain() {
+            if g.0 != 0
+                && let Err(e) = self.gpu.destroy_graph(g)
+            {
+                tracing::warn!("LoRA graph clear: destroy decode_graph: {e:#}");
+            }
+        }
+        for (_, g) in self.batch_decode_graphs.lock().drain() {
+            if g.0 != 0
+                && let Err(e) = self.gpu.destroy_graph(g)
+            {
+                tracing::warn!("LoRA graph clear: destroy batch_decode_graph: {e:#}");
+            }
+        }
+    }
+
     /// Runtime adapter rotation (eager-on-rotate). Selects the resident
     /// adapter named `name` as ACTIVE: re-points every layer's LoraPair (a/b
     /// DevicePtr + rank/scale) to that slot's sub-region, then clears the
@@ -361,8 +385,7 @@ impl TransformerModel {
         // Defensive: drop any captured decode graphs so a stale-pointer replay
         // is impossible even if `lora_rotatable` were ever mis-derived. Under
         // forced eager these are already empty.
-        self.decode_graph.lock().clear();
-        self.batch_decode_graphs.lock().clear();
+        self.destroy_lora_decode_graphs();
         tracing::info!(
             "LoRA rotation → slot {slot} '{active_name}' (r={r}) re-installed on \
              {installed} layers"
@@ -461,8 +484,7 @@ impl TransformerModel {
             let kernels = ops::lora_delta::LoraKernels::new(self.gpu.as_ref())?;
             self.install_lora_layers(&installed_layers, kernels, &tables, scale_table)?;
             self.lora.as_mut().unwrap().name = adapter_name.to_string();
-            self.decode_graph.lock().clear();
-            self.batch_decode_graphs.lock().clear();
+            self.destroy_lora_decode_graphs();
         }
         tracing::info!(
             "LoRA RDMA swap: '{adapter_name}' landed in slot {slot} \
@@ -536,8 +558,7 @@ impl TransformerModel {
             };
             let kernels = ops::lora_delta::LoraKernels::new(self.gpu.as_ref())?;
             self.install_lora_layers(&layers, kernels, &tables, scale_table)?;
-            self.decode_graph.lock().clear();
-            self.batch_decode_graphs.lock().clear();
+            self.destroy_lora_decode_graphs();
         }
         // Stamp the freshly-promoted slot as most-recently-used so a back-to-back
         // promote of a DIFFERENT cold adapter picks an older victim, not this one,
@@ -625,8 +646,7 @@ impl TransformerModel {
             let kernels = ops::lora_delta::LoraKernels::new(self.gpu.as_ref())?;
             self.install_lora_layers(&layers, kernels, &tables, scale_table)?;
             self.lora.as_mut().unwrap().name = name.to_string();
-            self.decode_graph.lock().clear();
-            self.batch_decode_graphs.lock().clear();
+            self.destroy_lora_decode_graphs();
         }
         tracing::info!(
             "LoRA disk swap: '{name}' packed into slot {slot} (r={}, active_slot={active})",

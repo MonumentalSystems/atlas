@@ -153,10 +153,12 @@ impl TransformerModel {
         // CUDA_LAUNCH_BLOCKING=1 reports the exact failing kernel — used
         // to localize K=γ illegal-address crashes downstream of SSM.
         let force_eager = std::env::var("ATLAS_DFLASH_DEBUG_NO_GRAPH").ok().as_deref() == Some("1");
-        // LoRA rotation (eager-on-rotate): stay eager when adapter rotation is
-        // armed so the spec verify graphs never replay stale slot pointers.
-        let lora_eager =
-            self.lora.is_some() && (crate::lora::lora_eager_env() || self.lora_rotatable);
+        // Task #28: a swappable pool no longer forces eager — the K=γ verify graph
+        // is keyed by the ACTIVE adapter id below (its SOLE invalidation guard: this
+        // cache is never touched by the rotate/swap defensive clears), so a
+        // rotate/swap re-keys instead of replaying baked slot pointers.
+        // ATLAS_LORA_EAGER stays a hard debug hatch.
+        let lora_eager = self.lora.is_some() && crate::lora::lora_eager_env();
         let use_graphs = self.comm.is_none()
             && !self
                 .suppress_graphs
@@ -185,7 +187,10 @@ impl TransformerModel {
             None
         };
 
-        let cache_key = (seq.slot_idx, k);
+        // Task #28: (slot, K, active_id) — active id (0 = base) is the SOLE guard
+        // against replaying over swapped active-adapter pool bytes here.
+        let active_id = self.adapter_id_for_slot(-1);
+        let cache_key = (seq.slot_idx, k, active_id);
         let cached_for_slot = graph_cache
             .as_ref()
             .and_then(|c| c.get(&cache_key).copied());

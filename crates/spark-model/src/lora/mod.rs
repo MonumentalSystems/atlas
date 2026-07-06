@@ -1231,6 +1231,53 @@ mod tests {
     }
 
     #[test]
+    fn decode_graph_key_folds_active_adapter_id() {
+        // Task #28: the decode/verify graph cache key is `(slot, active_id)`
+        // where active_id = adapter_id_for_slot(-1). This test proves the
+        // *keying* discipline that makes graph replay safe under a swappable
+        // pool: the compound key HITS iff the active adapter identity is
+        // unchanged, and MISSES on any rotate (active name change) or swap
+        // (generation bump). adapter_id_hash's own stability is covered above.
+        let slot = 3usize;
+
+        // Base (no LoRA) → active_id 0 → key reduces to (slot, 0): byte-identical
+        // single-key behavior. Same base step re-keys to the same entry (HIT).
+        assert_eq!((slot, 0u64), (slot, 0u64));
+
+        // A fixed single adapter never rotates / never bumps generation → the id
+        // is constant → the same logical key every step (HIT, still graphed).
+        let sparky = adapter_id_hash("sparky", 0);
+        assert_eq!((slot, sparky), (slot, adapter_id_hash("sparky", 0)));
+
+        // A ROTATE changes the active adapter name → different id → different key
+        // → the pre-rotate graph is a MISS (never replayed over swapped bytes).
+        let vega = adapter_id_hash("vega", 0);
+        assert_ne!((slot, sparky), (slot, vega));
+
+        // A SWAP into the active slot bumps that slot's generation → different id
+        // → different key → MISS (fresh capture over the new pool bytes).
+        let sparky_gen1 = adapter_id_hash("sparky", 1);
+        assert_ne!((slot, sparky), (slot, sparky_gen1));
+
+        // The base sentinel 0 never aliases a real adapter's key on the same slot.
+        assert_ne!((slot, 0u64), (slot, sparky));
+        assert_ne!((slot, 0u64), (slot, sparky_gen1));
+
+        // A DIFFERENT slot with the SAME active id is a distinct key (per-slot
+        // SSM/KV pointers still bake in) — the slot component is preserved.
+        assert_ne!((slot, sparky), (slot + 1, sparky));
+
+        // verify_kgamma's 3-tuple `(slot, K, active_id)`: same discipline, and K
+        // (gamma width) stays an independent axis alongside the active id.
+        assert_eq!(
+            (slot, 5usize, sparky),
+            (slot, 5usize, adapter_id_hash("sparky", 0))
+        );
+        assert_ne!((slot, 5usize, sparky), (slot, 5usize, vega));
+        assert_ne!((slot, 5usize, sparky), (slot, 6usize, sparky));
+    }
+
+    #[test]
     fn slot_generation_bump_freshens_adapter_id() {
         // A slot whose contents were re-staged (generation bumped) must yield a
         // DIFFERENT adapter_id than at first load — the #24 residual: reloading

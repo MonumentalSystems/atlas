@@ -82,16 +82,22 @@ pub struct TransformerModel {
     pub(super) batched_embed_kernel: KernelHandle,
     pub(super) fill_slots_kernel: KernelHandle,
     /// Cached CUDA graph for single-sequence decode (layer loop + norm + LM head).
-    /// CUDA graph cache for n=1 decode, keyed by `seq.slot_idx`. The captured
-    /// graph has SSM h_state/conv_state pointers baked in as kernel arguments,
-    /// so a graph captured for slot S can ONLY be replayed for slot S — replay
-    /// for any other slot reads/writes the wrong sequence's recurrent state
+    /// CUDA graph cache for n=1 decode, keyed by `(seq.slot_idx, active_id)`. The
+    /// captured graph has SSM h_state/conv_state pointers baked in as kernel
+    /// arguments, so a graph captured for slot S can ONLY be replayed for slot S —
+    /// replay for any other slot reads/writes the wrong sequence's recurrent state
     /// and produces gibberish for both sequences. With concurrent users we may
     /// alternate between slots in n=1 decode (e.g. via the per-seq fresh-decode
     /// fix in scheduler::step_decode_only), so we keep one graph per slot.
-    pub(super) decode_graph: Mutex<std::collections::HashMap<usize, GraphHandle>>,
-    /// Cached CUDA graphs for batched decode, keyed by padded batch size.
-    pub(super) batch_decode_graphs: Mutex<HashMap<usize, GraphHandle>>,
+    /// Task #28: the second key component is the ACTIVE adapter id
+    /// (`adapter_id_for_slot(-1)`, `0` = base) — a captured graph also bakes the
+    /// INSTALLED-ACTIVE LoRA pair pointers, so a rotate/swap that changes the
+    /// active identity RE-KEYS (fresh capture) instead of replaying over swapped
+    /// pool bytes. `0` when no LoRA is resident → byte-identical single-key base.
+    pub(super) decode_graph: Mutex<std::collections::HashMap<(usize, u64), GraphHandle>>,
+    /// Cached CUDA graphs for batched decode, keyed by `(padded batch size,
+    /// active_id)` (Task #28 active-adapter id as the second component).
+    pub(super) batch_decode_graphs: Mutex<HashMap<(usize, u64), GraphHandle>>,
     /// Pre-allocated SSM state pool for stable GPU addresses across graph replays.
     /// `Arc` so each `SequenceState` can hold a `SlotGuard` that releases its
     /// claimed slot on drop — guaranteeing the slot returns to the free list on
@@ -138,15 +144,20 @@ pub struct TransformerModel {
     /// a different slot writes to the wrong sequence's recurrent state. With
     /// concurrent users alternating through MTP verify, a single
     /// `Option<GraphHandle>` would corrupt both slots' SSM state.
-    pub(super) verify2_graph: Mutex<std::collections::HashMap<usize, GraphHandle>>,
-    /// Cached CUDA graphs for K=3 verification, keyed by `seq.slot_idx`.
-    pub(super) verify3_graph: Mutex<std::collections::HashMap<usize, GraphHandle>>,
-    /// Cached CUDA graphs for K=4 verification, keyed by `seq.slot_idx`.
-    pub(super) verify4_graph: Mutex<std::collections::HashMap<usize, GraphHandle>>,
+    pub(super) verify2_graph: Mutex<std::collections::HashMap<(usize, u64), GraphHandle>>,
+    /// Cached CUDA graphs for K=3 verification, keyed by `(seq.slot_idx, active_id)`.
+    pub(super) verify3_graph: Mutex<std::collections::HashMap<(usize, u64), GraphHandle>>,
+    /// Cached CUDA graphs for K=4 verification, keyed by `(seq.slot_idx, active_id)`.
+    pub(super) verify4_graph: Mutex<std::collections::HashMap<(usize, u64), GraphHandle>>,
     /// Cached CUDA graphs for DFlash K=γ verification, keyed by
-    /// `(seq.slot_idx, K)`. K is `tokens.len()` (γ+1 typically). One graph
-    /// per (slot, K) — different γ values coexist via the K dimension.
-    pub(super) verify_kgamma_graph: Mutex<std::collections::HashMap<(usize, usize), GraphHandle>>,
+    /// `(seq.slot_idx, K, active_id)`. K is `tokens.len()` (γ+1 typically). One
+    /// graph per (slot, K) — different γ values coexist via the K dimension.
+    /// Task #28: `active_id` (`adapter_id_for_slot(-1)`, `0` = base) is the SOLE
+    /// invalidation guard here — this cache is never touched by the rotate/swap
+    /// defensive clears — so a rotate/swap must re-key it to avoid replaying a
+    /// graph baked over swapped active-adapter pool bytes.
+    pub(super) verify_kgamma_graph:
+        Mutex<std::collections::HashMap<(usize, usize, u64), GraphHandle>>,
     /// Prefix cache for KV block reuse across requests.
     pub(super) prefix_cache: Box<dyn spark_runtime::prefix_cache::PrefixCache>,
     /// Secondary CUDA stream for pipelining checkpoint D2D with MTP propose.

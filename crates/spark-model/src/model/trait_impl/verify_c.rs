@@ -161,10 +161,10 @@ impl TransformerModel {
 
         // Phase 6.2.c — HSS host I/O is illegal under CUDA graph capture.
         let hss_engaged = kv_cache.config().cache_blocks_per_seq.is_some();
-        // LoRA rotation (eager-on-rotate): stay eager when adapter rotation is
-        // armed so the spec verify graphs never replay stale slot pointers.
-        let lora_eager =
-            self.lora.is_some() && (crate::lora::lora_eager_env() || self.lora_rotatable);
+        // Task #28: a swappable pool no longer forces eager — the K=3 verify graph
+        // is keyed by the ACTIVE adapter id below, so a rotate/swap re-keys instead
+        // of replaying stale slot pointers. ATLAS_LORA_EAGER stays a debug hatch.
+        let lora_eager = self.lora.is_some() && crate::lora::lora_eager_env();
         let use_graphs = self.comm.is_none() && !hss_engaged && !lora_eager;
 
         let ctx = ForwardContext {
@@ -181,6 +181,9 @@ impl TransformerModel {
 
         // ── Phase 2: CUDA graph capture / replay ──
 
+        // Task #28: ACTIVE adapter id (0 = base) folded into the verify graph key;
+        // bound once and reused for lookup + insert.
+        let active_id = self.adapter_id_for_slot(-1);
         let mut graph_cache = if use_graphs {
             Some(self.verify3_graph.lock())
         } else {
@@ -190,7 +193,7 @@ impl TransformerModel {
         // SLOT-KEYED LOOKUP: only replay if this seq's slot has a captured graph.
         let cached_for_slot = graph_cache
             .as_ref()
-            .and_then(|c| c.get(&seq.slot_idx).copied());
+            .and_then(|c| c.get(&(seq.slot_idx, active_id)).copied());
         if let Some(graph) = cached_for_slot
             && graph.0 != 0
         {
@@ -301,7 +304,7 @@ impl TransformerModel {
                 if graph.0 != 0 {
                     tracing::info!("Captured CUDA graph for K=3 verify (slot={})", seq.slot_idx);
                     if let Some(ref mut cache) = graph_cache {
-                        cache.insert(seq.slot_idx, graph);
+                        cache.insert((seq.slot_idx, active_id), graph);
                     }
                     self.gpu.launch_graph(graph, stream)?;
                 }

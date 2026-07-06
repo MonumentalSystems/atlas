@@ -193,12 +193,10 @@ impl TransformerModel {
         // the verify eagerly. Zero production impact — only when K2_DIAG is set
         // (mirrors ATLAS_DFLASH_DEBUG_NO_GRAPH for the DFlash verify path).
         let k2_diag_eager = std::env::var("ATLAS_K2_DIAG").ok().as_deref() == Some("1");
-        // LoRA rotation (eager-on-rotate): when an adapter is loaded and rotation
-        // is armed, the slot pointers may be re-pointed at runtime, so the spec
-        // verify path must stay eager too (its graphs bake slot pointers exactly
-        // like decode). Collapses to the M1 gate when rotation isn't armed.
-        let lora_eager =
-            self.lora.is_some() && (crate::lora::lora_eager_env() || self.lora_rotatable);
+        // Task #28: a swappable pool no longer forces eager — the K=2 verify graph
+        // is keyed by the ACTIVE adapter id below, so a rotate/swap re-keys instead
+        // of replaying baked slot pointers. ATLAS_LORA_EAGER stays a debug hatch.
+        let lora_eager = self.lora.is_some() && crate::lora::lora_eager_env();
         let use_graphs = self.comm.is_none()
             && !self
                 .suppress_graphs
@@ -232,6 +230,9 @@ impl TransformerModel {
 
         // ── Phase 2: CUDA graph capture / replay ──
 
+        // Task #28: ACTIVE adapter id (0 = base) folded into the verify graph key;
+        // bound once and reused for lookup + insert.
+        let active_id = self.adapter_id_for_slot(-1);
         let mut graph_cache = if use_graphs {
             Some(self.verify2_graph.lock())
         } else {
@@ -241,7 +242,7 @@ impl TransformerModel {
         // SLOT-KEYED LOOKUP: only replay if this seq's slot has a captured graph.
         let cached_for_slot = graph_cache
             .as_ref()
-            .and_then(|c| c.get(&seq.slot_idx).copied());
+            .and_then(|c| c.get(&(seq.slot_idx, active_id)).copied());
         if let Some(graph) = cached_for_slot
             && graph.0 != 0
         {
@@ -374,7 +375,7 @@ impl TransformerModel {
                 if graph.0 != 0 {
                     tracing::info!("Captured CUDA graph for K=2 verify (slot={})", seq.slot_idx);
                     if let Some(ref mut cache) = graph_cache {
-                        cache.insert(seq.slot_idx, graph);
+                        cache.insert((seq.slot_idx, active_id), graph);
                     }
                     self.gpu.launch_graph(graph, stream)?;
                 }

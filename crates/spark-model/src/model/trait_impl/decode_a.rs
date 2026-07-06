@@ -191,12 +191,11 @@ impl TransformerModel {
         // Default (unset) keeps graphs ON — the LoRA delta launches are
         // capture-safe (pool weights / arena scratch / f32 scale are all
         // load-time-fixed). Folded in as one more suppressor.
-        // eager-on-rotate: an armed rotatable adapter also forces eager (so a
-        // runtime `set_active_lora` re-point is immediately live, never a stale
-        // graph replay). Single startup adapter + no rotation env ⇒ false ⇒
-        // graphs captured exactly as before.
-        let lora_eager =
-            self.lora.is_some() && (crate::lora::lora_eager_env() || self.lora_rotatable);
+        // Task #28: a swappable pool no longer forces eager. The decode graph is
+        // keyed by the ACTIVE adapter id below, so a rotate/swap re-keys (fresh
+        // capture) instead of replaying a graph baked over swapped pool bytes.
+        // ATLAS_LORA_EAGER remains a hard debug hatch (never graph when set).
+        let lora_eager = self.lora.is_some() && crate::lora::lora_eager_env();
         let use_graphs = decode_graphs_allowed(
             self.comm.is_none(),
             ep_graphs,
@@ -229,6 +228,11 @@ impl TransformerModel {
 
         // ── Phase 2: Try CUDA graph replay ──
 
+        // Task #28: the ACTIVE adapter id (0 = base) folded into the graph key.
+        // Bound ONCE per step and reused for both the lookup and the capture-insert
+        // so a rotate (only at scheduler-quiescent points) can never split the key
+        // across the two accesses within this step.
+        let active_id = self.adapter_id_for_slot(-1);
         let mut graph_cache = if use_graphs {
             Some(self.decode_graph.lock())
         } else {
@@ -242,7 +246,7 @@ impl TransformerModel {
         // before each graph replay.
         // SLOT-KEYED LOOKUP: only replay if this seq's slot matches a captured graph.
         if let Some(ref cache) = graph_cache
-            && let Some(graph) = cache.get(&seq.slot_idx)
+            && let Some(graph) = cache.get(&(seq.slot_idx, active_id))
             && graph.0 != 0
         {
             self.gpu.launch_graph(*graph, stream)?;
@@ -394,7 +398,7 @@ impl TransformerModel {
                     graph.0
                 );
                 if let Some(ref mut cache) = graph_cache {
-                    cache.insert(seq.slot_idx, graph);
+                    cache.insert((seq.slot_idx, active_id), graph);
                 }
                 self.gpu.launch_graph(graph, stream)?;
             } else {
