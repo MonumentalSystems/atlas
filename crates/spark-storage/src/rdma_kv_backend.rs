@@ -29,6 +29,7 @@
 // SSD. Peer CPU idle (one-sided); each group belongs to one client, no coherence.
 
 use std::collections::HashMap;
+use std::ffi::c_void;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 
@@ -63,6 +64,12 @@ struct Rail {
     free: Vec<usize>,
     inflight: HashMap<u64, InFlight>,
     next_wr: u64,
+    /// Zero-copy restore: lkeys of destination MRs registered on demand (a UMA
+    /// dst is GPU-addressable, so RDMA lands there directly — no bounce, no
+    /// copy_h2d). Cached by dst address; KV scratch slots are reused.
+    dst_lkeys: HashMap<u64, u32>,
+    /// In-flight direct (zero-copy) reads on this rail — no bounce to free.
+    direct_inflight: usize,
 }
 
 impl Rail {
@@ -71,6 +78,22 @@ impl Rail {
         let w = self.next_wr;
         self.next_wr = self.next_wr.wrapping_add(1);
         w
+    }
+
+    /// Register (once, cached) a `bytes`-sized destination MR at `addr` for a
+    /// zero-copy RDMA READ landing. On GB10 UMA the dst is GPU-addressable pinned
+    /// host memory, so `ibv_reg_mr` on its VA succeeds and the GPU reads the
+    /// landed bytes at the same address — no `copy_h2d`.
+    fn reg_dst(&mut self, addr: u64, bytes: usize) -> Result<u32> {
+        if let Some(&lk) = self.dst_lkeys.get(&addr) {
+            return Ok(lk);
+        }
+        // SAFETY: caller guarantees zero-copy mode => addr is a live UMA buffer
+        // of at least `bytes` (else reg_mr fails, surfacing a clear error).
+        let keys = unsafe { self.verbs.reg_mr(addr as *mut c_void, bytes, false) }
+            .context("zero-copy restore needs a UMA (GPU-addressable) dst; reg_mr failed")?;
+        self.dst_lkeys.insert(addr, keys.lkey);
+        Ok(keys.lkey)
     }
 
     /// Reap exactly one completion on this rail, freeing its bounce. For a READ,
@@ -139,6 +162,10 @@ pub struct RdmaKvBackend {
     layout: GroupLayout,
     remote_base: u64,
     rr: usize, // round-robin rail cursor for writes
+    /// Zero-copy restore (ATLAS_KV_ZERO_COPY=1): RDMA READ lands directly into
+    /// the (UMA) destination, skipping the bounce + copy_h2d that otherwise caps
+    /// restore at the copy-engine bandwidth.
+    zero_copy: bool,
     _stream: TcpStream,
 }
 
@@ -202,6 +229,8 @@ impl RdmaKvBackend {
                 bounces,
                 inflight: HashMap::new(),
                 next_wr: 0,
+                dst_lkeys: HashMap::new(),
+                direct_inflight: 0,
             });
         }
 
@@ -249,6 +278,7 @@ impl RdmaKvBackend {
             layout,
             remote_base: base,
             rr: 0,
+            zero_copy: std::env::var("ATLAS_KV_ZERO_COPY").ok().as_deref() == Some("1"),
             _stream: stream,
         })
     }
@@ -256,6 +286,57 @@ impl RdmaKvBackend {
     #[inline]
     fn remote_addr(&self, key: GroupKey) -> u64 {
         self.remote_base + self.layout.group_id(key).0 * self.layout.group_stride
+    }
+
+    /// Zero-copy restore: RDMA READ each group DIRECTLY into its (UMA) HBM dest —
+    /// the dst is registered as the landing MR, so there is no bounce and no
+    /// `copy_h2d`. On completion the bytes are already GPU-visible at `dst`
+    /// (same host==dev VA), so no `stream_sync` either. Removes the copy-engine
+    /// bottleneck that pinned single-rail restore at ~9.7 GB/s, letting it
+    /// dual-rail. Requires UMA destinations (else `reg_dst` errors clearly).
+    fn read_zero_copy(&mut self, requests: &[ReadRequest], bytes: usize) -> Result<()> {
+        let n = self.rails.len();
+        let depth = self.rails[0].bounces.len(); // in-flight cap per rail
+        let mut pend: Vec<std::collections::VecDeque<usize>> = vec![Default::default(); n];
+        for (j, _) in requests.iter().enumerate() {
+            pend[j % n].push_back(j);
+        }
+        loop {
+            let mut active = false;
+            for (ri, rail) in self.rails.iter_mut().enumerate() {
+                while rail.direct_inflight < depth {
+                    let Some(j) = pend[ri].pop_front() else { break };
+                    let dst = requests[j].dst_dev_ptr;
+                    let lkey = rail.reg_dst(dst, bytes)?;
+                    let raddr = self.remote_base
+                        + self.layout.group_id(requests[j].group).0 * self.layout.group_stride;
+                    let wr = rail.fresh_wr();
+                    // SAFETY: dst is a live UMA MR (lkey) of `bytes`; raddr/rkey
+                    // address the peer blade. The NIC DMAs straight into the
+                    // GPU-addressable dst.
+                    unsafe {
+                        rail.verbs.post_read(
+                            dst as *mut c_void,
+                            lkey,
+                            raddr,
+                            rail.remote_rkey,
+                            bytes as u32,
+                            wr,
+                        )?;
+                    }
+                    rail.direct_inflight += 1;
+                }
+                if rail.direct_inflight > 0 {
+                    rail.verbs.poll()?; // completion => bytes GPU-visible in dst
+                    rail.direct_inflight -= 1;
+                    active = true;
+                }
+            }
+            if !active && pend.iter().all(|q| q.is_empty()) {
+                break;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -269,6 +350,9 @@ impl StorageBackend for RdmaKvBackend {
         // Ensure any pending offloads land first, so a restore sees them.
         for rail in &mut self.rails {
             rail.drain(bytes, stream)?;
+        }
+        if self.zero_copy {
+            return self.read_zero_copy(requests, bytes);
         }
         let n = self.rails.len();
         // Per-rail queues of pending request indices, striped round-robin.
@@ -338,13 +422,19 @@ impl Drop for RdmaKvBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cuda_min::{CudaCtx, DeviceBuffer, copy_d_to_h_async};
+    use crate::cuda_min::CudaCtx;
     use crate::group::KvKind;
+
+    // Read a UMA (pinned, host==dev VA) dst's bytes host-side — valid for both
+    // the bounce path (copy_h2d lands there) and zero-copy (RDMA lands there).
+    unsafe fn uma_bytes(buf: &PinnedBuffer, n: usize) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(buf.ptr as *const u8, n) }
+    }
 
     #[test]
     #[ignore = "requires GPU + live kv-peer at $ATLAS_KV_PEER"]
     fn rdma_kv_round_trip() {
-        let ctx = CudaCtx::new(0).expect("cuda init");
+        let _ctx = CudaCtx::new(0).expect("cuda init");
         let peer = std::env::var("ATLAS_KV_PEER").expect("set ATLAS_KV_PEER=host:port");
         let layout = GroupLayout::new(2, 4, 2, 16, 128, 2, 4096);
         let bytes = layout.group_bytes() as usize;
@@ -359,18 +449,20 @@ mod tests {
         for (i, k) in keys.iter().enumerate() {
             be.write_from_host(*k, &pat(i)).expect("write_from_host");
         }
-        let devs: Vec<_> = keys.iter().map(|_| DeviceBuffer::new(bytes).unwrap()).collect();
+        // UMA dsts so the same test validates both the bounce and zero-copy paths.
+        let devs: Vec<_> = keys.iter().map(|_| PinnedBuffer::new(bytes).unwrap()).collect();
         let reqs: Vec<_> = keys
             .iter()
             .zip(&devs)
-            .map(|(k, d)| ReadRequest { group: *k, dst_dev_ptr: d.ptr })
+            .map(|(k, d)| ReadRequest {
+                group: *k,
+                dst_dev_ptr: d.device_ptr().unwrap(),
+            })
             .collect();
-        be.read(&reqs, ctx.stream).expect("read");
+        be.read(&reqs, _ctx.stream).expect("read");
         for (i, d) in devs.iter().enumerate() {
-            let mut back = vec![0u8; bytes];
-            copy_d_to_h_async(back.as_mut_ptr() as *mut _, d.ptr, bytes, ctx.stream).unwrap();
-            stream_sync(ctx.stream).unwrap();
-            assert_eq!(back, pat(i), "group {:?} corrupted through the RDMA blade", keys[i]);
+            let back = unsafe { uma_bytes(d, bytes) };
+            assert_eq!(back, &pat(i)[..], "group {:?} corrupted through the RDMA blade", keys[i]);
         }
     }
 
@@ -397,7 +489,9 @@ mod tests {
             })
             .collect();
         let src = vec![0xABu8; gbytes];
-        let dev = DeviceBuffer::new(gbytes).unwrap();
+        // UMA dst so zero-copy (ATLAS_KV_ZERO_COPY=1) can RDMA straight in.
+        let dst = PinnedBuffer::new(gbytes).unwrap();
+        let dptr = dst.device_ptr().unwrap();
 
         let t0 = std::time::Instant::now();
         for k in &keys {
@@ -410,7 +504,7 @@ mod tests {
 
         let reqs: Vec<_> = keys
             .iter()
-            .map(|k| ReadRequest { group: *k, dst_dev_ptr: dev.ptr })
+            .map(|k| ReadRequest { group: *k, dst_dev_ptr: dptr })
             .collect();
         let t1 = std::time::Instant::now();
         be.read(&reqs, ctx.stream).expect("read");
@@ -418,10 +512,11 @@ mod tests {
 
         let gbps = |dt: f64| (total as f64) / dt / 1e9;
         println!(
-            "\nRDMA KV tier ({} rail(s), pipelined): {} groups × {} B = {:.0} MiB\n  \
+            "\nRDMA KV tier ({} rail(s), {}, pipelined): {} groups × {} B = {:.0} MiB\n  \
              OFFLOAD (RDMA WRITE): {:.3}s => {:.2} GB/s\n  \
-             RESTORE (RDMA READ + h2d): {:.3}s => {:.2} GB/s",
+             RESTORE (RDMA READ): {:.3}s => {:.2} GB/s",
             be.rails.len(),
+            if be.zero_copy { "zero-copy" } else { "bounce+h2d" },
             ngroups,
             gbytes,
             total as f64 / 1048576.0,
