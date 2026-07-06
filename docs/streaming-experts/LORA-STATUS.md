@@ -85,3 +85,30 @@ Batching is the ceiling and the global-active-adapter is the wart. BGMV is the
 5. **#28 Generation-keyed graphs** — retire `lora_rotatable` forced-eager.
 6. **#26 Fix `pack_store_into_slot` stale table** — cheap hardening.
 7. **#29 / bgmv** — wire the fused kernel into the reliable batch>1 path (last).
+
+## Update (2026-07-06 pm) — reviewer roadmap #22-#29 landed
+
+The reviewer's ranked plan is implemented + validated on GB10 (holo-0.8b):
+
+| # | task | commit | state |
+|---|---|---|---|
+| 23 | request-scoped selector (prefill+single-seq route) | 067b676 | ✅ solo request routes to its adapter |
+| 24 | adapter-correct KV (per-adapter radix roots + snapshot id) | 30b2852 | ✅ 3× LGTM, base byte-identical |
+| 25 | slot generation + ref_count (safe swap) | 125d168 | ✅ closes #24 same-name residual |
+| 27 | demand-driven RDMA promotion (coalesced, LRU) | 6b546ab | ✅ hot cache over 1000s staged |
+| 28 | generation-keyed graphs (retire forced-eager) | 939fcc4 | ✅ swappable pool decodes GRAPHED |
+| 26 | slot-swap table refresh (stale-coverage) | 94bea6d | ✅ both disk + RDMA swap paths |
+| 22 | LoRA HTTP guard-pass (CodeQL) | 5101c02 | ✅ allocation cap + input bounds |
+| 29 | reliable batch>1 routed decode | (umbrella) | ✅ validated: concurrent diff-adapter routing, graph-safe |
+
+**The WIP "DO NOT ENABLE" on the fused bgmv (d3ea611) is LIFTED**: with request-scoped
+routing (#23) + adapter-correct KV (#24) + the gen/ref_count substrate (#25) +
+gen-keyed graphs (#28), the batched multi-seq routed decode is correct and enabled.
+Validated: two concurrent requests naming different adapters each route to their own
+adapter (active byte-clean; routed applies its adapter), single-seq routes, decode
+graphs stay captured under a swappable pool.
+
+**Remaining refinements:** #30 routed-prefill precision (routed prefill uses the bgmv
+per-row gemv vs dense_gemm_tc → an overfit adapter's exact low-margin tokens degrade;
+persona/behaviour route correctly); #31 spilled-seq panic-leak hardening (bare atomic
+ref; the swap-side hole is already closed by #27's swapped.is_empty() drain gate).
