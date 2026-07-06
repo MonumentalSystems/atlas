@@ -100,7 +100,10 @@ impl HighSpeedSwap {
                         "high-speed-swap: KV overflow tier = RDMA peer {peer} (group_stride {})",
                         group_layout.group_stride
                     );
-                    Box::new(crate::rdma_kv_backend::RdmaKvBackend::connect(&peer, group_layout)?)
+                    Box::new(crate::rdma_kv_backend::RdmaKvBackend::connect(
+                        &peer,
+                        group_layout,
+                    )?)
                 } else {
                     let layout = Layout::create(&cfg.dir, group_layout).context("create layout")?;
                     Box::new(IoUringBackend::new(layout, cfg.qd as usize)?)
@@ -134,7 +137,11 @@ impl HighSpeedSwap {
             tracing::info!(
                 "high-speed-swap: scratch pool UMA={} (zero-copy restore {})",
                 pool.is_uma(),
-                if pool.is_uma() { "enabled" } else { "unavailable — using bounce" },
+                if pool.is_uma() {
+                    "enabled"
+                } else {
+                    "unavailable — using bounce"
+                },
             );
         }
         // T1 cascade: wrap `backing` in a local pinned-RAM write-back cache when

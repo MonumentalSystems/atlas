@@ -107,9 +107,7 @@ impl ScratchPool {
                 let dev = p.device_ptr()?;
                 Ok((p, dev))
             }) {
-                Ok((pinned, dev)) if dev == pinned.ptr as u64 => {
-                    (PoolMem::Uma(pinned), dev, true)
-                }
+                Ok((pinned, dev)) if dev == pinned.ptr as u64 => (PoolMem::Uma(pinned), dev, true),
                 Ok((pinned, dev)) => {
                     tracing::warn!(
                         "ScratchPool: pinned host VA {:#x} != device VA {dev:#x} — host is \

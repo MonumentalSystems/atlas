@@ -372,9 +372,9 @@ mod helpers_b;
 mod helpers_c;
 mod helpers_stream;
 mod init;
-mod streamer;
 #[cfg(test)]
 mod mod_tests;
+mod streamer;
 
 pub(crate) use streamer::ExpertStreamerShared;
 

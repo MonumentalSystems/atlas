@@ -62,7 +62,12 @@ impl RdmaWeightLoader {
         }
     }
 
-    pub fn with_ep(peer_addr: String, ep_rank: usize, ep_world_size: usize, num_experts: usize) -> Self {
+    pub fn with_ep(
+        peer_addr: String,
+        ep_rank: usize,
+        ep_world_size: usize,
+        num_experts: usize,
+    ) -> Self {
         Self {
             peer_addr,
             model_id: None,
@@ -210,10 +215,14 @@ impl RdmaWeightLoader {
                 .filter(|t| t.dtype == "F8_E4M3")
                 .map(|t| t.len)
                 .sum();
-            let fp8_frac = if est > 0 { fp8 as f64 / est as f64 } else { 0.0 };
-            let mult = self
-                .peak_memory_multiplier
-                .unwrap_or(if fp8_frac > 0.5 { 1.5 } else { 1.3 });
+            let fp8_frac = if est > 0 {
+                fp8 as f64 / est as f64
+            } else {
+                0.0
+            };
+            let mult =
+                self.peak_memory_multiplier
+                    .unwrap_or(if fp8_frac > 0.5 { 1.5 } else { 1.3 });
             let peak = (est as f64 * mult) as usize;
             let free = gpu.free_memory()?;
             let gib = |b: usize| b as f64 / (1024.0 * 1024.0 * 1024.0);
@@ -241,9 +250,15 @@ impl RdmaWeightLoader {
         // dual-rail is opt-in (ATLAS_WEIGHT_DUAL_RAIL=1). ATLAS_WEIGHT_* overrides
         // fall back to the ATLAS_EXPERT_* names so a single fabric config serves
         // both tiers.
-        let dev0 = env_str(&["ATLAS_WEIGHT_RDMA_DEV", "ATLAS_EXPERT_RDMA_DEV"], "roceP2p1s0f1");
+        let dev0 = env_str(
+            &["ATLAS_WEIGHT_RDMA_DEV", "ATLAS_EXPERT_RDMA_DEV"],
+            "roceP2p1s0f1",
+        );
         let gid0 = env_u32(&["ATLAS_WEIGHT_RDMA_GID", "ATLAS_EXPERT_RDMA_GID"], 3);
-        let dev1 = env_str(&["ATLAS_WEIGHT_RAIL2_DEV", "ATLAS_EXPERT_RAIL2_DEV"], "rocep1s0f1");
+        let dev1 = env_str(
+            &["ATLAS_WEIGHT_RAIL2_DEV", "ATLAS_EXPERT_RAIL2_DEV"],
+            "rocep1s0f1",
+        );
         let gid1 = env_u32(&["ATLAS_WEIGHT_RAIL2_GID", "ATLAS_EXPERT_RAIL2_GID"], 3);
         let dual = std::env::var("ATLAS_WEIGHT_DUAL_RAIL").ok().as_deref() == Some("1");
         let rail_devs: Vec<(String, u32)> = if dual {
@@ -307,7 +322,9 @@ impl RdmaWeightLoader {
         }
 
         // Reply with our QP params, connect each rail, await the ready ack.
-        stream.write_all(&[n_rails as u8]).context("send client n_rails")?;
+        stream
+            .write_all(&[n_rails as u8])
+            .context("send client n_rails")?;
         for r in &rails {
             VerbsClientParams {
                 qpn: r.verbs.qpn(),
@@ -322,7 +339,9 @@ impl RdmaWeightLoader {
             r.verbs.connect(sp.qpn, sp.psn, &sp.gid)?;
         }
         let mut ack = [0u8; 1];
-        stream.read_exact(&mut ack).context("read verbs ready ack")?;
+        stream
+            .read_exact(&mut ack)
+            .context("read verbs ready ack")?;
         if ack[0] != STATUS_OK {
             bail!("weight peer refused connection (ack {})", ack[0]);
         }
@@ -368,7 +387,10 @@ impl RdmaWeightLoader {
             }
             match rail.verbs.poll() {
                 Ok(got) if got == wr_id => {}
-                Ok(got) => bail!("completion wr_id {got:#x} != expected {wr_id:#x} ({})", rec.name),
+                Ok(got) => bail!(
+                    "completion wr_id {got:#x} != expected {wr_id:#x} ({})",
+                    rec.name
+                ),
                 Err(e) => return Err(e).with_context(|| format!("poll {}", rec.name)),
             }
 

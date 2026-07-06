@@ -19,7 +19,7 @@ use std::path::PathBuf;
 
 use spark_storage::cuda_min::CudaCtx;
 use spark_storage::expert::{ExpertKey, Proj};
-use spark_storage::expert_tier::{read_device, ArenaSlot, ExpertTier, PosixTier, UmaArenaTier};
+use spark_storage::expert_tier::{ArenaSlot, ExpertTier, PosixTier, UmaArenaTier, read_device};
 use spark_storage::expert_tier_rdma::RdmaTier;
 use spark_storage::{ExpertFileWriter, ExpertIndex, ExpertRecordHeader, ProjData};
 
@@ -76,8 +76,14 @@ fn build_store(tag: &str) -> (PathBuf, HashMap<(u32, u32), Expected>) {
                 let seed = (layer as u64) << 24 | (expert as u64) << 8 | p as u64;
                 packed[p as usize] = fill((n * k / 2) as usize, seed);
                 scale[p as usize] = fill((n * k / GS) as usize, seed ^ 0x5555);
-                assert_eq!(packed[p as usize].len() as u64, spec.proj_bytes(p).packed_bytes);
-                assert_eq!(scale[p as usize].len() as u64, spec.proj_bytes(p).scale_bytes);
+                assert_eq!(
+                    packed[p as usize].len() as u64,
+                    spec.proj_bytes(p).packed_bytes
+                );
+                assert_eq!(
+                    scale[p as usize].len() as u64,
+                    spec.proj_bytes(p).scale_bytes
+                );
             }
             let scale2 = [
                 1.0 + layer as f32,
@@ -95,16 +101,30 @@ fn build_store(tag: &str) -> (PathBuf, HashMap<(u32, u32), Expected>) {
                 input_scale,
             };
             let projs = [
-                ProjData { packed: &packed[0], scale: &scale[0] },
-                ProjData { packed: &packed[1], scale: &scale[1] },
-                ProjData { packed: &packed[2], scale: &scale[2] },
+                ProjData {
+                    packed: &packed[0],
+                    scale: &scale[0],
+                },
+                ProjData {
+                    packed: &packed[1],
+                    scale: &scale[1],
+                },
+                ProjData {
+                    packed: &packed[2],
+                    scale: &scale[2],
+                },
             ];
             writer
                 .write_record(ExpertKey::new(layer, expert), &header, &projs)
                 .expect("write record");
             expected.insert(
                 (layer, expert),
-                Expected { packed, scale, scale2, input_scale },
+                Expected {
+                    packed,
+                    scale,
+                    scale2,
+                    input_scale,
+                },
             );
         }
     }
@@ -123,7 +143,8 @@ fn assert_matches(
     let r = tier.fetch(key, slot, stream).expect("fetch");
     assert_eq!(r.scale2, exp.scale2, "{:?} scale2 ({:?})", key, tier.kind());
     assert_eq!(
-        r.input_scale, exp.input_scale,
+        r.input_scale,
+        exp.input_scale,
         "{:?} input_scale ({:?})",
         key,
         tier.kind()
@@ -134,14 +155,20 @@ fn assert_matches(
         let got_packed = read_device(r.packed_addr[p as usize], pl, stream).unwrap();
         let got_scale = read_device(r.scale_addr[p as usize], sl, stream).unwrap();
         assert_eq!(
-            got_packed, exp.packed[p as usize],
+            got_packed,
+            exp.packed[p as usize],
             "{:?} {:?} packed via {:?}",
-            key, p, tier.kind()
+            key,
+            p,
+            tier.kind()
         );
         assert_eq!(
-            got_scale, exp.scale[p as usize],
+            got_scale,
+            exp.scale[p as usize],
             "{:?} {:?} scale via {:?}",
-            key, p, tier.kind()
+            key,
+            p,
+            tier.kind()
         );
     }
 }
@@ -257,9 +284,17 @@ fn fetch_touches_only_its_slot() {
     // ...slot 0's bytes are unchanged.
     let e0 = &expected[&(0, 0)];
     for p in Proj::ALL {
-        let got = read_device(r0.packed_addr[p as usize], e0.packed[p as usize].len(), ctx.stream)
-            .unwrap();
-        assert_eq!(got, e0.packed[p as usize], "slot 0 {:?} disturbed by slot 1 fetch", p);
+        let got = read_device(
+            r0.packed_addr[p as usize],
+            e0.packed[p as usize].len(),
+            ctx.stream,
+        )
+        .unwrap();
+        assert_eq!(
+            got, e0.packed[p as usize],
+            "slot 0 {:?} disturbed by slot 1 fetch",
+            p
+        );
     }
     let _ = std::fs::remove_dir_all(&dir);
 }

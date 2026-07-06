@@ -41,7 +41,9 @@ impl PinnedStore {
     #[inline]
     fn slot_host_ptr(&self, slot: u32) -> *const c_void {
         // SAFETY: slot < cap_slots (SlotCache invariant); offset within the buf.
-        unsafe { (self.buf.ptr as *const u8).add(slot as usize * self.group_bytes) as *const c_void }
+        unsafe {
+            (self.buf.ptr as *const u8).add(slot as usize * self.group_bytes) as *const c_void
+        }
     }
     /// Copy the group bytes for `slot` out into a fresh Vec (releases the borrow
     /// so the flush can call `&mut backing`).

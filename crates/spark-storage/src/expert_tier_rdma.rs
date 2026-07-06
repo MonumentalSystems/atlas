@@ -138,7 +138,10 @@ impl RdmaTier {
     /// Two-sided TCP fetch: request the record, read `[status][stride bytes]`
     /// straight into the pinned slot.
     fn fetch_tcp(&mut self, key: ExpertKey, host: *mut u8, stride: usize) -> Result<()> {
-        if let Err(e) = self.stream.write_all(&encode_request(key.layer, key.expert)) {
+        if let Err(e) = self
+            .stream
+            .write_all(&encode_request(key.layer, key.expert))
+        {
             self.healthy = false;
             return Err(e).with_context(|| format!("peer request {:?}", key));
         }
@@ -163,7 +166,10 @@ impl RdmaTier {
 
 #[cfg(atlas_rdma_verbs)]
 fn env_u32(k: &str, default: u32) -> u32 {
-    std::env::var(k).ok().and_then(|s| s.parse().ok()).unwrap_or(default)
+    std::env::var(k)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(default)
 }
 
 /// Bring up the one-sided verbs transport: create N rails, register the arena on
@@ -229,7 +235,9 @@ fn connect_verbs(
     }
 
     // Reply with each rail's client QP, then connect each rail to its peer rail.
-    stream.write_all(&[n_rails as u8]).context("send client n_rails")?;
+    stream
+        .write_all(&[n_rails as u8])
+        .context("send client n_rails")?;
     for v in &verbs_rails {
         VerbsClientParams {
             qpn: v.qpn(),

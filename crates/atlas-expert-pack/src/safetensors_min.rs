@@ -103,7 +103,15 @@ impl SafeTensors {
             if end < begin {
                 bail!("tensor {name} has end < begin");
             }
-            tensors.insert(name.clone(), TensorInfo { dtype, shape, begin, end });
+            tensors.insert(
+                name.clone(),
+                TensorInfo {
+                    dtype,
+                    shape,
+                    begin,
+                    end,
+                },
+            );
         }
         Ok(Self {
             file,

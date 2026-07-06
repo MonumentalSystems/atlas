@@ -24,9 +24,9 @@ use anyhow::{Context, Result, bail};
 use atlas_core::config::ModelConfig;
 
 use spark_storage::CudaEvent;
+use spark_storage::ExpertIndex;
 use spark_storage::expert::ExpertKey;
 use spark_storage::expert_tier::{ArenaSlot, ExpertResidency, TierKind, open_tier};
-use spark_storage::ExpertIndex;
 
 /// A prefetch job for dense MoE layer `dense`.
 ///
@@ -279,12 +279,7 @@ impl ExpertStreamerShared {
     /// result into the persistent cache.
     pub fn take(&self, dense: u32) -> Result<Vec<ExpertResidency>> {
         // Fast path: resident in cache.
-        if let Some(res) = self
-            .resident_cache
-            .lock()
-            .expect("cache mutex")
-            .get(&dense)
-        {
+        if let Some(res) = self.resident_cache.lock().expect("cache mutex").get(&dense) {
             return Ok(res.clone());
         }
         // Slow path: wait for the worker fetch, then cache it.
@@ -292,7 +287,10 @@ impl ExpertStreamerShared {
         let mut map = lock.lock().expect("done mutex");
         loop {
             if let Some(entry) = map.remove(&dense) {
-                self.requested.lock().expect("requested mutex").remove(&dense);
+                self.requested
+                    .lock()
+                    .expect("requested mutex")
+                    .remove(&dense);
                 let res = entry.map_err(|e| anyhow::anyhow!(e))?;
                 self.resident_cache
                     .lock()

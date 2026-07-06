@@ -132,7 +132,10 @@ mod tests {
         assert_eq!(b - a, stride as u64);
         assert_eq!(c - a, 3 * stride as u64);
         // Same-VA property already asserted in the ctor; re-confirm host==dev.
-        assert_eq!(arena.slot_host_ptr(1, 2).unwrap() as u64, arena.slot_dev_va(1, 2).unwrap());
+        assert_eq!(
+            arena.slot_host_ptr(1, 2).unwrap() as u64,
+            arena.slot_dev_va(1, 2).unwrap()
+        );
         // Out-of-range is an error, not a panic.
         assert!(arena.slot_dev_va(2, 0).is_err());
     }

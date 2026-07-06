@@ -183,8 +183,7 @@ impl ExpertIndex {
     #[cfg(unix)]
     pub fn load(dir: &std::path::Path) -> Result<Self> {
         let p = dir.join(Self::MANIFEST_NAME);
-        let json = std::fs::read_to_string(&p)
-            .with_context(|| format!("read {}", p.display()))?;
+        let json = std::fs::read_to_string(&p).with_context(|| format!("read {}", p.display()))?;
         let index: ExpertIndex =
             serde_json::from_str(&json).with_context(|| format!("parse {}", p.display()))?;
         if index.version != ExpertRecordHeader::VERSION {
@@ -247,8 +246,7 @@ mod fs_impl {
 
     impl ExpertFileWriter {
         pub fn create(dir: &Path, index: ExpertIndex) -> Result<Self> {
-            std::fs::create_dir_all(dir)
-                .with_context(|| format!("mkdir {}", dir.display()))?;
+            std::fs::create_dir_all(dir).with_context(|| format!("mkdir {}", dir.display()))?;
             let spec = index.spec();
             let layout = index.layout();
             let mut files = Vec::with_capacity(index.num_moe_layers as usize);
@@ -324,10 +322,10 @@ mod fs_impl {
     impl ExpertFileReader {
         pub fn open(dir: &Path) -> Result<Self> {
             let mp = dir.join(ExpertIndex::MANIFEST_NAME);
-            let json = std::fs::read_to_string(&mp)
-                .with_context(|| format!("read {}", mp.display()))?;
-            let index: ExpertIndex = serde_json::from_str(&json)
-                .with_context(|| format!("parse {}", mp.display()))?;
+            let json =
+                std::fs::read_to_string(&mp).with_context(|| format!("read {}", mp.display()))?;
+            let index: ExpertIndex =
+                serde_json::from_str(&json).with_context(|| format!("parse {}", mp.display()))?;
             if index.version != ExpertRecordHeader::VERSION {
                 bail!(
                     "manifest version {} != supported {}",
@@ -474,12 +472,18 @@ mod fs_impl {
                     assert_eq!(&hdr, exp_hdr, "header {:?}", key);
                     for p in Proj::ALL {
                         assert_eq!(
-                            views[p as usize].packed, &raw[0][p as usize].0[..],
-                            "packed {:?} {:?}", key, p
+                            views[p as usize].packed,
+                            &raw[0][p as usize].0[..],
+                            "packed {:?} {:?}",
+                            key,
+                            p
                         );
                         assert_eq!(
-                            views[p as usize].scale, &raw[0][p as usize].1[..],
-                            "scale {:?} {:?}", key, p
+                            views[p as usize].scale,
+                            &raw[0][p as usize].1[..],
+                            "scale {:?} {:?}",
+                            key,
+                            p
                         );
                     }
                 }
@@ -524,7 +528,10 @@ mod fs_impl {
         fn read_record_raw_rejects_out_of_range_layer() {
             let dir = tmpdir("oob");
             let index = synth_index(); // 2 MoE layers
-            ExpertFileWriter::create(&dir, index).unwrap().finish().unwrap();
+            ExpertFileWriter::create(&dir, index)
+                .unwrap()
+                .finish()
+                .unwrap();
             let r = ExpertFileReader::open(&dir).unwrap();
             // Valid layer is fine; an out-of-range layer is a graceful Err, not a panic.
             assert!(r.read_record_raw(ExpertKey::new(0, 0)).is_ok());
@@ -560,16 +567,27 @@ mod tests {
         let mk = |p: Proj, base: u8| {
             let pb = spec.proj_bytes(p);
             let packed: Vec<u8> = (0..pb.packed_bytes).map(|i| i as u8 ^ base).collect();
-            let scale: Vec<u8> = (0..pb.scale_bytes).map(|i| (i as u8).wrapping_add(base)).collect();
+            let scale: Vec<u8> = (0..pb.scale_bytes)
+                .map(|i| (i as u8).wrapping_add(base))
+                .collect();
             (packed, scale)
         };
         let g = mk(Proj::Gate, 1);
         let u = mk(Proj::Up, 2);
         let d = mk(Proj::Down, 3);
         let projs = [
-            ProjData { packed: &g.0, scale: &g.1 },
-            ProjData { packed: &u.0, scale: &u.1 },
-            ProjData { packed: &d.0, scale: &d.1 },
+            ProjData {
+                packed: &g.0,
+                scale: &g.1,
+            },
+            ProjData {
+                packed: &u.0,
+                scale: &u.1,
+            },
+            ProjData {
+                packed: &d.0,
+                scale: &d.1,
+            },
         ];
         let header = ExpertRecordHeader {
             layer: 2,

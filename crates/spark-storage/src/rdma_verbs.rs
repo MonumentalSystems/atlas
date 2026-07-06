@@ -124,7 +124,12 @@ impl Verbs {
     /// # Safety
     /// `addr` must point at `len` bytes that outlive this `Verbs` (the MR is
     /// dereg'd on drop, but the NIC may DMA into/out of it until then).
-    pub unsafe fn reg_mr(&mut self, addr: *mut c_void, len: usize, remote_read: bool) -> Result<MrKeys> {
+    pub unsafe fn reg_mr(
+        &mut self,
+        addr: *mut c_void,
+        len: usize,
+        remote_read: bool,
+    ) -> Result<MrKeys> {
         let mut lkey = 0u32;
         let mut rkey = 0u32;
         // SAFETY: conn live; lkey/rkey out params valid; caller upholds addr/len.
@@ -199,7 +204,8 @@ impl Verbs {
         wr_id: u64,
     ) -> Result<()> {
         // SAFETY: conn live; caller upholds local_addr/lkey validity.
-        let rc = unsafe { rs_post_read(self.conn, local_addr, lkey, remote_addr, rkey, len, wr_id) };
+        let rc =
+            unsafe { rs_post_read(self.conn, local_addr, lkey, remote_addr, rkey, len, wr_id) };
         if rc != 0 {
             bail!("ibv_post_send(RDMA_READ) failed: {rc}");
         }

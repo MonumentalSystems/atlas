@@ -17,7 +17,7 @@ use std::path::Path;
 
 use spark_storage::expert::{ExpertKey, ExpertRecordHeader, Proj};
 use spark_storage::expert_pack::{ExpertFileReader, ExpertFileWriter, ExpertIndex, ProjData};
-use spark_storage::{unpack_record, ProjView};
+use spark_storage::{ProjView, unpack_record};
 
 use crate::checkpoint::Checkpoint;
 use crate::transpose::transpose_bytes;
@@ -125,15 +125,20 @@ pub fn discover_geometry(ckpt: &Checkpoint) -> Result<Geometry> {
     let inter = packed.rows();
     let hidden = packed.cols() * 2;
     if scale.rows() != inter || scale.cols() == 0 {
-        bail!("gate scale shape {:?} inconsistent with packed", scale.shape);
+        bail!(
+            "gate scale shape {:?} inconsistent with packed",
+            scale.shape
+        );
     }
     let group_size = hidden / scale.cols();
     if group_size == 0 || hidden % scale.cols() != 0 {
-        bail!("cannot derive group_size from hidden={hidden}, scale_cols={}", scale.cols());
+        bail!(
+            "cannot derive group_size from hidden={hidden}, scale_cols={}",
+            scale.cols()
+        );
     }
 
-    let has_input_scale =
-        ckpt.has(&tensor_name(&base, first, 0, "gate", "input_global_scale"));
+    let has_input_scale = ckpt.has(&tensor_name(&base, first, 0, "gate", "input_global_scale"));
 
     Ok(Geometry {
         base_prefix: base,
@@ -163,7 +168,12 @@ struct ExpertData {
 }
 
 /// Read + transpose one expert's projections from the checkpoint.
-fn load_expert(ckpt: &Checkpoint, geo: &Geometry, abs_layer: u32, expert: u32) -> Result<ExpertData> {
+fn load_expert(
+    ckpt: &Checkpoint,
+    geo: &Geometry,
+    abs_layer: u32,
+    expert: u32,
+) -> Result<ExpertData> {
     let mut packed: [Vec<u8>; 3] = Default::default();
     let mut scale: [Vec<u8>; 3] = Default::default();
     let mut scale2 = [0f32; 3];
@@ -224,8 +234,13 @@ fn load_expert(ckpt: &Checkpoint, geo: &Geometry, abs_layer: u32, expert: u32) -
         scale2[p as usize] = 1.0 / gs; // compressed-tensors reciprocal convention
 
         if geo.has_input_scale {
-            let is_name =
-                tensor_name(&geo.base_prefix, abs_layer, expert, pname, "input_global_scale");
+            let is_name = tensor_name(
+                &geo.base_prefix,
+                abs_layer,
+                expert,
+                pname,
+                "input_global_scale",
+            );
             if ckpt.has(&is_name) {
                 input_scale[p as usize] = Some(ckpt.read_f32_scalar(&is_name)?);
             }

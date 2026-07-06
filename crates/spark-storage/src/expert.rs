@@ -126,7 +126,10 @@ impl ExpertRecordSpec {
     /// given `inter`(mediate) and `hidden` dims. `sub_align` is the alignment
     /// applied to every sub-buffer (256 is a safe default for CUTLASS/MMQ).
     pub fn new(inter: u64, hidden: u64, group_size: u64, sub_align: u64) -> Self {
-        assert!(sub_align.is_power_of_two(), "sub_align must be a power of two");
+        assert!(
+            sub_align.is_power_of_two(),
+            "sub_align must be a power of two"
+        );
         // gate/up: N=inter, K=hidden ; down: N=hidden, K=inter.
         // packed = N*K/2 and scale = N*K/group_size are symmetric in (N,K),
         // so all three projections have identical byte sizes — but we keep them
@@ -395,10 +398,7 @@ mod tests {
             layout.file_offset(ExpertKey::new(3, 5)),
             5 * layout.record_stride
         );
-        assert_eq!(
-            layout.bytes_per_layer(),
-            256 * layout.record_stride
-        );
+        assert_eq!(layout.bytes_per_layer(), 256 * layout.record_stride);
     }
 
     #[test]

@@ -30,8 +30,8 @@ impl Checkpoint {
         if index.exists() {
             let json = std::fs::read_to_string(&index)
                 .with_context(|| format!("read {}", index.display()))?;
-            let v: serde_json::Value =
-                serde_json::from_str(&json).with_context(|| format!("parse {}", index.display()))?;
+            let v: serde_json::Value = serde_json::from_str(&json)
+                .with_context(|| format!("parse {}", index.display()))?;
             let wm = v
                 .get("weight_map")
                 .and_then(|w| w.as_object())

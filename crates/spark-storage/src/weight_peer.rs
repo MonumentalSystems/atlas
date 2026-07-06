@@ -159,9 +159,9 @@ pub fn read_weight_manifest<R: std::io::Read>(r: &mut R) -> Result<WeightManifes
         bail!("implausible weight manifest length: {len}");
     }
     let mut buf = vec![0u8; len];
-    r.read_exact(&mut buf).context("read weight manifest json")?;
-    let m: WeightManifest =
-        serde_json::from_slice(&buf).context("parse weight manifest json")?;
+    r.read_exact(&mut buf)
+        .context("read weight manifest json")?;
+    let m: WeightManifest = serde_json::from_slice(&buf).context("parse weight manifest json")?;
     if m.version != WeightManifest::VERSION {
         bail!(
             "weight manifest version {} != supported {}",
@@ -271,7 +271,10 @@ mod server_impl {
             if cfg.max_blade_bytes == 0 {
                 "unlimited".to_string()
             } else {
-                format!("{:.1} GiB", cfg.max_blade_bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+                format!(
+                    "{:.1} GiB",
+                    cfg.max_blade_bytes as f64 / (1024.0 * 1024.0 * 1024.0)
+                )
             },
             cfg.allow_any_path,
         );
@@ -314,7 +317,9 @@ mod server_impl {
 
         // 3. Transport selection. Only verbs is served for weights.
         let mut mode = [0u8; 1];
-        stream.read_exact(&mut mode).context("read transport mode")?;
+        stream
+            .read_exact(&mut mode)
+            .context("read transport mode")?;
         match mode[0] {
             MODE_VERBS => serve_verbs(stream, &model, cfg),
             other => bail!("weight-peer only serves verbs; client asked for mode {other}"),
@@ -387,7 +392,11 @@ mod server_impl {
     /// on every rail, publishes the per-shard `(base, rkey)`, connects to the
     /// client's QPs, then idles — the client pulls all tensor bytes one-sided.
     #[cfg(not(atlas_rdma_verbs))]
-    fn serve_verbs(_stream: TcpStream, _model: &Arc<StagedModel>, _cfg: &WeightPeerConfig) -> Result<()> {
+    fn serve_verbs(
+        _stream: TcpStream,
+        _model: &Arc<StagedModel>,
+        _cfg: &WeightPeerConfig,
+    ) -> Result<()> {
         bail!("client requested verbs transport but this peer was built without rdma-core");
     }
 
@@ -397,7 +406,9 @@ mod server_impl {
         model: &Arc<StagedModel>,
         cfg: &WeightPeerConfig,
     ) -> Result<()> {
-        use crate::expert_peer::{STATUS_OK, VerbsClientParams, VerbsServerParams, write_server_rails};
+        use crate::expert_peer::{
+            STATUS_OK, VerbsClientParams, VerbsServerParams, write_server_rails,
+        };
         use crate::rdma_verbs::Verbs;
         use std::io::Write;
 
@@ -408,7 +419,10 @@ mod server_impl {
         stream.read_exact(&mut b1).context("read n_rails")?;
         let n_rails = b1[0] as usize;
         if n_rails == 0 || n_rails > cfg.rails.len() {
-            bail!("client asked for {n_rails} rails; peer has {}", cfg.rails.len());
+            bail!(
+                "client asked for {n_rails} rails; peer has {}",
+                cfg.rails.len()
+            );
         }
 
         // One QP per rail (distinct per-rail PSN so successive clients don't
@@ -424,8 +438,9 @@ mod server_impl {
         // Register each shard mmap (REMOTE_READ) on EVERY rail's PD — one rkey
         // per (rail, shard), identical base VA, shared physical pages. The mmaps
         // live in the persistent StagedModel, so they outlive these MRs.
-        let mut per_rail_shards: Vec<Vec<(u64, u32)>> =
-            (0..n_rails).map(|_| Vec::with_capacity(num_shards)).collect();
+        let mut per_rail_shards: Vec<Vec<(u64, u32)>> = (0..n_rails)
+            .map(|_| Vec::with_capacity(num_shards))
+            .collect();
         for m in &model.shard_mmaps {
             for (ri, v) in rails.iter_mut().enumerate() {
                 // SAFETY: the mapping covers `m.len` bytes at `m.addr` and lives
@@ -459,7 +474,9 @@ mod server_impl {
                 VerbsClientParams::read_from(&mut stream).context("read verbs client params")?;
             v.connect(cp.qpn, cp.psn, &cp.gid)?;
         }
-        stream.write_all(&[STATUS_OK]).context("send verbs ready ack")?;
+        stream
+            .write_all(&[STATUS_OK])
+            .context("send verbs ready ack")?;
         tracing::info!(
             "weight-peer verbs client connected to {} ({n_rails} rail(s), {num_shards} shard MRs/rail)",
             model.manifest.model_id,
@@ -558,8 +575,8 @@ mod server_impl {
         };
 
         if let Some(ip) = actual {
-            let json = std::fs::read_to_string(&ip)
-                .with_context(|| format!("read {}", ip.display()))?;
+            let json =
+                std::fs::read_to_string(&ip).with_context(|| format!("read {}", ip.display()))?;
             let v: Value = serde_json::from_str(&json)?;
             let map = v
                 .get("weight_map")
@@ -615,14 +632,17 @@ mod server_impl {
         weight_map: Option<&HashMap<String, String>>,
         out: &mut Vec<WeightTensorRecord>,
     ) -> Result<()> {
-        let mut f = std::fs::File::open(path)
-            .with_context(|| format!("open {}", path.display()))?;
+        let mut f =
+            std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
         let mut size_buf = [0u8; 8];
         f.read_exact(&mut size_buf)
             .with_context(|| format!("read header size of {}", path.display()))?;
         let header_size = u64::from_le_bytes(size_buf) as usize;
         if header_size > 64 * 1024 * 1024 {
-            bail!("{}: safetensor header too large ({header_size} bytes)", path.display());
+            bail!(
+                "{}: safetensor header too large ({header_size} bytes)",
+                path.display()
+            );
         }
         let mut header_buf = vec![0u8; header_size];
         f.read_exact(&mut header_buf)

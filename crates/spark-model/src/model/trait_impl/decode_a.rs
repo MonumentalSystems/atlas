@@ -434,23 +434,39 @@ mod decode_graph_gate_tests {
     #[test]
     fn streaming_experts_forces_eager() {
         // Invariant F: expert_streaming=true must disable graphs, all else equal.
-        assert!(!decode_graphs_allowed(true, false, false, false, false, true, false));
+        assert!(!decode_graphs_allowed(
+            true, false, false, false, false, true, false
+        ));
     }
 
     #[test]
     fn each_suppressor_disables_graphs() {
         // profile, suppress, hss, expert_streaming, dump_step0 each gate off.
-        assert!(!decode_graphs_allowed(true, false, true, false, false, false, false));
-        assert!(!decode_graphs_allowed(true, false, false, true, false, false, false));
-        assert!(!decode_graphs_allowed(true, false, false, false, true, false, false));
-        assert!(!decode_graphs_allowed(true, false, false, false, false, true, false));
-        assert!(!decode_graphs_allowed(true, false, false, false, false, false, true));
+        assert!(!decode_graphs_allowed(
+            true, false, true, false, false, false, false
+        ));
+        assert!(!decode_graphs_allowed(
+            true, false, false, true, false, false, false
+        ));
+        assert!(!decode_graphs_allowed(
+            true, false, false, false, true, false, false
+        ));
+        assert!(!decode_graphs_allowed(
+            true, false, false, false, false, true, false
+        ));
+        assert!(!decode_graphs_allowed(
+            true, false, false, false, false, false, true
+        ));
     }
 
     #[test]
     fn comm_present_needs_ep_graphs_optin() {
         // With a communicator (comm_none=false) graphs need the ep_graphs opt-in.
-        assert!(!decode_graphs_allowed(false, false, false, false, false, false, false));
-        assert!(decode_graphs_allowed(false, true, false, false, false, false, false));
+        assert!(!decode_graphs_allowed(
+            false, false, false, false, false, false, false
+        ));
+        assert!(decode_graphs_allowed(
+            false, true, false, false, false, false, false
+        ));
     }
 }

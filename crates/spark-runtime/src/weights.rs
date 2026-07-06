@@ -326,7 +326,11 @@ mod skip_tests {
             ("F8_E8M0", FP8E8M0),
             ("I64", Int64),
         ] {
-            assert_eq!(WeightDtype::from_safetensors_str(s).unwrap(), want, "dtype {s}");
+            assert_eq!(
+                WeightDtype::from_safetensors_str(s).unwrap(),
+                want,
+                "dtype {s}"
+            );
         }
         assert!(WeightDtype::from_safetensors_str("F16").is_err());
         assert!(WeightDtype::from_safetensors_str("bogus").is_err());

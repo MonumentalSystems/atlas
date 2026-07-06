@@ -55,9 +55,9 @@ pub mod kv_peer;
 // One-sided RDMA READ/WRITE verbs FFI (WS2 Phase B + KV overflow). CUDA-free so
 // BOTH the non-cuda peer servers and the cuda client tiers can use it. Compiled
 // only where the C shim is (build.rs emits `atlas_rdma_verbs` on Linux + rdma-core).
+pub mod group;
 #[cfg(atlas_rdma_verbs)]
 pub mod rdma_verbs;
-pub mod group;
 // T1 tier-cascade placement/eviction policy (pure LRU; unit-testable on
 // metal/skip). The cuda composite backend is `cascade_backend`.
 pub mod cascade_policy;
@@ -118,8 +118,16 @@ pub mod tiled_attention;
 
 #[cfg(feature = "cuda")]
 pub use backend::{IoUringBackend, PosixBackend, ReadRequest, StorageBackend};
+pub use config::HighSpeedSwapConfig;
+pub use eviction::EvictionPolicy;
+pub use expert::{
+    ExpertKey, ExpertLayout, ExpertRecordHeader, ExpertRecordId, ExpertRecordSpec, Proj, ProjBytes,
+};
 #[cfg(feature = "cuda")]
 pub use expert_arena::ExpertArena;
+#[cfg(unix)]
+pub use expert_pack::{ExpertFileReader, ExpertFileWriter};
+pub use expert_pack::{ExpertIndex, ProjData, ProjView, pack_record, unpack_record};
 #[cfg(feature = "cuda")]
 pub use expert_tier::{
     ArenaSlot, ExpertResidency, ExpertTier, PosixTier, TierKind, UmaArenaTier, open_tier,
@@ -127,20 +135,12 @@ pub use expert_tier::{
 #[cfg(feature = "cuda")]
 pub use expert_tier_rdma::RdmaTier;
 #[cfg(feature = "cuda")]
-pub use weight_tier_rdma::RdmaWeightLoader;
-pub use weight_peer::{WeightManifest, WeightTensorRecord};
+pub use high_speed_swap::{HighSpeedSwap, install_local, local_installed, with_local};
 #[cfg(all(feature = "cuda", atlas_rdma_verbs))]
 pub use rdma_kv_backend::RdmaKvBackend;
-pub use config::HighSpeedSwapConfig;
-pub use eviction::EvictionPolicy;
-pub use expert::{
-    ExpertKey, ExpertLayout, ExpertRecordHeader, ExpertRecordId, ExpertRecordSpec, Proj, ProjBytes,
-};
-pub use expert_pack::{ExpertIndex, ProjData, ProjView, pack_record, unpack_record};
-#[cfg(unix)]
-pub use expert_pack::{ExpertFileReader, ExpertFileWriter};
+pub use weight_peer::{WeightManifest, WeightTensorRecord};
 #[cfg(feature = "cuda")]
-pub use high_speed_swap::{HighSpeedSwap, install_local, local_installed, with_local};
+pub use weight_tier_rdma::RdmaWeightLoader;
 
 // Non-cuda stub surface — same names as the real CUDA orchestrator
 // above so spark-model's call sites compile unchanged. `with_local`

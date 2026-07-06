@@ -286,7 +286,11 @@ pub fn open_tier(
     };
     match backend {
         "posix" => Ok(Box::new(PosixTier::open(dir, num_slabs, slots_per_slab)?)),
-        "uma" => Ok(Box::new(UmaArenaTier::open(dir, num_slabs, slots_per_slab)?)),
+        "uma" => Ok(Box::new(UmaArenaTier::open(
+            dir,
+            num_slabs,
+            slots_per_slab,
+        )?)),
         "rdma" => rdma(false),
         "rdma-verbs" => rdma(true),
         other => bail!("unknown expert backend '{other}' (want posix|uma|rdma|rdma-verbs)"),

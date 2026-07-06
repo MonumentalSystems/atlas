@@ -31,7 +31,9 @@ fn main() -> Result<()> {
         match a.as_str() {
             "--store" | "-s" => store = Some(it.next().context("--store needs a dir")?.into()),
             "--listen" | "-l" => listen = it.next().context("--listen needs host:port")?,
-            "--rdma-dev" => rdma.rails[0].0 = it.next().context("--rdma-dev needs a device name")?,
+            "--rdma-dev" => {
+                rdma.rails[0].0 = it.next().context("--rdma-dev needs a device name")?
+            }
             "--rdma-gid" => {
                 rdma.rails[0].1 = it
                     .next()

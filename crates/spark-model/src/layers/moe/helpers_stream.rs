@@ -154,9 +154,7 @@ impl MoeLayer {
         num_tokens: usize,
         stream: u64,
     ) -> Result<Option<Vec<u32>>> {
-        if self.streamer.is_none()
-            || ctx.graph_capture
-            || num_tokens as u32 > reactive_max_tokens()
+        if self.streamer.is_none() || ctx.graph_capture || num_tokens as u32 > reactive_max_tokens()
         {
             return Ok(None);
         }
@@ -246,10 +244,7 @@ impl MoeLayer {
                         ids.len()
                     );
                 }
-                ids.iter()
-                    .map(|&e| e as usize)
-                    .zip(residencies)
-                    .collect()
+                ids.iter().map(|&e| e as usize).zip(residencies).collect()
             }
         };
 

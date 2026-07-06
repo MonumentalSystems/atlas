@@ -111,7 +111,10 @@ mod server_impl {
             if rdma.max_blade_bytes == 0 {
                 "unlimited".to_string()
             } else {
-                format!("{:.1} GiB", rdma.max_blade_bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+                format!(
+                    "{:.1} GiB",
+                    rdma.max_blade_bytes as f64 / (1024.0 * 1024.0 * 1024.0)
+                )
             },
         );
         for conn in listener.incoming() {
@@ -164,16 +167,17 @@ mod server_impl {
         stream.read_exact(&mut b1).context("read n_rails")?;
         let n_rails = b1[0] as usize;
         if n_rails == 0 || n_rails > rdma.rails.len() {
-            bail!("client asked for {n_rails} rails; peer has {}", rdma.rails.len());
+            bail!(
+                "client asked for {n_rails} rails; peer has {}",
+                rdma.rails.len()
+            );
         }
 
         // Admission gate: charge the arena size ONCE (the N per-rail MRs pin the
         // SAME refcounted pages, so the committed footprint is `total`, not
         // total*n_rails). Reserve BEFORE any mmap/reg_mr pins RAM; the RAII guard
         // releases on every exit below (early bail, reg_mr error, normal hangup).
-        let _reservation = ledger
-            .try_reserve(total as u64)
-            .context("kv blade cap")?;
+        let _reservation = ledger.try_reserve(total as u64).context("kv blade cap")?;
 
         // Anonymous, page-aligned, lazily-zeroed arena — registered ONCE per rail
         // (each device its own PD/rkey). The physical pages are shared (pinned
@@ -214,7 +218,9 @@ mod server_impl {
             let cp = VerbsClientParams::read_from(&mut stream).context("read kv client params")?;
             v.connect(cp.qpn, cp.psn, &cp.gid)?;
         }
-        stream.write_all(&[STATUS_OK]).context("send kv ready ack")?;
+        stream
+            .write_all(&[STATUS_OK])
+            .context("send kv ready ack")?;
         tracing::info!(
             "kv-peer client connected: {n_rails} rail(s), {:.1} GiB RW blade",
             total as f64 / (1024.0 * 1024.0 * 1024.0),
@@ -257,7 +263,10 @@ mod server_impl {
                 )
             };
             if addr == libc::MAP_FAILED {
-                bail!("mmap anon {len} failed: {}", std::io::Error::last_os_error());
+                bail!(
+                    "mmap anon {len} failed: {}",
+                    std::io::Error::last_os_error()
+                );
             }
             Ok(Self { addr, len })
         }

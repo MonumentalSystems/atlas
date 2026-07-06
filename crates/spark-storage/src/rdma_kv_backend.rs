@@ -129,7 +129,12 @@ impl Rail {
             .with_context(|| format!("kv: completion for unknown wr_id {wr:#x}"))?;
         let bounce = match op {
             InFlight::Read { bounce, dst } => {
-                copy_h_to_d_async(dst, self.bounces[bounce].buf.ptr as *const _, group_bytes, stream)?;
+                copy_h_to_d_async(
+                    dst,
+                    self.bounces[bounce].buf.ptr as *const _,
+                    group_bytes,
+                    stream,
+                )?;
                 bounce
             }
             InFlight::Write { bounce } => bounce,
@@ -146,7 +151,13 @@ impl Rail {
     }
 
     /// # Safety: bounce/len/remote must describe a live MR and the peer arena.
-    unsafe fn post_read(&mut self, bounce: usize, raddr: u64, bytes: usize, dst: u64) -> Result<()> {
+    unsafe fn post_read(
+        &mut self,
+        bounce: usize,
+        raddr: u64,
+        bytes: usize,
+        dst: u64,
+    ) -> Result<()> {
         let wr = self.fresh_wr();
         unsafe {
             self.verbs.post_read(
@@ -229,9 +240,7 @@ impl RdmaKvBackend {
         stream
             .write_all(&total_bytes.to_le_bytes())
             .context("send kv total_bytes")?;
-        stream
-            .write_all(&[n_rails as u8])
-            .context("send n_rails")?;
+        stream.write_all(&[n_rails as u8]).context("send n_rails")?;
 
         // Create each rail's QP + bounce ring.
         let mut rails: Vec<Rail> = Vec::with_capacity(n_rails);
@@ -243,7 +252,10 @@ impl RdmaKvBackend {
                 let buf = PinnedBuffer::new(group_bytes).context("alloc pinned kv bounce")?;
                 // SAFETY: buf lives as long as the rail (and thus the MR).
                 let keys = unsafe { verbs.reg_mr(buf.ptr, group_bytes, false)? };
-                bounces.push(Bounce { buf, lkey: keys.lkey });
+                bounces.push(Bounce {
+                    buf,
+                    lkey: keys.lkey,
+                });
             }
             rails.push(Rail {
                 verbs,
@@ -272,7 +284,9 @@ impl RdmaKvBackend {
             server.push(sp);
         }
         // Reply with each rail's client QP, then connect.
-        stream.write_all(&[n_rails as u8]).context("send client n_rails")?;
+        stream
+            .write_all(&[n_rails as u8])
+            .context("send client n_rails")?;
         for rail in &rails {
             VerbsClientParams {
                 qpn: rail.verbs.qpn(),
@@ -318,7 +332,12 @@ impl RdmaKvBackend {
     /// (same host==dev VA), so no `stream_sync` either. Removes the copy-engine
     /// bottleneck that pinned single-rail restore at ~9.7 GB/s, letting it
     /// dual-rail. Requires UMA destinations (else `reg_dst` errors clearly).
-    fn read_zero_copy(&mut self, requests: &[ReadRequest], bytes: usize, stream: u64) -> Result<()> {
+    fn read_zero_copy(
+        &mut self,
+        requests: &[ReadRequest],
+        bytes: usize,
+        stream: u64,
+    ) -> Result<()> {
         // WAR barrier: the NIC is about to DMA into UMA slots that the PREVIOUS
         // tile's attention kernel may still be reading on `stream`. Unlike the
         // bounce path (whose copy_h2d is stream-ordered after attention + ends in
@@ -374,7 +393,10 @@ impl RdmaKvBackend {
 }
 
 fn env_u32(k: &str, default: u32) -> u32 {
-    std::env::var(k).ok().and_then(|s| s.parse().ok()).unwrap_or(default)
+    std::env::var(k)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(default)
 }
 
 impl StorageBackend for RdmaKvBackend {
@@ -428,8 +450,8 @@ impl StorageBackend for RdmaKvBackend {
                 while !rail.free.is_empty() {
                     let Some(j) = pend[ri].pop_front() else { break };
                     let b = rail.free.pop().unwrap();
-                    let raddr =
-                        self.remote_base + self.layout.group_id(requests[j].group).0 * self.layout.group_stride;
+                    let raddr = self.remote_base
+                        + self.layout.group_id(requests[j].group).0 * self.layout.group_stride;
                     // SAFETY: bounce b is a live MR; raddr/rkey are the blade.
                     unsafe { rail.post_read(b, raddr, bytes, requests[j].dst_dev_ptr)? };
                 }
@@ -463,7 +485,10 @@ impl StorageBackend for RdmaKvBackend {
     fn write_from_host(&mut self, key: GroupKey, src: &[u8]) -> Result<()> {
         let bytes = self.layout.group_bytes() as usize;
         if src.len() != bytes {
-            bail!("write_from_host: src len {} != group bytes {bytes}", src.len());
+            bail!(
+                "write_from_host: src len {} != group bytes {bytes}",
+                src.len()
+            );
         }
         let raddr = self.remote_addr(key);
         let n = self.rails.len();
@@ -519,12 +544,16 @@ mod tests {
             GroupKey::new(1, 2, 0, KvKind::V),
             GroupKey::new(1, 0, 1, KvKind::K),
         ];
-        let pat = |i: usize| -> Vec<u8> { (0..bytes).map(|b| ((b + i * 37) & 0xFF) as u8).collect() };
+        let pat =
+            |i: usize| -> Vec<u8> { (0..bytes).map(|b| ((b + i * 37) & 0xFF) as u8).collect() };
         for (i, k) in keys.iter().enumerate() {
             be.write_from_host(*k, &pat(i)).expect("write_from_host");
         }
         // UMA dsts so the same test validates both the bounce and zero-copy paths.
-        let devs: Vec<_> = keys.iter().map(|_| PinnedBuffer::new(bytes).unwrap()).collect();
+        let devs: Vec<_> = keys
+            .iter()
+            .map(|_| PinnedBuffer::new(bytes).unwrap())
+            .collect();
         let reqs: Vec<_> = keys
             .iter()
             .zip(&devs)
@@ -536,7 +565,12 @@ mod tests {
         be.read(&reqs, _ctx.stream).expect("read");
         for (i, d) in devs.iter().enumerate() {
             let back = unsafe { uma_bytes(d, bytes) };
-            assert_eq!(back, &pat(i)[..], "group {:?} corrupted through the RDMA blade", keys[i]);
+            assert_eq!(
+                back,
+                &pat(i)[..],
+                "group {:?} corrupted through the RDMA blade",
+                keys[i]
+            );
         }
     }
 
@@ -557,7 +591,10 @@ mod tests {
             .flat_map(|l| {
                 (0..layout.num_blocks).flat_map(move |b| {
                     (0..layout.num_kv_heads).flat_map(move |h| {
-                        [GroupKey::new(l, b, h, KvKind::K), GroupKey::new(l, b, h, KvKind::V)]
+                        [
+                            GroupKey::new(l, b, h, KvKind::K),
+                            GroupKey::new(l, b, h, KvKind::V),
+                        ]
                     })
                 })
             })
@@ -578,7 +615,10 @@ mod tests {
 
         let reqs: Vec<_> = keys
             .iter()
-            .map(|k| ReadRequest { group: *k, dst_dev_ptr: dptr })
+            .map(|k| ReadRequest {
+                group: *k,
+                dst_dev_ptr: dptr,
+            })
             .collect();
         let t1 = std::time::Instant::now();
         be.read(&reqs, ctx.stream).expect("read");
@@ -590,7 +630,11 @@ mod tests {
              OFFLOAD (RDMA WRITE): {:.3}s => {:.2} GB/s\n  \
              RESTORE (RDMA READ): {:.3}s => {:.2} GB/s",
             be.rails.len(),
-            if be.zero_copy { "zero-copy" } else { "bounce+h2d" },
+            if be.zero_copy {
+                "zero-copy"
+            } else {
+                "bounce+h2d"
+            },
             ngroups,
             gbytes,
             total as f64 / 1048576.0,

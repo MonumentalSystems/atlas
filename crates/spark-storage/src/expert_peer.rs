@@ -237,7 +237,10 @@ mod server_impl {
             if rdma.max_blade_bytes == 0 {
                 "unlimited".to_string()
             } else {
-                format!("{:.1} GiB", rdma.max_blade_bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+                format!(
+                    "{:.1} GiB",
+                    rdma.max_blade_bytes as f64 / (1024.0 * 1024.0 * 1024.0)
+                )
             },
         );
         for conn in listener.incoming() {
@@ -279,7 +282,9 @@ mod server_impl {
         // RAM, so only the verbs path (which mmaps + registers the store) is
         // charged against the ledger.
         let mut mode = [0u8; 1];
-        stream.read_exact(&mut mode).context("read transport mode")?;
+        stream
+            .read_exact(&mut mode)
+            .context("read transport mode")?;
         match mode[0] {
             MODE_TCP => serve_tcp(stream, reader),
             MODE_VERBS => serve_verbs(stream, reader, dir, rdma, ledger),
@@ -348,7 +353,10 @@ mod server_impl {
         stream.read_exact(&mut b1).context("read n_rails")?;
         let n_rails = b1[0] as usize;
         if n_rails == 0 || n_rails > rdma.rails.len() {
-            bail!("client asked for {n_rails} rails; peer has {}", rdma.rails.len());
+            bail!(
+                "client asked for {n_rails} rails; peer has {}",
+                rdma.rails.len()
+            );
         }
 
         // Admission gate: charge the deterministic store size (identical for
@@ -379,8 +387,7 @@ mod server_impl {
             .collect();
         for l in 0..num_layers {
             let path = dir.join(index.file_name(l));
-            let m = Mmap::open_ro(&path)
-                .with_context(|| format!("mmap {}", path.display()))?;
+            let m = Mmap::open_ro(&path).with_context(|| format!("mmap {}", path.display()))?;
             for (ri, v) in rails.iter_mut().enumerate() {
                 // SAFETY: the mapping covers `m.len` bytes at `m.addr` and
                 // outlives every rail's Verbs (mmaps dropped after rails below).
@@ -413,7 +420,9 @@ mod server_impl {
                 VerbsClientParams::read_from(&mut stream).context("read verbs client params")?;
             v.connect(cp.qpn, cp.psn, &cp.gid)?;
         }
-        stream.write_all(&[STATUS_OK]).context("send verbs ready ack")?;
+        stream
+            .write_all(&[STATUS_OK])
+            .context("send verbs ready ack")?;
         tracing::info!(
             "expert-peer verbs client connected ({n_rails} rail(s), {} layer MRs/rail)",
             num_layers,
@@ -487,11 +496,11 @@ mod server_impl {
 /// Read the length-prefixed manifest from a freshly-connected stream and parse
 /// it. Shared by the client (`expert_tier_rdma`).
 #[cfg(unix)]
-pub fn read_manifest<R: std::io::Read>(
-    stream: &mut R,
-) -> Result<crate::expert_pack::ExpertIndex> {
+pub fn read_manifest<R: std::io::Read>(stream: &mut R) -> Result<crate::expert_pack::ExpertIndex> {
     let mut lenb = [0u8; 4];
-    stream.read_exact(&mut lenb).context("read manifest length")?;
+    stream
+        .read_exact(&mut lenb)
+        .context("read manifest length")?;
     let len = u32::from_le_bytes(lenb) as usize;
     if len == 0 || len > 16 * 1024 * 1024 {
         bail!("implausible peer manifest length: {len}");
@@ -520,9 +529,7 @@ mod tests {
         let sp = VerbsServerParams {
             qpn: 0x1234,
             psn: 0x00ab_cdef & 0xff_ffff,
-            gid: [
-                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 192, 168, 178, 12,
-            ],
+            gid: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 192, 168, 178, 12],
             layers: vec![(0x7f00_0000_0000, 1001), (0x7f00_0100_0000, 1002)],
         };
         let mut buf = Vec::new();
@@ -552,7 +559,10 @@ mod tests {
             psn: 0x0012_3456 & 0xff_ffff,
             gid: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 192, 168, 178, 12],
             // Same base VA across rails (shared pages), distinct rkeys per rail.
-            layers: vec![(0x7f00_0000_0000, 1001 + qpn), (0x7f00_0100_0000, 1002 + qpn)],
+            layers: vec![
+                (0x7f00_0000_0000, 1001 + qpn),
+                (0x7f00_0100_0000, 1002 + qpn),
+            ],
         };
         let rails = vec![mk(0x1111), mk(0x2222)];
         let mut buf = Vec::new();
