@@ -54,6 +54,9 @@ pub mod kv_peer;
 #[cfg(atlas_rdma_verbs)]
 pub mod rdma_verbs;
 pub mod group;
+// T1 tier-cascade placement/eviction policy (pure LRU; unit-testable on
+// metal/skip). The cuda composite backend is `cascade_backend`.
+pub mod cascade_policy;
 pub mod model_dims;
 pub mod predictor_ref;
 pub mod projection;
@@ -89,6 +92,9 @@ pub mod expert_tier_rdma;
 // copy_h2d) and the verbs shim.
 #[cfg(all(feature = "cuda", atlas_rdma_verbs))]
 pub mod rdma_kv_backend;
+// T1 write-back cache composite (wraps any StorageBackend). cuda but not verbs.
+#[cfg(feature = "cuda")]
+pub mod cascade_backend;
 #[cfg(feature = "cuda")]
 pub mod high_speed_swap;
 #[cfg(feature = "cuda")]

@@ -92,7 +92,7 @@ impl HighSpeedSwap {
         // KV overflow tier selection: RDMA RAM blade when $ATLAS_KV_PEER is set,
         // else the local NVMe io_uring backend (default, unchanged).
         let kv_peer = std::env::var("ATLAS_KV_PEER").ok();
-        let mut backend: Box<dyn crate::backend::StorageBackend> = {
+        let backing: Box<dyn crate::backend::StorageBackend> = {
             #[cfg(atlas_rdma_verbs)]
             {
                 if let Some(peer) = kv_peer {
@@ -136,19 +136,40 @@ impl HighSpeedSwap {
                 pool.is_uma(),
                 if pool.is_uma() { "enabled" } else { "unavailable — using bounce" },
             );
-            // Register the whole UMA pool as one landing MR so zero-copy restore
-            // reuses that lkey per slot (per-slot registration fails on GB10).
-            // No-op for the file backends. On failure the backend degrades to
-            // the bounce path at read() time, so this is best-effort.
-            if pool.is_uma()
-                && let Err(e) =
-                    backend.register_landing_region(pool.pool_dev_ptr(), pool.dims().pool_bytes())
-            {
-                tracing::warn!(
-                    "high-speed-swap: UMA landing-region registration failed ({e:#}); \
-                     restore will use the bounce path"
-                );
-            }
+        }
+        // T1 cascade: wrap `backing` in a local pinned-RAM write-back cache when
+        // $ATLAS_KV_LOCAL_GB > 0 (hot groups stay local, evictions flush down to
+        // the peer/SSD). 0 (default) is the passthrough — byte-identical to today.
+        let local_gb: f64 = std::env::var("ATLAS_KV_LOCAL_GB")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|g: &f64| g.is_finite() && *g >= 0.0)
+            .unwrap_or(0.0);
+        let mut backend: Box<dyn crate::backend::StorageBackend> = if local_gb > 0.0 {
+            let cap_slots =
+                ((local_gb * 1024.0 * 1024.0 * 1024.0) / group_layout.group_bytes() as f64) as u32;
+            Box::new(crate::cascade_backend::CascadeBackend::new(
+                backing,
+                group_layout,
+                cap_slots.max(1),
+            )?)
+        } else {
+            backing
+        };
+        // Register the whole UMA pool as one landing MR so zero-copy restore
+        // reuses that lkey per slot (per-slot registration fails on GB10). When a
+        // cascade wraps the backing, this forwards to the backing so RDMA restore
+        // of MISSES still lands zero-copy. No-op for the file backends; on failure
+        // the backend degrades to the bounce path at read() time (best-effort).
+        if want_uma
+            && pool.is_uma()
+            && let Err(e) =
+                backend.register_landing_region(pool.pool_dev_ptr(), pool.dims().pool_bytes())
+        {
+            tracing::warn!(
+                "high-speed-swap: UMA landing-region registration failed ({e:#}); \
+                 restore will use the bounce path"
+            );
         }
         let predictor = Predictor::new_on_stream(
             stream,
