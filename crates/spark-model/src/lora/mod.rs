@@ -302,11 +302,72 @@ pub fn adapter_id_hash(name: &str, generation: u64) -> u64 {
     if h == 0 { 1 } else { h }
 }
 
+impl LoraLayerWeights {
+    /// Select this layer's [`LoraPair`] for `module` (`None` = module not
+    /// adapted). The single source of truth for the (layer, module) → pair map,
+    /// shared by [`select_routed_pair`] and [`LoraWeights::refresh_slot_tables`].
+    pub fn module_pair(&self, module: LoraModule) -> Option<&LoraPair> {
+        match module {
+            LoraModule::KProj => self.k_proj.as_ref(),
+            LoraModule::VProj => self.v_proj.as_ref(),
+            LoraModule::OProj => self.o_proj.as_ref(),
+            LoraModule::GateProj => self.gate_proj.as_ref(),
+            LoraModule::UpProj => self.up_proj.as_ref(),
+            LoraModule::DownProj => self.down_proj.as_ref(),
+        }
+    }
+}
+
+/// #30 (routed-prefill precision): the pure predicate behind
+/// [`LoraWeights::routed_prefill_slot`], split out for unit testing. Resolves a
+/// request's `adapter_slot` (`>= 0` → that slot, `-1` → active) and returns
+/// `Some(resolved)` ONLY when it routes to a NON-active, in-range slot. Returns
+/// `None` for an active/base request (byte-identical installed-pair path) and for
+/// out-of-range slots. Kept in exact lockstep with `upload_seq_slot_uniform`
+/// (`resolved == active` → `DevicePtr(0)`).
+pub fn routed_prefill_slot_of(adapter_slot: i32, active: usize, num_slots: usize) -> Option<usize> {
+    let resolved = if adapter_slot >= 0 {
+        adapter_slot as usize
+    } else {
+        active
+    };
+    (resolved != active && resolved < num_slots).then_some(resolved)
+}
+
+/// #30 (routed-prefill precision): pure selector for a routed prefill's
+/// (global_layer, module) [`LoraPair`] out of a request slot's GLOBAL-layer-indexed
+/// `layers`. `None` when the index is out of range, the layer is unadapted, or the
+/// routed adapter does not adapt that module (the caller then falls back to the
+/// bgmv/installed path — no delta if the slot's a_table cell is base). GPU-free +
+/// unit-tested so the (layer, module) indexing is verifiable without hardware.
+pub fn select_routed_pair(
+    layers: &[Option<LoraLayerWeights>],
+    global_layer_idx: usize,
+    module: LoraModule,
+) -> Option<&LoraPair> {
+    layers
+        .get(global_layer_idx)
+        .and_then(|o| o.as_ref())
+        .and_then(|l| l.module_pair(module))
+}
+
 impl LoraWeights {
     /// The active slot's per-layer pairs (GLOBAL-layer-indexed) — what the
     /// install walk copies onto the layer structs.
     pub fn active_layers(&self) -> &[Option<LoraLayerWeights>] {
         &self.slots[self.active].layers
+    }
+
+    /// #30 (routed-prefill precision): resolve a request's `adapter_slot`
+    /// (`>= 0` → that slot, `-1` → active) and return `Some(resolved)` ONLY when it
+    /// routes to a NON-active, in-range slot — the SINGLE source of truth for
+    /// "this prefill must apply the request slot's pair via the dense path". Kept
+    /// in exact lockstep with [`crate::model`]'s `upload_seq_slot_uniform`
+    /// (`resolved == active` → `DevicePtr(0)` → installed-pair path). Returns
+    /// `None` for an active/base request (byte-identical) and for out-of-range
+    /// slots (bad request → installed active pair, never a panic).
+    pub fn routed_prefill_slot(&self, adapter_slot: i32) -> Option<usize> {
+        routed_prefill_slot_of(adapter_slot, self.active, self.slots.len())
     }
 
     /// Resolve an adapter NAME to its slot index (for runtime rotation).
@@ -1597,5 +1658,94 @@ mod tests {
             (4, view(true, 7, 2)),
         ];
         assert_eq!(select_victim_slot(&cache2), Ok(3));
+    }
+
+    // ── #30 routed-prefill precision: the two pure correctness invariants
+    // (right predicate → Some only for a non-active slot; right pair selection
+    // by GLOBAL layer index + module) — locked without a GPU.
+
+    fn dummy_pair(tag: u64, k_in: u32, n_out: u32) -> LoraPair {
+        // `tag` distinguishes pairs by their A device pointer so a test can
+        // assert it selected the intended one (no GPU / no real weights).
+        LoraPair {
+            a: DenseWeight {
+                weight: DevicePtr(tag),
+            },
+            b: DenseWeight {
+                weight: DevicePtr(tag + 1),
+            },
+            rank: 8,
+            k_in,
+            n_out,
+            scale: 0.5,
+            max_rank: 16,
+        }
+    }
+
+    #[test]
+    fn routed_prefill_slot_predicate() {
+        // active = 0, pool of 2 slots.
+        assert_eq!(
+            routed_prefill_slot_of(-1, 0, 2),
+            None,
+            "-1 defers to active"
+        );
+        assert_eq!(
+            routed_prefill_slot_of(0, 0, 2),
+            None,
+            "names the active slot"
+        );
+        assert_eq!(
+            routed_prefill_slot_of(1, 0, 2),
+            Some(1),
+            "routes to a non-active slot"
+        );
+        assert_eq!(routed_prefill_slot_of(5, 0, 2), None, "out of range");
+        // active = 1: now slot 0 is the non-active one, slot 1 defers.
+        assert_eq!(routed_prefill_slot_of(0, 1, 2), Some(0));
+        assert_eq!(routed_prefill_slot_of(1, 1, 2), None);
+        assert_eq!(routed_prefill_slot_of(-1, 1, 2), None);
+    }
+
+    #[test]
+    fn select_routed_pair_by_global_index_and_module() {
+        // A GLOBAL-layer-indexed slice: only global layer 3 is adapted, with a
+        // distinct pair per module so a wrong (layer, module) selection is caught.
+        let mut layers: Vec<Option<LoraLayerWeights>> = (0..8).map(|_| None).collect();
+        let k = dummy_pair(100, 1024, 512);
+        let v = dummy_pair(200, 1024, 512);
+        let o = dummy_pair(300, 2048, 1024);
+        layers[3] = Some(LoraLayerWeights {
+            layer_idx: 3,
+            k_proj: Some(k),
+            v_proj: Some(v),
+            o_proj: Some(o),
+            gate_proj: None,
+            up_proj: None,
+            down_proj: None,
+        });
+
+        // Right pair for the adapted (layer, module) triples.
+        assert_eq!(
+            select_routed_pair(&layers, 3, LoraModule::KProj).map(|p| p.a.weight.0),
+            Some(100)
+        );
+        assert_eq!(
+            select_routed_pair(&layers, 3, LoraModule::VProj).map(|p| p.a.weight.0),
+            Some(200)
+        );
+        assert_eq!(
+            select_routed_pair(&layers, 3, LoraModule::OProj).map(|p| p.a.weight.0),
+            Some(300)
+        );
+
+        // A module the slot does NOT adapt on this layer → None (caller falls
+        // back to base for that module, never mis-applies another module's pair).
+        assert!(select_routed_pair(&layers, 3, LoraModule::GateProj).is_none());
+        // An unadapted layer → None (would be the WRONG layer if indexed by an
+        // attention-only counter; this test pins GLOBAL-index selection).
+        assert!(select_routed_pair(&layers, 2, LoraModule::KProj).is_none());
+        // Out-of-range global index → None, never a panic.
+        assert!(select_routed_pair(&layers, 99, LoraModule::KProj).is_none());
     }
 }

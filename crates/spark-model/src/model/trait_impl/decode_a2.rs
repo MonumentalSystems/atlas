@@ -237,6 +237,7 @@ impl TransformerModel {
             graph_capture: use_graphs,
             gdn_exact_replay: false,
             token_ids: None,
+            routed_lora_layers: None, // #30: batched decode never routes prefill.
         };
 
         // ── Phase 2: CUDA graph lookup / capture ──

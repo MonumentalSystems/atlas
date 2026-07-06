@@ -90,6 +90,12 @@ pub struct LoraPair {
 /// Q half). The named rejection lives in the loader (`crate::lora`).
 #[derive(Clone, Copy)]
 pub struct LoraAttnWeights {
+    /// #30: the TRUE global layer index (`0..num_hidden_layers`), stamped at
+    /// install from the global `idx`. The prefill apply sites index the
+    /// request slot's GLOBAL-layer-indexed pairs with THIS (not `attn_layer_idx`,
+    /// an attention-only counter that diverges from the global index on hybrid
+    /// GDN/attention models).
+    pub layer_idx: usize,
     pub k: Option<LoraPair>,
     pub v: Option<LoraPair>,
     pub o: Option<LoraPair>,

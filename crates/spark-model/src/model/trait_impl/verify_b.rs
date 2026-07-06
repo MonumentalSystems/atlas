@@ -226,6 +226,7 @@ impl TransformerModel {
             graph_capture: use_graphs,
             gdn_exact_replay: false,
             token_ids: Some(self.buffers.token_ids()),
+            routed_lora_layers: None, // #30: decode/verify never routes prefill.
         };
 
         // ── Phase 2: CUDA graph capture / replay ──

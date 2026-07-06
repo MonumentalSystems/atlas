@@ -331,6 +331,7 @@ impl DeepseekV4MtpHead {
             graph_capture: false,
             gdn_exact_replay: false,
             token_ids: ctx.token_ids,
+            routed_lora_layers: None, // #30: MTP draft body; no prefill LoRA route.
         };
 
         // `decode_inner_hc` reads the persistent multi-stream state from

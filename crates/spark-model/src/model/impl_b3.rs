@@ -88,6 +88,7 @@ impl TransformerModel {
             graph_capture: false,
             gdn_exact_replay: false,
             token_ids: None,
+            routed_lora_layers: None, // #30: MTP/draft decode never routes prefill.
         };
         let prop_state = seq
             .proposer_state
@@ -271,6 +272,9 @@ impl TransformerModel {
                     )
                 })?;
             let attn_weights = ops::lora_delta::LoraAttnWeights {
+                // #30: the global layer index (from `self.layers.enumerate()`) —
+                // the key the request slot's GLOBAL-layer-indexed pairs use.
+                layer_idx: idx,
                 k: layer_weights.k_proj,
                 v: layer_weights.v_proj,
                 o: layer_weights.o_proj,

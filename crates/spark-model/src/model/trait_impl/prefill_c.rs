@@ -427,6 +427,8 @@ impl TransformerModel {
             // and must use the bit-faithful WY4 recurrence (see layer.rs).
             gdn_exact_replay: marconi_skip,
             token_ids: None,
+            // #30: request slot pairs (None unless routing to a non-active slot).
+            routed_lora_layers: self.routed_slot_layers(seq.adapter_slot),
         };
 
         // ── 4. Per-layer forward: SSM uses three-phase, attention uses standard ──

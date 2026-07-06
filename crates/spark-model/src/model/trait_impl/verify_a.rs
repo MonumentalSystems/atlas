@@ -143,6 +143,7 @@ impl TransformerModel {
                         graph_capture: false,
                         gdn_exact_replay: false,
                         token_ids: None,
+                        routed_lora_layers: None, // #30: verify decode; no prefill route.
                     };
 
                     let h_t = hidden.offset(t * h * fp32);
@@ -172,6 +173,7 @@ impl TransformerModel {
                     graph_capture: false,
                     gdn_exact_replay: false,
                     token_ids: None,
+                    routed_lora_layers: None, // #30: verify decode; no prefill route.
                 };
 
                 layer.decode_batched(

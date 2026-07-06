@@ -239,6 +239,17 @@ pub struct ForwardContext<'a> {
     /// for models without hash routing. Must be a STABLE address across the
     /// layer loop (and, under CUDA-graph decode, uploaded before each replay).
     pub token_ids: Option<DevicePtr>,
+    /// #30 (routed-prefill precision): the REQUEST slot's per-layer LoRA pairs,
+    /// GLOBAL-layer-indexed (`len == num_hidden_layers`), set ONLY at the prefill
+    /// entries and ONLY when the request routes to a NON-active slot. `Some` makes
+    /// the K/V/O prefill apply sites select the request slot's pair and fold it
+    /// through the SAME dense `apply_lora_delta` (dense_gemm_tc) the ACTIVE adapter
+    /// uses — numerically identical to serving that adapter active, instead of the
+    /// per-row bgmv (whose fp accumulation order tips razor-margin tokens). `None`
+    /// (active/base request, no LoRA, and every decode/verify/mtp/moe pass) leaves
+    /// the installed-active-pair path byte-identical. Prefill runs eager
+    /// (`graph_capture: false`) so this per-pass CPU borrow is safe.
+    pub routed_lora_layers: Option<&'a [Option<crate::lora::LoraLayerWeights>]>,
 }
 
 /// A single transformer layer performing the full per-layer computation.

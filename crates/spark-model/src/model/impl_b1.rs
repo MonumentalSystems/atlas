@@ -199,6 +199,23 @@ impl TransformerModel {
         Ok(dst)
     }
 
+    /// #30 (routed-prefill precision): the request slot's GLOBAL-layer-indexed
+    /// LoRA pairs for a prefill's `ForwardContext.routed_lora_layers`, borrowed
+    /// from the pool. `Some` ONLY when `adapter_slot` routes to a NON-active,
+    /// in-range slot (see [`crate::lora::LoraWeights::routed_prefill_slot`], the
+    /// same predicate `upload_seq_slot_uniform` uses to decide bgmv-vs-installed);
+    /// `None` for active/base requests and no-LoRA runs (installed-pair path,
+    /// byte-identical). A shared `&self.lora` borrow living exactly as long as the
+    /// prefill `ForwardContext`.
+    pub(crate) fn routed_slot_layers(
+        &self,
+        adapter_slot: i32,
+    ) -> Option<&[Option<crate::lora::LoraLayerWeights>]> {
+        let lw = self.lora.as_ref()?;
+        let resolved = lw.routed_prefill_slot(adapter_slot)?;
+        Some(lw.slots[resolved].layers.as_slice())
+    }
+
     /// Upload batch metadata to a caller-specified device address.
     ///
     /// Same layout as `upload_batch_metadata_fixed` (positions at +0, slots
@@ -352,6 +369,9 @@ impl TransformerModel {
                 graph_capture: ctx.graph_capture,
                 gdn_exact_replay: false,
                 token_ids: None,
+                // #30: forward the parent's routing (None on this decode-profiling
+                // path, but never silently drop it if a prefill ever re-wraps).
+                routed_lora_layers: ctx.routed_lora_layers,
             }
         };
 
@@ -544,6 +564,7 @@ impl TransformerModel {
             graph_capture: false, // Eager mode — no CUDA graph
             gdn_exact_replay: false,
             token_ids: None,
+            routed_lora_layers: None, // #30: offline single-seq decode; no prefill route.
         };
 
         // Eager layer loop: skip SSM layers, run attention layers only
