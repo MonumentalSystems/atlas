@@ -20,29 +20,34 @@ fn main() -> Result<()> {
 
     let mut listen = String::from("0.0.0.0:9910");
     let mut rdma = spark_storage::kv_peer::RdmaConfig::default();
+    let mut custom_rails: Vec<(String, u32)> = Vec::new();
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
             "--listen" | "-l" => listen = it.next().context("--listen needs host:port")?,
-            "--rdma-dev" => rdma.dev = it.next().context("--rdma-dev needs a device name")?,
-            "--rdma-gid" => {
-                rdma.gid_idx = it
-                    .next()
-                    .context("--rdma-gid needs an index")?
-                    .parse()
-                    .context("--rdma-gid must be an integer")?
+            // Repeatable: --rail <dev>:<gid_idx>. First --rail replaces the
+            // 2-rail default; give it twice for both CX7 adapters.
+            "--rail" => {
+                let spec = it.next().context("--rail needs <dev>:<gid_idx>")?;
+                let (dev, gid) = spec
+                    .rsplit_once(':')
+                    .context("--rail format is <dev>:<gid_idx>")?;
+                custom_rails.push((dev.to_string(), gid.parse().context("gid must be int")?));
             }
             "-h" | "--help" => {
                 eprintln!(
                     "atlas-kv-peer — RW RDMA overflow blade for the KV cache\n\n\
-                     USAGE: atlas-kv-peer [--listen host:port] [--rdma-dev <ibdev>] [--rdma-gid <idx>]\n\
-                     defaults: listen 0.0.0.0:9910, rdma-dev roceP2p1s0f1, rdma-gid 3\n\
-                     client selects via $ATLAS_KV_PEER=host:port"
+                     USAGE: atlas-kv-peer [--listen host:port] [--rail <dev>:<gid> ...]\n\
+                     defaults: listen 0.0.0.0:9910, rails roceP2p1s0f1:3 rocep1s0f1:3\n\
+                     client selects via $ATLAS_KV_PEER=host:port ($ATLAS_KV_DUAL_RAIL=1 for both)"
                 );
                 return Ok(());
             }
             other => bail!("unknown arg: {other} (try --help)"),
         }
+    }
+    if !custom_rails.is_empty() {
+        rdma.rails = custom_rails;
     }
     spark_storage::kv_peer::serve(&listen, rdma)
 }

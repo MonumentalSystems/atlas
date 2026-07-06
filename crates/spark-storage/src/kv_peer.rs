@@ -75,18 +75,19 @@ mod server_impl {
     use super::*;
     use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 
-    /// RDMA device selection for the blade (defaults match the cabled GB10 link).
+    /// RDMA rail selection for the blade. One `(dev, gid_idx)` per CX7 adapter;
+    /// a client requests N rails and the peer registers its arena on each so the
+    /// client can stripe traffic across both adapters (~1.75x aggregate on GB10).
     #[derive(Clone, Debug)]
     pub struct RdmaConfig {
-        pub dev: String,
-        pub gid_idx: u32,
+        /// `(device, gid_idx)` per rail, in link order (rail 0 = .178, 1 = .177).
+        pub rails: Vec<(String, u32)>,
     }
 
     impl Default for RdmaConfig {
         fn default() -> Self {
             Self {
-                dev: "roceP2p1s0f1".into(),
-                gid_idx: 3,
+                rails: vec![("roceP2p1s0f1".into(), 3), ("rocep1s0f1".into(), 3)],
             }
         }
     }
@@ -97,10 +98,9 @@ mod server_impl {
         let listener = TcpListener::bind(addr).context("bind kv-peer listener")?;
         let local = listener.local_addr().ok();
         tracing::info!(
-            "kv-peer (RW RDMA overflow blade) listening on {:?} (verbs dev={} gid={})",
+            "kv-peer (RW RDMA overflow blade) listening on {:?} (rails {:?})",
             local,
-            rdma.dev,
-            rdma.gid_idx,
+            rdma.rails,
         );
         for conn in listener.incoming() {
             let stream = match conn {
@@ -132,40 +132,62 @@ mod server_impl {
         use std::io::{Read, Write};
         stream.set_nodelay(true).ok();
 
-        // 1. Client tells us how much RAM it will address.
+        // 1. Client tells us how much RAM to register and how many rails it wants.
         let mut b8 = [0u8; 8];
         stream.read_exact(&mut b8).context("read total_bytes")?;
         let total = u64::from_le_bytes(b8) as usize;
         if total == 0 || total > (1usize << 42) {
             bail!("implausible kv blade size: {total}");
         }
-
-        // Anonymous, page-aligned, lazily-zeroed arena (faulted+pinned by reg_mr).
-        let arena = Mmap::anon(total).context("mmap kv blade arena")?;
-        let psn: u32 = 0x5a5a5a ^ std::process::id();
-        let mut verbs = Verbs::create(&rdma.dev, rdma.gid_idx, psn & 0xff_ffff)?;
-        // SAFETY: the arena outlives `verbs` (dropped after it below).
-        let keys = unsafe { verbs.reg_mr_rw(arena.addr as *mut _, arena.len)? };
-
-        // 2. Publish our QP + the RW MR.
-        KvServerParams {
-            qpn: verbs.qpn(),
-            psn: verbs.psn(),
-            gid: verbs.gid(),
-            base_addr: arena.addr as u64,
-            rkey: keys.rkey,
+        let mut b1 = [0u8; 1];
+        stream.read_exact(&mut b1).context("read n_rails")?;
+        let n_rails = b1[0] as usize;
+        if n_rails == 0 || n_rails > rdma.rails.len() {
+            bail!("client asked for {n_rails} rails; peer has {}", rdma.rails.len());
         }
-        .write_to(&mut stream)
-        .context("send kv server params")?;
 
-        // 3-4. Learn the client's QP, connect, ack.
-        let cp = VerbsClientParams::read_from(&mut stream).context("read kv client params")?;
-        verbs.connect(cp.qpn, cp.psn, &cp.gid)?;
+        // Anonymous, page-aligned, lazily-zeroed arena — registered ONCE per rail
+        // (each device its own PD/rkey). The physical pages are shared (pinned
+        // refcounted), so N rails do NOT cost N× RAM — only N MR handles + rkeys.
+        let arena = Mmap::anon(total).context("mmap kv blade arena")?;
+        let pid = std::process::id();
+        let mut rails: Vec<Verbs> = Vec::with_capacity(n_rails);
+        let mut rkeys: Vec<u32> = Vec::with_capacity(n_rails);
+        for (i, (dev, gid)) in rdma.rails.iter().take(n_rails).enumerate() {
+            let psn = (0x5a5a5a ^ pid ^ ((i as u32) << 20)) & 0xff_ffff;
+            let mut v = Verbs::create(dev, *gid, psn)?;
+            // SAFETY: the arena outlives every rail (dropped after them below).
+            let keys = unsafe { v.reg_mr_rw(arena.addr as *mut _, arena.len)? };
+            rkeys.push(keys.rkey);
+            rails.push(v);
+        }
+
+        // 2. Publish rail count + each rail's QP + rkey (shared base).
+        stream.write_all(&[n_rails as u8]).context("send n_rails")?;
+        for (v, rkey) in rails.iter().zip(&rkeys) {
+            KvServerParams {
+                qpn: v.qpn(),
+                psn: v.psn(),
+                gid: v.gid(),
+                base_addr: arena.addr as u64,
+                rkey: *rkey,
+            }
+            .write_to(&mut stream)
+            .context("send kv server params")?;
+        }
+
+        // 3-4. Learn each client rail's QP, connect, ack.
+        stream.read_exact(&mut b1).context("read client n_rails")?;
+        if b1[0] as usize != n_rails {
+            bail!("client rail count mismatch");
+        }
+        for v in rails.iter_mut() {
+            let cp = VerbsClientParams::read_from(&mut stream).context("read kv client params")?;
+            v.connect(cp.qpn, cp.psn, &cp.gid)?;
+        }
         stream.write_all(&[STATUS_OK]).context("send kv ready ack")?;
         tracing::info!(
-            "kv-peer client connected (qpn {} -> {}, {:.1} GiB RW blade)",
-            verbs.qpn(),
-            cp.qpn,
+            "kv-peer client connected: {n_rails} rail(s), {:.1} GiB RW blade",
             total as f64 / (1024.0 * 1024.0 * 1024.0),
         );
 
@@ -178,8 +200,8 @@ mod server_impl {
                 Err(_) => break,
             }
         }
-        // Dereg (verbs) before unmap (arena): drop verbs first.
-        drop(verbs);
+        // Dereg (rails) before unmap (arena): drop rails first.
+        drop(rails);
         drop(arena);
         Ok(())
     }
