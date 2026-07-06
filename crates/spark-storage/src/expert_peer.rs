@@ -117,6 +117,46 @@ fn read_u32<R: std::io::Read>(r: &mut R) -> Result<u32> {
     Ok(u32::from_le_bytes(b))
 }
 
+/// Frame N per-rail `VerbsServerParams` for the dual-rail expert tier: a leading
+/// `[u8 n_rails]` count followed by each rail's params — exactly how `kv_peer`
+/// frames its per-rail `KvServerParams`. Single-rail (`n == 1`) is the default,
+/// byte-for-byte the pre-dual-rail path plus the one-byte count prefix. This is
+/// pure wire logic, un-gated so it unit-tests on the metal/skip build with no
+/// rdma-core.
+pub fn write_server_rails<W: std::io::Write>(w: &mut W, rails: &[VerbsServerParams]) -> Result<()> {
+    if rails.is_empty() || rails.len() > 8 {
+        bail!("implausible server rail count: {}", rails.len());
+    }
+    w.write_all(&[rails.len() as u8])?;
+    for sp in rails {
+        sp.write_to(w)?;
+    }
+    Ok(())
+}
+
+/// Read `want` per-rail `VerbsServerParams` framed by a leading `[u8 n_rails]`.
+/// Bails if the framed count is zero, absurd (> 8), or != `want` — the client
+/// already negotiated `want` rails, so any other count is a protocol error.
+pub fn read_server_rails<R: std::io::Read>(
+    r: &mut R,
+    want: usize,
+) -> Result<Vec<VerbsServerParams>> {
+    let mut b1 = [0u8; 1];
+    r.read_exact(&mut b1).context("read server rail count")?;
+    let n = b1[0] as usize;
+    if n == 0 || n > 8 {
+        bail!("implausible server rail count: {n}");
+    }
+    if n != want {
+        bail!("server framed {n} rails but client negotiated {want}");
+    }
+    let mut rails = Vec::with_capacity(n);
+    for _ in 0..n {
+        rails.push(VerbsServerParams::read_from(r)?);
+    }
+    Ok(rails)
+}
+
 /// Serialize a request: `(layer, expert)`.
 pub fn encode_request(layer: u32, expert: u32) -> [u8; 8] {
     let mut b = [0u8; 8];
@@ -146,19 +186,29 @@ mod server_impl {
     use std::sync::Arc;
 
     /// RDMA device selection for the verbs (`MODE_VERBS`) transport. Ignored for
-    /// TCP clients. Defaults match the cabled GB10 CX7 link (`roceP2p1s0f1`,
-    /// RoCEv2 GID index 3).
+    /// TCP clients. One `(device, gid_idx)` per CX7 adapter: a dual-rail client
+    /// requests N rails and the peer registers each layer mmap on every rail so
+    /// the client can stripe expert fetches across both adapters. The default is
+    /// a SINGLE rail (`roceP2p1s0f1`, RoCEv2 GID index 3) — the pre-dual-rail
+    /// behavior, unchanged for `verify_verbs.sh`; add a second `--rail` to serve
+    /// dual-rail clients.
     #[derive(Clone, Debug)]
     pub struct RdmaConfig {
-        pub dev: String,
-        pub gid_idx: u32,
+        /// `(device, gid_idx)` per rail, in link order (rail 0 = the cabled link).
+        pub rails: Vec<(String, u32)>,
+        /// Ceiling on total registered store RAM across concurrent verbs
+        /// connections, in bytes. `0` = unlimited (the default). Each verbs
+        /// connection registers the whole store (`index.total_bytes()`) once (the
+        /// N per-rail MRs share the same mmap pages), so this bounds the number of
+        /// concurrent store registrations.
+        pub max_blade_bytes: u64,
     }
 
     impl Default for RdmaConfig {
         fn default() -> Self {
             Self {
-                dev: "roceP2p1s0f1".into(),
-                gid_idx: 3,
+                rails: vec![("roceP2p1s0f1".into(), 3)],
+                max_blade_bytes: 0,
             }
         }
     }
@@ -170,18 +220,25 @@ mod server_impl {
         let manifest = serde_json::to_vec(reader.index())?;
         let dir: Arc<PathBuf> = Arc::new(dir.to_path_buf());
         let rdma = Arc::new(rdma);
+        // One process-global ledger; each verbs connection reserves the store
+        // size before it mmaps/registers the layer files.
+        let ledger = Arc::new(crate::blade_cap::CommitLedger::new(rdma.max_blade_bytes));
         let listener = TcpListener::bind(addr).context("bind expert-peer listener")?;
         let local = listener.local_addr().ok();
         tracing::info!(
             "expert-peer serving {} ({} layers, {} experts, stride {}) on {:?} \
-             (verbs dev={} gid={})",
+             (verbs rails {:?}, cap {})",
             dir.display(),
             reader.index().num_moe_layers,
             reader.index().num_experts,
             reader.index().record_stride,
             local,
-            rdma.dev,
-            rdma.gid_idx,
+            rdma.rails,
+            if rdma.max_blade_bytes == 0 {
+                "unlimited".to_string()
+            } else {
+                format!("{:.1} GiB", rdma.max_blade_bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+            },
         );
         for conn in listener.incoming() {
             let stream = match conn {
@@ -195,8 +252,9 @@ mod server_impl {
             let manifest = manifest.clone();
             let dir = dir.clone();
             let rdma = rdma.clone();
+            let ledger = ledger.clone();
             std::thread::spawn(move || {
-                if let Err(e) = handle_conn(stream, &reader, &manifest, &dir, &rdma) {
+                if let Err(e) = handle_conn(stream, &reader, &manifest, &dir, &rdma, &ledger) {
                     tracing::warn!("expert-peer connection ended: {e}");
                 }
             });
@@ -210,18 +268,21 @@ mod server_impl {
         manifest: &[u8],
         dir: &Path,
         rdma: &RdmaConfig,
+        ledger: &Arc<crate::blade_cap::CommitLedger>,
     ) -> Result<()> {
         stream.set_nodelay(true).ok();
         // 1. Send the manifest.
         stream.write_all(&(manifest.len() as u32).to_le_bytes())?;
         stream.write_all(manifest)?;
 
-        // 2. The client picks a transport.
+        // 2. The client picks a transport. TCP `pread`s on demand and pins no
+        // RAM, so only the verbs path (which mmaps + registers the store) is
+        // charged against the ledger.
         let mut mode = [0u8; 1];
         stream.read_exact(&mut mode).context("read transport mode")?;
         match mode[0] {
             MODE_TCP => serve_tcp(stream, reader),
-            MODE_VERBS => serve_verbs(stream, reader, dir, rdma),
+            MODE_VERBS => serve_verbs(stream, reader, dir, rdma, ledger),
             other => bail!("client requested unknown transport mode {other}"),
         }
     }
@@ -259,6 +320,7 @@ mod server_impl {
         _reader: &ExpertFileReader,
         _dir: &Path,
         _rdma: &RdmaConfig,
+        _ledger: &Arc<crate::blade_cap::CommitLedger>,
     ) -> Result<()> {
         bail!("client requested verbs transport but this peer was built without rdma-core");
     }
@@ -273,45 +335,87 @@ mod server_impl {
         reader: &ExpertFileReader,
         dir: &Path,
         rdma: &RdmaConfig,
+        ledger: &Arc<crate::blade_cap::CommitLedger>,
     ) -> Result<()> {
         use crate::rdma_verbs::Verbs;
 
         let index = reader.index();
         let num_layers = index.num_moe_layers;
-        // A per-connection PSN so successive clients don't collide.
-        let psn: u32 = 0x424242 ^ (std::process::id().rotate_left(3));
-        let mut verbs = Verbs::create(&rdma.dev, rdma.gid_idx, psn & 0xff_ffff)?;
 
-        // mmap + register every layer file (REMOTE_READ). Keep the mappings alive
-        // for the whole connection — the NIC DMAs out of them.
+        // The client requests how many rails it wants to stripe across (default
+        // 1). Validate against what this peer is configured to serve.
+        let mut b1 = [0u8; 1];
+        stream.read_exact(&mut b1).context("read n_rails")?;
+        let n_rails = b1[0] as usize;
+        if n_rails == 0 || n_rails > rdma.rails.len() {
+            bail!("client asked for {n_rails} rails; peer has {}", rdma.rails.len());
+        }
+
+        // Admission gate: charge the deterministic store size (identical for
+        // every client) ONCE — the N per-rail MRs pin the SAME refcounted mmap
+        // pages, so the committed footprint is `total_bytes`, not total*n_rails.
+        // Reserve BEFORE any mmap/reg_mr; the RAII guard releases on every exit
+        // below (early bail, reg_mr error, hangup).
+        let _reservation = ledger
+            .try_reserve(index.total_bytes())
+            .context("expert blade cap")?;
+
+        // One QP per rail (distinct per-rail PSN so successive clients/rails
+        // don't collide).
+        let pid = std::process::id();
+        let mut rails: Vec<Verbs> = Vec::with_capacity(n_rails);
+        for (i, (dev, gid)) in rdma.rails.iter().take(n_rails).enumerate() {
+            let psn = (0x424242 ^ pid ^ ((i as u32) << 20)) & 0xff_ffff;
+            rails.push(Verbs::create(dev, *gid, psn)?);
+        }
+
+        // mmap each layer file ONCE (REMOTE_READ) and register that SAME virtual
+        // range on EVERY rail's PD — one rkey per (rail, layer), identical base
+        // VA, shared physical pages (not N× RAM). Keep the mappings alive for the
+        // whole connection — the NIC DMAs out of them.
         let mut mmaps: Vec<Mmap> = Vec::with_capacity(num_layers as usize);
-        let mut layers: Vec<(u64, u32)> = Vec::with_capacity(num_layers as usize);
+        let mut per_rail_layers: Vec<Vec<(u64, u32)>> = (0..n_rails)
+            .map(|_| Vec::with_capacity(num_layers as usize))
+            .collect();
         for l in 0..num_layers {
             let path = dir.join(index.file_name(l));
             let m = Mmap::open_ro(&path)
                 .with_context(|| format!("mmap {}", path.display()))?;
-            // SAFETY: the mapping covers `m.len` bytes at `m.addr` and outlives
-            // `verbs` (mmaps dropped after verbs at scope end — see note below).
-            let keys = unsafe { verbs.reg_mr(m.addr as *mut _, m.len, true)? };
-            layers.push((m.addr as u64, keys.rkey));
+            for (ri, v) in rails.iter_mut().enumerate() {
+                // SAFETY: the mapping covers `m.len` bytes at `m.addr` and
+                // outlives every rail's Verbs (mmaps dropped after rails below).
+                let keys = unsafe { v.reg_mr(m.addr as *mut _, m.len, true)? };
+                per_rail_layers[ri].push((m.addr as u64, keys.rkey));
+            }
             mmaps.push(m);
         }
 
-        // Publish our QP + MR table, learn the client's QP, connect, ack.
-        let sp = VerbsServerParams {
-            qpn: verbs.qpn(),
-            psn: verbs.psn(),
-            gid: verbs.gid(),
-            layers,
-        };
-        sp.write_to(&mut stream).context("send verbs server params")?;
-        let cp = VerbsClientParams::read_from(&mut stream).context("read verbs client params")?;
-        verbs.connect(cp.qpn, cp.psn, &cp.gid)?;
+        // Publish one VerbsServerParams per rail (shared base, per-rail rkey).
+        let sp: Vec<VerbsServerParams> = rails
+            .iter()
+            .enumerate()
+            .map(|(ri, v)| VerbsServerParams {
+                qpn: v.qpn(),
+                psn: v.psn(),
+                gid: v.gid(),
+                layers: std::mem::take(&mut per_rail_layers[ri]),
+            })
+            .collect();
+        write_server_rails(&mut stream, &sp).context("send verbs server params")?;
+
+        // Learn each client rail's QP, connect, ack.
+        stream.read_exact(&mut b1).context("read client n_rails")?;
+        if b1[0] as usize != n_rails {
+            bail!("client rail count mismatch");
+        }
+        for v in rails.iter_mut() {
+            let cp =
+                VerbsClientParams::read_from(&mut stream).context("read verbs client params")?;
+            v.connect(cp.qpn, cp.psn, &cp.gid)?;
+        }
         stream.write_all(&[STATUS_OK]).context("send verbs ready ack")?;
         tracing::info!(
-            "expert-peer verbs client connected (qpn {} -> {}, {} layer MRs)",
-            verbs.qpn(),
-            cp.qpn,
+            "expert-peer verbs client connected ({n_rails} rail(s), {} layer MRs/rail)",
             num_layers,
         );
 
@@ -325,11 +429,9 @@ mod server_impl {
                 Err(_) => break,
             }
         }
-        // Drop order: `verbs` (which dereg's the MRs) must fall before `mmaps`
-        // are unmapped. Rust drops locals in reverse declaration order, and
-        // `verbs` was declared before `mmaps`, so `mmaps` unmaps first — reorder
-        // by dropping verbs explicitly first.
-        drop(verbs);
+        // Drop order: `rails` (which dereg's every MR) must fall before `mmaps`
+        // are unmapped, so dereg happens over live mappings. Drop rails first.
+        drop(rails);
         drop(mmaps);
         Ok(())
     }
@@ -440,6 +542,67 @@ mod tests {
         cp.write_to(&mut buf).unwrap();
         let back = VerbsClientParams::read_from(&mut &buf[..]).unwrap();
         assert_eq!(cp, back);
+    }
+
+    #[test]
+    fn server_rails_round_trip() {
+        // The dual-rail framing: N `VerbsServerParams` with a leading count.
+        let mk = |qpn| VerbsServerParams {
+            qpn,
+            psn: 0x0012_3456 & 0xff_ffff,
+            gid: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 192, 168, 178, 12],
+            // Same base VA across rails (shared pages), distinct rkeys per rail.
+            layers: vec![(0x7f00_0000_0000, 1001 + qpn), (0x7f00_0100_0000, 1002 + qpn)],
+        };
+        let rails = vec![mk(0x1111), mk(0x2222)];
+        let mut buf = Vec::new();
+        write_server_rails(&mut buf, &rails).unwrap();
+        let back = read_server_rails(&mut &buf[..], 2).unwrap();
+        assert_eq!(rails, back);
+    }
+
+    #[test]
+    fn single_rail_framing_round_trips() {
+        // n == 1 is the default path; must round-trip through the framing.
+        let sp = VerbsServerParams {
+            qpn: 7,
+            psn: 9,
+            gid: [1u8; 16],
+            layers: vec![(0x1000, 42)],
+        };
+        let mut buf = Vec::new();
+        write_server_rails(&mut buf, std::slice::from_ref(&sp)).unwrap();
+        // Leading count byte then the single params struct.
+        assert_eq!(buf[0], 1);
+        let back = read_server_rails(&mut &buf[..], 1).unwrap();
+        assert_eq!(back, vec![sp]);
+    }
+
+    #[test]
+    fn read_server_rails_rejects_mismatch() {
+        // Framed count (1) != what the caller negotiated (2) -> protocol error.
+        let sp = VerbsServerParams {
+            qpn: 1,
+            psn: 2,
+            gid: [0u8; 16],
+            layers: vec![(0x1000, 7)],
+        };
+        let mut buf = Vec::new();
+        write_server_rails(&mut buf, std::slice::from_ref(&sp)).unwrap();
+        assert!(read_server_rails(&mut &buf[..], 2).is_err());
+    }
+
+    #[test]
+    fn read_server_rails_rejects_zero_count() {
+        // A zero rail count is a corrupt/hostile frame.
+        let buf = [0u8; 1];
+        assert!(read_server_rails(&mut &buf[..], 1).is_err());
+    }
+
+    #[test]
+    fn write_server_rails_rejects_empty() {
+        let mut buf = Vec::new();
+        assert!(write_server_rails(&mut buf, &[]).is_err());
     }
 
     #[test]

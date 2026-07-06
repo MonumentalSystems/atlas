@@ -34,11 +34,26 @@ fn main() -> Result<()> {
                     .context("--rail format is <dev>:<gid_idx>")?;
                 custom_rails.push((dev.to_string(), gid.parse().context("gid must be int")?));
             }
+            // Ceiling on total committed blade RAM (GiB) across all concurrent
+            // connections. 0 or absent = unlimited (unchanged default).
+            "--max-blade-gb" => {
+                let gb: f64 = it
+                    .next()
+                    .context("--max-blade-gb needs a number")?
+                    .parse()
+                    .context("--max-blade-gb must be a number")?;
+                if !gb.is_finite() || gb < 0.0 {
+                    bail!("--max-blade-gb must be a non-negative number (got {gb})");
+                }
+                rdma.max_blade_bytes = (gb * 1024.0 * 1024.0 * 1024.0) as u64;
+            }
             "-h" | "--help" => {
                 eprintln!(
                     "atlas-kv-peer — RW RDMA overflow blade for the KV cache\n\n\
                      USAGE: atlas-kv-peer [--listen host:port] [--rail <dev>:<gid> ...]\n\
+                     \x20                  [--max-blade-gb <g>]\n\
                      defaults: listen 0.0.0.0:9910, rails roceP2p1s0f1:3 rocep1s0f1:3\n\
+                     --max-blade-gb <g>: cap total blade RAM (0/absent = unlimited)\n\
                      client selects via $ATLAS_KV_PEER=host:port ($ATLAS_KV_DUAL_RAIL=1 for both)"
                 );
                 return Ok(());

@@ -207,7 +207,11 @@ fn rdma_tier_matches_oracle_over_loopback() {
     let serve_dir = dir.clone();
     let serve_addr = addr.clone();
     std::thread::spawn(move || {
-        let _ = spark_storage::expert_peer::serve(&serve_dir, serve_addr.as_str());
+        let _ = spark_storage::expert_peer::serve(
+            &serve_dir,
+            serve_addr.as_str(),
+            spark_storage::expert_peer::RdmaConfig::default(),
+        );
     });
     // Wait for the listener to come up.
     let mut connected = None;
@@ -220,7 +224,7 @@ fn rdma_tier_matches_oracle_over_loopback() {
     }
     connected.expect("peer never accepted a connection");
 
-    let mut rdma = RdmaTier::connect(&addr, LAYERS, EXPERTS).expect("rdma connect");
+    let mut rdma = RdmaTier::connect(&addr, LAYERS, EXPERTS, false).expect("rdma connect");
     let mut posix = PosixTier::open(&dir, LAYERS, EXPERTS).expect("posix tier");
     for layer in 0..LAYERS {
         for expert in 0..EXPERTS {

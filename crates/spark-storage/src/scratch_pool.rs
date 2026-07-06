@@ -26,7 +26,7 @@
 use anyhow::{Result, bail};
 use std::collections::{HashMap, VecDeque};
 
-use crate::cuda_min::DeviceBuffer;
+use crate::cuda_min::{DeviceBuffer, PinnedBuffer};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct ResidentKey {
@@ -50,25 +50,98 @@ impl ScratchDims {
     }
 }
 
+/// Backing store for the scratch pool. `Device` (cuMemAlloc, HBM) is the
+/// default, portable path. `Uma` (cuMemAllocHost, pinned LPDDR) is used when
+/// the restore path wants zero-copy RDMA: on GB10 its `device_ptr()` equals the
+/// host VA, so the same base is GPU-readable by the tiled-attention kernel AND
+/// `ibv_reg_mr`-able as an RDMA landing MR (no bounce, no copy_h2d).
+// The variant payloads are held purely to own the allocation (RAII drop);
+// the pool addresses memory through the cached `base` VA, not through these.
+#[allow(dead_code)]
+enum PoolMem {
+    Device(DeviceBuffer),
+    Uma(PinnedBuffer),
+}
+
 pub struct ScratchPool {
     dims: ScratchDims,
-    pool: DeviceBuffer,
+    // Owns the backing allocation for its lifetime; addressed via `base`.
+    #[allow(dead_code)]
+    mem: PoolMem,
+    /// Device VA of the pool base: `DeviceBuffer::ptr` for the device path,
+    /// `PinnedBuffer::device_ptr()` for UMA. Cached once at construction so the
+    /// hot restore-path accessors stay infallible u64 getters (device_ptr() is
+    /// a fallible driver call).
+    base: u64,
+    uma: bool,
     residents: Vec<Option<ResidentKey>>, // indexed by slot idx
     lookup: HashMap<ResidentKey, u32>,
     free_list: VecDeque<u32>,
 }
 
 impl ScratchPool {
+    /// Device-backed pool (default). Portable to discrete GPUs; the restore
+    /// path uses the bounce (copy_h2d) restore into these device slots.
     pub fn new(dims: ScratchDims) -> Result<Self> {
+        Self::build(dims, false)
+    }
+
+    /// Prefer a UMA (pinned LPDDR) backing so zero-copy RDMA restore can land
+    /// directly into the slots. Falls back to the device path when the pinned
+    /// allocation isn't unified-addressing (device VA != host VA, e.g. a
+    /// discrete GPU) — the caller then uses the bounce restore, unchanged.
+    pub fn new_preferring_uma(dims: ScratchDims) -> Result<Self> {
+        Self::build(dims, true)
+    }
+
+    fn build(dims: ScratchDims, prefer_uma: bool) -> Result<Self> {
         if dims.num_slots == 0 {
             bail!("ScratchPool requires at least one slot");
         }
-        let pool = DeviceBuffer::new(dims.pool_bytes())?;
+        let bytes = dims.pool_bytes();
+        let (mem, base, uma) = if prefer_uma {
+            // Try UMA; require host VA == device VA (GB10 unified addressing).
+            // On any failure (alloc or non-UMA host) fall back to device memory
+            // so the bounce restore path stays correct on discrete GPUs.
+            match PinnedBuffer::new(bytes).and_then(|p| {
+                let dev = p.device_ptr()?;
+                Ok((p, dev))
+            }) {
+                Ok((pinned, dev)) if dev == pinned.ptr as u64 => {
+                    (PoolMem::Uma(pinned), dev, true)
+                }
+                Ok((pinned, dev)) => {
+                    tracing::warn!(
+                        "ScratchPool: pinned host VA {:#x} != device VA {dev:#x} — host is \
+                         not unified-addressing; using device memory + bounce restore",
+                        pinned.ptr as u64,
+                    );
+                    let pool = DeviceBuffer::new(bytes)?;
+                    let base = pool.ptr;
+                    (PoolMem::Device(pool), base, false)
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "ScratchPool: UMA pinned alloc failed ({e:#}); using device memory + \
+                         bounce restore"
+                    );
+                    let pool = DeviceBuffer::new(bytes)?;
+                    let base = pool.ptr;
+                    (PoolMem::Device(pool), base, false)
+                }
+            }
+        } else {
+            let pool = DeviceBuffer::new(bytes)?;
+            let base = pool.ptr;
+            (PoolMem::Device(pool), base, false)
+        };
         let residents = vec![None; dims.num_slots as usize];
         let free_list = (0..dims.num_slots).collect();
         Ok(Self {
             dims,
-            pool,
+            mem,
+            base,
+            uma,
             residents,
             lookup: HashMap::new(),
             free_list,
@@ -78,11 +151,16 @@ impl ScratchPool {
     pub fn dims(&self) -> ScratchDims {
         self.dims
     }
+    /// True iff the pool is UMA-backed (pinned LPDDR, GB10 same-VA), so its
+    /// slots are valid RDMA landing MRs for zero-copy restore.
+    pub fn is_uma(&self) -> bool {
+        self.uma
+    }
     pub fn pool_dev_ptr(&self) -> u64 {
-        self.pool.ptr
+        self.base
     }
     pub fn slot_dev_ptr(&self, slot: u32) -> u64 {
-        self.pool.ptr + (slot as u64) * (self.dims.slot_bytes() as u64)
+        self.base + (slot as u64) * (self.dims.slot_bytes() as u64)
     }
     /// K stripe device pointer for (slot, kv_head).
     pub fn slot_k_ptr(&self, slot: u32, kv_head: u16) -> u64 {
@@ -237,9 +315,34 @@ mod tests {
         })
         .unwrap();
         let base = pool.pool_dev_ptr();
+        assert_eq!(base, pool.base);
+        assert!(!pool.is_uma(), "new() must stay device-backed");
         assert_eq!(pool.slot_dev_ptr(0), base);
         assert_eq!(pool.slot_dev_ptr(1), base + 8 * 4096);
         assert_eq!(pool.slot_k_ptr(0, 2), base + 2 * 4096);
+        assert_eq!(pool.slot_v_ptr(0, 2), base + (4 + 2) * 4096);
+    }
+
+    #[test]
+    #[ignore = "requires GPU (UMA GB10)"]
+    fn uma_pool_publishes_device_ptr() {
+        let _ctx = ctx();
+        let pool = ScratchPool::new_preferring_uma(ScratchDims {
+            num_slots: 2,
+            num_kv_heads: 4,
+            group_stride: 4096,
+        })
+        .unwrap();
+        // On GB10 the pinned pool is UMA and pool_dev_ptr() is its device_ptr();
+        // slot geometry is base-relative regardless of backing kind.
+        let base = pool.pool_dev_ptr();
+        assert_eq!(base, pool.base);
+        if let PoolMem::Uma(ref p) = pool.mem {
+            assert!(pool.is_uma());
+            assert_eq!(base, p.device_ptr().unwrap());
+            assert_eq!(base, p.ptr as u64, "GB10 UMA: device VA == host VA");
+        }
+        assert_eq!(pool.slot_dev_ptr(1), base + 8 * 4096);
         assert_eq!(pool.slot_v_ptr(0, 2), base + (4 + 2) * 4096);
     }
 }

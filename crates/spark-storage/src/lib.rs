@@ -37,6 +37,14 @@ pub mod eviction;
 pub mod expert;
 pub mod expert_pack;
 pub mod expert_peer;
+// Process-global commit ledger shared by the RW/RO memory blades. Un-gated pure
+// arithmetic (outside atlas_rdma_verbs) so the cap logic is unit-testable on the
+// metal/skip build; consumed by the two unix `server_impl` modules.
+#[cfg(unix)]
+// Some accessors/paths are only exercised by tests or by the verbs-gated
+// handshake, so allow dead_code across build configs (metal/skip vs verbs).
+#[allow(dead_code)]
+pub(crate) mod blade_cap;
 // KV cache overflow blade: RW remote-RAM tier (wire types always available; the
 // verbs server compiles under atlas_rdma_verbs). Faster-than-SSD KV overflow.
 pub mod kv_peer;

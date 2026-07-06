@@ -25,11 +25,17 @@ pub struct HighSpeedSwap {
     cfg: HighSpeedSwapConfig,
     model: ModelDims,
     predictor: Predictor,
-    pool: ScratchPool,
     /// KV overflow tier: local NVMe (`IoUringBackend`) by default, or a remote
     /// RDMA RAM blade (`RdmaKvBackend`) when `$ATLAS_KV_PEER` is set — the same
     /// `StorageBackend` trait, so the offload/restore call sites are unchanged.
+    ///
+    /// Declared BEFORE `pool` so Rust's declaration-order drop tears the backend
+    /// down first: with a UMA (pinned) `pool`, the RDMA backend caches
+    /// destination MRs (`Rail::dst_lkeys`) registered INTO the pool's pages, and
+    /// those MRs must be deregistered before the pool's `cuMemFreeHost` runs —
+    /// otherwise it's a dereg-on-freed-pages use-after-free.
     backend: Box<dyn crate::backend::StorageBackend>,
+    pool: ScratchPool,
     attn: TiledAttention,
     eviction: EvictionPolicy,
     // Reusable scratch buffers.
@@ -107,11 +113,30 @@ impl HighSpeedSwap {
                 Box::new(IoUringBackend::new(layout, cfg.qd as usize)?)
             }
         };
-        let pool = ScratchPool::new(ScratchDims {
+        // Restore-destination pool. When zero-copy restore is requested
+        // (ATLAS_KV_ZERO_COPY=1, the same flag the RDMA backend keys off), prefer
+        // a UMA (pinned LPDDR) pool so the NIC can RDMA straight into the slots
+        // with no bounce/copy_h2d. Default (flag unset) stays device-backed,
+        // byte-for-byte the prior behavior. `new_preferring_uma` self-falls-back
+        // to device memory on a non-UMA host, so this is always safe.
+        let want_uma = std::env::var("ATLAS_KV_ZERO_COPY").ok().as_deref() == Some("1");
+        let dims = ScratchDims {
             num_slots: cfg.resident_blocks,
             num_kv_heads: model.num_kv_heads,
             group_stride: group_layout.group_stride,
-        })?;
+        };
+        let pool = if want_uma {
+            ScratchPool::new_preferring_uma(dims)?
+        } else {
+            ScratchPool::new(dims)?
+        };
+        if want_uma {
+            tracing::info!(
+                "high-speed-swap: scratch pool UMA={} (zero-copy restore {})",
+                pool.is_uma(),
+                if pool.is_uma() { "enabled" } else { "unavailable — using bounce" },
+            );
+        }
         let predictor = Predictor::new_on_stream(
             stream,
             PredictorDims {
@@ -144,8 +169,8 @@ impl HighSpeedSwap {
             cfg,
             model,
             predictor,
-            pool,
             backend,
+            pool,
             attn,
             eviction,
             q_proj,

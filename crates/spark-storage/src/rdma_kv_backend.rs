@@ -294,7 +294,16 @@ impl RdmaKvBackend {
     /// (same host==dev VA), so no `stream_sync` either. Removes the copy-engine
     /// bottleneck that pinned single-rail restore at ~9.7 GB/s, letting it
     /// dual-rail. Requires UMA destinations (else `reg_dst` errors clearly).
-    fn read_zero_copy(&mut self, requests: &[ReadRequest], bytes: usize) -> Result<()> {
+    fn read_zero_copy(&mut self, requests: &[ReadRequest], bytes: usize, stream: u64) -> Result<()> {
+        // WAR barrier: the NIC is about to DMA into UMA slots that the PREVIOUS
+        // tile's attention kernel may still be reading on `stream`. Unlike the
+        // bounce path (whose copy_h2d is stream-ordered after attention + ends in
+        // stream_sync), the NIC write is off-stream, so we must drain in-flight
+        // consumers of these slots first — else zero-copy restore under eviction
+        // pressure silently corrupts KV. This restores the bounce path's implicit
+        // barrier. (RAW is already safe: the poll below means the bytes have
+        // landed before the next kernel that reads them is queued.)
+        stream_sync(stream)?;
         let n = self.rails.len();
         let depth = self.rails[0].bounces.len(); // in-flight cap per rail
         let mut pend: Vec<std::collections::VecDeque<usize>> = vec![Default::default(); n];
@@ -352,7 +361,34 @@ impl StorageBackend for RdmaKvBackend {
             rail.drain(bytes, stream)?;
         }
         if self.zero_copy {
-            return self.read_zero_copy(requests, bytes);
+            if requests.is_empty() {
+                return Ok(());
+            }
+            // Register EVERY dst on EVERY rail up front — before any RDMA READ is
+            // posted — so a reg_mr failure (dst not UMA-registerable on some rail)
+            // degrades to the bounce path CLEANLY, with no half-posted batch. A
+            // per-slot / per-rail probe is required: rail 1's device/PD can reject
+            // a host region rail 0 accepted, and later scratch slots differ from
+            // the first. reg_dst caches, so read_zero_copy reuses these lkeys.
+            let mut all_ok = true;
+            'reg: for req in requests {
+                for rail in &mut self.rails {
+                    if let Err(e) = rail.reg_dst(req.dst_dev_ptr, bytes) {
+                        tracing::warn!(
+                            "kv restore dst not UMA-registerable ({e:#}); \
+                             permanently using bounce restore"
+                        );
+                        all_ok = false;
+                        break 'reg;
+                    }
+                }
+            }
+            if all_ok {
+                return self.read_zero_copy(requests, bytes, stream);
+            }
+            // Non-UMA dst — fall through to the bounce path for this and all
+            // future reads.
+            self.zero_copy = false;
         }
         let n = self.rails.len();
         // Per-rail queues of pending request indices, striped round-robin.

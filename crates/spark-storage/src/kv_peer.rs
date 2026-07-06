@@ -82,12 +82,16 @@ mod server_impl {
     pub struct RdmaConfig {
         /// `(device, gid_idx)` per rail, in link order (rail 0 = .178, 1 = .177).
         pub rails: Vec<(String, u32)>,
+        /// Ceiling on total committed (registered) blade RAM across all
+        /// concurrent connections, in bytes. `0` = unlimited (the default).
+        pub max_blade_bytes: u64,
     }
 
     impl Default for RdmaConfig {
         fn default() -> Self {
             Self {
                 rails: vec![("roceP2p1s0f1".into(), 3), ("rocep1s0f1".into(), 3)],
+                max_blade_bytes: 0,
             }
         }
     }
@@ -97,10 +101,18 @@ mod server_impl {
     pub fn serve<A: ToSocketAddrs>(addr: A, rdma: RdmaConfig) -> Result<()> {
         let listener = TcpListener::bind(addr).context("bind kv-peer listener")?;
         let local = listener.local_addr().ok();
+        // One process-global ledger, shared by every connection thread; a
+        // connection reserves its arena size before it maps/registers any RAM.
+        let ledger = std::sync::Arc::new(crate::blade_cap::CommitLedger::new(rdma.max_blade_bytes));
         tracing::info!(
-            "kv-peer (RW RDMA overflow blade) listening on {:?} (rails {:?})",
+            "kv-peer (RW RDMA overflow blade) listening on {:?} (rails {:?}, cap {})",
             local,
             rdma.rails,
+            if rdma.max_blade_bytes == 0 {
+                "unlimited".to_string()
+            } else {
+                format!("{:.1} GiB", rdma.max_blade_bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+            },
         );
         for conn in listener.incoming() {
             let stream = match conn {
@@ -111,8 +123,9 @@ mod server_impl {
                 }
             };
             let rdma = rdma.clone();
+            let ledger = ledger.clone();
             std::thread::spawn(move || {
-                if let Err(e) = handle_conn(stream, &rdma) {
+                if let Err(e) = handle_conn(stream, &rdma, &ledger) {
                     tracing::warn!("kv-peer connection ended: {e}");
                 }
             });
@@ -121,12 +134,20 @@ mod server_impl {
     }
 
     #[cfg(not(atlas_rdma_verbs))]
-    fn handle_conn(_stream: TcpStream, _rdma: &RdmaConfig) -> Result<()> {
+    fn handle_conn(
+        _stream: TcpStream,
+        _rdma: &RdmaConfig,
+        _ledger: &std::sync::Arc<crate::blade_cap::CommitLedger>,
+    ) -> Result<()> {
         bail!("kv-peer needs a build with rdma-core (atlas_rdma_verbs)");
     }
 
     #[cfg(atlas_rdma_verbs)]
-    fn handle_conn(mut stream: TcpStream, rdma: &RdmaConfig) -> Result<()> {
+    fn handle_conn(
+        mut stream: TcpStream,
+        rdma: &RdmaConfig,
+        ledger: &std::sync::Arc<crate::blade_cap::CommitLedger>,
+    ) -> Result<()> {
         use crate::expert_peer::{STATUS_OK, VerbsClientParams};
         use crate::rdma_verbs::Verbs;
         use std::io::{Read, Write};
@@ -145,6 +166,14 @@ mod server_impl {
         if n_rails == 0 || n_rails > rdma.rails.len() {
             bail!("client asked for {n_rails} rails; peer has {}", rdma.rails.len());
         }
+
+        // Admission gate: charge the arena size ONCE (the N per-rail MRs pin the
+        // SAME refcounted pages, so the committed footprint is `total`, not
+        // total*n_rails). Reserve BEFORE any mmap/reg_mr pins RAM; the RAII guard
+        // releases on every exit below (early bail, reg_mr error, normal hangup).
+        let _reservation = ledger
+            .try_reserve(total as u64)
+            .context("kv blade cap")?;
 
         // Anonymous, page-aligned, lazily-zeroed arena — registered ONCE per rail
         // (each device its own PD/rkey). The physical pages are shared (pinned
