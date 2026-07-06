@@ -161,6 +161,7 @@ impl Model for MockModel {
             disk_last_offloaded_per_layer: Vec::new(),
             adapter_slot: -1,
             adapter_id: 0,
+            acquired_adapter_slot: -1,
         })
     }
 

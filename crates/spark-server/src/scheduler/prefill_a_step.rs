@@ -136,6 +136,11 @@ pub fn start_chunked_prefill(
     // active slot for the `-1 = defer to active` case). Keys the KV/prefix cache
     // so this request reuses only same-adapter blocks.
     seq.adapter_id = model.adapter_id_for(req_adapter_slot);
+    // Task #25: acquire a ref on the resolved LoRA slot so a swap into it is
+    // refused while this seq is in-flight. Before the `defer` branch so both the
+    // InProgress co-dispatch and the inline path (and all error frees below,
+    // which route through free_sequence) hold + release the ref symmetrically.
+    seq.acquired_adapter_slot = model.acquire_adapter_slot(req_adapter_slot);
 
     // Deferred co-dispatch: setup + EP broadcast, then return InProgress at
     // chunk 0 WITHOUT prefilling — the batched step packs >=2 streams into one

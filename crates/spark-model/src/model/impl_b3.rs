@@ -156,6 +156,28 @@ impl TransformerModel {
         }
     }
 
+    /// Task #25: acquire a per-slot ref for a sequence beginning to use its
+    /// adapter (called at prefill, resolving `-1 -> active` exactly like
+    /// [`Self::adapter_id_for_slot`]). Returns the RESOLVED pool index the ref
+    /// was taken on — the caller stores it and releases EXACTLY that index at
+    /// terminal free, so an intervening rotate changing `active` cannot make
+    /// release hit a different counter. `-1` ("nothing acquired") when no LoRA
+    /// pool is resident or the slot is out of range → byte-identical no-op base.
+    pub fn acquire_adapter_slot(&self, slot: i32) -> i32 {
+        match self.lora.as_ref() {
+            Some(lw) => lw.acquire_slot(slot),
+            None => -1,
+        }
+    }
+
+    /// Task #25: release a ref acquired by [`Self::acquire_adapter_slot`], by the
+    /// RESOLVED index it returned. `-1` and no-pool are no-ops (base path).
+    pub fn release_adapter_slot(&self, resolved: i32) {
+        if let Some(lw) = self.lora.as_ref() {
+            lw.release_slot(resolved);
+        }
+    }
+
     pub fn set_lora_weights(&mut self, lora: Option<crate::lora::LoraWeights>) -> Result<()> {
         if let Some(ref lw) = lora {
             // eager-on-rotate: ONLY the global rotate/swap re-point path forces
@@ -298,6 +320,21 @@ impl TransformerModel {
                  set ATLAS_LORA_ROTATE=1 (forces eager decode) to rotate at runtime"
             );
         }
+        // #25 safety: rotation RE-INSTALLS the new slot's pairs onto the layer
+        // structs, so any in-flight sequence still decoding on the OLD active
+        // adapter (via the installed pair) would replay with the wrong delta.
+        // Refuse while the current active slot has in-flight sequences — rotate
+        // only at a scheduler-quiescent point (matches this method's contract).
+        {
+            let lw = self.lora.as_ref().unwrap();
+            let cur = lw.active;
+            if lw.slot_ref_count(cur) > 0 {
+                anyhow::bail!(
+                    "LoRA rotation refused: active slot {cur} has in-flight \
+                     sequences (ref_count>0); rotate at a quiescent point"
+                );
+            }
+        }
         // Re-point onto the new active slot.
         let (layers, active_name, r, tables, scale_table) = {
             let lw = self.lora.as_mut().unwrap();
@@ -362,6 +399,19 @@ impl TransformerModel {
         if slot >= max_loras {
             anyhow::bail!("LoRA RDMA swap: slot {slot} >= max_loras {max_loras}");
         }
+        // Task #25 busy-slot refusal: bail BEFORE the destructive memset/stage
+        // below so a refused swap leaves the slot's bytes + identity untouched.
+        // Replacing an adapter while sequences are mid-decode on it would corrupt
+        // their KV and replay a captured graph over swapped pool bytes.
+        {
+            let busy = self.lora.as_ref().unwrap().slot_ref_count(slot);
+            if busy > 0 {
+                anyhow::bail!(
+                    "LoRA RDMA swap REFUSED: slot {slot} has {busy} in-flight \
+                     sequence(s) (ref_count>0); cannot replace an adapter mid-decode"
+                );
+            }
+        }
 
         // 1) Fetch manifest + build landing targets (classify + slot offsets).
         let manifest = rdma_stage::fetch_adapter_manifest(peer_addr, adapter_id)?;
@@ -389,6 +439,10 @@ impl TransformerModel {
             s.name = adapter_name.to_string();
             s.adapter_config = peft;
             s.layers = layers;
+            // Task #25: contents changed → bump generation so this re-staged slot
+            // yields a FRESH adapter_id (a later same-name request misses the
+            // stale prior KV). Pure rotate does NOT reach here.
+            s.generation = s.generation.wrapping_add(1);
         }
 
         // 4) If the swapped slot is active, re-install onto the layer structs.
@@ -432,6 +486,19 @@ impl TransformerModel {
                  decode runs eager); a single startup adapter with no rotation env \
                  is baked into the decode graph and a re-point would replay stale"
             );
+        }
+        // Task #25 busy-slot refusal: fail fast (before the disk load + pack)
+        // when the target slot has in-flight sequences. `pack_store_into_slot`
+        // re-checks under `&mut lw` right before the destructive memset (the
+        // authoritative gate); this early check just avoids the wasted load.
+        if let Some(lw) = self.lora.as_ref() {
+            let busy = lw.slot_ref_count(slot);
+            if busy > 0 {
+                anyhow::bail!(
+                    "LoRA disk swap REFUSED: slot {slot} has {busy} in-flight \
+                     sequence(s) (ref_count>0); cannot replace an adapter mid-decode"
+                );
+            }
         }
         // Parse the adapter's own PEFT config (scaling read per adapter, never
         // defaulted) — the same hard-fail parser the startup path uses.

@@ -117,6 +117,10 @@ pub fn prefill_request(
     // active slot for the `-1 = defer to active` case). Keys the KV/prefix cache
     // so this request reuses only same-adapter blocks.
     seq.adapter_id = model.adapter_id_for(req_adapter_slot);
+    // Task #25: acquire a ref on the resolved LoRA slot so a swap into it is
+    // refused while this seq is in-flight; released symmetrically in
+    // free_sequence (normal finish + the error guard below both route there).
+    seq.acquired_adapter_slot = model.acquire_adapter_slot(req_adapter_slot);
 
     // Guard: free SSM slot on any error after allocation (Bug #16).
     let prefill_result = (|| -> Result<u32> {

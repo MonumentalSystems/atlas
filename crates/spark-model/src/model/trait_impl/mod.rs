@@ -158,6 +158,12 @@ impl Model for TransformerModel {
     fn adapter_id_for(&self, slot: i32) -> u64 {
         self.adapter_id_for_slot(slot)
     }
+    fn acquire_adapter_slot(&self, slot: i32) -> i32 {
+        TransformerModel::acquire_adapter_slot(self, slot)
+    }
+    fn release_adapter_slot(&self, resolved: i32) {
+        TransformerModel::release_adapter_slot(self, resolved)
+    }
     fn swap_lora_from_disk(
         &mut self,
         dir: &std::path::Path,

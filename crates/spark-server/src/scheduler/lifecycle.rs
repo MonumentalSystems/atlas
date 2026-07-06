@@ -250,6 +250,12 @@ pub fn resume_swapped_seq(
     seq.seq_len = s.seq_len;
     seq.adapter_slot = s.adapter_slot;
     seq.adapter_id = s.adapter_id;
+    // Task #25: swap-out released this seq's slot ref (via free_sequence); a
+    // resumed seq re-enters ACTIVE decode WITHOUT re-running the prefill stamp,
+    // so re-acquire here to balance that release and re-protect the slot for the
+    // remainder of the decode. Stores the freshly resolved index (release keys
+    // off it, so the acquire/release stay balanced regardless of any rotate).
+    seq.acquired_adapter_slot = model.acquire_adapter_slot(s.adapter_slot);
 
     Ok(ActiveSeq {
         seq,

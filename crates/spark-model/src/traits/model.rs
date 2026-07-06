@@ -221,6 +221,20 @@ pub trait Model: Send + Sync {
         0
     }
 
+    /// Task #25: acquire a per-slot ref when a sequence begins using its adapter
+    /// (at prefill), resolving `-1 -> active` like [`Self::adapter_id_for`].
+    /// Returns the RESOLVED pool index the ref was taken on (store it, release
+    /// EXACTLY that index at terminal free — immune to a rotate changing active).
+    /// Default (no LoRA) returns `-1` "nothing acquired" so the release guard
+    /// skips and the base path is byte-identical.
+    fn acquire_adapter_slot(&self, _slot: i32) -> i32 {
+        -1
+    }
+
+    /// Task #25: release a per-slot ref acquired by [`Self::acquire_adapter_slot`],
+    /// by the RESOLVED index it returned. `-1` is a no-op. Default: no-op.
+    fn release_adapter_slot(&self, _resolved: i32) {}
+
     /// Runtime LoRA adapter dynamic-load: load the adapter at `dir` INTO pool
     /// `slot` and make it resident there (pool-size-1 per-request weight change).
     /// MUST be called at a scheduler quiescent point; needs rotation armed.

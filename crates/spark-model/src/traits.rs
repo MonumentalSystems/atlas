@@ -181,6 +181,16 @@ pub struct SequenceState {
     /// computed under the same adapter. Base (`0`) keys byte-identically to the
     /// pre-LoRA token-only cache.
     pub adapter_id: u64,
+    /// Task #25 (slot ref_count): the RESOLVED LoRA pool slot this sequence holds
+    /// a ref on (`-1` = none / not acquired — the default and every non-LoRA
+    /// path). Set at the prefill acquire (and re-acquire on swap-in resume) to
+    /// the index `Model::acquire_adapter_slot` returned; the terminal free
+    /// releases EXACTLY this index (not a re-resolved `adapter_slot`, which would
+    /// mis-decrement if `active` rotated between prefill and finish) and zeroes
+    /// it back to `-1` so release fires exactly once per acquire. Stored resolved
+    /// (not raw) so it also guards the non-scheduler alloc paths (which never
+    /// acquire) from an underflow.
+    pub acquired_adapter_slot: i32,
 }
 
 impl SequenceState {

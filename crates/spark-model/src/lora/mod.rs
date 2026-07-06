@@ -13,6 +13,7 @@
 //! holo adapter scale (~tens of MiB).
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::{Result, anyhow, bail};
 use atlas_core::config::{LayerType, ModelConfig, PeftAdapterConfig};
@@ -104,6 +105,15 @@ pub struct AdapterSlot {
     pub name: String,
     pub adapter_config: PeftAdapterConfig,
     pub layers: Vec<Option<LoraLayerWeights>>,
+    /// Task #25 (slot generation): monotonic counter bumped every time this
+    /// slot's CONTENTS are replaced (disk/RDMA swap-into-slot). Folded into the
+    /// adapter identity ([`adapter_id_hash`]) so re-staging DIFFERENT weights
+    /// under the SAME adapter name yields a FRESH id — a later request then
+    /// misses the stale (previous-generation) prefix/KV instead of warm-hitting
+    /// it. Init 0; gen 0 is a strict no-op in the fold so a slot's FIRST-load id
+    /// (and the base sentinel) stay byte-identical to the pre-#25 (#24) value. A
+    /// pure rotate (same weights re-pointed) does NOT bump.
+    pub generation: u64,
 }
 
 /// One adapter to pack, for the multi-adapter entry point. `store` is the
@@ -148,6 +158,18 @@ pub struct LoraWeights {
     /// (not per-module), so ONE table suffices. Built once at pool pack time
     /// alongside the a/b tables (load-time-fixed → graph-safe kernel arg).
     pub scale_table: DevicePtr,
+    /// Task #25 (slot ref_count): per-slot in-flight-sequence count, one
+    /// [`AtomicUsize`] per pool index (`len() == max_loras`, stable across
+    /// swaps). A sequence acquires (`+1`) its resolved slot at prefill and
+    /// releases (`-1`) at terminal free; a swap/rotate INTO a slot with
+    /// `ref_count > 0` is REFUSED (you cannot replace an adapter mid-decode —
+    /// it would corrupt in-flight KV and replay a captured graph over swapped
+    /// pool bytes). Kept as a parallel Vec here (not on [`AdapterSlot`], which
+    /// derives Clone and is cloned during install — `AtomicUsize` is not Clone);
+    /// [`LoraWeights`] is deliberately non-Clone and already `Send + Sync`.
+    /// Interior-mutable through `&self` (acquire/release run on the prefill/free
+    /// `&self` paths); swaps read it under `&mut self` at a quiescent point.
+    pub ref_counts: Vec<AtomicUsize>,
 }
 
 /// Build the per-step `seq_slot[padded_n]` host buffer the batched bgmv reads,
@@ -195,11 +217,26 @@ pub(crate) fn scale_table_values(adapters: &[LoraAdapterInput<'_>], max_loras: u
 /// a real name that would hash to 0 is bumped to 1 — a real adapter never aliases
 /// base. Two different names never collide (modulo the 64-bit hash); the SAME
 /// adapter re-staged into a different pool slot keeps its name, hence its id.
-pub fn adapter_id_hash(name: &str) -> u64 {
+///
+/// Task #25 (slot generation): `generation` folds into the identity ONLY when it
+/// is non-zero, so `generation == 0` returns byte-identically to the pre-#25
+/// value (first-load ids and the base sentinel are unchanged — the #24 base
+/// byte-identity pins hold). A re-staged slot bumps its generation, changing the
+/// id so a later request under the SAME name misses the stale prior-generation
+/// prefix/KV. The `if h == 0 { 1 }` base-reserve is re-applied AFTER the fold so
+/// no (name, generation) pair can alias the base sentinel.
+pub fn adapter_id_hash(name: &str, generation: u64) -> u64 {
     let mut h: u64 = 0xcbf29ce484222325; // FNV-1a basis
     for &b in name.as_bytes() {
         h ^= b as u64;
         h = h.wrapping_mul(0x100000001b3); // FNV-1a prime
+    }
+    // gen 0 = strict no-op → byte-identical to the pre-#25 name-only hash.
+    if generation != 0 {
+        for &b in generation.to_le_bytes().iter() {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
     }
     if h == 0 { 1 } else { h }
 }
@@ -235,9 +272,53 @@ impl LoraWeights {
             self.active
         };
         match self.slots.get(resolved) {
-            Some(s) => adapter_id_hash(&s.name),
+            Some(s) => adapter_id_hash(&s.name, s.generation),
             None => 0,
         }
+    }
+
+    /// Task #25: resolve `slot` (`>= 0` → that slot, `-1` → active) to a concrete
+    /// pool index and `+1` its ref_count, returning the RESOLVED index so the
+    /// caller can release EXACTLY that index later (immune to an intervening
+    /// rotate changing `active`). Returns `-1` — "nothing acquired" — when the
+    /// resolved index is out of range (bad request slot); the active slot is
+    /// always in range so `-1 -> active` never no-ops here for a loaded pool.
+    pub fn acquire_slot(&self, slot: i32) -> i32 {
+        let resolved = if slot >= 0 {
+            slot as usize
+        } else {
+            self.active
+        };
+        match self.ref_counts.get(resolved) {
+            Some(rc) => {
+                rc.fetch_add(1, Ordering::AcqRel);
+                resolved as i32
+            }
+            None => -1,
+        }
+    }
+
+    /// Task #25: release a ref previously taken by [`Self::acquire_slot`], by the
+    /// RESOLVED index it returned. `-1` (nothing acquired) is a no-op. Saturating
+    /// so a stray double-release can never wrap the counter below 0.
+    pub fn release_slot(&self, resolved: i32) {
+        if resolved < 0 {
+            return;
+        }
+        if let Some(rc) = self.ref_counts.get(resolved as usize) {
+            let _ = rc.fetch_update(Ordering::Release, Ordering::Acquire, |v| {
+                Some(v.saturating_sub(1))
+            });
+        }
+    }
+
+    /// Task #25: current in-flight ref_count of pool `slot` (the exact read the
+    /// swap busy-slot gate branches on). Out-of-range → 0.
+    pub fn slot_ref_count(&self, slot: usize) -> usize {
+        self.ref_counts
+            .get(slot)
+            .map(|rc| rc.load(Ordering::Acquire))
+            .unwrap_or(0)
     }
 }
 
@@ -726,6 +807,7 @@ pub fn load_lora_adapters_multi(
             name: a.name.clone(),
             adapter_config: a.peft.clone(),
             layers,
+            generation: 0, // first load: gen 0 keeps ids byte-identical to #24
         });
     }
 
@@ -763,6 +845,9 @@ pub fn load_lora_adapters_multi(
         active: 0,
         tables,
         scale_table,
+        // One counter per pool index, stable across swaps (sized to max_loras,
+        // not slots.len(), so a later swap-into an empty slot has a counter).
+        ref_counts: (0..max_loras).map(|_| AtomicUsize::new(0)).collect(),
     })
 }
 
@@ -792,6 +877,17 @@ pub fn pack_store_into_slot(
             lw.max_loras
         );
     }
+    // Task #25 busy-slot refusal: bail BEFORE any destructive op (memset/pack)
+    // so a refused swap leaves the slot's bytes + identity untouched. Replacing
+    // an adapter while sequences are mid-decode on it would corrupt their KV and
+    // replay a captured graph over swapped pool bytes.
+    let busy = lw.slot_ref_count(slot);
+    if busy > 0 {
+        bail!(
+            "LoRA disk swap REFUSED: slot {slot} has {busy} in-flight sequence(s) \
+             (ref_count>0); cannot replace an adapter mid-decode"
+        );
+    }
     validate_peft_config(peft, lw.max_rank)?;
     let found = audit_adapter(store, peft, cfg, lw.max_rank)?;
     let slot_bytes = pool_slot_bytes(cfg, lw.max_rank);
@@ -814,6 +910,10 @@ pub fn pack_store_into_slot(
     lw.slots[slot].name = name.to_string();
     lw.slots[slot].adapter_config = peft.clone();
     lw.slots[slot].layers = layers.clone();
+    // Task #25: contents changed → bump generation so this re-staged slot yields
+    // a FRESH adapter_id and a later request misses the stale prior KV. (Covers
+    // the disk swap and any future caller of this shared helper.)
+    lw.slots[slot].generation = lw.slots[slot].generation.wrapping_add(1);
     Ok(layers)
 }
 
@@ -922,6 +1022,7 @@ mod tests {
             name: name.to_string(),
             adapter_config: peft.clone(),
             layers: Vec::new(),
+            generation: 0,
         };
         let lw = LoraWeights {
             name: "alpha".into(),
@@ -934,14 +1035,16 @@ mod tests {
             active: 0,
             tables: BTreeMap::new(),
             scale_table: DevicePtr(0),
+            ref_counts: (0..8).map(|_| AtomicUsize::new(0)).collect(),
         };
         assert_eq!(lw.adapter_names(), vec!["alpha", "beta"]);
         assert_eq!(lw.slot_of("beta"), Some(1));
         assert_eq!(lw.slot_of("missing"), None);
 
         // Task #24: stable adapter_id resolution. Name-derived, `-1 -> active`.
-        let id_alpha = adapter_id_hash("alpha");
-        let id_beta = adapter_id_hash("beta");
+        // Task #25: gen 0 keeps these byte-identical to the #24 name-only value.
+        let id_alpha = adapter_id_hash("alpha", 0);
+        let id_beta = adapter_id_hash("beta", 0);
         assert_ne!(id_alpha, id_beta, "distinct names must not collide");
         assert_ne!(
             id_alpha, 0,
@@ -960,11 +1063,134 @@ mod tests {
     fn adapter_id_hash_is_stable_and_base_reserved() {
         // Deterministic and name-derived (survives pool-slot reuse: same name →
         // same id regardless of which runtime slot it lands in).
-        assert_eq!(adapter_id_hash("sparky"), adapter_id_hash("sparky"));
-        assert_ne!(adapter_id_hash("sparky"), adapter_id_hash("vega"));
+        assert_eq!(adapter_id_hash("sparky", 0), adapter_id_hash("sparky", 0));
+        assert_ne!(adapter_id_hash("sparky", 0), adapter_id_hash("vega", 0));
         // 0 is reserved for base; the empty name still yields a non-zero id.
-        assert_ne!(adapter_id_hash(""), 0);
-        assert_ne!(adapter_id_hash("anything"), 0);
+        assert_ne!(adapter_id_hash("", 0), 0);
+        assert_ne!(adapter_id_hash("anything", 0), 0);
+    }
+
+    #[test]
+    fn adapter_id_hash_generation_changes_id_but_never_base() {
+        // Task #25: gen 0 is a strict no-op; a bumped generation changes the id
+        // (so a re-staged same-name slot misses the stale prefix), and no
+        // (name, generation) pair aliases the base sentinel 0.
+        for name in ["sparky", "vega", ""] {
+            let g0 = adapter_id_hash(name, 0);
+            let g1 = adapter_id_hash(name, 1);
+            let g2 = adapter_id_hash(name, 2);
+            assert_ne!(g0, g1, "generation bump must change the id ({name})");
+            assert_ne!(g1, g2, "each generation is distinct ({name})");
+            assert_ne!(g0, 0, "gen 0 never aliases base ({name})");
+            assert_ne!(g1, 0, "gen 1 never aliases base ({name})");
+            assert_ne!(g2, 0, "gen 2 never aliases base ({name})");
+            // Determinism across calls.
+            assert_eq!(g1, adapter_id_hash(name, 1));
+        }
+    }
+
+    #[test]
+    fn slot_generation_bump_freshens_adapter_id() {
+        // A slot whose contents were re-staged (generation bumped) must yield a
+        // DIFFERENT adapter_id than at first load — the #24 residual: reloading
+        // different weights under the SAME name no longer warm-hits stale KV.
+        let peft = PeftAdapterConfig {
+            r: 4,
+            lora_alpha: 8.0,
+            target_modules: vec!["k_proj".into()],
+            use_rslora: false,
+            layers_to_transform: None,
+        };
+        let mut lw = LoraWeights {
+            name: "sol".into(),
+            adapter_config: peft.clone(),
+            max_rank: 4,
+            max_loras: 4,
+            pool: DevicePtr(0),
+            pool_bytes: 0,
+            slots: vec![AdapterSlot {
+                name: "sol".into(),
+                adapter_config: peft.clone(),
+                layers: Vec::new(),
+                generation: 0,
+            }],
+            active: 0,
+            tables: BTreeMap::new(),
+            scale_table: DevicePtr(0),
+            ref_counts: (0..4).map(|_| AtomicUsize::new(0)).collect(),
+        };
+        let id_v1 = lw.adapter_id_for_slot(0);
+        assert_eq!(id_v1, adapter_id_hash("sol", 0));
+        // Simulate a same-name content swap: bump generation (what the two
+        // content-replacing swaps do), name unchanged.
+        lw.slots[0].generation = lw.slots[0].generation.wrapping_add(1);
+        let id_v2 = lw.adapter_id_for_slot(0);
+        assert_ne!(id_v1, id_v2, "re-staged slot must yield a fresh id");
+        assert_eq!(id_v2, adapter_id_hash("sol", 1));
+    }
+
+    #[test]
+    fn ref_count_acquire_release_balance_and_busy_gate() {
+        // Task #25 ref_count invariants on a hand-built (no-GPU) LoraWeights.
+        let peft = PeftAdapterConfig {
+            r: 4,
+            lora_alpha: 8.0,
+            target_modules: vec!["k_proj".into()],
+            use_rslora: false,
+            layers_to_transform: None,
+        };
+        let mk_slot = |name: &str| AdapterSlot {
+            name: name.to_string(),
+            adapter_config: peft.clone(),
+            layers: Vec::new(),
+            generation: 0,
+        };
+        let lw = LoraWeights {
+            name: "alpha".into(),
+            adapter_config: peft.clone(),
+            max_rank: 4,
+            max_loras: 4,
+            pool: DevicePtr(0),
+            pool_bytes: 0,
+            slots: vec![mk_slot("alpha"), mk_slot("beta")],
+            active: 1, // active != 0 so we can prove `-1 -> active` resolution
+            tables: BTreeMap::new(),
+            scale_table: DevicePtr(0),
+            ref_counts: (0..4).map(|_| AtomicUsize::new(0)).collect(),
+        };
+
+        // acquire(0) returns the resolved index 0 and increments its counter.
+        assert_eq!(lw.acquire_slot(0), 0);
+        assert_eq!(lw.slot_ref_count(0), 1);
+        // The busy gate (exact read the swap bail uses) now fires for slot 0.
+        assert!(lw.slot_ref_count(0) > 0);
+        assert_eq!(lw.slot_ref_count(1), 0, "other slots untouched");
+
+        // -1 resolves to active (=1) and increments slot 1.
+        assert_eq!(lw.acquire_slot(-1), 1);
+        assert_eq!(lw.slot_ref_count(1), 1);
+
+        // Two seqs on slot 0.
+        assert_eq!(lw.acquire_slot(0), 0);
+        assert_eq!(lw.slot_ref_count(0), 2);
+
+        // Release by the RESOLVED index; balance returns each to 0.
+        lw.release_slot(0);
+        assert_eq!(lw.slot_ref_count(0), 1);
+        lw.release_slot(0);
+        assert_eq!(lw.slot_ref_count(0), 0);
+        assert!(lw.slot_ref_count(0) == 0, "gate clears after full release");
+        lw.release_slot(1);
+        assert_eq!(lw.slot_ref_count(1), 0);
+
+        // Saturating: a stray double-release cannot wrap below 0.
+        lw.release_slot(0);
+        assert_eq!(lw.slot_ref_count(0), 0);
+
+        // Out-of-range / nothing-acquired paths are no-ops.
+        assert_eq!(lw.acquire_slot(99), -1, "bad slot acquires nothing");
+        lw.release_slot(-1); // no-op
+        assert_eq!(lw.slot_ref_count(99), 0);
     }
 
     #[test]
