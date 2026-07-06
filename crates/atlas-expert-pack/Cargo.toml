@@ -18,6 +18,10 @@ path = "src/bin/expert_peer_main.rs"
 name = "atlas-kv-peer"
 path = "src/bin/kv_peer_main.rs"
 
+[[bin]]
+name = "atlas-weight-peer"
+path = "src/bin/weight_peer_main.rs"
+
 [dependencies]
 anyhow = { workspace = true }
 serde = { workspace = true }

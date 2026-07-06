@@ -35,6 +35,35 @@ pub(crate) fn load_weight_store(
 ) -> Result<spark_runtime::weights::WeightStore> {
     use spark_runtime::weights::WeightLoader;
     let mult = quant_multiplier(config);
+
+    // RDMA weight peer: when $ATLAS_WEIGHT_PEER is set, stage weights from a
+    // peer's RAM over one-sided RDMA (fast model swaps, ~13x the USB SSD). This
+    // takes precedence over the disk loaders; both existing paths below stay
+    // byte-for-byte unchanged when the env var is unset. cuda-only (the loader
+    // needs pinned bounces + copy_h2d); the atlas_rdma_verbs gate + a clear
+    // runtime error live inside spark-storage, mirroring the expert tier.
+    #[cfg(feature = "cuda")]
+    if let Ok(peer_addr) = std::env::var("ATLAS_WEIGHT_PEER") {
+        tracing::info!("Loading weights via RDMA weight peer at {peer_addr}");
+        let mut loader = if ep_size > 1 {
+            spark_storage::weight_tier_rdma::RdmaWeightLoader::with_ep(
+                peer_addr,
+                ep_rank,
+                ep_size,
+                config.num_experts,
+            )
+        } else {
+            spark_storage::weight_tier_rdma::RdmaWeightLoader::new(peer_addr)
+        };
+        loader.peak_memory_multiplier = mult;
+        loader.stream_all_experts = config.expert_streaming;
+        let store = loader
+            .load(model_dir, gpu, oom_reserve_bytes)
+            .context("Failed to load model weights (RDMA weight peer)")?;
+        tracing::info!("Loaded {} weight tensors", store.len());
+        return Ok(store);
+    }
+
     let use_fast_load =
         !args.no_fast_load && std::env::var("ATLAS_FAST_LOAD").ok().as_deref() != Some("0");
     let store = if use_fast_load {

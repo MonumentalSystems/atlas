@@ -37,6 +37,10 @@ pub mod eviction;
 pub mod expert;
 pub mod expert_pack;
 pub mod expert_peer;
+// Weight-staging peer + wire protocol (RDMA weight tier for fast model swaps).
+// Wire types are un-gated (unit-testable on metal/skip); the mmap+reg_mr server
+// body is `cfg(unix)` and the verbs handshake compiles under atlas_rdma_verbs.
+pub mod weight_peer;
 // Process-global commit ledger shared by the RW/RO memory blades. Un-gated pure
 // arithmetic (outside atlas_rdma_verbs) so the cap logic is unit-testable on the
 // metal/skip build; consumed by the two unix `server_impl` modules.
@@ -88,6 +92,12 @@ pub mod expert_arena;
 pub mod expert_tier;
 #[cfg(feature = "cuda")]
 pub mod expert_tier_rdma;
+// RDMA weight loader (client of weight_peer). Needs cuda (pinned bounce +
+// copy_h2d + GpuBackend from spark-runtime); the verbs data path is gated on
+// atlas_rdma_verbs inside, with a runtime bail otherwise — the expert_tier_rdma
+// precedent. Builds a WeightStore byte-identical to the disk loaders.
+#[cfg(feature = "cuda")]
+pub mod weight_tier_rdma;
 // KV overflow tier (StorageBackend over RDMA). Needs both cuda (pinned bounce +
 // copy_h2d) and the verbs shim.
 #[cfg(all(feature = "cuda", atlas_rdma_verbs))]
@@ -116,6 +126,9 @@ pub use expert_tier::{
 };
 #[cfg(feature = "cuda")]
 pub use expert_tier_rdma::RdmaTier;
+#[cfg(feature = "cuda")]
+pub use weight_tier_rdma::RdmaWeightLoader;
+pub use weight_peer::{WeightManifest, WeightTensorRecord};
 #[cfg(all(feature = "cuda", atlas_rdma_verbs))]
 pub use rdma_kv_backend::RdmaKvBackend;
 pub use config::HighSpeedSwapConfig;
