@@ -468,10 +468,17 @@ pub(super) async fn completions_stream(
 
 /// GET /v1/models
 pub async fn list_models(State(state): State<Arc<AppState>>) -> Json<ModelListResponse> {
-    let mut data = Vec::with_capacity(state.adapter_names.len() + 1);
+    // #22 hardening: bound the advertised set so the pre-sized allocation can
+    // never be driven large. adapter_names is startup-bounded by --max-loras
+    // today, but capping keeps the allocation independent of that (and clears the
+    // CodeQL "allocation size from a user-provided value" alert). A real pool far
+    // below the cap is unaffected.
+    const MAX_ADVERTISED_MODELS: usize = 1024;
+    let advertised = state.adapter_names.len().min(MAX_ADVERTISED_MODELS);
+    let mut data = Vec::with_capacity(advertised.saturating_add(1));
     // The resident adapters ARE served models — advertise them first (slot
     // order; data[0] is the default route) so clients can pick a fine-tune.
-    for adapter in &state.adapter_names {
+    for adapter in state.adapter_names.iter().take(MAX_ADVERTISED_MODELS) {
         data.push(ModelInfo {
             id: adapter.clone(),
             object: "model".to_string(),

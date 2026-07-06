@@ -132,6 +132,27 @@ pub async fn load_lora_into_slot(
         }
     };
 
+    // #22 hardening: bound the request inputs before doing any work (the name is
+    // stamped onto a pool slot; the path is opened; the slot indexes the pool).
+    if req.name.is_empty() || req.name.len() > 256 {
+        return openai_error_response(
+            StatusCode::BAD_REQUEST,
+            "adapter name must be 1..=256 chars".to_string(),
+        );
+    }
+    if req.path.len() > 4096 {
+        return openai_error_response(
+            StatusCode::BAD_REQUEST,
+            "adapter path too long (max 4096 chars)".to_string(),
+        );
+    }
+    if req.slot > 4096 {
+        return openai_error_response(
+            StatusCode::BAD_REQUEST,
+            format!("slot {} out of range (max 4096)", req.slot),
+        );
+    }
+
     let Some(ref tx) = state.rotation_tx else {
         return openai_error_response(
             StatusCode::BAD_REQUEST,
