@@ -198,12 +198,19 @@ impl TransformerModel {
             let tables = lw.tables.clone();
             let scale_table = lw.scale_table;
             let installed = self.install_lora_layers(&active, kernels, &tables, scale_table)?;
+            // Task #27: `slots` is pre-sized to max_loras with empty cache
+            // placeholders; report only the filled (named) adapters.
+            let resident: Vec<String> = lw
+                .adapter_names()
+                .into_iter()
+                .filter(|n| !n.is_empty())
+                .collect();
             tracing::info!(
                 "LoRA: {} adapter(s) resident [{}], active '{}' installed on \
                  {installed} layers (r={}, max_rank={}, max_loras={}, \
                  pool={:.1} MiB, rotatable={})",
-                lw.slots.len(),
-                lw.adapter_names().join(", "),
+                resident.len(),
+                resident.join(", "),
                 lw.name,
                 lw.adapter_config.r,
                 lw.max_rank,
@@ -463,6 +470,85 @@ impl TransformerModel {
             targets.len()
         );
         Ok(())
+    }
+
+    /// Task #27 (demand-driven promotion): promote the adapter `adapter_name`
+    /// (staged on `peer_addr` at `adapter_id`) from the peer into a CACHE-region
+    /// pool slot and make it ACTIVE, returning `(slot, evicted_name)`. Runs on
+    /// the scheduler thread at a QUIESCENT point (the only place per-slot
+    /// `ref_count` is authoritative). Victim policy (pure [`select_victim_slot`]):
+    /// a never-filled placeholder first, else the LRU idle (`ref_count == 0`)
+    /// cache slot, else `POOL_FULL` (retryable — a busy slot is NEVER evicted).
+    /// The underlying [`Self::swap_lora_slot_from_peer`] re-checks `ref_count>0`
+    /// and bails as a backstop, and bumps the slot generation so #24 KV stays
+    /// correct. Making the promoted slot active mirrors the rotate/load control
+    /// plane so the delta actually applies under batch-1 (the per-slot bgmv route
+    /// tables are still dormant — compute reads the installed active adapter).
+    #[cfg(feature = "cuda")]
+    pub fn promote_lora_slot_from_peer(
+        &mut self,
+        peer_addr: &str,
+        adapter_id: &str,
+        adapter_name: &str,
+        peft: atlas_core::config::PeftAdapterConfig,
+    ) -> Result<(usize, Option<String>)> {
+        // 1) Snapshot the cache region + pick a victim (pure policy).
+        let (slot, evicted) = {
+            let lw = self
+                .lora
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("LoRA promote: no adapter pool loaded"))?;
+            let views = lw.cache_slot_views();
+            let slot = crate::lora::select_victim_slot(&views).map_err(|e| match e {
+                crate::lora::VictimError::PoolFull => anyhow::anyhow!(
+                    "POOL_FULL: all {} cache slot(s) are busy (ref_count>0); retry",
+                    views.len()
+                ),
+            })?;
+            // The name being replaced (if the victim already held an adapter) so
+            // the caller can drop the stale name->slot overlay entry.
+            let evicted = lw
+                .slots
+                .get(slot)
+                .map(|s| s.name.clone())
+                .filter(|n| !n.is_empty());
+            (slot, evicted)
+        };
+
+        // 2) RDMA-stage into the victim slot (re-checks ref_count>0, bumps gen).
+        self.swap_lora_slot_from_peer(peer_addr, adapter_id, adapter_name, slot, peft)?;
+
+        // 3) Make the promoted slot ACTIVE so its delta applies (batch-1 honest).
+        //    `swap_lora_slot_from_peer` already re-installed if the victim WAS the
+        //    active slot; otherwise re-point the installed pairs onto it here.
+        let already_active = self.lora.as_ref().unwrap().active == slot;
+        if !already_active {
+            let (layers, tables, scale_table) = {
+                let lw = self.lora.as_mut().unwrap();
+                lw.active = slot;
+                lw.name = lw.slots[slot].name.clone();
+                lw.adapter_config = lw.slots[slot].adapter_config.clone();
+                (
+                    lw.slots[slot].layers.clone(),
+                    lw.tables.clone(),
+                    lw.scale_table,
+                )
+            };
+            let kernels = ops::lora_delta::LoraKernels::new(self.gpu.as_ref())?;
+            self.install_lora_layers(&layers, kernels, &tables, scale_table)?;
+            self.decode_graph.lock().clear();
+            self.batch_decode_graphs.lock().clear();
+        }
+        // Stamp the freshly-promoted slot as most-recently-used so a back-to-back
+        // promote of a DIFFERENT cold adapter picks an older victim, not this one,
+        // before the request that triggered this promote has acquired its ref.
+        self.lora.as_ref().unwrap().touch_slot(slot);
+        tracing::info!(
+            "LoRA promote: '{adapter_name}' hot in cache slot {slot} \
+             (evicted={:?}), now active",
+            evicted
+        );
+        Ok((slot, evicted))
     }
 
     /// Disk-swap the adapter at `adapter_dir` INTO pool `slot`, in place, then

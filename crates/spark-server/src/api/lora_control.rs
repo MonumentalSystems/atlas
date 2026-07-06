@@ -77,7 +77,7 @@ pub async fn set_active_lora(
         );
     }
     match ack_rx.await {
-        Ok(Ok(())) => {
+        Ok(Ok(_)) => {
             // Optimistic status mirror (the scheduler's model owns the truth).
             if let Ok(mut a) = state.active_adapter.lock() {
                 *a = Some(req.adapter.clone());
@@ -160,7 +160,7 @@ pub async fn load_lora_into_slot(
         );
     }
     match ack_rx.await {
-        Ok(Ok(())) => {
+        Ok(Ok(_)) => {
             // The swapped slot becomes the served adapter; mirror it.
             if let Ok(mut a) = state.active_adapter.lock() {
                 *a = Some(req.name.clone());

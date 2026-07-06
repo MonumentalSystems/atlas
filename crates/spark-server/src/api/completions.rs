@@ -155,14 +155,27 @@ pub async fn completions(
     ) {
         Some(s) => s,
         None => {
-            return openai_error_response(
-                axum::http::StatusCode::BAD_REQUEST,
-                format!(
-                    "unknown adapter '{}'; resident adapters: [{}]",
-                    req.adapter.as_deref().unwrap_or(""),
-                    state.adapter_names.join(", ")
-                ),
-            );
+            // #27: on-miss RDMA promotion for a stageable adapter (see chat/mod.rs).
+            let name = req.adapter.as_deref().unwrap_or("");
+            match state.ensure_adapter_hot_opt(name).await {
+                Ok(Some(slot)) => slot,
+                Ok(None) => {
+                    return openai_error_response(
+                        axum::http::StatusCode::BAD_REQUEST,
+                        format!(
+                            "unknown adapter '{}'; resident adapters: [{}]",
+                            name,
+                            state.adapter_names.join(", ")
+                        ),
+                    );
+                }
+                Err(crate::main_modules::promotion::PromoteReject::PoolFull(m)) => {
+                    return openai_error_response(axum::http::StatusCode::SERVICE_UNAVAILABLE, m);
+                }
+                Err(crate::main_modules::promotion::PromoteReject::Peer(m)) => {
+                    return openai_error_response(axum::http::StatusCode::BAD_GATEWAY, m);
+                }
+            }
         }
     };
 

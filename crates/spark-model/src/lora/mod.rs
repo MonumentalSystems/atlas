@@ -13,7 +13,7 @@
 //! holo adapter scale (~tens of MiB).
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use anyhow::{Result, anyhow, bail};
 use atlas_core::config::{LayerType, ModelConfig, PeftAdapterConfig};
@@ -170,6 +170,67 @@ pub struct LoraWeights {
     /// Interior-mutable through `&self` (acquire/release run on the prefill/free
     /// `&self` paths); swaps read it under `&mut self` at a quiescent point.
     pub ref_counts: Vec<AtomicUsize>,
+    /// Task #27 (demand-driven promotion): the PINNED/CACHE boundary. Slots
+    /// `[0, pinned)` are the startup `--lora-adapter` set — advertised by
+    /// `/v1/models`, resolved by the position-based `resolve_adapter_slot`, and
+    /// NEVER an eviction victim. Slots `[pinned, max_loras)` are the promotion
+    /// HOT CACHE (empty placeholders at load): a demand-promoted adapter lands
+    /// in one of these. `pinned == slots-populated-at-load`.
+    pub pinned: usize,
+    /// Task #27: per-slot last-used LRU tick, one [`AtomicU64`] per pool index
+    /// (`len() == max_loras`, parallel to `ref_counts`). Bumped in
+    /// [`Self::acquire_slot`] on the RESOLVED index so victim selection ages the
+    /// TRUE slot a request used (including `-1 -> active`). A cache slot with the
+    /// smallest `last_used` among the `ref_count == 0` idle slots is the LRU
+    /// eviction victim. Interior-mutable through `&self` like `ref_counts`.
+    pub last_used: Vec<AtomicU64>,
+    /// Task #27: monotonic source for `last_used` ticks (never wraps in
+    /// practice). Bumped once per acquire.
+    pub lru_tick: AtomicU64,
+}
+
+/// Task #27: a per-slot snapshot for the pure victim-selection policy. Taken on
+/// the model thread at a scheduler-quiescent point (the only place `ref_count`
+/// is authoritative), then handed to [`select_victim_slot`].
+#[derive(Clone, Copy, Debug)]
+pub struct SlotView {
+    /// `true` if this slot currently holds a (non-placeholder) adapter.
+    pub filled: bool,
+    /// In-flight sequence count (`0` == idle == evictable).
+    pub ref_count: usize,
+    /// LRU tick (larger = more recently used).
+    pub last_used: u64,
+}
+
+/// Why a promotion cannot find a victim slot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VictimError {
+    /// Every cache slot is busy (`ref_count > 0`) — a RETRYABLE condition, never
+    /// an eviction of an in-flight adapter.
+    PoolFull,
+}
+
+/// Task #27 pure victim-selection policy over the CACHE region only (the caller
+/// passes `(slot_index, view)` for slots `[pinned, max_loras)` — pinned startup
+/// adapters are never candidates, so the resident set and its position-based
+/// resolver can never desync). Tiers:
+///   1. FREE-FIRST: the first `!filled` (never-promoted) placeholder slot.
+///   2. LRU-IDLE: else the `ref_count == 0` slot with the smallest `last_used`.
+///   3. POOL-FULL: else every cache slot is busy → `Err(PoolFull)` (retryable);
+///      a `ref_count > 0` slot is NEVER returned.
+pub fn select_victim_slot(cache: &[(usize, SlotView)]) -> Result<usize, VictimError> {
+    // Tier 1: a never-filled placeholder is the cheapest victim (no eviction).
+    if let Some((idx, _)) = cache.iter().find(|(_, v)| !v.filled) {
+        return Ok(*idx);
+    }
+    // Tier 2: LRU among the idle (ref_count == 0) filled slots.
+    cache
+        .iter()
+        .filter(|(_, v)| v.ref_count == 0)
+        .min_by_key(|(_, v)| v.last_used)
+        .map(|(idx, _)| *idx)
+        // Tier 3: all cache slots busy — retryable, never evict a busy slot.
+        .ok_or(VictimError::PoolFull)
 }
 
 /// Build the per-step `seq_slot[padded_n]` host buffer the batched bgmv reads,
@@ -292,10 +353,58 @@ impl LoraWeights {
         match self.ref_counts.get(resolved) {
             Some(rc) => {
                 rc.fetch_add(1, Ordering::AcqRel);
+                // Task #27: stamp the RESOLVED slot as most-recently-used so the
+                // LRU victim policy ages the slot a request actually touched
+                // (including `-1 -> active`). Ticks are strictly increasing.
+                if let Some(lu) = self.last_used.get(resolved) {
+                    let t = self.lru_tick.fetch_add(1, Ordering::Relaxed) + 1;
+                    lu.store(t, Ordering::Relaxed);
+                }
                 resolved as i32
             }
             None => -1,
         }
+    }
+
+    /// Task #27: stamp `slot` as most-recently-used WITHOUT taking a ref. Called
+    /// right after a promote so a freshly-staged (ref_count==0) slot is NOT the
+    /// immediate LRU victim of a back-to-back promote before its own request has
+    /// acquired — otherwise two distinct cold adapters promoted in quick
+    /// succession would collide on the same slot (the second evicting the first).
+    pub fn touch_slot(&self, slot: usize) {
+        if let Some(lu) = self.last_used.get(slot) {
+            let t = self.lru_tick.fetch_add(1, Ordering::Relaxed) + 1;
+            lu.store(t, Ordering::Relaxed);
+        }
+    }
+
+    /// Task #27: current LRU tick of pool `slot` (larger = more recently
+    /// acquired). Out-of-range → 0 (never used).
+    pub fn slot_last_used(&self, slot: usize) -> u64 {
+        self.last_used
+            .get(slot)
+            .map(|lu| lu.load(Ordering::Relaxed))
+            .unwrap_or(0)
+    }
+
+    /// Task #27: snapshot the CACHE region `[pinned, max_loras)` as
+    /// `(slot_index, SlotView)` for [`select_victim_slot`]. `filled` = the slot
+    /// holds a non-placeholder adapter (non-empty name). Read on the model
+    /// thread at a quiescent point.
+    pub fn cache_slot_views(&self) -> Vec<(usize, SlotView)> {
+        (self.pinned..self.max_loras)
+            .map(|k| {
+                let filled = self.slots.get(k).is_some_and(|s| !s.name.is_empty());
+                (
+                    k,
+                    SlotView {
+                        filled,
+                        ref_count: self.slot_ref_count(k),
+                        last_used: self.slot_last_used(k),
+                    },
+                )
+            })
+            .collect()
     }
 
     /// Task #25: release a ref previously taken by [`Self::acquire_slot`], by the
@@ -811,6 +920,32 @@ pub fn load_lora_adapters_multi(
         });
     }
 
+    // Task #27: the pinned/cache boundary is the startup adapter count; the
+    // remaining pool indices `[pinned, max_loras)` are the promotion HOT CACHE.
+    // Pre-size `slots` to `max_loras` with EMPTY placeholders so a demand-promote
+    // (`swap_lora_slot_from_peer`) can `slots.get_mut(cache_slot)` a never-filled
+    // index (it would otherwise bail "slot not resident"). The placeholder's pool
+    // byte-region is already allocated + zeroed above; its empty name is never
+    // matched by the resolver nor advertised, and it contributes nothing to the
+    // a/b/scale tables — so resident-only serving is byte-identical. `pinned == 0`
+    // is impossible here (the caller rejects an empty adapter set).
+    let pinned = slots.len();
+    let num_layers = cfg.num_hidden_layers;
+    while slots.len() < max_loras {
+        slots.push(AdapterSlot {
+            name: String::new(),
+            adapter_config: PeftAdapterConfig {
+                r: 1,
+                lora_alpha: 0.0,
+                target_modules: Vec::new(),
+                use_rslora: false,
+                layers_to_transform: None,
+            },
+            layers: vec![None; num_layers],
+            generation: 0,
+        });
+    }
+
     // Post-pass: materialize the per-module [max_loras] u64 pointer tables (the
     // frozen M2 BGMV contract; currently dormant — no compute site reads them).
     // build_ptr_table pattern (nemotron_moe.rs:414): pack le bytes → alloc → h2d.
@@ -848,6 +983,9 @@ pub fn load_lora_adapters_multi(
         // One counter per pool index, stable across swaps (sized to max_loras,
         // not slots.len(), so a later swap-into an empty slot has a counter).
         ref_counts: (0..max_loras).map(|_| AtomicUsize::new(0)).collect(),
+        pinned,
+        last_used: (0..max_loras).map(|_| AtomicU64::new(0)).collect(),
+        lru_tick: AtomicU64::new(0),
     })
 }
 
@@ -1036,6 +1174,9 @@ mod tests {
             tables: BTreeMap::new(),
             scale_table: DevicePtr(0),
             ref_counts: (0..8).map(|_| AtomicUsize::new(0)).collect(),
+            pinned: 2,
+            last_used: (0..8).map(|_| AtomicU64::new(0)).collect(),
+            lru_tick: AtomicU64::new(0),
         };
         assert_eq!(lw.adapter_names(), vec!["alpha", "beta"]);
         assert_eq!(lw.slot_of("beta"), Some(1));
@@ -1118,6 +1259,9 @@ mod tests {
             tables: BTreeMap::new(),
             scale_table: DevicePtr(0),
             ref_counts: (0..4).map(|_| AtomicUsize::new(0)).collect(),
+            pinned: 1,
+            last_used: (0..4).map(|_| AtomicU64::new(0)).collect(),
+            lru_tick: AtomicU64::new(0),
         };
         let id_v1 = lw.adapter_id_for_slot(0);
         assert_eq!(id_v1, adapter_id_hash("sol", 0));
@@ -1157,6 +1301,9 @@ mod tests {
             tables: BTreeMap::new(),
             scale_table: DevicePtr(0),
             ref_counts: (0..4).map(|_| AtomicUsize::new(0)).collect(),
+            pinned: 2,
+            last_used: (0..4).map(|_| AtomicU64::new(0)).collect(),
+            lru_tick: AtomicU64::new(0),
         };
 
         // acquire(0) returns the resolved index 0 and increments its counter.
@@ -1299,5 +1446,64 @@ mod tests {
             SEQ_SLOT_OFF + 33 * 4 > 256,
             "K=33 overruns — guard required"
         );
+    }
+
+    // ── Task #27: pure victim-selection policy ──
+    fn view(filled: bool, ref_count: usize, last_used: u64) -> SlotView {
+        SlotView {
+            filled,
+            ref_count,
+            last_used,
+        }
+    }
+
+    #[test]
+    fn victim_free_first_before_lru() {
+        // Cache region starts at slot 2. Slot 3 is a never-filled placeholder;
+        // it must be chosen BEFORE evicting any filled slot, even a very-idle one.
+        let cache = vec![
+            (2, view(true, 0, 1)),  // filled, idle, oldest tick
+            (3, view(false, 0, 0)), // never filled → free-first winner
+            (4, view(true, 0, 9)),  // filled, idle
+        ];
+        assert_eq!(select_victim_slot(&cache), Ok(3));
+    }
+
+    #[test]
+    fn victim_lru_idle_when_all_filled() {
+        // No free slot: evict the idle slot with the smallest last_used tick.
+        let cache = vec![
+            (2, view(true, 0, 50)), // idle but recently used
+            (3, view(true, 1, 5)),  // BUSY — never a victim despite oldest tick
+            (4, view(true, 0, 12)), // idle, older than slot 2 → LRU winner
+        ];
+        assert_eq!(select_victim_slot(&cache), Ok(4));
+    }
+
+    #[test]
+    fn victim_pool_full_when_all_busy() {
+        // Every cache slot has ref_count>0 → retryable PoolFull, never an evict.
+        let cache = vec![(2, view(true, 1, 1)), (3, view(true, 2, 2))];
+        assert_eq!(select_victim_slot(&cache), Err(VictimError::PoolFull));
+    }
+
+    #[test]
+    fn victim_never_returns_busy_slot() {
+        // A free placeholder coexists with busy slots: still pick the free one,
+        // and NEVER a ref_count>0 index.
+        let cache = vec![
+            (2, view(true, 3, 1)),
+            (3, view(false, 0, 0)),
+            (4, view(true, 7, 2)),
+        ];
+        let picked = select_victim_slot(&cache).unwrap();
+        assert_eq!(picked, 3);
+        // And with no free slot, a lone idle among busies is the only choice.
+        let cache2 = vec![
+            (2, view(true, 3, 1)),
+            (3, view(true, 0, 8)), // the only idle
+            (4, view(true, 7, 2)),
+        ];
+        assert_eq!(select_victim_slot(&cache2), Ok(3));
     }
 }

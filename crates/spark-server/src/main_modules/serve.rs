@@ -635,6 +635,64 @@ pub(crate) async fn serve(mut args: cli::ServeArgs) -> Result<()> {
     if let Some(max_pixels) = vision_max_pixels {
         tracing::info!("Vision max_pixels cap enabled: {}", max_pixels);
     }
+    // #27: build the STAGEABLE registry (name -> {peer_stage_id, peft}). The peer
+    // WeightManifest carries no r/alpha, so the peft scaling is parsed from each
+    // adapter's local CONFIG_DIR/adapter_config.json HERE (fail-fast at startup —
+    // a wrong/absent scale must never be discovered mid-serve).
+    let lora_peer_addr = spark_model::lora::lora_peer_env();
+    let mut lora_stageable = std::collections::HashMap::new();
+    for (name, peer_id, dir) in &args.lora_stageable {
+        let cfg_path = std::path::Path::new(dir).join("adapter_config.json");
+        let raw = std::fs::read_to_string(&cfg_path).with_context(|| {
+            format!(
+                "--lora-stageable '{name}': read peft config {}",
+                cfg_path.display()
+            )
+        })?;
+        let peft = atlas_core::config::parse_peft_adapter_config(&raw)
+            .with_context(|| format!("--lora-stageable '{name}': parse {}", cfg_path.display()))?;
+        lora_stageable.insert(
+            name.clone(),
+            crate::main_modules::promotion::StageableAdapter {
+                peer_stage_id: peer_id.clone(),
+                peft,
+            },
+        );
+    }
+    if !lora_stageable.is_empty() && lora_peer_addr.is_none() {
+        anyhow::bail!(
+            "--lora-stageable given ({} adapter(s)) but $ATLAS_LORA_PEER is unset; \
+             demand promotion needs a weight peer to RDMA-stage from",
+            lora_stageable.len()
+        );
+    }
+    if !lora_stageable.is_empty() && lora_states.is_empty() {
+        anyhow::bail!(
+            "--lora-stageable needs a resident pool to promote INTO; start with at \
+             least one --lora-adapter (and --max-loras > that count for cache headroom)"
+        );
+    }
+    // Promotion is armed only when the registry is non-empty, a peer is set, AND
+    // a rotation channel exists (a LoRA pool is resident). Otherwise every field
+    // is inert and a miss 404s byte-identically to today.
+    let promotion =
+        if !lora_stageable.is_empty() && lora_peer_addr.is_some() && !lora_states.is_empty() {
+            Some(Arc::new(
+                crate::main_modules::promotion::PromotionManager::default(),
+            ))
+        } else {
+            None
+        };
+    if promotion.is_some() {
+        tracing::info!(
+            "LoRA #27: {} stageable adapter(s) armed for demand promotion \
+             (peer={:?}, cache headroom={} slots)",
+            lora_stageable.len(),
+            lora_peer_addr,
+            args.max_loras.saturating_sub(lora_states.len()),
+        );
+    }
+
     let state = Arc::new(AppState {
         tokenizer,
         model_name,
@@ -689,6 +747,10 @@ pub(crate) async fn serve(mut args: cli::ServeArgs) -> Result<()> {
         conversation_store,
         dump_writer,
         auth,
+        lora_stageable,
+        lora_peer_addr,
+        promotion,
+        promoted_slots: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
     });
 
     serve_phases::log_behavior_audit(&args, &ptx_set);

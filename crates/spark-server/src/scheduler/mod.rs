@@ -118,14 +118,37 @@ pub enum LoraCommand {
         dir: std::path::PathBuf,
         slot: usize,
     },
+    /// Task #27: demand-driven RDMA PROMOTE of a stageable-but-not-resident
+    /// adapter from the peer into a cache pool slot (victim chosen on the model
+    /// thread), then make it active. The chosen slot + any evicted name flow
+    /// back through the ack. `peft` supplies the r/alpha the peer manifest lacks.
+    Promote {
+        peer_addr: String,
+        adapter_id: String,
+        name: String,
+        peft: atlas_core::config::PeftAdapterConfig,
+    },
+}
+
+/// Successful result of a [`LoraCommand`] applied at quiescence. Rotate/Load
+/// return [`LoraAck::Done`]; a Promote returns the resolved cache slot (which the
+/// HTTP miss path uses as the request's `adapter_slot`) and any evicted adapter
+/// name (so the caller drops its stale name->slot overlay entry).
+#[derive(Debug, Clone)]
+pub enum LoraAck {
+    Done,
+    Promoted {
+        slot: usize,
+        evicted: Option<String>,
+    },
 }
 
 /// A LoRA control command plus the oneshot ack the HTTP handler awaits
-/// (`Ok(())` on success, `Err(reason)` on unknown adapter / rotation not armed /
-/// load failure).
+/// (`Ok(ack)` on success, `Err(reason)` on unknown adapter / rotation not armed /
+/// load failure / pool full).
 pub type LoraRotation = (
     LoraCommand,
-    tokio::sync::oneshot::Sender<Result<(), String>>,
+    tokio::sync::oneshot::Sender<Result<LoraAck, String>>,
 );
 
 /// Run the scheduler loop on the current thread.
@@ -277,15 +300,21 @@ pub fn run(
 
         // ── Apply queued LoRA adapter rotations at a QUIESCENT point ──
         // Only when nothing is in flight (no active decode, no in-progress
-        // prefill, no just-drained request) so the re-point never races a
-        // live delta read or a graph replay. Otherwise the rotations stay
-        // queued and are retried once the batch drains.
-        if active.is_empty() && prefilling.is_empty() && new_reqs.is_empty() {
+        // prefill, no just-drained request, AND no sequence spilled to disk) so
+        // the re-point/promote never races a live delta read or a graph replay.
+        // `swapped` MUST be empty too: a spilled sequence has RELEASED its adapter
+        // ref (#25), so without this gate a Promote/swap could evict/re-stage the
+        // slot its KV was computed under and corrupt it on resume (#27 FINDING 1 /
+        // #31). Otherwise the commands stay queued and retry once the batch drains.
+        if active.is_empty() && prefilling.is_empty() && new_reqs.is_empty() && swapped.is_empty() {
             let rotations = std::mem::take(&mut pending.0.lock().rotations);
             for (cmd, ack) in rotations {
                 let res = match cmd {
                     LoraCommand::Rotate(name) => {
-                        let r = model.set_active_lora(&name).map_err(|e| format!("{e:#}"));
+                        let r = model
+                            .set_active_lora(&name)
+                            .map(|()| LoraAck::Done)
+                            .map_err(|e| format!("{e:#}"));
                         if let Err(ref e) = r {
                             tracing::warn!("LoRA rotation to '{name}' failed: {e}");
                         }
@@ -294,9 +323,25 @@ pub fn run(
                     LoraCommand::LoadIntoSlot { name, dir, slot } => {
                         let r = model
                             .swap_lora_from_disk(&dir, &name, slot)
+                            .map(|()| LoraAck::Done)
                             .map_err(|e| format!("{e:#}"));
                         if let Err(ref e) = r {
                             tracing::warn!("LoRA disk swap '{name}' → slot {slot} failed: {e}");
+                        }
+                        r
+                    }
+                    LoraCommand::Promote {
+                        peer_addr,
+                        adapter_id,
+                        name,
+                        peft,
+                    } => {
+                        let r = model
+                            .promote_lora_from_peer(&peer_addr, &adapter_id, &name, peft)
+                            .map(|(slot, evicted)| LoraAck::Promoted { slot, evicted })
+                            .map_err(|e| format!("{e:#}"));
+                        if let Err(ref e) = r {
+                            tracing::warn!("LoRA promote '{name}' failed: {e}");
                         }
                         r
                     }

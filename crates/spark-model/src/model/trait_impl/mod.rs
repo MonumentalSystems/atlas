@@ -172,6 +172,23 @@ impl Model for TransformerModel {
     ) -> Result<()> {
         self.swap_lora_slot_from_disk(dir, name, slot)
     }
+    fn promote_lora_from_peer(
+        &mut self,
+        peer_addr: &str,
+        adapter_id: &str,
+        name: &str,
+        peft: atlas_core::config::PeftAdapterConfig,
+    ) -> Result<(usize, Option<String>)> {
+        #[cfg(feature = "cuda")]
+        {
+            self.promote_lora_slot_from_peer(peer_addr, adapter_id, name, peft)
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = (peer_addr, adapter_id, name, peft);
+            anyhow::bail!("LoRA peer promotion requires the cuda feature")
+        }
+    }
     fn high_speed_swap_dims(&self) -> Option<spark_storage::ModelDims> {
         self.high_speed_swap_dims_dispatch()
     }

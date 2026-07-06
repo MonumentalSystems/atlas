@@ -160,14 +160,29 @@ pub(crate) async fn chat_completions_inner(
     ) {
         Some(s) => s,
         None => {
-            return openai_error_response(
-                axum::http::StatusCode::BAD_REQUEST,
-                format!(
-                    "unknown adapter '{}'; resident adapters: [{}]",
-                    req.adapter.as_deref().unwrap_or(""),
-                    state.adapter_names.join(", ")
-                ),
-            );
+            // #27: a non-resident name may be STAGEABLE — try an on-miss RDMA
+            // promotion into a cache slot. Only 404 when it isn't stageable
+            // (byte-identical to today) or the promote fails.
+            let name = req.adapter.as_deref().unwrap_or("");
+            match state.ensure_adapter_hot_opt(name).await {
+                Ok(Some(slot)) => slot,
+                Ok(None) => {
+                    return openai_error_response(
+                        axum::http::StatusCode::BAD_REQUEST,
+                        format!(
+                            "unknown adapter '{}'; resident adapters: [{}]",
+                            name,
+                            state.adapter_names.join(", ")
+                        ),
+                    );
+                }
+                Err(crate::main_modules::promotion::PromoteReject::PoolFull(m)) => {
+                    return openai_error_response(axum::http::StatusCode::SERVICE_UNAVAILABLE, m);
+                }
+                Err(crate::main_modules::promotion::PromoteReject::Peer(m)) => {
+                    return openai_error_response(axum::http::StatusCode::BAD_GATEWAY, m);
+                }
+            }
         }
     };
 

@@ -248,6 +248,21 @@ pub trait Model: Send + Sync {
         bail!("this model does not support LoRA disk swap")
     }
 
+    /// Task #27 (demand-driven promotion): RDMA-promote the adapter `name`
+    /// (staged on `peer_addr` at `adapter_id`) from the peer into a cache pool
+    /// slot and make it active, returning `(slot, evicted_name)`. Runs at a
+    /// scheduler quiescent point. `peft` supplies the r/alpha/scaling the peer
+    /// manifest does not carry. Default: unsupported (non-LoRA / non-cuda).
+    fn promote_lora_from_peer(
+        &mut self,
+        _peer_addr: &str,
+        _adapter_id: &str,
+        _name: &str,
+        _peft: atlas_core::config::PeftAdapterConfig,
+    ) -> Result<(usize, Option<String>)> {
+        bail!("this model does not support LoRA peer promotion")
+    }
+
     /// Dims for the `--high-speed-swap` orchestrator (installed thread-local
     /// after `bind_gpu_to_thread`). `None` for legacy/non-attention models.
     fn high_speed_swap_dims(&self) -> Option<spark_storage::ModelDims> {

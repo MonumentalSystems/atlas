@@ -544,6 +544,18 @@ pub struct ServeArgs {
     /// so the M2 multi-adapter layout is frozen from day one.
     #[arg(long, default_value_t = 8)]
     pub max_loras: usize,
+
+    /// Task #27: a STAGEABLE (promotable-but-not-resident) LoRA adapter, as
+    /// `NAME=PEER_STAGE_ID=CONFIG_DIR` (repeatable). NAME is what a request's
+    /// `adapter` field asks for; PEER_STAGE_ID is the adapter's id on the
+    /// `$ATLAS_LORA_PEER` weight peer; CONFIG_DIR is a local dir with
+    /// `adapter_config.json` (the peer manifest carries no r/alpha, so the peft
+    /// scaling is read from here at startup). A request naming a stageable
+    /// adapter triggers an on-miss RDMA promotion into a cache pool slot instead
+    /// of a 404. Requires `$ATLAS_LORA_PEER`. Empty = today's resident-only
+    /// behaviour, byte-identical.
+    #[arg(long, value_name = "NAME=PEER_ID=DIR", value_parser = parse_lora_stageable_spec)]
+    pub lora_stageable: Vec<(String, String, String)>,
 }
 
 /// Value parser for `--lora-adapter NAME=PATH_OR_HF_ID`.
@@ -555,4 +567,57 @@ fn parse_lora_adapter_spec(s: &str) -> Result<(String, String), String> {
         return Err(format!("--lora-adapter: empty name or path in '{s}'"));
     }
     Ok((name.to_string(), spec.to_string()))
+}
+
+/// Value parser for `--lora-stageable NAME=PEER_ID=DIR` (Task #27). Splits into
+/// exactly three non-empty parts on the first two `=` (a filesystem DIR may
+/// itself contain no `=`; peer ids and names never do). All three parts are
+/// required — a missing DIR would leave the promoted adapter with no peft
+/// scaling source.
+fn parse_lora_stageable_spec(s: &str) -> Result<(String, String, String), String> {
+    let mut parts = s.splitn(3, '=');
+    let name = parts.next().unwrap_or("");
+    let peer_id = parts.next().unwrap_or("");
+    let dir = parts.next().unwrap_or("");
+    if name.is_empty() || peer_id.is_empty() || dir.is_empty() {
+        return Err(format!(
+            "--lora-stageable must be NAME=PEER_ID=DIR (all three non-empty), got '{s}'"
+        ));
+    }
+    Ok((name.to_string(), peer_id.to_string(), dir.to_string()))
+}
+
+#[cfg(test)]
+mod stageable_spec_tests {
+    use super::parse_lora_stageable_spec;
+
+    #[test]
+    fn parses_three_parts() {
+        assert_eq!(
+            parse_lora_stageable_spec("sparky=stage-7=/data/adapters/sparky"),
+            Ok((
+                "sparky".to_string(),
+                "stage-7".to_string(),
+                "/data/adapters/sparky".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn rejects_missing_parts() {
+        assert!(parse_lora_stageable_spec("sparky").is_err());
+        assert!(parse_lora_stageable_spec("sparky=stage-7").is_err());
+        assert!(parse_lora_stageable_spec("=stage-7=/dir").is_err());
+        assert!(parse_lora_stageable_spec("sparky==/dir").is_err());
+        assert!(parse_lora_stageable_spec("sparky=stage-7=").is_err());
+    }
+
+    #[test]
+    fn dir_may_contain_equals_after_first_two() {
+        // splitn(3) keeps everything after the 2nd '=' as the DIR.
+        assert_eq!(
+            parse_lora_stageable_spec("n=p=/weird/dir=x"),
+            Ok(("n".to_string(), "p".to_string(), "/weird/dir=x".to_string()))
+        );
+    }
 }
