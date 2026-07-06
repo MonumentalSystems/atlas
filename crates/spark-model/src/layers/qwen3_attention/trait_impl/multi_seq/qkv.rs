@@ -25,7 +25,6 @@ impl Qwen3AttentionLayer {
             nq,
             nkv,
             hd,
-            eps,
             bf16,
             q_dim,
             q_proj_dim,
@@ -49,6 +48,9 @@ impl Qwen3AttentionLayer {
         {
             self.ms_qkv_batch2(c)?;
         } else {
+            // Projection only — the q/k RMS norms are deferred to the shared
+            // tail so the per-request K/V LoRA delta lands BEFORE k_norm
+            // (HF: k_norm(k_proj(x)+Δ); the single-seq oracle does the same).
             for i in 0..n {
                 let normed_i = normed.offset(i * h * bf16);
                 let q_out_i = qkv_buf.offset(i * per_seq_qkv);
@@ -57,33 +59,118 @@ impl Qwen3AttentionLayer {
 
                 self.ms_qkv_seq_q(fwd, normed_i, q_out_i, q_proj_dim, q_dim, nq, hd, h, stream)?;
                 self.ms_qkv_seq_kv(fwd, normed_i, k_out_i, v_out_i, nkv, hd, h, stream)?;
+            }
+        }
 
-                if !self.attn.q_norm.weight.is_null() {
-                    ops::rms_norm(
-                        fwd.gpu,
-                        self.rms_norm_k,
-                        q_out_i,
-                        &self.attn.q_norm,
-                        q_out_i,
-                        nq,
-                        hd,
-                        eps,
-                        stream,
-                    )?;
-                }
-                if !self.attn.k_norm.weight.is_null() {
-                    ops::rms_norm(
-                        fwd.gpu,
-                        self.rms_norm_k,
-                        k_out_i,
-                        &self.attn.k_norm,
-                        k_out_i,
-                        nkv,
-                        hd,
-                        eps,
-                        stream,
-                    )?;
-                }
+        // ── Per-request K/V LoRA delta (batched bgmv), pre-norm. No-op when no
+        // routing table is installed or `seq_slot` is null (base model / n==1).
+        self.ms_qkv_apply_lora(c)?;
+
+        // ── Shared q/k RMS-norm pass (all three projection branches).
+        let _ = (q_dim, q_proj_dim); // consumed by the projection branches
+        self.ms_qkv_norms(c)?;
+        Ok(())
+    }
+
+    /// Per-request K/V LoRA routing on the batched decode path. Applies each
+    /// sequence's own adapter delta to the strided `qkv_buf` K and V regions
+    /// via the fused bgmv (byte-identical to N single-seq `apply_lora_delta`).
+    /// No-op unless a routing table is installed AND `seq_slot` is non-null.
+    fn ms_qkv_apply_lora(&self, c: &MultiSeqCtx<'_>) -> Result<()> {
+        let Some(ref lw) = self.lora else {
+            return Ok(());
+        };
+        if c.seq_slot.0 == 0 {
+            return Ok(());
+        }
+        let bf16 = c.bf16;
+        let out_row_stride = (c.per_seq_qkv / bf16) as u32; // strided [Q|K|V] layout
+        let x_row_stride = c.h as u32; // normed rows are contiguous [n, h]
+        let kv_bytes = (c.nkv * c.hd) as usize * bf16;
+        // K delta: base_out = k_out region (after Q), fold in place.
+        if let Some(ref route) = lw.k_route {
+            let k_out0 = c.qkv_buf.offset(c.q_proj_bytes);
+            ops::lora_delta::apply_lora_bgmv(
+                c.fwd.gpu,
+                &lw.kernels,
+                route,
+                c.normed,
+                k_out0,
+                c.seq_slot,
+                c.n as u32,
+                x_row_stride,
+                out_row_stride,
+                c.fwd.buffers.lora_xa(),
+                c.stream,
+            )?;
+        }
+        // V delta: base_out = v_out region (after Q and K).
+        if let Some(ref route) = lw.v_route {
+            let v_out0 = c.qkv_buf.offset(c.q_proj_bytes + kv_bytes);
+            ops::lora_delta::apply_lora_bgmv(
+                c.fwd.gpu,
+                &lw.kernels,
+                route,
+                c.normed,
+                v_out0,
+                c.seq_slot,
+                c.n as u32,
+                x_row_stride,
+                out_row_stride,
+                c.fwd.buffers.lora_xa(),
+                c.stream,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Shared q/k RMS-norm pass over the per-seq `qkv_buf` regions. Extracted
+    /// so all three projection branches (seq / batch2 / batch3) defer norms to
+    /// one place, after the pre-norm K/V LoRA delta.
+    fn ms_qkv_norms(&self, c: &MultiSeqCtx<'_>) -> Result<()> {
+        let MultiSeqCtx {
+            fwd,
+            n,
+            stream,
+            nq,
+            nkv,
+            hd,
+            eps,
+            bf16,
+            q_proj_bytes,
+            per_seq_qkv,
+            qkv_buf,
+            ..
+        } = *c;
+        for i in 0..n {
+            let q_out_i = qkv_buf.offset(i * per_seq_qkv);
+            let k_out_i = q_out_i.offset(q_proj_bytes);
+            let _ = bf16;
+            if !self.attn.q_norm.weight.is_null() {
+                ops::rms_norm(
+                    fwd.gpu,
+                    self.rms_norm_k,
+                    q_out_i,
+                    &self.attn.q_norm,
+                    q_out_i,
+                    nq,
+                    hd,
+                    eps,
+                    stream,
+                )?;
+            }
+            if !self.attn.k_norm.weight.is_null() {
+                ops::rms_norm(
+                    fwd.gpu,
+                    self.rms_norm_k,
+                    k_out_i,
+                    &self.attn.k_norm,
+                    k_out_i,
+                    nkv,
+                    hd,
+                    eps,
+                    stream,
+                )?;
             }
         }
         Ok(())
@@ -98,7 +185,6 @@ impl Qwen3AttentionLayer {
             nq,
             nkv,
             hd,
-            eps,
             bf16,
             q_proj_dim,
             q_proj_bytes,
@@ -170,37 +256,7 @@ impl Qwen3AttentionLayer {
             fwd.gpu
                 .copy_d2d_async(v_scratch.offset(i * kv_bytes), v_out_i, kv_bytes, stream)?;
         }
-
-        for i in 0..3usize {
-            let q_out_i = qkv_buf.offset(i * per_seq_qkv);
-            let k_out_i = q_out_i.offset(q_proj_bytes);
-            if !self.attn.q_norm.weight.is_null() {
-                ops::rms_norm(
-                    fwd.gpu,
-                    self.rms_norm_k,
-                    q_out_i,
-                    &self.attn.q_norm,
-                    q_out_i,
-                    nq,
-                    hd,
-                    eps,
-                    stream,
-                )?;
-            }
-            if !self.attn.k_norm.weight.is_null() {
-                ops::rms_norm(
-                    fwd.gpu,
-                    self.rms_norm_k,
-                    k_out_i,
-                    &self.attn.k_norm,
-                    k_out_i,
-                    nkv,
-                    hd,
-                    eps,
-                    stream,
-                )?;
-            }
-        }
+        // q/k norms deferred to ms_qkv_norms (after the pre-norm K/V LoRA delta).
         Ok(())
     }
 
@@ -213,7 +269,6 @@ impl Qwen3AttentionLayer {
             nq,
             nkv,
             hd,
-            eps,
             bf16,
             q_proj_dim,
             q_proj_bytes,
@@ -285,37 +340,7 @@ impl Qwen3AttentionLayer {
             fwd.gpu
                 .copy_d2d_async(v_scratch.offset(i * kv_bytes), v_out_i, kv_bytes, stream)?;
         }
-
-        for i in 0..2usize {
-            let q_out_i = qkv_buf.offset(i * per_seq_qkv);
-            let k_out_i = q_out_i.offset(q_proj_bytes);
-            if !self.attn.q_norm.weight.is_null() {
-                ops::rms_norm(
-                    fwd.gpu,
-                    self.rms_norm_k,
-                    q_out_i,
-                    &self.attn.q_norm,
-                    q_out_i,
-                    nq,
-                    hd,
-                    eps,
-                    stream,
-                )?;
-            }
-            if !self.attn.k_norm.weight.is_null() {
-                ops::rms_norm(
-                    fwd.gpu,
-                    self.rms_norm_k,
-                    k_out_i,
-                    &self.attn.k_norm,
-                    k_out_i,
-                    nkv,
-                    hd,
-                    eps,
-                    stream,
-                )?;
-            }
-        }
+        // q/k norms deferred to ms_qkv_norms (after the pre-norm K/V LoRA delta).
         Ok(())
     }
 

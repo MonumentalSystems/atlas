@@ -147,10 +147,30 @@ pub async fn completions(
     });
     let stop_tokens = tokenize_stop_sequences(&state.tokenizer, &req.stop);
 
+    // M2 per-request LoRA routing: resolve the optional `adapter` name to a
+    // pool slot (`-1` = defer to installed active; unknown = 400).
+    let adapter_slot = match crate::main_modules::app_state::resolve_adapter_slot(
+        &state.adapter_names,
+        req.adapter.as_deref(),
+    ) {
+        Some(s) => s,
+        None => {
+            return openai_error_response(
+                axum::http::StatusCode::BAD_REQUEST,
+                format!(
+                    "unknown adapter '{}'; resident adapters: [{}]",
+                    req.adapter.as_deref().unwrap_or(""),
+                    state.adapter_names.join(", ")
+                ),
+            );
+        }
+    };
+
     if req.stream {
         return match completions_stream(
             state,
             prompt_tokens,
+            adapter_slot,
             req.max_tokens,
             temperature,
             top_k,
@@ -178,6 +198,7 @@ pub async fn completions(
     let request = InferenceRequest::Blocking {
         prompt_tokens: std::sync::Arc::new(prompt_tokens),
         session_hash,
+        adapter_slot,
         image_pixels: Vec::new(),
         max_tokens: req.max_tokens,
         min_tokens: 0,
@@ -292,6 +313,8 @@ pub async fn completions(
 pub(super) async fn completions_stream(
     state: Arc<AppState>,
     prompt_tokens: Vec<u32>,
+    // M2 per-request LoRA routing: resolved adapter slot (-1 = defer to active).
+    adapter_slot: i32,
     max_tokens: usize,
     temperature: f32,
     top_k: u32,
@@ -314,6 +337,7 @@ pub(super) async fn completions_stream(
     let request = InferenceRequest::Streaming {
         prompt_tokens: std::sync::Arc::new(prompt_tokens),
         session_hash,
+        adapter_slot,
         image_pixels: Vec::new(),
         max_tokens,
         min_tokens: 0,
@@ -459,8 +483,9 @@ pub async fn get_model(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(model_id): axum::extract::Path<String>,
 ) -> Response {
-    let known =
-        model_id == state.model_name || state.adapter_name.as_deref() == Some(model_id.as_str());
+    // Any resident adapter is a routable model id (M2): `models.retrieve(name)`
+    // must succeed for every adapter advertised by /v1/models, not just slot 0.
+    let known = model_id == state.model_name || state.adapter_names.iter().any(|n| n == &model_id);
     if known {
         Json(serde_json::json!({
             "id": model_id,

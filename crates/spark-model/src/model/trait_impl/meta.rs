@@ -191,6 +191,7 @@ impl TransformerModel {
             prompt_len: 0,
             disk_block_ids: Vec::new(),
             disk_last_offloaded_per_layer: vec![0; num_attn_layers],
+            adapter_slot: -1, // default: defer to installed active adapter
         })
     }
 

@@ -13,6 +13,25 @@ use crate::{
     tool_parser,
 };
 
+/// Resolve a per-request `adapter` name to a LoRA pool slot index for M2
+/// routing. Rules (pure — unit-tested):
+///   `None`               → `Some(-1)` : defer to the installed active adapter
+///                          (byte-identical to today for unset requests).
+///   known name           → `Some(slot)` : its index in `adapter_names`
+///                          (slot order, matching the pool pack order).
+///   unknown name         → `None` : the caller returns HTTP 400.
+/// A request that names the base `model` is treated as "unknown adapter" here
+/// (callers pass only the explicit `adapter` field, never `model`).
+pub fn resolve_adapter_slot(adapter_names: &[String], adapter: Option<&str>) -> Option<i32> {
+    match adapter {
+        None => Some(-1),
+        Some(name) => adapter_names
+            .iter()
+            .position(|n| n == name)
+            .map(|i| i as i32),
+    }
+}
+
 /// Shared application state accessible from all HTTP handlers.
 pub struct AppState {
     pub tokenizer: ChatTokenizer,
@@ -114,3 +133,24 @@ pub struct AppState {
 
 /// Re-export for convenience in api.rs / anthropic.rs.
 pub type ModelBehavior = atlas_kernels::ModelBehavior;
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_adapter_slot;
+
+    #[test]
+    fn adapter_slot_resolution_rules() {
+        let names = vec!["alpha".to_string(), "beta".to_string(), "gamma".to_string()];
+        // Unset defers to installed active (-1) — byte-identical to today.
+        assert_eq!(resolve_adapter_slot(&names, None), Some(-1));
+        // Known names resolve to their slot index (pool pack order).
+        assert_eq!(resolve_adapter_slot(&names, Some("alpha")), Some(0));
+        assert_eq!(resolve_adapter_slot(&names, Some("beta")), Some(1));
+        assert_eq!(resolve_adapter_slot(&names, Some("gamma")), Some(2));
+        // Unknown name → None → caller returns 400.
+        assert_eq!(resolve_adapter_slot(&names, Some("delta")), None);
+        // No adapters resident: any explicit name is unknown; None still defers.
+        assert_eq!(resolve_adapter_slot(&[], Some("alpha")), None);
+        assert_eq!(resolve_adapter_slot(&[], None), Some(-1));
+    }
+}

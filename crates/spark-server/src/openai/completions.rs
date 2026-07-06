@@ -11,6 +11,11 @@ use super::*;
 #[allow(dead_code)]
 pub struct CompletionRequest {
     pub model: String,
+    /// M2 per-request LoRA routing: optional resident adapter NAME to apply to
+    /// this request (independent of `model`). Unset = defer to installed active
+    /// (byte-identical to today); unknown = 400. See `ChatCompletionRequest`.
+    #[serde(default)]
+    pub adapter: Option<String>,
     /// OpenAI-compatible `prompt`: a string, an array of strings, an array
     /// of integer token IDs, or an array of token-ID arrays (batch). The
     /// token-ID forms bypass tokenization and feed the scheduler verbatim

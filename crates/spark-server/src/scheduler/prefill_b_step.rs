@@ -44,6 +44,7 @@ pub fn prefill_request(
     let logit_bias = req.logit_bias().to_vec();
     let req_min_tokens = req.min_tokens();
     let req_session_hash = req.session_hash();
+    let req_adapter_slot = req.adapter_slot(); // M2 per-request LoRA routing
     let req_enable_thinking = req.enable_thinking();
     let req_thinking_budget = req.thinking_budget();
     let req_repetition_detection = req.repetition_detection();
@@ -111,6 +112,7 @@ pub fn prefill_request(
         }
     };
     seq.session_hash = req_session_hash;
+    seq.adapter_slot = req_adapter_slot;
 
     // Guard: free SSM slot on any error after allocation (Bug #16).
     let prefill_result = (|| -> Result<u32> {

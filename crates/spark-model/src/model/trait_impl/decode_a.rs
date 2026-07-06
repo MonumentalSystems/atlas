@@ -138,6 +138,7 @@ impl TransformerModel {
             block_table: meta_base.offset(256),
             max_blocks_per_seq: max_blocks,
             num_seqs: 1,
+            seq_slot: spark_runtime::gpu::DevicePtr(0),
         };
 
         // CUDA graphs cannot capture NCCL all-reduce (it runs on a separate

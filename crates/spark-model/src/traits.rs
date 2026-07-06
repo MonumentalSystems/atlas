@@ -165,6 +165,14 @@ pub struct SequenceState {
     /// uninitialised. Length equals the model's attention layer count;
     /// empty when HSS is disabled.
     pub disk_last_offloaded_per_layer: Vec<u32>,
+    /// M2 per-request LoRA routing: the adapter POOL SLOT this sequence's
+    /// requests select (NOT `slot_idx`, which is the KV/SSM pool slot). `-1`
+    /// (the default for every existing path) means "defer to the installed
+    /// active adapter" — so an unset request is byte-identical to today. Set
+    /// once from `InferenceRequest::adapter_slot()` at prefill; read by
+    /// `decode_batch` to build the per-step device `seq_slot[N]` buffer the
+    /// batched bgmv routes on.
+    pub adapter_slot: i32,
 }
 
 impl SequenceState {

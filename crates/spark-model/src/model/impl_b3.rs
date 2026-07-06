@@ -146,17 +146,24 @@ impl TransformerModel {
     /// unchanged until the M1 compute insertions read it.
     pub fn set_lora_weights(&mut self, lora: Option<crate::lora::LoraWeights>) -> Result<()> {
         if let Some(ref lw) = lora {
-            // eager-on-rotate: >1 resident adapter, or the rotate/peer env,
-            // ARMS rotation and forces eager decode (see `lora_rotatable`).
-            self.lora_rotatable = lw.slots.len() > 1
-                || crate::lora::lora_rotate_env()
-                || crate::lora::lora_peer_env().is_some();
+            // eager-on-rotate: ONLY the global rotate/swap re-point path forces
+            // eager decode. A multi-adapter pool no longer implies eager —
+            // per-request routing (M2) is graph-safe by construction (the
+            // per-seq slot buffer is per-step-uploaded to a stable address, the
+            // pool tables are load-time-fixed), so decode graphs STAY captured
+            // under routing. Equating slots.len()>1 with eager here would throw
+            // away the entire point of batched routing.
+            self.lora_rotatable =
+                crate::lora::lora_rotate_env() || crate::lora::lora_peer_env().is_some();
             let kernels = ops::lora_delta::LoraKernels::new(self.gpu.as_ref())?;
             // Clone the active slot's pairs (small; LoraPair is Copy) so the
             // install walk can hold a shared borrow while it &mut-borrows
-            // `self.layers`.
+            // `self.layers`. Clone the (Copy) pool table pointers + scale table
+            // too so the routed batched-decode path can read them per layer.
             let active = lw.active_layers().to_vec();
-            let installed = self.install_lora_layers(&active, kernels)?;
+            let tables = lw.tables.clone();
+            let scale_table = lw.scale_table;
+            let installed = self.install_lora_layers(&active, kernels, &tables, scale_table)?;
             tracing::info!(
                 "LoRA: {} adapter(s) resident [{}], active '{}' installed on \
                  {installed} layers (r={}, max_rank={}, max_loras={}, \
@@ -182,7 +189,32 @@ impl TransformerModel {
         &mut self,
         layers: &[Option<crate::lora::LoraLayerWeights>],
         kernels: ops::lora_delta::LoraKernels,
+        tables: &std::collections::BTreeMap<
+            (usize, crate::lora::LoraModule),
+            (spark_runtime::gpu::DevicePtr, spark_runtime::gpu::DevicePtr),
+        >,
+        scale_table: spark_runtime::gpu::DevicePtr,
     ) -> Result<usize> {
+        use crate::lora::LoraModule;
+        // Build the per-module routing table from the frozen pool tables + the
+        // active-slot pair dims (k_in/n_out/max_rank identical across slots, so
+        // the active pair supplies them). `None` when the module has no table
+        // (base-only) — the bgmv apply site then no-ops for that module.
+        let mk_route = |layer_idx: usize,
+                        module: LoraModule,
+                        pair: &Option<ops::lora_delta::LoraPair>|
+         -> Option<ops::lora_delta::LoraRoute> {
+            let p = pair.as_ref()?;
+            let (a_table, b_table) = *tables.get(&(layer_idx, module))?;
+            Some(ops::lora_delta::LoraRoute {
+                a_table,
+                b_table,
+                scale_table,
+                k_in: p.k_in,
+                n_out: p.n_out,
+                max_rank: p.max_rank,
+            })
+        };
         let mut installed = 0usize;
         for (idx, layer) in self.layers.iter_mut().enumerate() {
             let Some(layer_weights) = layers.get(idx).and_then(|o| o.as_ref()) else {
@@ -202,6 +234,9 @@ impl TransformerModel {
                 v: layer_weights.v_proj,
                 o: layer_weights.o_proj,
                 kernels,
+                k_route: mk_route(idx, LoraModule::KProj, &layer_weights.k_proj),
+                v_route: mk_route(idx, LoraModule::VProj, &layer_weights.v_proj),
+                o_route: mk_route(idx, LoraModule::OProj, &layer_weights.o_proj),
             };
             let ffn_weights = if layer_weights.gate_proj.is_some()
                 || layer_weights.up_proj.is_some()
@@ -252,7 +287,7 @@ impl TransformerModel {
             );
         }
         // Re-point onto the new active slot.
-        let (layers, active_name, r) = {
+        let (layers, active_name, r, tables, scale_table) = {
             let lw = self.lora.as_mut().unwrap();
             lw.active = slot;
             lw.name = lw.slots[slot].name.clone();
@@ -261,10 +296,12 @@ impl TransformerModel {
                 lw.slots[slot].layers.clone(),
                 lw.name.clone(),
                 lw.adapter_config.r,
+                lw.tables.clone(),
+                lw.scale_table,
             )
         };
         let kernels = ops::lora_delta::LoraKernels::new(self.gpu.as_ref())?;
-        let installed = self.install_lora_layers(&layers, kernels)?;
+        let installed = self.install_lora_layers(&layers, kernels, &tables, scale_table)?;
         // Defensive: drop any captured decode graphs so a stale-pointer replay
         // is impossible even if `lora_rotatable` were ever mis-derived. Under
         // forced eager these are already empty.
@@ -346,8 +383,10 @@ impl TransformerModel {
         let active = self.lora.as_ref().unwrap().active;
         if active == slot {
             let installed_layers = self.lora.as_ref().unwrap().slots[slot].layers.clone();
+            let tables = self.lora.as_ref().unwrap().tables.clone();
+            let scale_table = self.lora.as_ref().unwrap().scale_table;
             let kernels = ops::lora_delta::LoraKernels::new(self.gpu.as_ref())?;
-            self.install_lora_layers(&installed_layers, kernels)?;
+            self.install_lora_layers(&installed_layers, kernels, &tables, scale_table)?;
             self.lora.as_mut().unwrap().name = adapter_name.to_string();
             self.decode_graph.lock().clear();
             self.batch_decode_graphs.lock().clear();
@@ -416,8 +455,10 @@ impl TransformerModel {
         // so subsequent requests apply the new adapter's delta.
         let active = self.lora.as_ref().unwrap().active;
         if active == slot {
+            let tables = self.lora.as_ref().unwrap().tables.clone();
+            let scale_table = self.lora.as_ref().unwrap().scale_table;
             let kernels = ops::lora_delta::LoraKernels::new(self.gpu.as_ref())?;
-            self.install_lora_layers(&layers, kernels)?;
+            self.install_lora_layers(&layers, kernels, &tables, scale_table)?;
             self.lora.as_mut().unwrap().name = name.to_string();
             self.decode_graph.lock().clear();
             self.batch_decode_graphs.lock().clear();

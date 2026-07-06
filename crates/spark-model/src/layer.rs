@@ -102,6 +102,13 @@ pub struct AttnMetadataDev {
     pub max_blocks_per_seq: u32,
     /// Number of sequences in this batch (1 for single-sequence decode).
     pub num_seqs: u32,
+    /// M2 per-request LoRA routing: `[num_seqs]` i32 at this device address,
+    /// one adapter SLOT index per row (`< 0` = base / no delta; pad rows are
+    /// `-1`). Uploaded each decode step to a stable address (like positions /
+    /// block_table), so the batched bgmv stays inside the captured decode
+    /// graph. `DevicePtr(0)` on every non-routed path (single-seq decode,
+    /// prefill, verify, MLA, MTP) — the bgmv apply sites no-op when it is null.
+    pub seq_slot: DevicePtr,
 }
 
 /// Q12 batched-prefill device-side metadata.

@@ -57,6 +57,7 @@ pub fn start_chunked_prefill(
     let logit_bias = req.logit_bias().to_vec();
     let req_min_tokens = req.min_tokens();
     let req_session_hash = req.session_hash();
+    let req_adapter_slot = req.adapter_slot(); // M2 per-request LoRA routing
     let req_enable_thinking = req.enable_thinking();
     let req_thinking_budget = req.thinking_budget();
     let req_repetition_detection = req.repetition_detection();
@@ -130,6 +131,7 @@ pub fn start_chunked_prefill(
         }
     };
     seq.session_hash = req_session_hash;
+    seq.adapter_slot = req_adapter_slot;
 
     // Deferred co-dispatch: setup + EP broadcast, then return InProgress at
     // chunk 0 WITHOUT prefilling — the batched step packs >=2 streams into one

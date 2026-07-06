@@ -300,6 +300,7 @@ impl DeepseekV4MtpHead {
             block_table: meta_base.offset(256),
             max_blocks_per_seq: max_blocks,
             num_seqs: 1,
+            seq_slot: spark_runtime::gpu::DevicePtr(0),
         };
 
         // The body's hash-MoE (if any) reads the decode token id from

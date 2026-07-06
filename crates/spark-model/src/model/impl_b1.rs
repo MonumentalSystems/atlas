@@ -112,6 +112,13 @@ impl TransformerModel {
         self.gpu
             .copy_h2d_async(&bt_bytes, meta_base.offset(768), stream)?;
 
+        // M2 per-request LoRA routing: upload the per-seq adapter-slot buffer to
+        // the unused metadata gap at meta_base+128 (positions occupy +0..+32 at
+        // padded_n<=8; slots begin at +256 — so +128 never overlaps). Fixed
+        // address, per-step contents → graph-safe. `DevicePtr(0)` when no
+        // adapter is resident (the bgmv apply sites then no-op).
+        let seq_slot = self.upload_seq_slots(seqs, padded_n, meta_base.offset(128), stream)?;
+
         Ok(AttnMetadataDev {
             positions: meta_base,
             positions_h: meta_base,
@@ -121,7 +128,31 @@ impl TransformerModel {
             block_table: meta_base.offset(768),
             max_blocks_per_seq: max_blocks,
             num_seqs: padded_n as u32,
+            seq_slot,
         })
+    }
+
+    /// Build + upload the `[padded_n]` i32 adapter-slot buffer for per-request
+    /// LoRA routing, at `dst`. Returns `dst` when an adapter pool is resident
+    /// (so the batched bgmv reads it), or `DevicePtr(0)` when there is no LoRA
+    /// (apply sites skip). Resolution + pad handling live in the pure
+    /// [`crate::lora::build_seq_slot_host`] (unit-tested).
+    fn upload_seq_slots(
+        &self,
+        seqs: &[&mut SequenceState],
+        padded_n: usize,
+        dst: DevicePtr,
+        stream: u64,
+    ) -> Result<DevicePtr> {
+        let active = match self.lora.as_ref() {
+            Some(lw) => lw.active as i32,
+            None => return Ok(DevicePtr(0)),
+        };
+        let adapter_slots: Vec<i32> = seqs.iter().map(|s| s.adapter_slot).collect();
+        let host = crate::lora::build_seq_slot_host(&adapter_slots, padded_n, active);
+        let bytes: Vec<u8> = host.iter().flat_map(|v| v.to_le_bytes()).collect();
+        self.gpu.copy_h2d_async(&bytes, dst, stream)?;
+        Ok(dst)
     }
 
     /// Upload batch metadata to a caller-specified device address.
@@ -196,6 +227,9 @@ impl TransformerModel {
         self.gpu
             .copy_h2d_async(&bt_bytes, meta_base.offset(768), stream)?;
 
+        // Per-request routing slots at the +128 gap (see upload_batch_metadata_fixed).
+        let seq_slot = self.upload_seq_slots(seqs, padded_n, meta_base.offset(128), stream)?;
+
         Ok(AttnMetadataDev {
             positions: meta_base,
             positions_h: meta_base,
@@ -205,6 +239,7 @@ impl TransformerModel {
             block_table: meta_base.offset(768),
             max_blocks_per_seq: max_blocks,
             num_seqs: padded_n as u32,
+            seq_slot,
         })
     }
 
@@ -444,6 +479,7 @@ impl TransformerModel {
             block_table: meta_base.offset(256),
             max_blocks_per_seq: max_blocks,
             num_seqs: 1,
+            seq_slot: DevicePtr(0),
         };
 
         let ctx = ForwardContext {

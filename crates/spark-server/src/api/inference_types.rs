@@ -61,6 +61,10 @@ pub enum InferenceRequest {
         prompt_tokens: std::sync::Arc<Vec<u32>>,
         /// Session hash for SSM snapshot isolation (hash of first 64 prompt tokens).
         session_hash: u64,
+        /// M2 per-request LoRA routing: adapter pool SLOT this request applies
+        /// (`-1` = defer to installed active; byte-identical to today). Set from
+        /// the resolved `adapter` field; carried onto `SequenceState.adapter_slot`.
+        adapter_slot: i32,
         /// Preprocessed image data: (pixels `[P,1536]` f32, grid_h, grid_w) per image.
         image_pixels: Vec<(Vec<f32>, usize, usize)>,
         max_tokens: usize,
@@ -147,6 +151,9 @@ pub enum InferenceRequest {
         prompt_tokens: std::sync::Arc<Vec<u32>>,
         /// Session hash for SSM snapshot isolation (hash of first 64 prompt tokens).
         session_hash: u64,
+        /// M2 per-request LoRA routing: adapter pool SLOT (`-1` = defer to
+        /// installed active). See the Blocking variant.
+        adapter_slot: i32,
         /// Preprocessed image data: (pixels `[P,1536]` f32, grid_h, grid_w) per image.
         image_pixels: Vec<(Vec<f32>, usize, usize)>,
         max_tokens: usize,

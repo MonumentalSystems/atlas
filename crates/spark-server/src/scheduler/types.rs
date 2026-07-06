@@ -357,6 +357,10 @@ pub(super) fn consume_budget(remaining: &mut usize) -> bool {
 pub(super) struct SwappedSeq {
     pub tokens: Vec<u32>,
     pub session_hash: u64,
+    /// M2 per-request LoRA routing: preserved across spill/restore so a
+    /// swapped-then-resumed sequence keeps its adapter (unlike `cancel_flag`,
+    /// which is intentionally dropped). CPU metadata, restored like `tokens`.
+    pub adapter_slot: i32,
     pub seq_len: usize,
     pub num_blocks: usize,
     pub last_token: u32,

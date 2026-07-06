@@ -150,18 +150,26 @@ pub(crate) async fn chat_completions_inner(
         req.repetition_penalty,
     );
 
-    // v0 LoRA wart (documented, accepted): one always-on adapter, no routing.
-    // Requests naming the base model (or anything else) still get ADAPTED output.
-    if let Some(ref adapter) = state.adapter_name
-        && req.model != *adapter
-    {
-        tracing::warn!(
-            "request.model='{}' but LoRA adapter '{}' is always-on — response uses \
-             adapted weights (per-request routing lands in M2)",
-            req.model,
-            adapter,
-        );
-    }
+    // M2 per-request LoRA routing: resolve the optional `adapter` name to a
+    // pool slot ONCE here (both dispatch paths inherit it). Unset defers to the
+    // installed active adapter (`-1`, byte-identical to today); an unknown name
+    // is a hard 400. Supersedes the v0 always-on-adapter warn.
+    let adapter_slot = match crate::main_modules::app_state::resolve_adapter_slot(
+        &state.adapter_names,
+        req.adapter.as_deref(),
+    ) {
+        Some(s) => s,
+        None => {
+            return openai_error_response(
+                axum::http::StatusCode::BAD_REQUEST,
+                format!(
+                    "unknown adapter '{}'; resident adapters: [{}]",
+                    req.adapter.as_deref().unwrap_or(""),
+                    state.adapter_names.join(", ")
+                ),
+            );
+        }
+    };
 
     // ── Phase 1: build MsgEntry vec + image preprocess + cwd ────
     let msg_entry::BuildOut {
@@ -272,6 +280,7 @@ pub(crate) async fn chat_completions_inner(
             dump_seq,
             prompt_tokens,
             session_hash,
+            adapter_slot,
             image_pixels,
             max_tokens,
             temperature,
@@ -308,6 +317,7 @@ pub(crate) async fn chat_completions_inner(
         dump_seq,
         prompt_tokens,
         session_hash,
+        adapter_slot,
         image_pixels,
         max_tokens,
         temperature,

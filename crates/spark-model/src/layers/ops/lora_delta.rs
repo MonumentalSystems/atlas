@@ -19,6 +19,10 @@ pub struct LoraKernels {
     pub gemm_tc_k: KernelHandle, // KernelHandle(0) on miss -> gemm_k fallback
     pub gemm_k: KernelHandle,
     pub scaled_add_k: KernelHandle,
+    /// M2 fused batched bgmv (per-request routing): shrink then expand+fold.
+    /// Module "lora_bgmv" (stem == module — no KERNEL.toml override).
+    pub bgmv_shrink_k: KernelHandle,
+    pub bgmv_expand_fold_k: KernelHandle,
 }
 
 impl LoraKernels {
@@ -28,8 +32,27 @@ impl LoraKernels {
             gemm_tc_k: crate::layers::try_kernel(gpu, "gemm_tc", "dense_gemm_tc"),
             gemm_k: gpu.kernel("gemm", "dense_gemm_bf16")?,
             scaled_add_k: gpu.kernel("residual_add", "bf16_scaled_add")?,
+            bgmv_shrink_k: gpu.kernel("lora_bgmv", "lora_bgmv_shrink")?,
+            bgmv_expand_fold_k: gpu.kernel("lora_bgmv", "lora_bgmv_expand_fold")?,
         })
     }
+}
+
+/// Frozen per-(layer,module) routing tables the bgmv reads: the `[max_loras]`
+/// device pointer tables (`a_table`/`b_table`, NULL=base) + the shared
+/// `[max_loras]` f32 `scale_table`, plus the projection dims. Load-time-fixed
+/// device addresses (built at pool pack time), so they are stable kernel args
+/// across CUDA-graph capture/replay — adapter identity flows ONLY through the
+/// per-step `seq_slot` buffer. Installed by copy onto the layer next to the
+/// active-slot [`LoraPair`] (which the single-seq n==1 path still uses).
+#[derive(Debug, Clone, Copy)]
+pub struct LoraRoute {
+    pub a_table: DevicePtr,
+    pub b_table: DevicePtr,
+    pub scale_table: DevicePtr,
+    pub k_in: u32,
+    pub n_out: u32,
+    pub max_rank: u32,
 }
 
 /// One adapted module. A/B are PEFT tensors VERBATIM (host F16->BF16 at load):
@@ -71,6 +94,13 @@ pub struct LoraAttnWeights {
     pub v: Option<LoraPair>,
     pub o: Option<LoraPair>,
     pub kernels: LoraKernels,
+    /// M2 per-request routing tables (per module). `None` = single/global
+    /// adapter with no routing (the n==1 path uses the pair above and stays
+    /// byte-identical). `Some` when a multi-adapter pool is resident; the
+    /// batched decode path reads these + the per-seq `seq_slot` via the bgmv.
+    pub k_route: Option<LoraRoute>,
+    pub v_route: Option<LoraRoute>,
+    pub o_route: Option<LoraRoute>,
 }
 
 /// Per-layer dense-FFN LoRA weights, installed by copy onto `DenseFfnLayer`.
@@ -193,4 +223,82 @@ pub fn apply_lora_delta(
         m * pair.n_out,
         stream,
     )
+}
+
+/// M2 per-request routed LoRA delta over a batch of `n` decode rows, each
+/// naming its own adapter slot via `seq_slot[n]` (i32, `<0` = base/no delta).
+/// Two launches — shrink then expand+fold — reading the module's frozen
+/// `route.a_table`/`route.b_table`/`route.scale_table` (`[max_loras]` device
+/// arrays, NULL/0 = base-only slot) at the load-time-fixed pool addresses.
+///
+/// out[i, :] += scale_s * (x[i, :] @ A_s^T) @ B_s^T   where s = seq_slot[i].
+///
+/// BYTE-IDENTICAL to `n` sequential `apply_lora_delta(m=1)` calls for the same
+/// `(x_i, s_i)` (the on-hardware oracle): kernel 1 is `dense_gemv_bf16` with a
+/// per-row A-base gather (emits BF16 xa = the oracle's lora_xa boundary);
+/// kernel 2 is the same body reading BF16 xa back, then the oracle's fold
+/// (round delta→BF16, then `base += scale*bf16(delta)`), so per-slot scale is
+/// applied in fp32 AFTER the BF16 delta rounding. Contraction runs at
+/// `route.max_rank` (never true rank) — pad rows/cols are zero, bit-identical.
+///
+/// STRIDES (elements, not bytes):
+/// - `x_row_stride`   : distance between `x` rows (normed = `h`; attn_out = `q_dim`).
+/// - `out_row_stride` : distance between `base_out` rows. Contiguous O uses
+///   `n_out`; the STRIDED K/V `qkv_buf` uses `per_seq_qkv/2` (BF16 elements) so
+///   the fold lands inside the interleaved `[Q|K|V]` layout without corrupting it.
+///
+/// GRAPH-SAFE: only pointer/value-stable args — `x`/`base_out` are the fixed
+/// forward buffers, the tables are load-time-fixed, `xa` is a fixed arena
+/// scratch (`>= n*max_rank` BF16), and `seq_slot` is a fixed-address buffer
+/// whose CONTENTS are re-uploaded each decode step (like positions/block_table).
+/// No alloc/sync — captures inside the decode graph.
+///
+/// ARG ORDER is in lockstep with `lora_bgmv.cu` (cuLaunchKernel is type-blind;
+/// the byte-identity oracle is the only guard — keep both in sync).
+#[allow(clippy::too_many_arguments)]
+pub fn apply_lora_bgmv(
+    gpu: &dyn GpuBackend,
+    kernels: &LoraKernels,
+    route: &LoraRoute,
+    x: DevicePtr,        // [n, x_row_stride] BF16
+    base_out: DevicePtr, // [n, out_row_stride] BF16, folded in place
+    seq_slot: DevicePtr, // [n] i32 (<0 => base)
+    n: u32,              // batch rows
+    x_row_stride: u32,   // elements between x rows (>= route.k_in)
+    out_row_stride: u32, // elements between base_out rows (>= route.n_out)
+    lora_xa: DevicePtr,  // arena scratch >= n * max_rank BF16
+    stream: u64,
+) -> Result<()> {
+    use spark_runtime::kernel_args::{KernelLaunch, div_ceil};
+
+    // Kernel 1: shrink — xa[n, max_rank] = x @ A_s^T.
+    // grid = (ceil(max_rank/4), n, 1)  block = (256,1,1).
+    KernelLaunch::new(gpu, kernels.bgmv_shrink_k)
+        .grid([div_ceil(route.max_rank, 4), n, 1])
+        .block([256, 1, 1])
+        .arg_ptr(x)
+        .arg_ptr(seq_slot)
+        .arg_ptr(route.a_table)
+        .arg_ptr(lora_xa)
+        .arg_u32(n)
+        .arg_u32(route.max_rank)
+        .arg_u32(route.k_in)
+        .arg_u32(x_row_stride)
+        .launch(stream)?;
+
+    // Kernel 2: expand + fold — base_out += scale_s * (xa @ B_s^T).
+    // grid = (ceil(n_out/4), n, 1)  block = (256,1,1).
+    KernelLaunch::new(gpu, kernels.bgmv_expand_fold_k)
+        .grid([div_ceil(route.n_out, 4), n, 1])
+        .block([256, 1, 1])
+        .arg_ptr(lora_xa)
+        .arg_ptr(seq_slot)
+        .arg_ptr(route.b_table)
+        .arg_ptr(route.scale_table)
+        .arg_ptr(base_out)
+        .arg_u32(n)
+        .arg_u32(route.n_out)
+        .arg_u32(route.max_rank)
+        .arg_u32(out_row_stride)
+        .launch(stream)
 }

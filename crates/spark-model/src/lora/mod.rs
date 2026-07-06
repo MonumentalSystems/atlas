@@ -141,6 +141,49 @@ pub struct LoraWeights {
     /// key = (global_layer_idx, module) → (a_table, b_table); each table is
     /// a device `[max_loras]` u64 array, NULL (0) = base-only slot.
     pub tables: BTreeMap<(usize, LoraModule), (DevicePtr, DevicePtr)>,
+    /// The parallel `[max_loras]` device f32 SCALE table the bgmv reads,
+    /// indexed by slot: `scale_table[k]` = `slots[k].adapter_config.scaling()`
+    /// (alpha/r, or alpha/√r under rsLoRA — the same per-adapter scale that
+    /// rides each [`LoraPair`]), 0.0 for unpacked slots. Scale is per-ADAPTER
+    /// (not per-module), so ONE table suffices. Built once at pool pack time
+    /// alongside the a/b tables (load-time-fixed → graph-safe kernel arg).
+    pub scale_table: DevicePtr,
+}
+
+/// Build the per-step `seq_slot[padded_n]` host buffer the batched bgmv reads,
+/// from each real sequence's `adapter_slot`. Resolution rules (graph-safe:
+/// contents vary per step, buffer address is fixed):
+///   real row i (< n): `adapter_slots[i]` if `>= 0`, else `active` — a request
+///     with no `adapter` field carries `-1` and DEFERS to the installed active
+///     adapter, so a single global adapter (or a rotate re-point) applies to
+///     every default row exactly like the n==1 path.
+///   pad row i (n..padded_n): `-1` — base / no delta (bgmv early-returns).
+/// A row that explicitly names the base model (some future `-1`-means-base
+/// convention) is out of scope here; `-1` uniformly means "defer to active".
+pub fn build_seq_slot_host(adapter_slots: &[i32], padded_n: usize, active: i32) -> Vec<i32> {
+    let n = adapter_slots.len();
+    (0..padded_n)
+        .map(|i| {
+            if i < n {
+                let s = adapter_slots[i];
+                if s >= 0 { s } else { active }
+            } else {
+                -1
+            }
+        })
+        .collect()
+}
+
+/// Pure per-slot scale vector for the `[max_loras]` f32 scale table: entry `k`
+/// = adapter `k`'s `scaling()` (alpha/r, or alpha/√r under rsLoRA — read per
+/// adapter, never defaulted), 0.0 for unpacked slots `k >= adapters.len()`.
+/// Split out for unit testing (the device upload is a thin wrapper).
+pub(crate) fn scale_table_values(adapters: &[LoraAdapterInput<'_>], max_loras: usize) -> Vec<f32> {
+    let mut v = vec![0.0f32; max_loras];
+    for (k, a) in adapters.iter().enumerate() {
+        v[k] = a.peft.scaling();
+    }
+    v
 }
 
 impl LoraWeights {
@@ -664,6 +707,14 @@ pub fn load_lora_adapters_multi(
         tables.insert(*key, (mk(a_tab)?, mk(b_tab)?));
     }
 
+    // Parallel [max_loras] f32 scale table (per-slot scale, 0.0 for unpacked
+    // slots) — the bgmv fold reads scale_table[seq_slot] in fp32. Same
+    // load-time-fixed pattern as the a/b tables.
+    let scale_vals = scale_table_values(adapters, max_loras);
+    let scale_bytes: Vec<u8> = scale_vals.iter().flat_map(|s| s.to_le_bytes()).collect();
+    let scale_table = gpu.alloc(scale_bytes.len())?;
+    gpu.copy_h2d(&scale_bytes, scale_table)?;
+
     Ok(LoraWeights {
         name: slots[0].name.clone(),
         adapter_config: slots[0].adapter_config.clone(),
@@ -674,6 +725,7 @@ pub fn load_lora_adapters_multi(
         slots,
         active: 0,
         tables,
+        scale_table,
     })
 }
 
@@ -844,9 +896,63 @@ mod tests {
             slots: vec![mk_slot("alpha"), mk_slot("beta")],
             active: 0,
             tables: BTreeMap::new(),
+            scale_table: DevicePtr(0),
         };
         assert_eq!(lw.adapter_names(), vec!["alpha", "beta"]);
         assert_eq!(lw.slot_of("beta"), Some(1));
         assert_eq!(lw.slot_of("missing"), None);
+    }
+
+    #[test]
+    fn scale_table_values_per_slot_and_padded() {
+        // scaling() = alpha/r (no rslora); alpha/sqrt(r) under rslora. The
+        // scale table carries one f32 per slot, 0.0 for unpacked slots, in
+        // slot order — exactly what bgmv indexes by seq_slot.
+        let store = WeightStore::empty();
+        let mk = |alpha: f64, r: usize, rslora: bool| LoraAdapterInput {
+            name: String::new(),
+            store: &store,
+            peft: PeftAdapterConfig {
+                r,
+                lora_alpha: alpha,
+                target_modules: vec!["k_proj".into()],
+                use_rslora: rslora,
+                layers_to_transform: None,
+            },
+        };
+        let adapters = [mk(16.0, 8, false), mk(16.0, 4, true)];
+        let v = scale_table_values(&adapters, 8);
+        assert_eq!(v.len(), 8);
+        assert_eq!(v[0], (16.0_f64 / 8.0) as f32); // alpha/r
+        assert_eq!(v[1], (16.0_f64 / (4.0_f64).sqrt()) as f32); // rslora: alpha/sqrt(r)
+        assert!(v[2..].iter().all(|&s| s == 0.0)); // unpacked slots
+        // Table order matches the a/b table slot order (slot k = adapters[k]).
+        for (k, a) in adapters.iter().enumerate() {
+            assert_eq!(v[k], a.peft.scaling());
+        }
+    }
+
+    #[test]
+    fn seq_slot_host_defers_negatives_and_pads() {
+        // Two real seqs on explicit slots 1 and 0, one defaulting (-1 -> active=2),
+        // padded to 4 (pad rows -1 = base/no delta).
+        let slots = [1i32, -1, 0];
+        let v = build_seq_slot_host(&slots, 4, 2);
+        assert_eq!(v, vec![1, 2, 0, -1]);
+    }
+
+    #[test]
+    fn seq_slot_host_single_global_adapter_all_active() {
+        // All requests default (-1) → all real rows resolve to the active slot,
+        // so a single global adapter applies to every row (matches n==1).
+        let slots = [-1i32, -1, -1, -1];
+        let v = build_seq_slot_host(&slots, 4, 0);
+        assert_eq!(v, vec![0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn seq_slot_host_no_pad_when_full() {
+        let slots = [3i32, 1];
+        assert_eq!(build_seq_slot_host(&slots, 2, 0), vec![3, 1]);
     }
 }
