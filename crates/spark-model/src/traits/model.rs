@@ -212,6 +212,15 @@ pub trait Model: Send + Sync {
         bail!("this model does not support LoRA adapter rotation")
     }
 
+    /// Task #24: stable adapter_id (KV/prefix-cache identity) for a per-request
+    /// pool-slot selector. `slot` follows `SequenceState.adapter_slot`: `>= 0`
+    /// picks that resident slot, `-1` defers to the installed active adapter.
+    /// The default (no LoRA) returns the base sentinel `0`, keeping the prefix
+    /// cache byte-identical to the pre-LoRA path.
+    fn adapter_id_for(&self, _slot: i32) -> u64 {
+        0
+    }
+
     /// Runtime LoRA adapter dynamic-load: load the adapter at `dir` INTO pool
     /// `slot` and make it resident there (pool-size-1 per-request weight change).
     /// MUST be called at a scheduler quiescent point; needs rotation armed.

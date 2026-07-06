@@ -152,6 +152,7 @@ impl TransformerModel {
             snap_id,
             seq.session_hash,
             snap_tokens,
+            seq.adapter_id,
         );
         if let Some(old) = displaced {
             self.ssm_snapshots.free(old);

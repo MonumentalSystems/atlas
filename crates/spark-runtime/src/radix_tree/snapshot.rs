@@ -66,11 +66,14 @@ impl SsmSnapshotIndex {
     }
 
     /// Find deepest snapshot matching session within matched_tokens range.
+    /// Task #24: `adapter_id` is folded into the recomputed prefix hash so a
+    /// snapshot registered under one adapter never matches another's lookup.
     pub(super) fn lookup(
         &mut self,
         tokens: &[u32],
         matched_tokens: usize,
         session_hash: u64,
+        adapter_id: u64,
     ) -> Option<(usize, usize)> {
         let mut best: Option<(usize, usize)> = None; // (snapshot_id, token_count)
         for entry in &mut self.entries {
@@ -80,7 +83,7 @@ impl SsmSnapshotIndex {
             if session_hash != 0 && entry.session_hash != 0 && entry.session_hash != session_hash {
                 continue;
             }
-            let h = hash_token_prefix(tokens, entry.token_count);
+            let h = hash_token_prefix(tokens, entry.token_count, adapter_id);
             if h != entry.prefix_hash {
                 continue;
             }

@@ -361,6 +361,12 @@ pub(super) struct SwappedSeq {
     /// swapped-then-resumed sequence keeps its adapter (unlike `cancel_flag`,
     /// which is intentionally dropped). CPU metadata, restored like `tokens`.
     pub adapter_slot: i32,
+    /// Task #24: STABLE adapter_id preserved across spill/restore. Stored (not
+    /// recomputed) because a swapped `-1` (defer-to-active) seq's KV was computed
+    /// under the adapter that was active AT PREFILL — recomputing from
+    /// `adapter_slot == -1` after a rotation would re-bind it to a different
+    /// active id and mis-key its own already-written blocks.
+    pub adapter_id: u64,
     pub seq_len: usize,
     pub num_blocks: usize,
     pub last_token: u32,

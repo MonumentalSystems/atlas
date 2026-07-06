@@ -160,6 +160,7 @@ impl Model for MockModel {
             disk_block_ids: Vec::new(),
             disk_last_offloaded_per_layer: Vec::new(),
             adapter_slot: -1,
+            adapter_id: 0,
         })
     }
 

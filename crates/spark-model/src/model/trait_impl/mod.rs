@@ -155,6 +155,9 @@ impl Model for TransformerModel {
     fn set_active_lora(&mut self, name: &str) -> Result<()> {
         self.rotate_lora_to(name)
     }
+    fn adapter_id_for(&self, slot: i32) -> u64 {
+        self.adapter_id_for_slot(slot)
+    }
     fn swap_lora_from_disk(
         &mut self,
         dir: &std::path::Path,

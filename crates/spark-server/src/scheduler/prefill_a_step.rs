@@ -132,6 +132,10 @@ pub fn start_chunked_prefill(
     };
     seq.session_hash = req_session_hash;
     seq.adapter_slot = req_adapter_slot;
+    // Task #24: resolve the STABLE adapter_id NOW (model owns the authoritative
+    // active slot for the `-1 = defer to active` case). Keys the KV/prefix cache
+    // so this request reuses only same-adapter blocks.
+    seq.adapter_id = model.adapter_id_for(req_adapter_slot);
 
     // Deferred co-dispatch: setup + EP broadcast, then return InProgress at
     // chunk 0 WITHOUT prefilling — the batched step packs >=2 streams into one

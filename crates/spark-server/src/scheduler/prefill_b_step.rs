@@ -113,6 +113,10 @@ pub fn prefill_request(
     };
     seq.session_hash = req_session_hash;
     seq.adapter_slot = req_adapter_slot;
+    // Task #24: resolve the STABLE adapter_id NOW (model owns the authoritative
+    // active slot for the `-1 = defer to active` case). Keys the KV/prefix cache
+    // so this request reuses only same-adapter blocks.
+    seq.adapter_id = model.adapter_id_for(req_adapter_slot);
 
     // Guard: free SSM slot on any error after allocation (Bug #16).
     let prefill_result = (|| -> Result<u32> {

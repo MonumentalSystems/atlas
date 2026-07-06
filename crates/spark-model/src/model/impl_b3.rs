@@ -144,6 +144,18 @@ impl TransformerModel {
     /// `Qwen3AttentionLayer` (which routes FFN pairs into its dense FFN
     /// component). M0: layers only STORE the adapter; base output is
     /// unchanged until the M1 compute insertions read it.
+    /// Task #24: stable adapter_id for a per-request pool-slot selector. Returns
+    /// the base sentinel `0` when no LoRA pool is resident (byte-identical base),
+    /// else the NAME-derived id of the resolved slot (`-1 -> active`). Resolved
+    /// here at prefill time because `LoraWeights.active` can rotate between HTTP
+    /// request resolution and prefill.
+    pub fn adapter_id_for_slot(&self, slot: i32) -> u64 {
+        match self.lora.as_ref() {
+            Some(lw) => lw.adapter_id_for_slot(slot),
+            None => 0,
+        }
+    }
+
     pub fn set_lora_weights(&mut self, lora: Option<crate::lora::LoraWeights>) -> Result<()> {
         if let Some(ref lw) = lora {
             // eager-on-rotate: ONLY the global rotate/swap re-point path forces

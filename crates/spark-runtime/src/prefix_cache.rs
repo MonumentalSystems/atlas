@@ -122,13 +122,24 @@ pub trait PrefixCache: Send + Sync {
     /// Increments ref_count on matched nodes so they survive eviction
     /// while the sequence is active. `session_hash` is used for SSM
     /// snapshot isolation (0 = legacy/no session tracking).
-    fn lookup(&self, tokens: &[u32], block_size: usize, session_hash: u64) -> PrefixMatch;
+    ///
+    /// Task #24: `adapter_id` keys the KV/prefix + SSM-snapshot cache so a
+    /// request reuses ONLY blocks computed under the same adapter. `0` = base /
+    /// no adapter, which keys byte-identically to the pre-LoRA token-only cache.
+    fn lookup(
+        &self,
+        tokens: &[u32],
+        block_size: usize,
+        session_hash: u64,
+        adapter_id: u64,
+    ) -> PrefixMatch;
 
     /// Read-only longest-prefix probe: number of tokens (block-aligned)
     /// `lookup` would match, WITHOUT taking refs, touching LRU state, or
     /// counting a hit/miss. Used by the prefill tail-checkpoint split to
     /// detect conversation reuse before deciding to pay the extra pass.
-    fn peek_matched_tokens(&self, _tokens: &[u32], _block_size: usize) -> usize {
+    /// Task #24: keyed by `adapter_id` so a cross-adapter peek reports a miss.
+    fn peek_matched_tokens(&self, _tokens: &[u32], _block_size: usize, _adapter_id: u64) -> usize {
         0
     }
 
@@ -166,6 +177,7 @@ pub trait PrefixCache: Send + Sync {
         disk_block_ids: &[u32],
         block_size: usize,
         matched_tokens: usize,
+        adapter_id: u64,
     ) -> Vec<u32>;
 
     /// Insert blocks with an SSM state snapshot registered in the snapshot index.
@@ -188,6 +200,7 @@ pub trait PrefixCache: Send + Sync {
         snapshot_id: usize,
         session_hash: u64,
         matched_tokens: usize,
+        adapter_id: u64,
     ) -> (Option<usize>, Vec<u32>);
 
     /// Insert an SSM snapshot at an intermediate token boundary.
@@ -207,13 +220,15 @@ pub trait PrefixCache: Send + Sync {
         snapshot_id: usize,
         session_hash: u64,
         matched_tokens: usize,
+        adapter_id: u64,
     ) -> Option<usize>;
 
     /// Release ref_counts on blocks that were acquired via `lookup`.
     ///
     /// Called when a sequence finishes. Decrements ref_count on cache
     /// nodes matching the token prefix, making them eligible for eviction.
-    fn release(&self, tokens: &[u32], block_size: usize);
+    /// Task #24: `adapter_id` must match the one used at `lookup`/`insert`.
+    fn release(&self, tokens: &[u32], block_size: usize, adapter_id: u64);
 
     /// Evict up to `num_blocks` cached blocks, returning their physical
     /// indices and parallel disk-block IDs (Phase 6.1.e).
@@ -244,7 +259,13 @@ impl PrefixCache for NoPrefixCaching {
         false
     }
 
-    fn lookup(&self, _tokens: &[u32], _block_size: usize, _session_hash: u64) -> PrefixMatch {
+    fn lookup(
+        &self,
+        _tokens: &[u32],
+        _block_size: usize,
+        _session_hash: u64,
+        _adapter_id: u64,
+    ) -> PrefixMatch {
         PrefixMatch::empty()
     }
 
@@ -255,6 +276,7 @@ impl PrefixCache for NoPrefixCaching {
         _disk_block_ids: &[u32],
         _block_size: usize,
         _matched_tokens: usize,
+        _adapter_id: u64,
     ) -> Vec<u32> {
         Vec::new()
     }
@@ -268,6 +290,7 @@ impl PrefixCache for NoPrefixCaching {
         _snapshot_id: usize,
         _session_hash: u64,
         _matched_tokens: usize,
+        _adapter_id: u64,
     ) -> (Option<usize>, Vec<u32>) {
         (None, Vec::new())
     }
@@ -281,11 +304,12 @@ impl PrefixCache for NoPrefixCaching {
         _snapshot_id: usize,
         _session_hash: u64,
         _matched_tokens: usize,
+        _adapter_id: u64,
     ) -> Option<usize> {
         None
     }
 
-    fn release(&self, _tokens: &[u32], _block_size: usize) {}
+    fn release(&self, _tokens: &[u32], _block_size: usize, _adapter_id: u64) {}
 
     fn evict(&self, _num_blocks: usize) -> EvictedBlocks {
         EvictedBlocks::default()
@@ -323,13 +347,13 @@ mod tests {
         let block_table = vec![0, 1];
         let disk_block_ids: Vec<u32> = vec![];
 
-        let m = cache.lookup(&tokens, 4, 0);
+        let m = cache.lookup(&tokens, 4, 0, 0);
         assert!(m.is_empty());
 
         // These should not panic
-        let new_acq = cache.insert(&tokens, &block_table, &disk_block_ids, 4, 0);
+        let new_acq = cache.insert(&tokens, &block_table, &disk_block_ids, 4, 0, 0);
         assert!(new_acq.is_empty());
-        cache.release(&tokens, 4);
+        cache.release(&tokens, 4, 0);
 
         let evicted = cache.evict(10);
         assert!(evicted.is_empty());

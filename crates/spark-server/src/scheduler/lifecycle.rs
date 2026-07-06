@@ -167,6 +167,7 @@ pub fn swap_out_sequence(
         tokens,
         session_hash: a.session_hash,
         adapter_slot: a.seq.adapter_slot,
+        adapter_id: a.seq.adapter_id,
         seq_len,
         num_blocks,
         last_token: a.last_token,
@@ -248,6 +249,7 @@ pub fn resume_swapped_seq(
     seq.tokens = s.tokens;
     seq.seq_len = s.seq_len;
     seq.adapter_slot = s.adapter_slot;
+    seq.adapter_id = s.adapter_id;
 
     Ok(ActiveSeq {
         seq,

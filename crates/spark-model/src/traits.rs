@@ -173,6 +173,14 @@ pub struct SequenceState {
     /// `decode_batch` to build the per-step device `seq_slot[N]` buffer the
     /// batched bgmv routes on.
     pub adapter_slot: i32,
+    /// Task #24 (adapter-correct KV): STABLE u64 adapter identity, derived from
+    /// the adapter's NAME (never the runtime `adapter_slot`, which is reused
+    /// across swap/rotation). `0` = base / no adapter. Resolved at prefill from
+    /// `Model::adapter_id_for(adapter_slot)` (which maps `-1 -> active`) and used
+    /// to key the KV/prefix + SSM-snapshot cache so a request reuses ONLY blocks
+    /// computed under the same adapter. Base (`0`) keys byte-identically to the
+    /// pre-LoRA token-only cache.
+    pub adapter_id: u64,
 }
 
 impl SequenceState {

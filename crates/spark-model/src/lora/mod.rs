@@ -186,6 +186,24 @@ pub(crate) fn scale_table_values(adapters: &[LoraAdapterInput<'_>], max_loras: u
     v
 }
 
+/// Stable u64 identity for an adapter, derived from its human NAME (never the
+/// runtime pool slot index, which is reused across swap/rotation). Task #24:
+/// this is the cache-identity key that keeps the KV/prefix cache adapter-correct
+/// so a request reuses ONLY blocks computed under the same adapter.
+///
+/// FNV-1a over the name bytes. `0` is the RESERVED base/no-adapter sentinel, so
+/// a real name that would hash to 0 is bumped to 1 — a real adapter never aliases
+/// base. Two different names never collide (modulo the 64-bit hash); the SAME
+/// adapter re-staged into a different pool slot keeps its name, hence its id.
+pub fn adapter_id_hash(name: &str) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325; // FNV-1a basis
+    for &b in name.as_bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3); // FNV-1a prime
+    }
+    if h == 0 { 1 } else { h }
+}
+
 impl LoraWeights {
     /// The active slot's per-layer pairs (GLOBAL-layer-indexed) — what the
     /// install walk copies onto the layer structs.
@@ -201,6 +219,25 @@ impl LoraWeights {
     /// All resident adapter names in slot order (for `/v1/models`).
     pub fn adapter_names(&self) -> Vec<String> {
         self.slots.iter().map(|s| s.name.clone()).collect()
+    }
+
+    /// Stable adapter_id (Task #24) for a pool slot request selector. `slot`
+    /// follows the `SequenceState.adapter_slot` convention: `>= 0` selects that
+    /// resident slot, `-1` means "defer to the installed active adapter" (so a
+    /// default request keys under whatever adapter is actually active — matching
+    /// `build_seq_slot_host`'s `-1 -> active` resolution). The id is the NAME
+    /// hash, resolved at prefill time (active may rotate between HTTP resolve and
+    /// prefill). Out-of-range slots fall back to the base sentinel `0`.
+    pub fn adapter_id_for_slot(&self, slot: i32) -> u64 {
+        let resolved = if slot >= 0 {
+            slot as usize
+        } else {
+            self.active
+        };
+        match self.slots.get(resolved) {
+            Some(s) => adapter_id_hash(&s.name),
+            None => 0,
+        }
     }
 }
 
@@ -901,6 +938,33 @@ mod tests {
         assert_eq!(lw.adapter_names(), vec!["alpha", "beta"]);
         assert_eq!(lw.slot_of("beta"), Some(1));
         assert_eq!(lw.slot_of("missing"), None);
+
+        // Task #24: stable adapter_id resolution. Name-derived, `-1 -> active`.
+        let id_alpha = adapter_id_hash("alpha");
+        let id_beta = adapter_id_hash("beta");
+        assert_ne!(id_alpha, id_beta, "distinct names must not collide");
+        assert_ne!(
+            id_alpha, 0,
+            "a real adapter must never alias the base sentinel"
+        );
+        // slot >= 0 keys under that slot's name.
+        assert_eq!(lw.adapter_id_for_slot(0), id_alpha);
+        assert_eq!(lw.adapter_id_for_slot(1), id_beta);
+        // slot == -1 defers to the active adapter (slot 0 = alpha here).
+        assert_eq!(lw.adapter_id_for_slot(-1), id_alpha);
+        // Out-of-range slot falls back to the base sentinel.
+        assert_eq!(lw.adapter_id_for_slot(99), 0);
+    }
+
+    #[test]
+    fn adapter_id_hash_is_stable_and_base_reserved() {
+        // Deterministic and name-derived (survives pool-slot reuse: same name →
+        // same id regardless of which runtime slot it lands in).
+        assert_eq!(adapter_id_hash("sparky"), adapter_id_hash("sparky"));
+        assert_ne!(adapter_id_hash("sparky"), adapter_id_hash("vega"));
+        // 0 is reserved for base; the empty name still yields a non-zero id.
+        assert_ne!(adapter_id_hash(""), 0);
+        assert_ne!(adapter_id_hash("anything"), 0);
     }
 
     #[test]
