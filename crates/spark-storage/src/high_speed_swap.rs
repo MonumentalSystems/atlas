@@ -26,7 +26,10 @@ pub struct HighSpeedSwap {
     model: ModelDims,
     predictor: Predictor,
     pool: ScratchPool,
-    backend: IoUringBackend,
+    /// KV overflow tier: local NVMe (`IoUringBackend`) by default, or a remote
+    /// RDMA RAM blade (`RdmaKvBackend`) when `$ATLAS_KV_PEER` is set — the same
+    /// `StorageBackend` trait, so the offload/restore call sites are unchanged.
+    backend: Box<dyn crate::backend::StorageBackend>,
     attn: TiledAttention,
     eviction: EvictionPolicy,
     // Reusable scratch buffers.
@@ -80,8 +83,30 @@ impl HighSpeedSwap {
             2, // BF16
             4096,
         );
-        let layout = Layout::create(&cfg.dir, group_layout).context("create layout")?;
-        let backend = IoUringBackend::new(layout, cfg.qd as usize)?;
+        // KV overflow tier selection: RDMA RAM blade when $ATLAS_KV_PEER is set,
+        // else the local NVMe io_uring backend (default, unchanged).
+        let kv_peer = std::env::var("ATLAS_KV_PEER").ok();
+        let backend: Box<dyn crate::backend::StorageBackend> = {
+            #[cfg(atlas_rdma_verbs)]
+            {
+                if let Some(peer) = kv_peer {
+                    tracing::info!(
+                        "high-speed-swap: KV overflow tier = RDMA peer {peer} (group_stride {})",
+                        group_layout.group_stride
+                    );
+                    Box::new(crate::rdma_kv_backend::RdmaKvBackend::connect(&peer, group_layout)?)
+                } else {
+                    let layout = Layout::create(&cfg.dir, group_layout).context("create layout")?;
+                    Box::new(IoUringBackend::new(layout, cfg.qd as usize)?)
+                }
+            }
+            #[cfg(not(atlas_rdma_verbs))]
+            {
+                let _ = &kv_peer;
+                let layout = Layout::create(&cfg.dir, group_layout).context("create layout")?;
+                Box::new(IoUringBackend::new(layout, cfg.qd as usize)?)
+            }
+        };
         let pool = ScratchPool::new(ScratchDims {
             num_slots: cfg.resident_blocks,
             num_kv_heads: model.num_kv_heads,

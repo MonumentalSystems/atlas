@@ -6,7 +6,7 @@ use anyhow::Result;
 use std::ffi::c_void;
 
 use super::HighSpeedSwap;
-use crate::backend::{ReadRequest, StorageBackend};
+use crate::backend::ReadRequest;
 use crate::config::HighSpeedSwapConfig;
 use crate::cuda_min::{CudaCtx, copy_d_to_h_async, copy_h_to_d_async, stream_sync};
 use crate::group::{GroupKey, KvKind};
