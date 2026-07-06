@@ -95,13 +95,20 @@ pub fn detect_nvfp4_variant(
     // weight prefix hasn't been resolved yet at detection time.
     let prefixes_to_check = [
         lp.clone(),
-        format!(
-            "model.language_model.layers.{}",
-            config
-                .local_expert_range()
-                .0
-                .min(config.num_hidden_layers.saturating_sub(1))
-        ),
+        // Alternate hard-coded spelling of the SAME layer-0 prefix, for
+        // checkpoints whose `layer_prefix` differs from the canonical
+        // `model.language_model.*`. This MUST be a fixed layer index (0),
+        // NOT `local_expert_range().0`: that value is an EXPERT index, and
+        // under EP the worker's local-expert start (e.g. 128) was being used
+        // as a *layer* index and clamped to `num_hidden_layers-1` (39). Layer
+        // 39 is a full-attention layer whose FP8 `self_attn.q_proj.weight`
+        // trips the FP8 sniff below, so rank>0 mis-detected this MIXED_PRECISION
+        // (NVFP4 MoE + FP8 attention) checkpoint as `Fp8Dequanted` while rank 0
+        // (layer 0 = linear_attn, no `self_attn.q_proj`) correctly detected
+        // `Standard`. Pinning to layer 0 makes detection rank-independent;
+        // rank 0 and world_size=1 already resolved this to layer 0, so their
+        // behaviour is byte-identical.
+        "model.language_model.layers.0".to_string(),
     ];
     for pfx in &prefixes_to_check {
         let fp8_key = format!("{pfx}.mlp.experts.{local_expert}.gate_proj.weight_scale_inv");
