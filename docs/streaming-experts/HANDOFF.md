@@ -30,6 +30,7 @@ streaming cold experts from NVMe/RDMA on the prefill path.
 | **WS4** | **smart loading** (skip routed experts at load) | ✅ over-core checkpoints don't OOM mid-load; 122B validated |
 | **WS5** | **reactive expert-granular prefetch** (fetch only routed) | ✅ **bit-identical** (sha `ac48cd2d`); 7× A3B over-core decode |
 | **WS6** | **RDMA KV overflow tier** (KV → remote RAM blade) | ✅ **24 GB/s offload / 21.65 restore, live over-budget recall** — see `RDMA-KV-TIER.md` |
+| **WS7** | **RDMA weight tier** (`RdmaWeightLoader`, fast model swaps) | ✅ **byte-identical live serve, 5.33 s vs 9.35 s disk (1.75×)** — see `RDMA-WEIGHT-TIER.md` |
 
 Over-core now does full **generation** on one box (not just prefill) — see §5.
 The verbs one-sided RDMA READ tier is landed and bit-identical. Since then this
