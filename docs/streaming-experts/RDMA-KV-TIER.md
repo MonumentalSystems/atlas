@@ -163,11 +163,16 @@ secret at the start of a 17,137-token prompt (HBM cap 10,240) → correct
    No per-client cap, no aggregate budget, no eviction under pressure. A client can
    OOM the peer. **TODO: `--max-blade-gb` (reject oversized at handshake) + a
    running aggregate across connections.** Applies to the expert peer too.
-3. **Zero-copy needs UMA KV scratch.** `ATLAS_KV_ZERO_COPY=1` requires the read
-   destination (`dst_dev_ptr`) to be pinned UMA (host==dev VA) so `ibv_reg_mr`
-   succeeds and the GPU reads it. The swap ScratchPool must allocate UMA buffers
-   for end-to-end zero-copy in the live path (the standalone tests use UMA dsts;
-   the serving demo used the bounce path). Until then serving uses bounce+copy.
+3. **Zero-copy in the serving path — LANDED (this note was stale).**
+   `ATLAS_KV_ZERO_COPY=1` requires the read destination to be pinned UMA (host==dev
+   VA) so `ibv_reg_mr` succeeds and the GPU reads it. The swap ScratchPool now
+   allocates a UMA pool for this (`high_speed_swap.rs:131`, `new_preferring_uma`,
+   with a safe fall-back to device memory on a non-UMA host). Verified live on the
+   35B (2026-07-06): log shows `scratch pool UMA=true (zero-copy restore enabled)` +
+   `registered UMA landing region … zero-copy restore live`. **BUT** it does NOT
+   speed decode — the per-step restore is latency-bound, so zero-copy/dual-rail
+   (bandwidth wins) only help prefill TTFT, not decode tok/s. See
+   `kv-bench/CONCURRENCY-FINDINGS.md`.
 4. **Coherence assumption:** after an RDMA completion the NIC's DMA to LPDDR is
    assumed GPU-visible (same as the expert arena). Holds on GB10; revalidate on
    other hardware.
