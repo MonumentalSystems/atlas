@@ -27,10 +27,28 @@ streaming cold experts from NVMe/RDMA on the prefill path.
 | — | **over-core generation** (decode-via-prefill) | ✅ **works, output == resident** (26.5 tok/s), see §5 |
 | WS2 | verbs one-sided RDMA READ **bandwidth** | ✅ measured ~14 GB/s (`ib_read_bw`) |
 | **WS2** | **verbs data-path INTEGRATION** | ✅ **bit-identical + ~12 GB/s in-app, 6.6× TCP prefill** — see §6 |
+| **WS4** | **smart loading** (skip routed experts at load) | ✅ over-core checkpoints don't OOM mid-load; 122B validated |
+| **WS5** | **reactive expert-granular prefetch** (fetch only routed) | ✅ **bit-identical** (sha `ac48cd2d`); 7× A3B over-core decode |
+| **WS6** | **RDMA KV overflow tier** (KV → remote RAM blade) | ✅ **24 GB/s offload / 21.65 restore, live over-budget recall** — see `RDMA-KV-TIER.md` |
 
 Over-core now does full **generation** on one box (not just prefill) — see §5.
-The verbs one-sided RDMA READ tier is the last WS — it is now **landed and
-bit-identical**; nothing in the plan remains uncoded.
+The verbs one-sided RDMA READ tier is landed and bit-identical. Since then this
+session also added **smart loading** (WS4, over-core checkpoints skip loading
+routed experts so they don't OOM — validated on the 122B), **reactive
+expert-granular prefetch** (WS5, decode fetches only the ~8 routed experts/layer
+not all 256 — 32× less store I/O, 7× faster A3B over-core decode, bit-identical),
+and a whole **RDMA KV overflow tier** (WS6): the KV cache spills to a peer's RAM
+over one-sided RDMA at 24/21 GB/s (~11× the SSD), wired into `--high-speed-swap`,
+proven with a live over-budget recall + an agentic benchmark (57% of local-KV).
+**WS6 has its own handoff: `RDMA-KV-TIER.md`.**
+
+**Vehicles beyond A3B:** 122B-A10B (Sehyo, `qwen3.5-122b-a10b`) over-core validated
+(store built, streams over verbs). MiniMax-M2.7-NVFP4 and DeepSeek-V4-Flash are
+supported for *resident* serving but their loaders don't yet attach the streamer
+/ resident-skip (qwen-family only) + the store builder uses `.mlp.experts.N.` not
+their `block_sparse_moe`/`w1w2w3` naming — so streaming them needs a loader+builder
+port (moderate; the MoE forward is the shared `MoeLayer`). qwen3.5-397b-a17b kernels
+exist but no checkpoint.
 
 ---
 
