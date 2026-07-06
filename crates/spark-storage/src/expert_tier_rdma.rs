@@ -77,7 +77,21 @@ impl RdmaTier {
         let arena = ExpertArena::new(num_slabs, slots_per_slab, layout.record_stride as usize)?;
 
         let transport = if use_verbs {
-            connect_verbs(&mut stream, &arena, index.num_moe_layers)?
+            #[cfg(atlas_rdma_verbs)]
+            {
+                connect_verbs(&mut stream, &arena, index.num_moe_layers)?
+            }
+            // Built without rdma-core (no C shim) — verbs is unavailable; the
+            // TCP `rdma` backend still works. Keeps the crate compiling under
+            // ATLAS_SKIP_BUILD / hosts without libibverbs.
+            #[cfg(not(atlas_rdma_verbs))]
+            {
+                let _ = &arena;
+                bail!(
+                    "--expert-backend rdma-verbs needs a build with rdma-core \
+                     (atlas_rdma_verbs cfg); use --expert-backend rdma (TCP) instead"
+                );
+            }
         } else {
             stream
                 .write_all(&[MODE_TCP])
