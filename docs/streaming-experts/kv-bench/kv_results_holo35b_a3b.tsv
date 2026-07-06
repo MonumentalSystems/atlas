@@ -1,0 +1,7 @@
+config	conc	ttft_ms_mean	decode_toks_mean	tokens_mean	correct	wall_s
+norm	1	5615	42.5	99.0	1/1	7.955510671
+norm	2	5648	12.1	89.5	2/2	17.032809794
+norm	4	5059	6.6	73.8	4/4	26.445955446
+nvmeB	1	6173	16.1	99.0	1/1	12.314515639
+rdmaA	1	5392	16.9	84.0	1/1	10.377355008
+rdmaB	1	6322	19.5	73.0	1/1	10.071731244

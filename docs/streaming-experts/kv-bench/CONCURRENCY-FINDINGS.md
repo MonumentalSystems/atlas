@@ -1,5 +1,9 @@
 # KV overflow tier — concurrency / agentic-load A/B (2026-07-06)
 
+> **Scale addendum (35B-A3B) is at the bottom** — the big-model granule where RDMA's
+> bandwidth finally beats NVMe. The small-model (0.8b) study below is the worst-case floor.
+
+
 First A/B of the KV backends under **concurrent** load: normal HBM KV vs
 `--high-speed-swap` overflow to {local NVMe, RDMA peer}. Ran on **dgx-00** (GB10)
 ↔ **gx10** kv-peer over a single ConnectX-7 rail (the proven live-serving bounce
@@ -73,3 +77,44 @@ a benchmark-time tweak.
 3. Re-run this sweep on a **big model** (35B-A3B) where RDMA's bandwidth beats NVMe,
    and land the zero-copy + dual-rail serving path (`RDMA-KV-TIER.md` §6/§7) so the
    21 GB/s restore reaches live inference.
+
+---
+
+# Scale addendum — 35B-A3B (2026-07-06)
+
+Same A/B on **Holo-3.1-35B-A3B-NVFP4** (a Qwen3.5-style hybrid SSM+MoE **thinking**
+model; 40 layers, 256 experts, ~3B active). This is the model size the tier is *for*.
+Single ConnectX-7 rail, bounce path (no zero-copy/dual-rail yet). Timing parsed from
+the server log (`Done: N tokens X tok/s TTFT=Yms`) since client `delta.content`
+counting misses the `<think>` reasoning tokens. 2500-tok context (forces overflow),
+greedy, ~99-tok gens. All rows recalled `TANGERINE-7742` correctly.
+
+| config | HBM cap | TTFT | **decode tok/s** | % of HBM | recall |
+|---|---|---|---|---|---|
+| **normal HBM** | full | 5615 ms | **42.5** | 100% | ✅ |
+| RDMA peer, full (cap=8) | 128 tok | 6322 ms | **19.5** | **46%** | ✅ |
+| RDMA peer, partial (cap=64) | 1024 tok | 5392 ms | 16.9 | 40% | ✅ |
+| local NVMe, full (cap=8) | 128 tok | 6173 ms | 16.1 | 38% | ✅ |
+
+(norm concurrency: C=2 → 12.1 tok/s·req, C=4 → 6.6 tok/s·req — aggregate decode
+plateaus ~26 tok/s; this hybrid 35B is memory-bound under batching. Overflow tiers
+remain C=1-only per the single-seq block-id finding above — not re-measured here.)
+
+## The two scale results
+
+1. **Full KV offload costs ~2.2× decode at 35B (42.5 → 19.5 tok/s, 46% of HBM)** —
+   vs **4.7×** (21%) on the 0.8b. The big model's per-token compute hides most of the
+   KV-restore latency, exactly as predicted. **The tier is far more viable at real
+   model scale.** (Comparable to the doc's earlier 5-turn A3B "57% of local-KV"; this
+   is a harder single-turn full-offload at cap=8.)
+
+2. **RDMA beats NVMe at the big granule: 19.5 vs 16.1 tok/s (1.21×)** at equal cap=8.
+   On the 0.8b they were *tied* (~40 tok/s) because the ~16 KiB granule is latency-
+   bound; at 35B the granule is large enough that RDMA's bandwidth wins. And this is
+   only **single-rail bounce** — zero-copy + dual-rail (`RDMA-KV-TIER.md` §6/§7, the
+   standalone path already hits 21 GB/s restore) should widen RDMA's lead further.
+
+**Bottom line for scaling:** at production model size the RDMA KV tier delivers ~46%
+of local-KV decode at C=1 while spilling ~all KV to a remote blade, and beats the SSD
+tier by ~1.2× (more once zero-copy lands). The gating limitation is **concurrency**
+(the single-seq disk-block-id namespace), not throughput — that's the fix to land next.
