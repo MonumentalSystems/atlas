@@ -118,3 +118,34 @@ remain C=1-only per the single-seq block-id finding above — not re-measured he
 of local-KV decode at C=1 while spilling ~all KV to a remote blade, and beats the SSD
 tier by ~1.2× (more once zero-copy lands). The gating limitation is **concurrency**
 (the single-seq disk-block-id namespace), not throughput — that's the fix to land next.
+
+## Zero-copy + dual-rail (the bandwidth-optimized serving path)
+
+Re-tested the 35B full-offload (cap=8) with `ATLAS_KV_ZERO_COPY=1 ATLAS_KV_DUAL_RAIL=1`
+(2-rail peer). Log confirms it engaged: `2 rail(s)`, `scratch pool UMA=true (zero-copy
+restore enabled)`, `registered UMA landing region 256 MiB — zero-copy restore live`.
+(Note: `RDMA-KV-TIER.md` §6.3's "zero-copy not in the serving path yet" is **stale** —
+`high_speed_swap.rs:131` wires a UMA scratch pool with a safe fallback; GB10 is UMA so
+it activates.)
+
+| path | decode tok/s | TTFT | recall |
+|---|---|---|---|
+| single-rail bounce (rdmaB) | 19.5 | 6322 ms | ✅ |
+| **zero-copy + dual-rail** | **19.7** | **5097 ms** | ✅ |
+
+**Decode is unchanged (19.7 vs 19.5); TTFT improves (~5.1 vs 6.3 s).** Why: **live
+decode restore is latency-bound, not bandwidth-bound** — each step restores only the
+few KV blocks that step attends to (small transfers), so zero-copy/dual-rail (which
+optimize *bandwidth*, and gave the 24/21 GB/s in the bulk standalone test) don't move
+decode. They help the *bulk* offload during **prefill** — hence the better TTFT. This
+also explains RDMA's modest 1.21× over NVMe: the per-step restore is latency-bound for
+both. To speed the tier's **decode**, the lever is restore *latency* (fewer round-trips
+/ deeper prefetch overlap), not more bandwidth.
+
+**Caveat — shared-box contention:** midway through, a concurrent `vllm serve` of the
+*same* 35B model appeared on dgx-00 (46 GB, ~92% GPU util). The sweep + the zero-copy
+sample above ran 23:04–23:22 UTC while vLLM was still loading (compute free); a later
+3-rep zero-copy run (23:23+) hit vLLM going compute-active and degraded to ~9 tok/s
+(TTFT ~8.9 s) — **discarded as contaminated**. The clean numbers are mutually
+consistent (two independent cap=8 RDMA samples at 19.5/19.7). A fully-clean multi-rep
+re-run needs a quiet GPU; I did not kill the other tester's server.
