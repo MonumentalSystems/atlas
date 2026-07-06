@@ -677,6 +677,57 @@ pub fn load_lora_adapters_multi(
     })
 }
 
+/// Runtime disk swap: audit + pack an already-loaded adapter `store` into an
+/// EXISTING pool `slot` of `lw`, in place, and stamp that slot's
+/// name/config/layers. Byte-identical to a startup pack of the same adapter into
+/// that slot — same audit, A-contiguous copy, and B row-repack via [`pack_slot`].
+/// The slot sub-region is re-zeroed first (a reused slot still holds the prior
+/// adapter's bytes, and pad rows/cols must stay 0 for padded-K correctness).
+/// Returns the rebuilt per-layer pairs so the caller can re-install them if the
+/// slot is currently active. Like the startup pack, the intermediate `store`'s
+/// device copies leak (small, one-off per swap). Used for the pool-size-1
+/// dynamic-load demo (load a different adapter into the single slot at runtime).
+pub fn pack_store_into_slot(
+    lw: &mut LoraWeights,
+    slot: usize,
+    name: &str,
+    store: &WeightStore,
+    peft: &PeftAdapterConfig,
+    cfg: &ModelConfig,
+    gpu: &dyn GpuBackend,
+) -> Result<Vec<Option<LoraLayerWeights>>> {
+    if slot >= lw.max_loras {
+        bail!(
+            "LoRA disk swap: slot {slot} >= max_loras {} (pool has {} slots)",
+            lw.max_loras,
+            lw.max_loras
+        );
+    }
+    validate_peft_config(peft, lw.max_rank)?;
+    let found = audit_adapter(store, peft, cfg, lw.max_rank)?;
+    let slot_bytes = pool_slot_bytes(cfg, lw.max_rank);
+    gpu.memset(
+        DevicePtr(lw.pool.0 + (slot * slot_bytes) as u64),
+        0,
+        slot_bytes,
+    )?;
+    let (layers, _slot_ptrs) = pack_slot(
+        slot,
+        name,
+        store,
+        peft,
+        &found,
+        cfg,
+        gpu,
+        lw.pool,
+        lw.max_rank,
+    )?;
+    lw.slots[slot].name = name.to_string();
+    lw.slots[slot].adapter_config = peft.clone();
+    lw.slots[slot].layers = layers.clone();
+    Ok(layers)
+}
+
 /// Single-adapter convenience wrapper (packs slot 0 only) — byte-identical to
 /// the pre-multi-adapter path. Kept for the unit tests and any single-adapter
 /// caller. The `name` is stamped onto the sole slot.

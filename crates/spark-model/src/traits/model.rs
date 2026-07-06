@@ -212,6 +212,19 @@ pub trait Model: Send + Sync {
         bail!("this model does not support LoRA adapter rotation")
     }
 
+    /// Runtime LoRA adapter dynamic-load: load the adapter at `dir` INTO pool
+    /// `slot` and make it resident there (pool-size-1 per-request weight change).
+    /// MUST be called at a scheduler quiescent point; needs rotation armed.
+    /// Default: unsupported (non-LoRA or non-rotatable).
+    fn swap_lora_from_disk(
+        &mut self,
+        _dir: &std::path::Path,
+        _name: &str,
+        _slot: usize,
+    ) -> Result<()> {
+        bail!("this model does not support LoRA disk swap")
+    }
+
     /// Dims for the `--high-speed-swap` orchestrator (installed thread-local
     /// after `bind_gpu_to_thread`). `None` for legacy/non-attention models.
     fn high_speed_swap_dims(&self) -> Option<spark_storage::ModelDims> {

@@ -105,12 +105,28 @@ use crate::grammar::{GrammarEngine, GrammarState};
 use crate::ngram::NgramProposer;
 use crate::scheduling_policy::SchedulingPolicy;
 
-/// A runtime LoRA adapter-rotation request: the target adapter NAME and a
-/// oneshot ack the HTTP handler awaits (`Ok(())` on success, `Err(reason)` on
-/// unknown adapter / rotation not armed). Applied by the scheduler at a
-/// QUIESCENT point (no in-flight decode) so the re-point never races a graph
-/// replay or a live delta read.
-pub type LoraRotation = (String, tokio::sync::oneshot::Sender<Result<(), String>>);
+/// A runtime LoRA adapter control command, applied by the scheduler at a
+/// QUIESCENT point (no in-flight decode) so it never races a graph replay or a
+/// live delta read.
+pub enum LoraCommand {
+    /// Rotate the globally-active adapter to a RESIDENT slot by NAME.
+    Rotate(String),
+    /// Dynamically LOAD the adapter at `dir` into pool `slot` (pool-size-1
+    /// per-request weight change) and make it that slot's resident adapter.
+    LoadIntoSlot {
+        name: String,
+        dir: std::path::PathBuf,
+        slot: usize,
+    },
+}
+
+/// A LoRA control command plus the oneshot ack the HTTP handler awaits
+/// (`Ok(())` on success, `Err(reason)` on unknown adapter / rotation not armed /
+/// load failure).
+pub type LoraRotation = (
+    LoraCommand,
+    tokio::sync::oneshot::Sender<Result<(), String>>,
+);
 
 /// Run the scheduler loop on the current thread.
 #[allow(clippy::too_many_arguments)]
@@ -266,11 +282,25 @@ pub fn run(
         // queued and are retried once the batch drains.
         if active.is_empty() && prefilling.is_empty() && new_reqs.is_empty() {
             let rotations = std::mem::take(&mut pending.0.lock().rotations);
-            for (name, ack) in rotations {
-                let res = model.set_active_lora(&name).map_err(|e| format!("{e:#}"));
-                if let Err(ref e) = res {
-                    tracing::warn!("LoRA rotation to '{name}' failed: {e}");
-                }
+            for (cmd, ack) in rotations {
+                let res = match cmd {
+                    LoraCommand::Rotate(name) => {
+                        let r = model.set_active_lora(&name).map_err(|e| format!("{e:#}"));
+                        if let Err(ref e) = r {
+                            tracing::warn!("LoRA rotation to '{name}' failed: {e}");
+                        }
+                        r
+                    }
+                    LoraCommand::LoadIntoSlot { name, dir, slot } => {
+                        let r = model
+                            .swap_lora_from_disk(&dir, &name, slot)
+                            .map_err(|e| format!("{e:#}"));
+                        if let Err(ref e) = r {
+                            tracing::warn!("LoRA disk swap '{name}' → slot {slot} failed: {e}");
+                        }
+                        r
+                    }
+                };
                 let _ = ack.send(res);
             }
         }

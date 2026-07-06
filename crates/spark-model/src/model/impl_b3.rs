@@ -6,7 +6,7 @@ use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use atlas_core::config::{LayerType, ModelConfig};
 use spark_runtime::buffers::BufferArena;
 use spark_runtime::gpu::{DevicePtr, GpuBackend, GraphHandle, KernelHandle};
@@ -356,6 +356,75 @@ impl TransformerModel {
             "LoRA RDMA swap: '{adapter_name}' landed in slot {slot} \
              ({} targets, active_slot={active})",
             targets.len()
+        );
+        Ok(())
+    }
+
+    /// Disk-swap the adapter at `adapter_dir` INTO pool `slot`, in place, then
+    /// make it that slot's resident adapter (re-installing onto the layer structs
+    /// if the slot is currently active). The local-disk analog of
+    /// [`Self::swap_lora_slot_from_peer`] — same audit + pack + re-point, no RDMA.
+    /// This is the pool-size-1 dynamic-load path: load a DIFFERENT adapter into
+    /// the single slot at runtime (per-request weight change). MUST be called at
+    /// a scheduler QUIESCENT point (no in-flight decode reading `slot`) and needs
+    /// rotation armed (`ATLAS_LORA_ROTATE=1`/`$ATLAS_LORA_PEER`) so decode is
+    /// eager and no captured graph replays the swapped slot's stale pointers.
+    pub fn swap_lora_slot_from_disk(
+        &mut self,
+        adapter_dir: &std::path::Path,
+        name: &str,
+        slot: usize,
+    ) -> Result<()> {
+        if !self.lora_rotatable {
+            anyhow::bail!(
+                "LoRA disk swap needs rotation armed (set ATLAS_LORA_ROTATE=1 so \
+                 decode runs eager); a single startup adapter with no rotation env \
+                 is baked into the decode graph and a re-point would replay stale"
+            );
+        }
+        // Parse the adapter's own PEFT config (scaling read per adapter, never
+        // defaulted) — the same hard-fail parser the startup path uses.
+        let cfg_path = adapter_dir.join("adapter_config.json");
+        let raw = std::fs::read_to_string(&cfg_path)
+            .with_context(|| format!("read {}", cfg_path.display()))?;
+        let peft = atlas_core::config::parse_peft_adapter_config(&raw)
+            .with_context(|| format!("parse {}", cfg_path.display()))?;
+        // Load the adapter's A/B into a device WeightStore (host F16/F32→BF16),
+        // then pack it into the slot (same layout as a startup pack).
+        let store = spark_runtime::weights::adapter::load_adapter_safetensors(
+            adapter_dir,
+            self.gpu.as_ref(),
+            0,
+        )
+        .context("load LoRA adapter weights for disk swap")?;
+        let layers = {
+            let lw = self
+                .lora
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("LoRA disk swap: no adapter pool loaded"))?;
+            crate::lora::pack_store_into_slot(
+                lw,
+                slot,
+                name,
+                &store,
+                &peft,
+                &self.config,
+                self.gpu.as_ref(),
+            )?
+        };
+        // If the swapped slot is the active one, re-install onto the layer structs
+        // so subsequent requests apply the new adapter's delta.
+        let active = self.lora.as_ref().unwrap().active;
+        if active == slot {
+            let kernels = ops::lora_delta::LoraKernels::new(self.gpu.as_ref())?;
+            self.install_lora_layers(&layers, kernels)?;
+            self.lora.as_mut().unwrap().name = name.to_string();
+            self.decode_graph.lock().clear();
+            self.batch_decode_graphs.lock().clear();
+        }
+        tracing::info!(
+            "LoRA disk swap: '{name}' packed into slot {slot} (r={}, active_slot={active})",
+            peft.r
         );
         Ok(())
     }
