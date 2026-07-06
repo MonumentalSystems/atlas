@@ -387,6 +387,47 @@ impl LoraWeights {
             .unwrap_or(0)
     }
 
+    /// Task #26: refresh `slot`'s cell in the `[max_loras]` a/b pointer tables +
+    /// the per-slot scale table from `layers` (the just-staged adapter's actual
+    /// per-module coverage). A re-staged adapter whose module coverage DIFFERS
+    /// from the evicted one would otherwise keep a STALE table entry: the
+    /// bgmv-routed path would SKIP a module the new adapter adds (a_table[slot]
+    /// stale-NULL → missed delta), keep applying an evicted module (stale non-NULL
+    /// → wrong delta), or use the wrong per-slot scale. Shared by BOTH the disk
+    /// swap (`pack_store_into_slot`) and the RDMA swap (`swap_lora_slot_from_peer`).
+    /// Only the `[slot]` cell of each fixed-address device array is rewritten.
+    pub fn refresh_slot_tables(
+        &self,
+        slot: usize,
+        layers: &[Option<LoraLayerWeights>],
+        scale: f32,
+        gpu: &dyn GpuBackend,
+    ) -> Result<()> {
+        for ((layer, module), (a_dev, b_dev)) in &self.tables {
+            let pair = layers
+                .get(*layer)
+                .and_then(|o| o.as_ref())
+                .and_then(|lw| match module {
+                    LoraModule::KProj => lw.k_proj.as_ref(),
+                    LoraModule::VProj => lw.v_proj.as_ref(),
+                    LoraModule::OProj => lw.o_proj.as_ref(),
+                    LoraModule::GateProj => lw.gate_proj.as_ref(),
+                    LoraModule::UpProj => lw.up_proj.as_ref(),
+                    LoraModule::DownProj => lw.down_proj.as_ref(),
+                });
+            let (a_ptr, b_ptr) = pair.map(|p| (p.a.weight.0, p.b.weight.0)).unwrap_or((0, 0));
+            gpu.copy_h2d(&a_ptr.to_le_bytes(), DevicePtr(a_dev.0 + (slot * 8) as u64))?;
+            gpu.copy_h2d(&b_ptr.to_le_bytes(), DevicePtr(b_dev.0 + (slot * 8) as u64))?;
+        }
+        if self.scale_table.0 != 0 {
+            gpu.copy_h2d(
+                &scale.to_le_bytes(),
+                DevicePtr(self.scale_table.0 + (slot * 4) as u64),
+            )?;
+        }
+        Ok(())
+    }
+
     /// Task #27: snapshot the CACHE region `[pinned, max_loras)` as
     /// `(slot_index, SlotView)` for [`select_victim_slot`]. `filled` = the slot
     /// holds a non-placeholder adapter (non-empty name). Read on the model
@@ -1048,6 +1089,10 @@ pub fn pack_store_into_slot(
     lw.slots[slot].name = name.to_string();
     lw.slots[slot].adapter_config = peft.clone();
     lw.slots[slot].layers = layers.clone();
+    // Task #26: refresh this slot's a/b pointer tables + scale table from the
+    // new adapter's actual coverage (see refresh_slot_tables) so a re-staged slot
+    // with different module coverage doesn't leave a stale/NULL bgmv route entry.
+    lw.refresh_slot_tables(slot, &layers, peft.scaling(), gpu)?;
     // Task #25: contents changed → bump generation so this re-staged slot yields
     // a FRESH adapter_id and a later request misses the stale prior KV. (Covers
     // the disk swap and any future caller of this shared helper.)

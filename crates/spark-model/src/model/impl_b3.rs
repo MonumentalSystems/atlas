@@ -460,6 +460,17 @@ impl TransformerModel {
         // 3) Rebuild the slot's per-layer pairs (new r/scale), stamp the slot.
         let layers =
             rdma_stage::rebuild_slot_layers(&targets, &self.config, &peft, pool, slot, max_rank)?;
+        // Task #26: refresh this slot's a/b pointer tables + scale table from the
+        // freshly-staged adapter's actual coverage BEFORE `peft`/`layers` are moved
+        // into the slot stamp — a promoted adapter with different module coverage
+        // than the evicted one would otherwise keep a stale bgmv route entry for the
+        // reused cache slot (missed / wrong-scaled delta). Same fix as the disk swap.
+        self.lora.as_ref().unwrap().refresh_slot_tables(
+            slot,
+            &layers,
+            peft.scaling(),
+            self.gpu.as_ref(),
+        )?;
         {
             let lw = self.lora.as_mut().unwrap();
             let s = lw
