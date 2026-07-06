@@ -108,7 +108,20 @@ Validated: two concurrent requests naming different adapters each route to their
 adapter (active byte-clean; routed applies its adapter), single-seq routes, decode
 graphs stay captured under a swappable pool.
 
-**Remaining refinements:** #30 routed-prefill precision (routed prefill uses the bgmv
-per-row gemv vs dense_gemm_tc → an overfit adapter's exact low-margin tokens degrade;
-persona/behaviour route correctly); #31 spilled-seq panic-leak hardening (bare atomic
-ref; the swap-side hole is already closed by #27's swapped.is_empty() drain gate).
+**#30 routed-prefill precision — landed (`b52efef`).** A routed (non-active) prefill
+now folds the REQUEST slot pair through the SAME `apply_lora_delta`/`dense_gemm_tc`
+path the active adapter uses, not the per-row bgmv (`ForwardContext.routed_lora_layers`
+set at prefill entries only for a non-active slot; `LoraAttnWeights` stamped with the
+GLOBAL layer index for hybrid GDN/attention models). 3× LGTM (numerics-match,
+byte-identity-decode, build-lifetime); active/base/no-lora byte-identical, decode
+untouched, 24 lora tests. **Known residual (#32):** the demo's razor-margin OVERFIT
+codeword still tips under routing — routed `vega` yields the Vega persona but not the
+exact `MOONVEIL-3390` digits. #30 fixes the prefill kernel; the routed DECODE still
+uses the bgmv vs the installed gemv, and these low-margin argmax digits tip on any
+residual difference (same fragility seen with lm-head precision). Production
+(non-overfit) adapters route correctly. The follow-up is making the WHOLE routed path
+(decode included) bit-identical to active-served.
+
+**#31 spilled-seq panic-leak** — closed: the swap-side hole is already covered by #27's
+`swapped.is_empty()` drain gate, and there is no catch_unwind / `panic=abort` in the
+workspace, so a scheduler-thread panic tears the process down (no recover-and-leak path).
