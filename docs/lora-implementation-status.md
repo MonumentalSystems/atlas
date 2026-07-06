@@ -128,3 +128,26 @@ startup adapter with no rotation env is byte-identical to M1.
 `research/lora` predates the switch to the `cu*` driver API, so `cuda_backend`'s
 `cudaMemcpy2DAsync` needs `libcudart` linked; `spark-runtime/build.rs` now does so and adds
 the CUDA-13 SBSA lib path. On `main` (driver-API) this is a harmless no-op.
+
+## M2 per-request routing — status correction (2026-07-06, after commit d3ea611)
+
+The WIP commit d3ea611 labelled the batched bgmv apply "BUGGY / DO NOT ENABLE".
+Live re-test on holo-0.8b **corrects that**: the bgmv decode routing is **not**
+buggy. The earlier "one-of-two-concurrent-garbled" was two known effects, not a
+kernel defect:
+
+1. **Scheduler.** Under the default `--scheduling-policy fifo`, two concurrent
+   requests serialized and never decode-batched, so each fell to the single-seq
+   path (= the global *active* adapter). Under `--scheduling-policy slai` they
+   co-decode and the bgmv routes each sequence to its own adapter. The
+   prefill+decode-consistent request (`starfall`) comes out **byte-clean**
+   (`STARFALL-7725`, identical to the single-seq path) — the bgmv decode is correct.
+2. **Prefill cut line.** A routed request still **prefills with the active adapter**
+   (prefill doesn't route yet), so its prompt KV is active-flavored — the persona
+   survives in decode but the exact codeword degrades. Fixed by the request-scoped
+   selector applied to prefill (task: "Request-scoped AdapterSelector").
+
+Net: bgmv decode routing works; the real remaining work is request-scoped routing
+(esp. prefill) + adapter-correct KV + reliable batch>1 — NOT the kernel. Keep the
+WIP disabled in prod until those land, but it is a correctness *sequencing* gap,
+not a broken kernel.
