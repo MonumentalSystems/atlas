@@ -37,9 +37,12 @@ pub mod eviction;
 pub mod expert;
 pub mod expert_pack;
 pub mod expert_peer;
-// One-sided RDMA READ verbs FFI (WS2 Phase B). CUDA-free so BOTH the non-cuda
-// peer server and the cuda client tier can use it. Compiled only where the C
-// shim is (build.rs emits `atlas_rdma_verbs` on Linux + rdma-core).
+// KV cache overflow blade: RW remote-RAM tier (wire types always available; the
+// verbs server compiles under atlas_rdma_verbs). Faster-than-SSD KV overflow.
+pub mod kv_peer;
+// One-sided RDMA READ/WRITE verbs FFI (WS2 Phase B + KV overflow). CUDA-free so
+// BOTH the non-cuda peer servers and the cuda client tiers can use it. Compiled
+// only where the C shim is (build.rs emits `atlas_rdma_verbs` on Linux + rdma-core).
 #[cfg(atlas_rdma_verbs)]
 pub mod rdma_verbs;
 pub mod group;
@@ -74,6 +77,10 @@ pub mod expert_arena;
 pub mod expert_tier;
 #[cfg(feature = "cuda")]
 pub mod expert_tier_rdma;
+// KV overflow tier (StorageBackend over RDMA). Needs both cuda (pinned bounce +
+// copy_h2d) and the verbs shim.
+#[cfg(all(feature = "cuda", atlas_rdma_verbs))]
+pub mod rdma_kv_backend;
 #[cfg(feature = "cuda")]
 pub mod high_speed_swap;
 #[cfg(feature = "cuda")]
@@ -95,6 +102,8 @@ pub use expert_tier::{
 };
 #[cfg(feature = "cuda")]
 pub use expert_tier_rdma::RdmaTier;
+#[cfg(all(feature = "cuda", atlas_rdma_verbs))]
+pub use rdma_kv_backend::RdmaKvBackend;
 pub use config::HighSpeedSwapConfig;
 pub use eviction::EvictionPolicy;
 pub use expert::{

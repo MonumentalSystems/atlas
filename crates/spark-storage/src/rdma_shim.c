@@ -97,7 +97,12 @@ struct rs_conn *rs_create(const char *dev_name, int gid_idx) {
     attr.qp_state = IBV_QPS_INIT;
     attr.pkey_index = 0;
     attr.port_num = c->port;
-    attr.qp_access_flags = IBV_ACCESS_REMOTE_READ | IBV_ACCESS_LOCAL_WRITE;
+    // Grant REMOTE_READ + REMOTE_WRITE on the QP. The expert tier only issues
+    // READs, and its MRs are REMOTE_READ-only, so a stray write is still refused
+    // at the MR level — but the KV overflow blade's QP must accept incoming
+    // RDMA WRITEs. QP-level flags are a ceiling; per-MR flags do the enforcing.
+    attr.qp_access_flags =
+        IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_LOCAL_WRITE;
     if (ibv_modify_qp(c->qp, &attr,
                       IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT |
                           IBV_QP_ACCESS_FLAGS)) {
@@ -114,17 +119,30 @@ uint32_t rs_qpn(struct rs_conn *c) { return c->qp->qp_num; }
 // Copy this QP's 16-byte GID (the one at gid_idx) out for the wire handshake.
 void rs_gid(struct rs_conn *c, uint8_t out[16]) { memcpy(out, c->gid.raw, 16); }
 
-// Register `[addr, addr+len)` as an MR. Access is exactly what each side needs
-// and no more: `remote_read != 0` -> REMOTE_READ ONLY (the server's read-only
-// mmap'd store — requesting LOCAL_WRITE on PROT_READ pages makes ibv_reg_mr
-// fail); `remote_read == 0` -> LOCAL_WRITE (the client's arena, the HCA's READ
-// landing buffer). Returns 0 and fills lkey/rkey on success, -1 otherwise.
-int rs_reg_mr(struct rs_conn *c, void *addr, size_t len, int remote_read,
+// Register `[addr, addr+len)` as an MR. `flags` is a bitmask giving each side
+// exactly the access it needs and no more:
+//   bit 0 (1) -> REMOTE_READ   (expert store; also the KV blade's read-back)
+//   bit 1 (2) -> REMOTE_WRITE  (KV overflow blade; implies LOCAL_WRITE per the
+//                               verbs rule that REMOTE_WRITE requires LOCAL_WRITE)
+//   flags == 0 -> LOCAL_WRITE  (the client's landing/bounce buffer)
+// REMOTE_READ alone deliberately omits LOCAL_WRITE (requesting it on a PROT_READ
+// mmap makes ibv_reg_mr fail — the expert store is registered read-only this way).
+// So: expert store = 1, client bounce = 0, KV blade = 3 (RR|RW|LW).
+int rs_reg_mr(struct rs_conn *c, void *addr, size_t len, int flags,
               uint32_t *lkey, uint32_t *rkey) {
     if (c->n_mr >= RS_MAX_MR) {
         return -1;
     }
-    int access = remote_read ? IBV_ACCESS_REMOTE_READ : IBV_ACCESS_LOCAL_WRITE;
+    int access = 0;
+    if (flags & 1) {
+        access |= IBV_ACCESS_REMOTE_READ;
+    }
+    if (flags & 2) {
+        access |= IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_LOCAL_WRITE;
+    }
+    if (access == 0) {
+        access = IBV_ACCESS_LOCAL_WRITE;
+    }
     struct ibv_mr *mr = ibv_reg_mr(c->pd, addr, len, access);
     if (!mr) {
         return -1;
@@ -198,6 +216,31 @@ int rs_post_read(struct rs_conn *c, void *local_addr, uint32_t lkey,
     wr.sg_list = &sge;
     wr.num_sge = 1;
     wr.opcode = IBV_WR_RDMA_READ;
+    wr.send_flags = IBV_SEND_SIGNALED;
+    wr.wr.rdma.remote_addr = remote_addr;
+    wr.wr.rdma.rkey = rkey;
+    struct ibv_send_wr *bad = NULL;
+    return ibv_post_send(c->qp, &wr, &bad);
+}
+
+// Post a single one-sided RDMA WRITE: push `len` bytes from local `local_addr`
+// (registered under `lkey`) to the remote `remote_addr` (protected by `rkey`).
+// Signaled, so it generates a completion tagged with `wr_id`. Used by the KV
+// overflow tier to offload a K/V group into the peer's registered RAM blade.
+int rs_post_write(struct rs_conn *c, void *local_addr, uint32_t lkey,
+                  uint64_t remote_addr, uint32_t rkey, uint32_t len,
+                  uint64_t wr_id) {
+    struct ibv_sge sge;
+    memset(&sge, 0, sizeof(sge));
+    sge.addr = (uintptr_t)local_addr;
+    sge.length = len;
+    sge.lkey = lkey;
+    struct ibv_send_wr wr;
+    memset(&wr, 0, sizeof(wr));
+    wr.wr_id = wr_id;
+    wr.sg_list = &sge;
+    wr.num_sge = 1;
+    wr.opcode = IBV_WR_RDMA_WRITE;
     wr.send_flags = IBV_SEND_SIGNALED;
     wr.wr.rdma.remote_addr = remote_addr;
     wr.wr.rdma.rkey = rkey;
