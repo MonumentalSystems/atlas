@@ -23,7 +23,7 @@ def one(results, idx):
     body = json.dumps({
         "model": "m",
         "messages": [{"role": "user", "content": PROMPT}],
-        "temperature": 0, "max_tokens": MAXTOK, "stream": True,
+        "temperature": 0, "max_tokens": MAXTOK, "min_tokens": MAXTOK, "stream": True,
     }).encode()
     req = urllib.request.Request(URL, data=body, headers={"Content-Type": "application/json"})
     t0 = time.time(); t_first = None; ntok = 0; text = ""
