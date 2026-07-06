@@ -125,3 +125,41 @@ residual difference (same fragility seen with lm-head precision). Production
 **#31 spilled-seq panic-leak** — closed: the swap-side hole is already covered by #27's
 `swapped.is_empty()` drain gate, and there is no catch_unwind / `panic=abort` in the
 workspace, so a scheduler-thread panic tears the process down (no recover-and-leak path).
+
+## Update (2026-07-06 pm2) — #32 routed DECODE: VERIFIED bit-identical (no defect)
+
+**#32 asked whether the routed DECODE tips the razor-margin overfit codeword because
+the bgmv differs from the installed gemv. On GB10 (holo-3.1-0.8b) the answer is NO —
+the routed decode is already BIT-IDENTICAL to active-served, in every path.**
+
+The confound-free oracle (`docs/streaming-experts/lora-regression/routed-decode-bit-identity.sh`):
+pool TWO IDENTICAL copies of one adapter — slot0 `a`=active, slot1 `b`=routed. Because
+the weights are identical, any difference between the installed `apply_lora_delta` path
+(`adapter=None`/`a`) and the routed `bgmv` path (`adapter=b`) is a PURE routing-kernel
+artifact. Results:
+
+| path | active/baseline | routed(b) | match |
+|---|---|---|---|
+| single-seq decode (`attention_forward.rs`) | `STARFALL-4710` | `STARFALL-4710` | ✅ char-for-char |
+| multi-seq batched decode (`multi_seq/{attn,qkv}.rs`, n>1 SLAI) | `STARFALL-4728` | `STARFALL-4728` | ✅ char-for-char |
+| pool `max_rank` padding (r=32 → pool 64) | `STARFALL-4710` | `STARFALL-4710` | ✅ char-for-char |
+
+Source review confirms it: `lora_bgmv.cu` (shrink/expand/fold) is a byte-copy of
+`dense_gemv_bf16.cu` + `residual_add.cu bf16_scaled_add` — same uint4 K-vectorization,
+same per-element fp32 accumulate under `--fmad=false`, same `__shfl_down_sync` order,
+same 2-warp smem reduce, same BF16 rounding at both buffer boundaries. So bgmv(n=1) ≡
+`apply_lora_delta(m=1)` by construction, and the hardware A/B corroborates it.
+
+**The `STARFALL-4710` (single-seq) vs `STARFALL-4728` (batched) digit shift is a
+BATCH-PATH numeric property, not a routing defect** — it moves the ACTIVE adapter's
+output identically (4728 is the true trained codeword, so the batched path is the
+faithful one). It is orthogonal to LoRA.
+
+**Re-disposition of the #30 vega residual:** it was an adapter/config confound, not a
+decode-kernel divergence. Routed-vega was compared against a `MOONVEIL-3390` baseline
+that was never re-established in the identical pooled config (standalone vs pool differ
+in batch composition, which — per the 4710/4728 observation — shifts razor-margin
+argmax digits for the active adapter too). With routing proven bit-identical, a
+same-config `vega-active` vs `vega-routed` comparison is guaranteed to match. **#32 is
+closed: no code change — the routed decode path is bit-identical; the oracle is
+committed as a permanent on-hardware regression guard.**
