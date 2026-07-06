@@ -75,10 +75,14 @@ fn main() {
     if let Ok(cuda_path) = std::env::var("CUDA_HOME") {
         println!("cargo:rustc-link-search=native={cuda_path}/lib64");
         println!("cargo:rustc-link-search=native={cuda_path}/lib64/stubs");
+        println!("cargo:rustc-link-search=native={cuda_path}/targets/sbsa-linux/lib");
     }
     // Standard CUDA locations
     println!("cargo:rustc-link-search=native=/usr/local/cuda/lib64");
     println!("cargo:rustc-link-search=native=/usr/local/cuda/lib64/stubs");
+    // CUDA 13 SBSA (Grace/GB10) runtime libs (libcudart.so lives here, not lib64)
+    println!("cargo:rustc-link-search=native=/usr/local/cuda/targets/sbsa-linux/lib");
+    println!("cargo:rustc-link-search=native=/usr/local/cuda-13.0/targets/sbsa-linux/lib");
     println!("cargo:rustc-link-search=native=/usr/lib/aarch64-linux-gnu");
 
     if let Some(cutlass_home) = std::env::var_os("CUTLASS_HOME") {

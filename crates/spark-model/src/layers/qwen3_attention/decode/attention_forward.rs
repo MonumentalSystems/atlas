@@ -223,6 +223,40 @@ impl Qwen3AttentionLayer {
 
         self.attention_forward_kv(normed, k_out, v_out, nkv, hd, h, ctx, stream)?;
 
+        // ── LoRA deltas on K/V (v0; Q excluded — gated [Q|gate] interleave).
+        // MUST run BEFORE the q/k RMS-norm, RoPE, and write_kv_cache below:
+        // HF computes k_norm(k_proj(x) + Δ), and the KV cache must store the
+        // ADAPTED k/v. Placed here rather than inside attention_forward_kv
+        // because that helper has three return points (MLA / FP8 / tail).
+        if let Some(ref lw) = self.lora {
+            if let Some(ref pair) = lw.k {
+                ops::lora_delta::apply_lora_delta(
+                    ctx.gpu,
+                    &lw.kernels,
+                    pair,
+                    normed,
+                    k_out,
+                    1,
+                    ctx.buffers.lora_xa(),
+                    ctx.buffers.lora_delta(),
+                    stream,
+                )?;
+            }
+            if let Some(ref pair) = lw.v {
+                ops::lora_delta::apply_lora_delta(
+                    ctx.gpu,
+                    &lw.kernels,
+                    pair,
+                    normed,
+                    v_out,
+                    1,
+                    ctx.buffers.lora_xa(),
+                    ctx.buffers.lora_delta(),
+                    stream,
+                )?;
+            }
+        }
+
         // Q/K RMS norms — three mutually-exclusive paths:
         //  1. MiniMax M2 style: RMSNorm over full projected hidden
         //     `[nq*hd]` per token, single learned weight of that shape.

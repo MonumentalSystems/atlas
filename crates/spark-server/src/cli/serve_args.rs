@@ -522,4 +522,37 @@ pub struct ServeArgs {
     /// `ps`/`/proc/<pid>/cmdline`. Use `--auth-tokens-file` instead.
     #[arg(long, value_name = "TOKEN", conflicts_with = "auth_tokens_file")]
     pub auth_token: Option<String>,
+
+    /// LoRA adapter to serve, as NAME=PATH_OR_HF_ID (e.g.
+    /// `holo-sft=/data/adapters/holo-sft` or `holo-sft=org/holo-31-08b-lora`).
+    /// v0 supports EXACTLY ONE adapter, loaded at startup and applied to every
+    /// request (the server *is* the fine-tuned model). The NAME is advertised
+    /// by GET /v1/models and accepted in `request.model`. Runtime BF16 delta —
+    /// never merged into the base weights. Repeating the flag is rejected at
+    /// startup with a named reason (multi-adapter slots land in M2).
+    #[arg(long, value_name = "NAME=PATH_OR_HF_ID", value_parser = parse_lora_adapter_spec)]
+    pub lora_adapter: Vec<(String, String)>,
+
+    /// Maximum LoRA adapter rank. The A/B slot pool and delta scratch buffers
+    /// are allocated rank-padded to this value at startup (frozen v1 layout
+    /// contract); an adapter whose `r` exceeds it is rejected at load.
+    #[arg(long, default_value_t = 64)]
+    pub max_lora_rank: usize,
+
+    /// Maximum number of LoRA adapter slots in the rank-padded pool. v0
+    /// loads exactly one adapter; the pool is still sized for `max_loras`
+    /// so the M2 multi-adapter layout is frozen from day one.
+    #[arg(long, default_value_t = 8)]
+    pub max_loras: usize,
+}
+
+/// Value parser for `--lora-adapter NAME=PATH_OR_HF_ID`.
+fn parse_lora_adapter_spec(s: &str) -> Result<(String, String), String> {
+    let (name, spec) = s
+        .split_once('=')
+        .ok_or_else(|| format!("--lora-adapter must be NAME=PATH_OR_HF_ID, got '{s}'"))?;
+    if name.is_empty() || spec.is_empty() {
+        return Err(format!("--lora-adapter: empty name or path in '{s}'"));
+    }
+    Ok((name.to_string(), spec.to_string()))
 }

@@ -173,6 +173,13 @@ impl TransformerModel {
         // Invariant F: streaming experts patch the prefill *_ptrs_t tables per
         // layer, so decode must stay on the eager path (graphs bake pointer
         // args). `expert_streaming` joins the existing suppressors.
+        //
+        // LoRA debugging hatch (ATLAS_LORA_EAGER=1): force eager decode when an
+        // adapter is active so graph-vs-eager delta parity can be compared.
+        // Default (unset) keeps graphs ON — the LoRA delta launches are
+        // capture-safe (pool weights / arena scratch / f32 scale are all
+        // load-time-fixed). Folded in as one more suppressor.
+        let lora_eager = self.lora.is_some() && crate::lora::lora_eager_env();
         let use_graphs = decode_graphs_allowed(
             self.comm.is_none(),
             ep_graphs,
@@ -182,7 +189,7 @@ impl TransformerModel {
             hss_engaged,
             self.config.expert_streaming,
             dump_step0,
-        );
+        ) && !lora_eager;
 
         let ctx = ForwardContext {
             buffers: &self.buffers,

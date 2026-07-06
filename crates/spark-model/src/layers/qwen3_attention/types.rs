@@ -150,6 +150,11 @@ pub struct Qwen3AttentionLayer {
     pub(super) post_attn_norm: DenseWeight,
     pub(super) ffn: FfnComponent,
     pub(super) attn_layer_idx: usize,
+    /// Startup-static LoRA adapter overlay for the K/V/O projections (v0;
+    /// q_proj excluded — gated Q+gate interleave). Installed
+    /// post-construction via `set_lora_weights`; `None` = base-only.
+    /// M0: stored only — the compute-path reads land in M1.
+    pub(super) lora: Option<crate::layers::ops::lora_delta::LoraAttnWeights>,
     /// Whether Q projection includes an output gate (Q+Gate interleaved).
     /// When true, q_proj output is 2× q_dim; attn output is gated by sigmoid.
     /// When false (e.g. Qwen3-VL), q_proj output is q_dim; no gating applied.

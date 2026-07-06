@@ -234,6 +234,26 @@ impl Qwen3AttentionLayer {
                 stream,
             )?;
         }
+        // ── LoRA delta on o_proj: o_out[n,h] += scale·(attn_out[n,nq*hd]@Aᵀ)@Bᵀ.
+        // attn_out is the exact o_proj input (post-attention), matching HF.
+        // Before the op_dump so dumps show the adapted output.
+        if let Some(ref lw) = self.lora
+            && let Some(ref pair) = lw.o
+        {
+            debug_assert_eq!(pair.k_in, nq * hd);
+            debug_assert_eq!(pair.n_out, h);
+            ops::lora_delta::apply_lora_delta(
+                ctx.gpu,
+                &lw.kernels,
+                pair,
+                attn_out,
+                o_out,
+                n,
+                ctx.buffers.lora_xa(),
+                ctx.buffers.lora_delta(),
+                stream,
+            )?;
+        }
         // ATLAS_OP_DUMP hook: post-O-projection — this is the FULL attention
         // block output (Q*K^T*V * O_proj). Compares 1:1 against the HF
         // module hooked on `full_attention.o_proj.forward` for the last

@@ -34,6 +34,25 @@ pub struct DflashBuildArgs<'a> {
     pub window_size: Option<usize>,
 }
 
+/// LoRA adapter build arguments (`--lora-adapter NAME=PATH`). `None` for
+/// base-only runs; `Some(...)` carries the adapter's separate on-device
+/// [`WeightStore`] (loaded via
+/// `spark_runtime::weights::adapter::load_adapter_safetensors`), the parsed
+/// `adapter_config.json`, and the pool-shape CLI knobs.
+///
+/// Unlike DFlash (loaded post-construction), the LoRA pool is allocated at
+/// the TOP of `build_model` — before the buffer arena and the free-memory
+/// snapshot — so its bytes are automatically debited from the KV budget.
+pub struct LoraBuildArgs<'a> {
+    pub adapter_store: &'a WeightStore,
+    pub peft_config: atlas_core::config::PeftAdapterConfig,
+    /// Adapter name (the NAME half of `--lora-adapter NAME=PATH`), stamped
+    /// onto the loaded `LoraWeights` for logs/status.
+    pub adapter_name: String,
+    pub max_lora_rank: usize,
+    pub max_loras: usize,
+}
+
 // ── Loader registry ─────────────────────────────────────────────────────────
 // Adding a new model: implement ModelWeightLoader and add a match arm below.
 // Everything else (KV cache, buffers, TransformerModel) is model-agnostic.
@@ -139,6 +158,7 @@ mod tests {
             0,
             None,
             None, // dflash_args
+            None, // lora_args
         );
         match result {
             Err(e) => assert!(e.to_string().contains("Unsupported model type: 'llama'")),

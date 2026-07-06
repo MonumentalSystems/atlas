@@ -11,9 +11,9 @@ use spark_runtime::kv_cache::{KvCacheConfig, KvCacheDtype, PagedKvCache};
 use spark_runtime::prefix_cache::PrefixCache;
 use spark_runtime::weights::WeightStore;
 
-use super::DflashBuildArgs;
 use super::loader_for_config;
 use super::m2_setup::maybe_run_minimax_m2_moe_transpose;
+use super::{DflashBuildArgs, LoraBuildArgs};
 use crate::layers::MtpQuantization;
 use crate::model::TransformerModel;
 use crate::traits::Model;
@@ -49,9 +49,37 @@ pub fn build_model(
     // DFlash speculative-decoding pairing. `None` = no DFlash; existing
     // MTP / no-spec paths unchanged.
     dflash_args: Option<DflashBuildArgs<'_>>,
+    // Startup-static LoRA adapter (`--lora-adapter`). `None` = base-only.
+    lora_args: Option<LoraBuildArgs<'_>>,
 ) -> Result<Box<dyn Model>> {
     // ── Step 1: Select weight loader (only model-specific dispatch) ──
     let loader = loader_for_config(&config)?;
+
+    // ── LoRA adapter load (pre-arena, pre-KV-sizing) ──
+    // MUST run before `BufferArena::new` and the `gpu.free_memory()`
+    // snapshot below: the pool allocation then lands in `used_so_far`, so
+    // the KV-cache budget shrinks automatically (positional budgeting —
+    // no arithmetic edit needed). Do NOT move this later. Setting
+    // `config.adapter_max_rank` here also lets `BufferSizes` size the
+    // lora_xa/lora_delta/lora_hact scratch.
+    let lora_weights: Option<crate::lora::LoraWeights> = if let Some(ref la) = lora_args {
+        config.adapter_max_rank = la.max_lora_rank;
+        loader
+            .load_lora_adapters(
+                la.adapter_store,
+                &la.peft_config,
+                &config,
+                gpu.as_ref(),
+                la.max_loras,
+                la.max_lora_rank,
+            )?
+            .map(|mut w| {
+                w.name = la.adapter_name.clone();
+                w
+            })
+    } else {
+        None
+    };
 
     // Pre-construction: when DFlash is active, populate the target's
     // capture-layer indices from the drafter's `dflash_config.target_layer_ids`
@@ -566,6 +594,12 @@ pub fn build_model(
             );
         }
     }
+
+    // ── Step 8: LoRA adapter install (optional, post-construction) ──
+    // The pool/tables were loaded up top (pre-KV-sizing); this walk copies
+    // the per-layer pairs into the layer structs. M0: layers only STORE the
+    // adapter — base output is unchanged until the M1 compute insertions.
+    model.set_lora_weights(lora_weights)?;
 
     Ok(Box::new(model))
 }

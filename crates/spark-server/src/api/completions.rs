@@ -431,14 +431,26 @@ pub(super) async fn completions_stream(
 
 /// GET /v1/models
 pub async fn list_models(State(state): State<Arc<AppState>>) -> Json<ModelListResponse> {
-    Json(ModelListResponse {
-        object: "list".to_string(),
-        data: vec![ModelInfo {
-            id: state.model_name.clone(),
+    let mut data = Vec::with_capacity(2);
+    // v0: the adapter IS the served model — advertise it first so clients
+    // that pick data[0] route to the fine-tune by default.
+    if let Some(ref adapter) = state.adapter_name {
+        data.push(ModelInfo {
+            id: adapter.clone(),
             object: "model".to_string(),
             created: crate::openai::unix_timestamp(),
             owned_by: "atlas-spark".to_string(),
-        }],
+        });
+    }
+    data.push(ModelInfo {
+        id: state.model_name.clone(),
+        object: "model".to_string(),
+        created: crate::openai::unix_timestamp(),
+        owned_by: "atlas-spark".to_string(),
+    });
+    Json(ModelListResponse {
+        object: "list".to_string(),
+        data,
     })
 }
 
@@ -447,9 +459,11 @@ pub async fn get_model(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(model_id): axum::extract::Path<String>,
 ) -> Response {
-    if model_id == state.model_name {
+    let known =
+        model_id == state.model_name || state.adapter_name.as_deref() == Some(model_id.as_str());
+    if known {
         Json(serde_json::json!({
-            "id": state.model_name,
+            "id": model_id,
             "object": "model",
             "created": crate::openai::unix_timestamp(),
             "owned_by": "atlas-spark",
