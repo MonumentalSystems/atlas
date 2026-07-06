@@ -236,4 +236,78 @@ mod tests {
             assert_eq!(back, pat(i), "group {k:?} corrupted through the RDMA blade");
         }
     }
+
+    // Throughput of the KV overflow tier: offload (RDMA WRITE) then restore
+    // (RDMA READ + copy_h2d) a large group set, reporting GB/s each way. Serial
+    // single-bounce (like PosixBackend), so this is the honest per-group rate at
+    // the given group size — the pipelined multi-bounce version is a follow-on.
+    // Needs a GPU and a live atlas-kv-peer at $ATLAS_KV_PEER.
+    #[test]
+    #[ignore = "requires GPU + live kv-peer at $ATLAS_KV_PEER"]
+    fn rdma_kv_bandwidth() {
+        let ctx = CudaCtx::new(0).expect("cuda init");
+        let peer = std::env::var("ATLAS_KV_PEER").expect("set ATLAS_KV_PEER=host:port");
+        // 16 KiB groups (block 64 × head_dim 128 × bf16), 16 layers × 64 blocks
+        // × 8 kv-heads × (K+V) = 16384 groups ≈ 256 MiB total.
+        let layout = GroupLayout::new(16, 64, 8, 64, 128, 2, 4096);
+        let gbytes = layout.group_bytes() as usize;
+        let mut be = RdmaKvBackend::connect(&peer, layout).expect("connect kv peer");
+        let ngroups = (layout.num_layers as u64)
+            * 2
+            * (layout.num_blocks as u64)
+            * (layout.num_kv_heads as u64);
+        let total = ngroups * gbytes as u64;
+
+        let keys: Vec<GroupKey> = (0..layout.num_layers)
+            .flat_map(|l| {
+                (0..layout.num_blocks).flat_map(move |b| {
+                    (0..layout.num_kv_heads).flat_map(move |h| {
+                        [
+                            GroupKey::new(l, b, h, KvKind::K),
+                            GroupKey::new(l, b, h, KvKind::V),
+                        ]
+                    })
+                })
+            })
+            .collect();
+        let src = vec![0xABu8; gbytes];
+        let dev = DeviceBuffer::new(gbytes).unwrap();
+
+        // Offload: RDMA WRITE every group to the blade.
+        let t0 = std::time::Instant::now();
+        for k in &keys {
+            be.write_from_host(*k, &src).expect("write");
+        }
+        let wdt = t0.elapsed().as_secs_f64();
+
+        // Restore: RDMA READ every group back into HBM.
+        let t1 = std::time::Instant::now();
+        for k in &keys {
+            be.read(
+                &[ReadRequest {
+                    group: *k,
+                    dst_dev_ptr: dev.ptr,
+                }],
+                ctx.stream,
+            )
+            .expect("read");
+        }
+        let rdt = t1.elapsed().as_secs_f64();
+
+        let gbps = |dt: f64| (total as f64) / dt / 1e9;
+        println!(
+            "\nRDMA KV tier: {} groups × {} B = {:.0} MiB\n  \
+             OFFLOAD (RDMA WRITE): {:.3}s => {:.2} GB/s ({:.1} us/group)\n  \
+             RESTORE (RDMA READ + h2d): {:.3}s => {:.2} GB/s ({:.1} us/group)",
+            ngroups,
+            gbytes,
+            total as f64 / 1048576.0,
+            wdt,
+            gbps(wdt),
+            wdt / ngroups as f64 * 1e6,
+            rdt,
+            gbps(rdt),
+            rdt / ngroups as f64 * 1e6,
+        );
+    }
 }
