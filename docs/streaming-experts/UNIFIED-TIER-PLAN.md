@@ -538,3 +538,38 @@ on the faster tier / at larger scale, not here.** Concretely, next:
    prerequisite to combine batched + prefetch.
 3. Larger model / deeper over-core, where attention compute (which the wide launch does speed up on
    resident steps) is a bigger fraction than the per-step KV re-read.
+
+### Phase 5 — reasonable-buffers + RDMA-tier measurements (2026-07-07)
+Two follow-ups to the pathological 128-tok-window NVMe run (which was read-bound, 4.8 tok/s). ALL numbers
+below are **profiling-on** (`ATLAS_MS_PROFILE=1` forces eager + per-phase syncs) so absolute tok/s is a
+FLOOR, not production — but A/B deltas (symmetric tax) are valid.
+
+**(1) Reasonable buffers — perf is healthy.** Realistic config (`--max-seq-len 32768 --ssm-cache-slots 256
+--enable-prefix-caching`, ~2K-tok prompts, 8 concurrent, working set fits → streaming dormant): **native
+15.0 tok/s/req** (profiling-on) vs the pathological 128-tok-window's 4.8 → **~3× faster with sane buffers.**
+So the low numbers were the deliberately-pathological tiny window, not a real regression; with buffers
+sized to hold the context, decode is healthy. (HSS-resident-32K config OOM-free after fixing an orphaned
+72 GB server that had leaked from a killed harness — hygiene note: `kill -9` serve, it wedges on SIGTERM.)
+
+**(2) RDMA tier vs NVMe (same 128-tok window, gx10 RAM over CX7, bounce mode):**
+
+| tier | attn (n=8) | attn/seq | per-tok | tok/s |
+|---|---|---|---|---|
+| NVMe (local io_uring) | 133.6 ms | 16.7 ms | 23.3 ms | 4.8 |
+| RDMA (gx10 blade) | 119.0 ms | 14.9 ms | 21.3 ms | 5.3 |
+
+**RDMA is faster but only ~10%** — far short of the raw bandwidth ratio (CX7 ~11–24 GB/s vs NVMe ~2 GB/s),
+with a fat tail (attn max **3034 ms** = a network/bounce stall). Why it's not 6–12×:
+- **Bounce mode, not zero-copy.** `ATLAS_KV_ZERO_COPY` needs UMA KV scratch that isn't wired yet (RDMA-
+  KV-TIER.md §6) → every read is D2H→RDMA→H2D, capping effective BW far below the link.
+- **Latency-bound, not bandwidth-bound.** Each step reads only the window's few new blocks/seq — small
+  transfers where round-trip + bounce overhead dominate, so 10× BW barely moves the needle.
+- Profiling/eager serialization on top.
+
+**Takeaways:** the over-core thesis is directionally confirmed (RDMA IS faster) but the current bounce-mode
+path doesn't expose the bandwidth advantage. Concrete levers, in order: **(a) wire zero-copy RDMA (UMA KV
+scratch)** — the pending RDMA-KV-TIER §6 item, likely the biggest single win; (b) prefetch-overlap to hide
+the read entirely (needs the CudaEvent coexistence fix so batched + prefetch combine); (c) larger reads /
+bigger models where the per-step re-read is a smaller fraction. Peer now runs as a durable systemd service
+on gx10 ([[atlas-kv-peer-service]]). Production tok/s (graphs-on, no profiling) still TODO — all numbers
+here are profiling floors.
