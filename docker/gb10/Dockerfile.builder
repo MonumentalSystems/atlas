@@ -98,15 +98,11 @@ ENV CUDARC_CUDA_VERSION=13010
 
 RUN cargo build --release -p spark-server
 
-# Re-link the GDN AOT shared lib from committed artifacts (gdn_holo_0.o is the
-# AOT-exported bf16 kernel; gdn_transpose.o is the k<->v state transpose). No
-# python/torch needed here — the .o is pre-exported and version-controlled.
-RUN cd 3rdparty_patches/gdn_aot && \
-    nvcc -arch=sm_121a -Xcompiler -fPIC -c gdn_transpose.cu -o gdn_transpose.o && \
-    g++ -O2 -fPIC -shared gdn_shim.cpp gdn_transpose.o gdn_holo_0.o \
-      -o /usr/local/lib/libatlasgdn.so \
-      -I. -I/usr/local/cuda/include -lcudart \
-      -L/usr/local/lib -lcute_dsl_runtime -Wl,-rpath,/usr/local/lib
+# GDN AOT shared lib. The re-link path needs gdn_holo_0.o (AOT-exported bf16
+# kernel), which is NOT in-tree — but the fully-linked libatlasgdn.so IS
+# version-controlled, so use it directly. GDN-FlashInfer is opt-in
+# (ATLAS_GDN_FLASHINFER=0 default), so this lib is only dlopened if enabled.
+RUN cp 3rdparty_patches/gdn_aot/libatlasgdn.so /usr/local/lib/libatlasgdn.so
 
 # ── Runtime stage: serve image on CUDA 13.2 + GDN runtime bundled ─────────────
 FROM nvidia/cuda:${CUDA_VER}-runtime-ubuntu24.04
