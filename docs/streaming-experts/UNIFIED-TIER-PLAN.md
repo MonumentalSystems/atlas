@@ -715,3 +715,31 @@ Confirmed against code before design — these are the load-bearing facts:
 - Cost-aware fault-in-vs-recompute telemetry gate (hazard 5).
 - Bounded-tier drop-on-reject index cleanup (perf; correctness already safe via miss-on-fault).
 - Zero-copy per-layer device-MR write path into the pre-stabilized arena offsets (design C drop-in).
+
+### Phase 4b — LANDED + LIVE-VALIDATED on gx10 (2026-07-07)
+All three increments shipped (`d43c065` Inc 1, `8cdf8e8` Inc 2+3) + live-validated over the real CX7 link.
+- **Inc 1** — RdmaSnapshotStore core (spark-model/ssm_tier.rs): fixed-slot arena allocator (free-list +
+  key→slot map; overwrite-in-place / pop-free-slot / Ok(false)-when-full; transport op outside the map lock
+  + rolls the allocator back on write-fail so a bad write never leaves a garbage slot mapped) +
+  SnapshotTransport seam + MockSnapshotTransport. 7 parity tests vs MemBlobStore.
+- **Inc 2** — RdmaSnapshotArena (spark-storage/rdma_snapshot.rs): synchronous, offset-addressed RDMA over
+  the same Verbs + atlas-kv-peer blade protocol, keyed by byte offset (NOT KV GroupKey — verified-wrong).
+  Dual-rail; each op drained to completion. Available unconditionally via a connect-errors stub when
+  cuda+atlas_rdma_verbs isn't built (so spark-model needs no cfg and degrades to host-RAM).
+- **Inc 3** — ssm_tier::build_tier_store + impl_a1 selector: `ATLAS_SSM_RDMA_TIER=host:port` +
+  `ATLAS_SSM_RDMA_ARENA_SLOTS` (default 512) → RDMA arena; connect-fail/no-verbs → MemBlobStore fallback.
+  Unset ⇒ byte-identical. 14/14 ssm_tier tests green; workspace (stub) + release spark-server (verbs) link.
+
+**LIVE (gx10 peer :9917, 2nd atlas-kv-peer instance, dual-rail; dgx-00 35B-A3B, --ssm-cache-slots 4 to force
+spill, ATLAS_SSM_RDMA_ARENA_SLOTS=64 = 3.98 GiB arena, blob 66,846,720 B):** log confirms `RdmaSnapshotArena
+connected … 4.0 GiB arena, 2 rail(s)` + peer `client connected: 2 rail(s), 4.0 GiB RW blade`; **8 spills + 6
+tier fault-ins** ("restored spilled snapshot at token 1328 into slot N") through the RDMA store; **18/18
+coherent, domain-matched** responses under an interleaved 6-session workload — a corrupted remote restore
+would garble temp-0 output, so the spill→RDMA→fault round-trip is byte-correct. (One-sided RDMA = the peer
+CPU is uninvolved per-op and releases the arena on client disconnect, so peer RSS after teardown is ~0 —
+expected, not a defect.) Peer runs as a durable systemd `--user` service (atlas-kv-peer-snap) on gx10.
+
+**Open follow-ups (perf, not correctness):** cost-aware fault-vs-recompute gate (CX7 ~64 MB restore ≈5–7 ms
+vs recompute); bounded-tier drop-on-reject index cleanup; zero-copy per-layer device-MR scatter into the
+pre-stabilized arena offsets. A same-config RDMA-vs-host-RAM byte-identical A/B would further harden the
+correctness claim beyond the coherent-restore evidence.
