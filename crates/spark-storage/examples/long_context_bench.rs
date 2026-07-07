@@ -181,14 +181,14 @@ fn main() -> Result<()> {
 
     // Warmup.
     for _ in 0..2 {
-        hss.attend_layer(&ctx, 0, &seq, q_dev.ptr, out_dev.ptr)?;
+        hss.attend_layer(0, &ctx, 0, &seq, q_dev.ptr, out_dev.ptr)?;
     }
     stream_sync(ctx.stream)?;
 
     // Streaming bench.
     let t_stream = Instant::now();
     for _ in 0..args.steps {
-        hss.attend_layer(&ctx, 0, &seq, q_dev.ptr, out_dev.ptr)?;
+        hss.attend_layer(0, &ctx, 0, &seq, q_dev.ptr, out_dev.ptr)?;
     }
     stream_sync(ctx.stream)?;
     let stream_dt = t_stream.elapsed().as_secs_f64();

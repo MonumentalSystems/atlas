@@ -202,7 +202,7 @@ fn orchestrator_multi_tile_with_eviction() {
     )
     .unwrap();
     let seq_blocks: Vec<u32> = (0..SEQ_BLOCKS).collect();
-    hss.attend_layer(&ctx, 0, &seq_blocks, q_dev.ptr, out_dev.ptr)
+    hss.attend_layer(0, &ctx, 0, &seq_blocks, q_dev.ptr, out_dev.ptr)
         .unwrap();
 
     let mut out = vec![bf16::from_f32(0.0); NUM_Q_HEADS as usize * HEAD_DIM as usize];
@@ -231,5 +231,28 @@ fn orchestrator_multi_tile_with_eviction() {
         max_d < 1e-2,
         "orchestrator output diverged from reference: {max_d}"
     );
+
+    // Phase 2: the SAME attention run through a DIFFERENT per-seq scratch slot
+    // (lazily grown) must be bit-for-bit identical — proves per-seq isolation is
+    // equivalence-preserving (each seq's scratch is independent, not shared).
+    hss.attend_layer(1, &ctx, 0, &seq_blocks, q_dev.ptr, out_dev.ptr)
+        .unwrap();
+    let mut out_slot1 = vec![bf16::from_f32(0.0); NUM_Q_HEADS as usize * HEAD_DIM as usize];
+    copy_d_to_h_async(
+        out_slot1.as_mut_ptr() as *mut c_void,
+        out_dev.ptr,
+        out_slot1.len() * 2,
+        ctx.stream,
+    )
+    .unwrap();
+    stream_sync(ctx.stream).unwrap();
+    for (a, b) in out.iter().zip(&out_slot1) {
+        assert_eq!(
+            a.to_bits(),
+            b.to_bits(),
+            "seq_slot 1 output differs from seq_slot 0 — per-seq scratch not equivalent"
+        );
+    }
+
     std::fs::remove_dir_all(&dir).ok();
 }

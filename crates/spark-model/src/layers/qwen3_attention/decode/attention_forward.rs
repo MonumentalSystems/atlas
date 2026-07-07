@@ -545,7 +545,9 @@ impl Qwen3AttentionLayer {
             )?;
             // Streaming attention over the full disk-side history.
             spark_storage::with_local(|hss| {
+                // Single-seq decode path → scratch slot 0.
                 hss.attend_layer_on_stream(
+                    0,
                     stream,
                     self.attn_layer_idx as u32,
                     disk_block_ids,

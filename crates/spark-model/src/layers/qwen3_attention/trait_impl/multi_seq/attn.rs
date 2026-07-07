@@ -221,7 +221,10 @@ impl Qwen3AttentionLayer {
                     let q_row = q_contiguous.offset(i * q_dim as usize * bf16);
                     let out_row = attn_out.offset(i * q_dim as usize * bf16);
                     spark_storage::with_local(|hss| {
+                        // Phase 2: `i` (the batch position) selects this seq's own
+                        // transient scratch so overlapping seqs don't clobber.
                         hss.attend_layer_on_stream(
+                            i,
                             stream,
                             self.attn_layer_idx as u32,
                             ds.disk_block_ids,

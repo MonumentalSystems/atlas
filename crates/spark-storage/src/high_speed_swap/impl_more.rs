@@ -5,7 +5,7 @@
 use anyhow::Result;
 use std::ffi::c_void;
 
-use super::HighSpeedSwap;
+use super::{HighSpeedSwap, SeqScratch};
 use crate::backend::ReadRequest;
 use crate::config::HighSpeedSwapConfig;
 use crate::cuda_min::{CudaCtx, copy_d_to_h_async, copy_h_to_d_async, stream_sync};
@@ -145,13 +145,14 @@ impl HighSpeedSwap {
     /// receives the [num_q_heads × head_dim] BF16 attention output.
     pub fn attend_layer(
         &mut self,
+        seq_slot: usize,
         ctx: &CudaCtx,
         layer: u32,
         seq_block_ids: &[u32],
         q_dev: u64,
         output_dev: u64,
     ) -> Result<()> {
-        self.attend_layer_on_stream(ctx.stream, layer, seq_block_ids, q_dev, output_dev)
+        self.attend_layer_on_stream(seq_slot, ctx.stream, layer, seq_block_ids, q_dev, output_dev)
     }
 
     /// Stream-only variant for production callers (spark-model decode path).
@@ -165,6 +166,7 @@ impl HighSpeedSwap {
     /// active block leak into past queries.
     pub fn attend_layer_on_stream(
         &mut self,
+        seq_slot: usize,
         stream: u64,
         layer: u32,
         seq_block_ids: &[u32],
@@ -172,7 +174,15 @@ impl HighSpeedSwap {
         output_dev: u64,
     ) -> Result<()> {
         let bs = self.model.block_size as i32;
-        self.attend_layer_on_stream_with_q_pos(stream, layer, seq_block_ids, q_dev, output_dev, bs)
+        self.attend_layer_on_stream_with_q_pos(
+            seq_slot,
+            stream,
+            layer,
+            seq_block_ids,
+            q_dev,
+            output_dev,
+            bs,
+        )
     }
 
     /// Causal-masking variant: `last_block_valid_slots` controls how many
@@ -182,6 +192,7 @@ impl HighSpeedSwap {
     /// the active block.
     pub fn attend_layer_on_stream_with_q_pos(
         &mut self,
+        seq_slot: usize,
         stream: u64,
         layer: u32,
         seq_block_ids: &[u32],
@@ -189,10 +200,16 @@ impl HighSpeedSwap {
         output_dev: u64,
         last_block_valid_slots: i32,
     ) -> Result<()> {
+        // Phase 2: use this sequence's OWN transient scratch so concurrent seqs
+        // don't clobber each other. Lazily grow the pool to cover `seq_slot`.
+        while self.scratch.len() <= seq_slot {
+            let s = SeqScratch::new(&self.attn, &self.model, &self.cfg)?;
+            self.scratch.push(s);
+        }
         // 1. Project Q. 2. Score every block at this layer (only seq subset
         //    is consumed; the rest is wasted compute but score_blocks is µs).
         self.predictor
-            .project_q_on_stream(stream, q_dev, self.q_proj.ptr)?;
+            .project_q_on_stream(stream, q_dev, self.scratch[seq_slot].q_proj.ptr)?;
         let m = &self.model;
         let layer_a_g = self.predictor.a_g_dev_ptr()
             + (layer as u64)
@@ -203,22 +220,26 @@ impl HighSpeedSwap {
                 * 2;
         self.predictor.score_blocks_on_stream(
             stream,
-            self.q_proj.ptr,
+            self.scratch[seq_slot].q_proj.ptr,
             layer_a_g,
-            self.block_scores_dev.ptr,
+            self.scratch[seq_slot].block_scores_dev.ptr,
             m.max_blocks_per_layer as usize,
         )?;
+        // Extract the immutable ptr/len before the mutable `as_mut_ptr` borrow
+        // so we don't alias `self.scratch[seq_slot]` mut+shared in one call.
+        let bs_ptr = self.scratch[seq_slot].block_scores_dev.ptr;
+        let hbuf_bytes = self.scratch[seq_slot].score_host_buf.len() * 4;
         copy_d_to_h_async(
-            self.score_host_buf.as_mut_ptr() as *mut c_void,
-            self.block_scores_dev.ptr,
-            self.score_host_buf.len() * 4,
+            self.scratch[seq_slot].score_host_buf.as_mut_ptr() as *mut c_void,
+            bs_ptr,
+            hbuf_bytes,
             stream,
         )?;
         stream_sync(stream)?;
 
         // 3. Tile loop.
         self.attn
-            .begin_step_on_stream(&self.attn_planes, stream, 1)?;
+            .begin_step_on_stream(&self.scratch[seq_slot].planes, stream, 1)?;
         let tile_cap = self.cfg.resident_blocks as usize;
         let mut tile_idx = 0;
         while tile_idx < seq_block_ids.len() {
@@ -249,7 +270,7 @@ impl HighSpeedSwap {
                 pinned.push(slot);
                 self.eviction.touch(slot);
                 self.eviction
-                    .record_score(slot, self.score_host_buf[blk as usize]);
+                    .record_score(slot, self.scratch[seq_slot].score_host_buf[blk as usize]);
                 // Find this block's index in the tile so the block_table is right.
                 let idx = tile.iter().position(|&x| x == blk).unwrap();
                 block_table[idx] = slot as i32;
@@ -269,13 +290,13 @@ impl HighSpeedSwap {
             // 4. Tiled attention launch.
             let counts = [(tile.len()) as i32];
             copy_h_to_d_async(
-                self.block_table_dev.ptr,
+                self.scratch[seq_slot].block_table_dev.ptr,
                 block_table.as_ptr() as *const c_void,
                 tile_cap * 4,
                 stream,
             )?;
             copy_h_to_d_async(
-                self.counts_dev.ptr,
+                self.scratch[seq_slot].counts_dev.ptr,
                 counts.as_ptr() as *const c_void,
                 4,
                 stream,
@@ -293,13 +314,13 @@ impl HighSpeedSwap {
                 self.model.block_size as i32
             };
             self.attn.step_tile_on_stream(
-                &self.attn_planes,
+                &self.scratch[seq_slot].planes,
                 stream,
                 q_dev,
                 self.pool.pool_dev_ptr(),
                 self.pool.pool_dev_ptr() + v_off,
-                self.block_table_dev.ptr,
-                self.counts_dev.ptr,
+                self.scratch[seq_slot].block_table_dev.ptr,
+                self.scratch[seq_slot].counts_dev.ptr,
                 1,
                 s_blk,
                 s_tok,
@@ -309,7 +330,7 @@ impl HighSpeedSwap {
             tile_idx = tile_end;
         }
         self.attn
-            .finalize_on_stream(&self.attn_planes, stream, output_dev, 1)?;
+            .finalize_on_stream(&self.scratch[seq_slot].planes, stream, output_dev, 1)?;
         Ok(())
     }
 

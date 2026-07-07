@@ -36,24 +36,59 @@ pub struct HighSpeedSwap {
     /// otherwise it's a dereg-on-freed-pages use-after-free.
     backend: Box<dyn crate::backend::StorageBackend>,
     pool: ScratchPool,
+    /// Shared, immutable tiled-attention kernel handles. The per-op accumulator
+    /// planes live per-seq in `scratch` (Phase 2).
     attn: TiledAttention,
-    /// Online-softmax accumulator planes (Phase 2: split out of `attn` so they
-    /// can go per-seq in `SeqScratch`). Single shared plane-set for now; the
-    /// per-seq `Vec` follows once `attend_layer` is seq-indexed.
-    attn_planes: TiledAttnPlanes,
     eviction: EvictionPolicy,
-    // Reusable scratch buffers.
-    q_proj: DeviceBuffer,
-    block_scores_dev: DeviceBuffer, // [max_blocks] f32
-    block_table_dev: DeviceBuffer,  // [tile_capacity] i32
-    counts_dev: DeviceBuffer,       // [1] i32 (single seq)
-    score_host_buf: Vec<f32>,
+    /// Phase 2: per-sequence transient orchestrator scratch — accumulator planes
+    /// + the single-use projection/score/tile buffers. Indexed by `seq_slot`
+    /// (the batch position) so two concurrent sequences never clobber each
+    /// other's partial softmax / scratch (the C=8 race that killed the
+    /// tile-pipeline). Lazily grown on first use of each slot; a serial pass
+    /// touches slot `i` under a barrier, a future pipeline can overlap slots.
+    /// The shared `pool`/`backend`/`predictor`/`disk_state` stay single-owner.
+    scratch: Vec<SeqScratch>,
     // Disk-block-ID allocator (Phase 6.1.a, refactored). One global
     // allocator: a `disk_block_id` indexes the SAME logical position
     // across every layer's file, so allocation, refcount, and free list
     // are layer-agnostic. Each layer's file independently stores its
     // K/V at `offset(layer, disk_block_id)`.
     disk_state: DiskState,
+}
+
+/// Per-sequence transient orchestrator scratch (Phase 2). Everything here is
+/// overwritten within a single `attend_layer` call, so one set per concurrent
+/// sequence is required to make overlapping sequences race-free.
+struct SeqScratch {
+    /// Online-softmax accumulator planes carried across the tile loop.
+    planes: TiledAttnPlanes,
+    /// Projected-Q scratch `[num_q_heads × rank]`.
+    q_proj: DeviceBuffer,
+    /// Per-block scores `[max_blocks]` f32.
+    block_scores_dev: DeviceBuffer,
+    /// Per-tile block table `[tile_capacity]` i32.
+    block_table_dev: DeviceBuffer,
+    /// Per-tile seq counts `[1]` i32.
+    counts_dev: DeviceBuffer,
+    /// Host staging for the D2H score copy.
+    score_host_buf: Vec<f32>,
+}
+
+impl SeqScratch {
+    fn new(
+        attn: &TiledAttention,
+        model: &ModelDims,
+        cfg: &HighSpeedSwapConfig,
+    ) -> anyhow::Result<Self> {
+        Ok(Self {
+            planes: attn.new_planes()?,
+            q_proj: DeviceBuffer::new(model.num_q_heads as usize * cfg.rank as usize * 2)?,
+            block_scores_dev: DeviceBuffer::new(model.max_blocks_per_layer as usize * 4)?,
+            block_table_dev: DeviceBuffer::new(cfg.resident_blocks as usize * 4)?,
+            counts_dev: DeviceBuffer::new(4)?,
+            score_host_buf: vec![0.0_f32; model.max_blocks_per_layer as usize],
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -203,13 +238,10 @@ impl HighSpeedSwap {
             block_size: model.block_size as usize,
             tile_capacity: cfg.resident_blocks as usize,
         })?;
-        let attn_planes = attn.new_planes()?;
         let eviction = EvictionPolicy::new(cfg.resident_blocks);
-        let q_proj = DeviceBuffer::new(model.num_q_heads as usize * cfg.rank as usize * 2)?;
-        let block_scores_dev = DeviceBuffer::new(model.max_blocks_per_layer as usize * 4)?;
-        let block_table_dev = DeviceBuffer::new(cfg.resident_blocks as usize * 4)?;
-        let counts_dev = DeviceBuffer::new(4)?;
-        let score_host_buf = vec![0.0_f32; model.max_blocks_per_layer as usize];
+        // One scratch slot to start; `attend_layer` grows the Vec on first use
+        // of each higher batch position (lazy — avoids plumbing max_batch_size).
+        let scratch = vec![SeqScratch::new(&attn, &model, &cfg)?];
         let disk_state = DiskState::new();
         Ok(Self {
             cfg,
@@ -218,13 +250,8 @@ impl HighSpeedSwap {
             backend,
             pool,
             attn,
-            attn_planes,
             eviction,
-            q_proj,
-            block_scores_dev,
-            block_table_dev,
-            counts_dev,
-            score_host_buf,
+            scratch,
             disk_state,
         })
     }
