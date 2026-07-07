@@ -1,17 +1,18 @@
 # Unified Tiered Cache — roadmap for the next ultracode push (2026-07-07)
 
-> **Status @ 2026-07-07 (this push):** **Phase 1 (spill-not-drop) is CODE-COMPLETE** —
-> Phase 0 ✅ · 1a ✅ · 1b-core ✅ · 1b-integration ✅ (serving path fully wired). All gated
-> `ATLAS_SSM_TIER`/`ATLAS_SSM_TAIL_PROTECT` (default off = byte-identical), full single-GPU
-> build **links**, `#![deny(warnings)]`-clean, **~25 new tests green, zero regressions**.
-> Validated at every layer testable without a live model: byte-fidelity spill↔fault round-trip
-> + slot-recycling (mock GPU), index `Location{Hbm｜Tier}` state machine, and the **full
-> resident→spilled→resident transition through the real `RadixTree` `PrefixCache`**.
-> **The ONE remaining step is a live-CUDA serving smoke** (stream-ordering under concurrent
-> graph replay + live fault-in during prefill) — see the recipe at the bottom. It needs a
-> kernel-target-matched build (`ATLAS_TARGET_MODEL=qwen3.6-35b-a3b`) + a served SSM model, so it
-> belongs to the operator's live-validation harness. **Do not recommend `ATLAS_SSM_TIER` on
-> until that smoke passes.** Phases 2–6 unstarted.
+> **Status @ 2026-07-07 (this push):** **Phase 1 (spill-not-drop) is COMPLETE + LIVE-VALIDATED
+> on GB10 CUDA.** Phase 0 ✅ · 1a ✅ · 1b-core ✅ · 1b-integration ✅ · **live smoke ✅**. All
+> gated `ATLAS_SSM_TIER`/`ATLAS_SSM_TAIL_PROTECT` (default off = byte-identical), full
+> single-GPU build links, `#![deny(warnings)]`-clean, ~25 unit tests + a real-CUDA serving run.
+>
+> **Live smoke result** (Qwen3.6-35B-A3B-NVFP4 on dgx-00 GB10, `--ssm-cache-slots 4`,
+> 6 interleaved multi-turn sessions, 72 requests): **72/72 OK, 0 errors, coherent output
+> throughout** (fault-in restores are correct — no state corruption). My `ssm-snap-stats`
+> telemetry: **`tier_spills=154`, `evictions(drops)=0`** (every eviction became a spill),
+> **`tier_hits=43`, `tier_fault_ins=13`**, `hit_rate=0.67`, **`mean_recompute_on_hit=15 tok`**
+> (vs the #278 ~4400-tok recompute baseline). The full serving path — `evict_to_tier` →
+> `spill_slot` (D2H) → tier → `lookup_tiered` → `fault_in_slot` (H2D) → `promote` → restore —
+> executes correctly under concurrent graph replay on real hardware. Phases 2–6 unstarted.
 
 **Architecture: one spill tier for BOTH KV blocks and SSM snapshots.** Route both
 through the *already-shipped* byte-agnostic `StorageBackend` cascade
@@ -96,7 +97,7 @@ from recompute → fault-in.
 | # | phase | goal | risk |
 |---|---|---|---|
 | **0** ✅ | Instrument + enlarge Marconi pool | Measure the SSM thrash + realistic baseline; prove pool-size (not a bug) is the loss. Sweep `ssm_cache_slots` (16→128), add hit-rate / warm-TTFT / read-bytes / CPU telemetry. **Cheapest lever first.** | very low (config+telemetry; watch HBM OOM) |
-| **1** ✅ | **SSM snapshots onto the cascade — spill-not-drop** — CODE-COMPLETE (1a byte-mover+tier · 1b-core index state-machine · 1b-integration serving-wiring all landed+gated). Live-CUDA smoke pending (recipe below). | *Headline win.* Second cascade instance (`GroupLayout num_layers=1`, synthetic elem so `group_stride == num_ssm_layers×(h+conv)`) reusing every hardened byte-mover — zero change to trait/GroupKey/ScratchPool/KV-attn. `SnapshotEntry` → `Location{Hbm(slot)｜Tier(key)}`; evict **spills** not drops; prefix-lookup faults back in. Gated `$ATLAS_SSM_TIER` (default off = byte-identical). | low-med — **cross-stream ordering** vs `wait_snapshot_saves_dispatch` (a fault-in reading a half-written snapshot = silent state corruption); pin slots during fault-in |
+| **1** ✅ | **SSM snapshots onto the cascade — spill-not-drop** — DONE + LIVE-VALIDATED on GB10 (154 spills / 0 drops / 13 fault-ins over 72 requests, 0 errors, recompute-on-hit 4400→15 tok). 1a byte-mover+tier · 1b-core state-machine · 1b-integration serving-wiring. | *Headline win.* Second cascade instance (`GroupLayout num_layers=1`, synthetic elem so `group_stride == num_ssm_layers×(h+conv)`) reusing every hardened byte-mover — zero change to trait/GroupKey/ScratchPool/KV-attn. `SnapshotEntry` → `Location{Hbm(slot)｜Tier(key)}`; evict **spills** not drops; prefix-lookup faults back in. Gated `$ATLAS_SSM_TIER` (default off = byte-identical). | low-med — **cross-stream ordering** vs `wait_snapshot_saves_dispatch` (a fault-in reading a half-written snapshot = silent state corruption); pin slots during fault-in |
 | **2** | **Per-seq orchestrator isolation** | Move transient orchestrator state (copy_stream, S-planes, events, `war_armed`) off the shared thread-local `HighSpeedSwap` into a per-seq context. Ships no perf; **unblocks 3 & 5**. Re-state the `unsafe Sync` soundness. | med — under-scoping reintroduces the exact 6/8 C=8 race that killed the tile-pipeline |
 | **3** | Cross-layer prefetch (deep lever A) | Hide tier reads behind the **SSM+MoE/FFN compute between two attention layers** (not the thin within-layer slice the pipeline tried) — for both KV and SSM fault-ins. The only overlap with enough compute. | med — a pin bug silently corrupts attention (wrong-layer blocks); must be measured at the agentic regime not cap=8 |
 | **4** | Reduce read volume — **native-quant tier storage** (deep lever B) | Stop the BF16 inflation: `decode/high_speed_swap.rs:232-289` dequants FP8/NVFP4/4-bit → BF16 *before* `write_from_host`, so quantized history is stored + re-read at **2–4×**. Store native-quant bytes; dequant on read. **Biggest concrete byte cut.** | med — wide per-format correctness surface (FP8/NVFP4/Turbo3/4/8); needs a per-format numeric-diff harness |
@@ -224,7 +225,18 @@ tier-aware path degenerates to the resident-only lookup).
 - **CPU-validated**: `test_spill_tier_lookup_transitions` drives resident→spilled→resident
   through the real `RadixTree`; pool byte-mover + slot-recycling on `MockGpuBackend`.
 
-### Live-validation recipe (the ONE remaining step — operator's harness)
+### Live-validation recipe (✅ EXECUTED 2026-07-07 — PASSED)
+**Learning — the workload must be INTERLEAVED multi-session, not single-turn.** First attempts
+(short single-turn prompts; identical re-sends) produced **0 spills / 0 fault-ins**: short
+prompts save no intermediate checkpoints, and a snapshot is only *re-needed* after it's been
+evicted by *other* sessions' activity. Only **6 interleaved sessions** (> the 4-slot pool), each
+with a distinct >1024-token root (stable `compute_session_hash` = first ≤1024 tokens) + multi-turn
+history, reproduced the #278 pattern: session A's snapshot spills while B..F run, then A resumes
+and faults it back in. That run gave 154 spills / 43 tier hits / 13 fault-ins, 0 drops. Repro
+script: an interleaved-session driver like `scripts/dev/agentic_test.py` (or the ad-hoc
+`ssm_interleaved.py` used here). Also: `--gpu-memory-utilization` must clear weights+buffers
+(~46 GB for 35B-A3B) *before* any KV budget — 0.35 OOMs, use ≥0.55.
+
 Build kernels for the SSM target, then serve with a **tiny** pool to force spill+fault-in:
 ```
 # rebuild so kernels match the served model (default target is qwen3-next-80b-a3b)
@@ -234,8 +246,10 @@ ATLAS_TARGET_MODEL=qwen3.6-35b-a3b cargo build --release -p spark-server \
 CKPT=~/.cache/huggingface/hub/models--AEON-7--Qwen3.6-35B-A3B-heretic-NVFP4/snapshots/*/
 ATLAS_SSM_TIER=1 ATLAS_SSM_TAIL_PROTECT=1 ATLAS_SSM_SNAP_STATS=1 RUST_LOG=info \
   ./target/release/spark serve --model-from-path $CKPT --model-name a3b --port 18999 \
-  --lm-head-dtype bf16 --gpu-memory-utilization 0.35 --max-seq-len 8192 --max-batch-size 2 \
+  --lm-head-dtype bf16 --gpu-memory-utilization 0.60 --max-seq-len 8192 --max-batch-size 2 \
   --enable-prefix-caching --ssm-cache-slots 4 --ssm-checkpoint-interval 16
+# NB: util must clear weights+buffers+reserve BEFORE any KV budget — 35B-A3B needs
+# ~46 GB committed, so 0.35 (=42.6 GB) OOMs "No memory left for KV cache"; use >=0.55.
 # workload: a few multi-turn repeated-prefix chats across 2-3 sessions (scripts/dev/agentic_test.py
 # or curl) so the 4-slot pool overflows → spill, and warm turns re-hit → fault-in.
 ```
