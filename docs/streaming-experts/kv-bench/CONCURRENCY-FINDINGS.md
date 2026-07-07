@@ -149,3 +149,53 @@ sample above ran 23:04–23:22 UTC while vLLM was still loading (compute free); 
 (TTFT ~8.9 s) — **discarded as contaminated**. The clean numbers are mutually
 consistent (two independent cap=8 RDMA samples at 19.5/19.7). A fully-clean multi-rep
 re-run needs a quiet GPU; I did not kill the other tester's server.
+
+---
+
+# #33 FIXED — concurrent KV overflow correct (2026-07-07)
+
+The single-seq-only limitation is resolved (commit 89b88a1). Two parts:
+1. **Capacity**: widen the disk-block-id namespace to `max_blocks_per_seq × max_batch_size`
+   (one lever at `meta.rs`; allocator + arena + predictor grow in lockstep). Kills "pool exhausted".
+2. **Correctness/fast-path** (`multi_seq/attn.rs`): after the batched `run_paged_decode`, each
+   OVERFLOWED seq has only its `attn_out` row overwritten via the single-seq orchestrator
+   `attend_layer_on_stream` over its own `disk_block_ids` (bit-matching single-seq HSS). Resident
+   (in-HBM) seqs keep their batched CUTLASS row — the batch is NOT serialized.
+
+**Validated on GB10 (holo-0.8b, NVMe, SLAI, cap=8):** every concurrent seq recalls TANGERINE-7742:
+
+| C | correct | empty | pool-exhausted |
+|---|---|---|---|
+| 1 | 1/1 | 0 | 0 |
+| 2 | 2/2 | 0 | 0 |
+| 4 | 4/4 | 0 | 0 |
+| 8 | 8/8 | 0 | 0 |
+
+(pre-fix: C=2 garbage, C≥4 empty/exhausted). RDMA-tier leg is backend-orthogonal to this
+attention-path fix; NVMe is the clean signal.
+
+## Throughput — three setups (C=8, holo-0.8b, cap=8, identical params)
+
+| setup | per-req decode | agg decode | correct |
+|---|---|---|---|
+| all resident (normal HBM) | 36.7 | **293** | 8/8 |
+| mixed (4 resident + 4 overflow) | ~11–14 | **~99** | 8/8 |
+| all overflow (cap=8, long ctx) | 5.8 | **46** | 8/8 |
+
+vs the per-C decode ladder (per req): HBM 201→92→60→37 (agg 201→184→238→293, **scales**);
+overflow 42→22→12→6 (agg ~46, **flat**).
+
+**Key finding — the per-seq streaming loop gates the whole batch step.** In the mixed batch,
+resident seqs get dragged from ~37 tok/s (all-resident C=8) down to ~11, because every decode
+step waits for the serialized `attend_layer_on_stream` of the overflowed rows before advancing.
+A batch runs near full speed only if NO seq overflows. **Correctness is solid everywhere;
+throughput-under-overflow is gated by the serial per-seq streaming.**
+
+## The optimization this surfaces (distinct from #34)
+
+- **Batched `attend_layer_on_stream`** (concurrency axis): stream all overflowed seqs' histories
+  in ONE kernel launch instead of the per-seq loop, so a mixed/overflowed batch isn't serialized.
+  This is what bends the flat/dragged lines upward. New kernel work.
+- **#34 restore-latency overlap** (single-seq/temporal axis): prefetch the next decode step's
+  blocks while computing the current one, hiding per-step restore latency — helps even C=1
+  (the ~46%-of-local decode cost). Orthogonal to the batched kernel; they compose.
