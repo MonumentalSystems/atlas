@@ -19,8 +19,11 @@
 >   `resident=4` (now correctly = slots). Nearly every warm hit now tier-restores instead of
 >   recomputing.
 >
-> **Phase 2 ✅ LANDED. Phase 3 foundation ✅ LANDED** (3a persistent pin + 3b-i prefetch mechanism,
-> GB10-tested); Phase 3b-ii integration OPEN (see below). Phases 4–6 remain.
+> **Phases 2 & 3 ✅ LANDED + validated on GB10.** Phase 3 (cross-layer KV prefetch, 3a+3b-i+3b-ii)
+> is complete and **live-validated correct** (prefetch on vs off = byte-identical output on a real
+> KV-overflow decode); it shows **no perf gain on fast local NVMe** (read not the bottleneck) and is a
+> ready lever for the slow-tier (NFS/RDMA) / deep-overflow regime. Phases 4–6 remain (Phase 4a =
+> native-quant KV tier — deferred: a lot of kernel/layout work for a spot not currently bottlenecked).
 
 ### Phase 3 — foundation LANDED (2026-07-07), integration OPEN
 Cross-layer prefetch: hide the tier read for attention layer L+1 behind the SSM+MoE compute
@@ -34,7 +37,22 @@ between L and L+1. Built + GB10-tested the correctness-critical foundation:
   next-layer prefetch; avoids a full-pinned-tile deadlock; stream-ordered so evict+overwrite is
   safe). GB10-tested: prefetch pins block 0 → attend consumes it → byte-correct output → block
   unpinned.
-- **3b-ii — OPEN, architecturally significant.** The scoping surfaced a real constraint: HSS is a
+- **3b-ii — LANDED + live-validated (2026-07-07).** Chose the **side-stream, no-thread** design over
+  the I/O-thread/`Arc<Mutex>` rework: the io_uring read already `stream_sync`s, so running prefetch on
+  a side CUDA stream (`cuda_min::create_stream`) makes its H2D overlap main-stream compute while the CPU
+  block overlaps already-enqueued SSM/MoE kernels — no shared-HSS, no touching the `unsafe Sync`
+  assumption. `decode_a2.rs` triggers `hss.prefetch_layer(next_attn_idx, disk_block_ids)` for each
+  overflowed seq when the next layer is full-attention. Gated `ATLAS_KV_PREFETCH`.
+  - **Live A/B (Qwen3.6-35B-A3B, GB10, `--high-speed-swap-cache-blocks-per-seq 64`, 2250-tok prompt →
+    KV overflow):** prefetch on vs off → **byte-identical output**, **identical 22 tok/s**. So it's
+    **correct** (the pin + prefetch don't corrupt) but delivers **no measurable win here** — local NVMe
+    (~GB/s) + ~1200-tok overflow means the tier read isn't the bottleneck. The overlap only pays when the
+    read dominates: a **slow tier (NFS ~2 GB/s / RDMA) or deep overflow**. It's a correct, ready lever
+    that will show its value in the over-core NFS/RDMA regime, not on fast local NVMe.
+  - **LEARNING**: use the **release** build for 35B serve iteration — debug loads in ~7 min (unoptimized
+    host-side BF16→FP32 weight promotion), release in **~40 s** and decodes faster; the fast weight
+    loader is auto-on either way.
+- **(historical) 3b-ii scoping note — architecturally significant.** The scoping surfaced a real constraint: HSS is a
   **thread-local `RefCell` singleton** and `backend.read` is **CPU-blocking**. A prefetch issued
   from the scheduler thread therefore overlaps only kernels *already enqueued* (L's FFN), NOT the
   SSM layers the same single CPU thread enqueues *after* the prefetch call — so triggering
@@ -149,7 +167,7 @@ from recompute → fault-in.
 | **0** ✅ | Instrument + enlarge Marconi pool | Measure the SSM thrash + realistic baseline; prove pool-size (not a bug) is the loss. Sweep `ssm_cache_slots` (16→128), add hit-rate / warm-TTFT / read-bytes / CPU telemetry. **Cheapest lever first.** | very low (config+telemetry; watch HBM OOM) |
 | **1** ✅ | **SSM snapshots onto the cascade — spill-not-drop** — DONE + LIVE-VALIDATED on GB10 (154 spills / 0 drops / 13 fault-ins over 72 requests, 0 errors, recompute-on-hit 4400→15 tok). 1a byte-mover+tier · 1b-core state-machine · 1b-integration serving-wiring. | *Headline win.* Second cascade instance (`GroupLayout num_layers=1`, synthetic elem so `group_stride == num_ssm_layers×(h+conv)`) reusing every hardened byte-mover — zero change to trait/GroupKey/ScratchPool/KV-attn. `SnapshotEntry` → `Location{Hbm(slot)｜Tier(key)}`; evict **spills** not drops; prefix-lookup faults back in. Gated `$ATLAS_SSM_TIER` (default off = byte-identical). | low-med — **cross-stream ordering** vs `wait_snapshot_saves_dispatch` (a fault-in reading a half-written snapshot = silent state corruption); pin slots during fault-in |
 | **2** ✅ | **Per-seq orchestrator isolation** | Move transient orchestrator state (copy_stream, S-planes, events, `war_armed`) off the shared thread-local `HighSpeedSwap` into a per-seq context. Ships no perf; **unblocks 3 & 5**. Re-state the `unsafe Sync` soundness. | med — under-scoping reintroduces the exact 6/8 C=8 race that killed the tile-pipeline |
-| **3** 🔨 | Cross-layer prefetch (deep lever A) — **foundation landed** (3a pin + 3b-i prefetch mechanism, GB10-tested); 3b-ii decode-loop async integration OPEN (needs an I/O thread — see below) | Hide tier reads behind the **SSM+MoE/FFN compute between two attention layers** (not the thin within-layer slice the pipeline tried) — for both KV and SSM fault-ins. The only overlap with enough compute. | med — a pin bug silently corrupts attention (wrong-layer blocks); must be measured at the agentic regime not cap=8 |
+| **3** ✅ | Cross-layer prefetch (deep lever A) — **LANDED + live-validated correct** (3a pin + 3b-i prefetch + 3b-ii side-stream + decode-loop trigger, gated `ATLAS_KV_PREFETCH`). **No perf gain on fast local NVMe** (read not the bottleneck there); the overlap pays off for slow tiers (NFS/RDMA) / deep overflow. | Hide tier reads behind the **SSM+MoE/FFN compute between two attention layers**. | med — a pin bug silently corrupts attention (wrong-layer blocks); must be measured at the agentic regime not cap=8 |
 | **4** | Reduce read volume — **native-quant tier storage** (deep lever B) | Stop the BF16 inflation: `decode/high_speed_swap.rs:232-289` dequants FP8/NVFP4/4-bit → BF16 *before* `write_from_host`, so quantized history is stored + re-read at **2–4×**. Store native-quant bytes; dequant on read. **Biggest concrete byte cut.** | med — wide per-format correctness surface (FP8/NVFP4/Turbo3/4/8); needs a per-format numeric-diff harness |
 | **5** | Parallel per-seq CPU orchestration (deep lever C) | De-serialize the `multi_seq/attn.rs:203` per-seq loop **without dropping the cache** — kills the observed **2-cores-pegged / spiky-throughput** symptom under C=8. | med-high — highest concurrency risk; breaks `unsafe Sync` if widened silently (UB, not just a race); thread-pool footgun on the shared box |
 | **6** | *(optional capstone)* one namespaced `BlobKey` space | Permanently kill KV/SSM re-divergence: one address space, one policy, per-namespace budgets. Only if cross-arbitration / shared budget proves worthwhile. | med — addressing/off-by-one cross-write hazard (KV over SSM bytes); pure hygiene, zero new user value |
