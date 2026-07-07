@@ -33,6 +33,18 @@ pub trait StorageBackend: Send + Sync {
     /// can issue subsequent kernels that depend on the data.
     fn read(&mut self, requests: &[ReadRequest], stream: u64) -> Result<()>;
 
+    /// Pipelined variant for the tile double-buffer: issue the H2D transfers
+    /// for `requests` on the caller-supplied copy `stream` and return WITHOUT
+    /// stream-synchronising. The caller records its own read-done event on
+    /// `stream` and gates the consuming kernel via `CudaEvent::wait`, so the
+    /// large latency-bound K/V reads for tile[t+1] overlap tile[t]'s attention
+    /// on the compute stream. The default falls back to the synchronous
+    /// `read()` (correct but serial — no overlap) for backends that have not
+    /// yet split their read path (posix / rdma / cascade).
+    fn read_async(&mut self, requests: &[ReadRequest], stream: u64) -> Result<()> {
+        self.read(requests, stream)
+    }
+
     /// One-shot sequential write — used at offload time to populate disk
     /// from a host-side K/V buffer.
     fn write_from_host(&mut self, key: GroupKey, src: &[u8]) -> Result<()>;

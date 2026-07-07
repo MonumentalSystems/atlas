@@ -24,6 +24,7 @@ unsafe extern "C" {
     fn cuMemHostGetDevicePointer_v2(pdptr: *mut u64, p: *mut c_void, flags: u32) -> i32;
     fn cuMemcpyHtoDAsync_v2(dst: u64, src: *const c_void, bytes: usize, stream: u64) -> i32;
     fn cuMemcpyDtoHAsync_v2(dst: *mut c_void, src: u64, bytes: usize, stream: u64) -> i32;
+    fn cuMemcpyDtoDAsync_v2(dst: u64, src: u64, bytes: usize, stream: u64) -> i32;
     fn cuMemGetInfo_v2(free: *mut usize, total: *mut usize) -> i32;
     fn cuStreamCreate(phStream: *mut u64, flags: u32) -> i32;
     fn cuStreamDestroy_v2(stream: u64) -> i32;
@@ -172,6 +173,37 @@ pub fn copy_d_to_h_async(dst: *mut c_void, src: u64, bytes: usize, stream: u64) 
     let s = unsafe { cuMemcpyDtoHAsync_v2(dst, src, bytes, stream) };
     if s != 0 {
         bail!("cuMemcpyDtoHAsync_v2 failed: {s}");
+    }
+    Ok(())
+}
+
+/// Device-to-device async copy on `stream`. Used by the tile pipeline to
+/// backfill a freshly-read streaming-plane slot into its assigned resident
+/// cache slot (so cross-step lookup-hits read correct bytes).
+pub fn copy_d_to_d_async(dst: u64, src: u64, bytes: usize, stream: u64) -> Result<()> {
+    let s = unsafe { cuMemcpyDtoDAsync_v2(dst, src, bytes, stream) };
+    if s != 0 {
+        bail!("cuMemcpyDtoDAsync_v2 failed: {s}");
+    }
+    Ok(())
+}
+
+/// Create a stream on the current context (flags=0). The tile pipeline owns a
+/// sibling copy stream so tile[t+1]'s tier read overlaps tile[t]'s attention.
+pub fn create_stream() -> Result<u64> {
+    let mut s = 0u64;
+    let r = unsafe { cuStreamCreate(&mut s, 0) };
+    if r != 0 {
+        bail!("cuStreamCreate failed: {r}");
+    }
+    Ok(s)
+}
+
+/// Destroy a stream created by [`create_stream`].
+pub fn destroy_stream(stream: u64) -> Result<()> {
+    let r = unsafe { cuStreamDestroy_v2(stream) };
+    if r != 0 {
+        bail!("cuStreamDestroy_v2 failed: {r}");
     }
     Ok(())
 }

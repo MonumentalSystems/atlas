@@ -107,10 +107,14 @@ impl IoUringBackend {
         }
         Ok(())
     }
-}
 
-impl StorageBackend for IoUringBackend {
-    fn read(&mut self, requests: &[ReadRequest], stream: u64) -> Result<()> {
+    /// Core read loop: submit every request through the pinned-buffer ring and
+    /// issue the H2D copies on `stream`, recording a per-buffer `CudaEvent` for
+    /// WAR-safe buffer reuse. Does NOT stream-sync and does NOT clear the
+    /// events — the two callers differ only in that tail:
+    /// `read` (synchronous) drains + frees the events; `read_async`
+    /// (pipelined) leaves them live for the next call's `wait_buffer_free`.
+    fn read_inner(&mut self, requests: &[ReadRequest], stream: u64) -> Result<()> {
         let bytes = self.layout.group_bytes() as u32;
         // user_data layout: high 16 bits = req index, low 16 bits = buf index.
         // (We never submit > 65k requests in one batch.)
@@ -171,6 +175,13 @@ impl StorageBackend for IoUringBackend {
                 completed += 1;
             }
         }
+        Ok(())
+    }
+}
+
+impl StorageBackend for IoUringBackend {
+    fn read(&mut self, requests: &[ReadRequest], stream: u64) -> Result<()> {
+        self.read_inner(requests, stream)?;
         // After all reads have produced device data, finalise the stream
         // (matches PosixBackend semantics: at return, the stream is synced).
         stream_sync(stream)?;
@@ -179,6 +190,14 @@ impl StorageBackend for IoUringBackend {
             *slot = None;
         }
         Ok(())
+    }
+
+    /// Pipelined read: issue the H2D copies on the caller's copy `stream` and
+    /// return without syncing. Per-buffer events stay live so the next call's
+    /// `wait_buffer_free` self-synchronises pinned-buffer reuse (the WAR gate);
+    /// the caller records its own read-done event on `stream` for the RAW gate.
+    fn read_async(&mut self, requests: &[ReadRequest], stream: u64) -> Result<()> {
+        self.read_inner(requests, stream)
     }
 
     fn write_from_host(&mut self, key: GroupKey, src: &[u8]) -> Result<()> {

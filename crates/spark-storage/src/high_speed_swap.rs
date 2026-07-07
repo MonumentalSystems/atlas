@@ -44,6 +44,17 @@ pub struct HighSpeedSwap {
     block_table_dev: DeviceBuffer,  // [tile_capacity] i32
     counts_dev: DeviceBuffer,       // [1] i32 (single seq)
     score_host_buf: Vec<f32>,
+    // Tile pipeline (see impl_more::attend_layer_on_stream_with_q_pos): a
+    // sibling copy stream carries tile[t+1]'s miss reads while tile[t]'s
+    // attention runs on the compute stream. `ev_read[plane]` is the RAW gate
+    // (compute waits for the plane's reads to land); `ev_war[plane]` is the
+    // plane-reuse gate (the copy stream waits for the prior consumer of that
+    // plane to finish before overwriting it). `war_armed` skips the very first
+    // wait on each plane, before any consumer has recorded ev_war.
+    copy_stream: u64,
+    ev_read: [crate::cuda_min::CudaEvent; 2],
+    ev_war: [crate::cuda_min::CudaEvent; 2],
+    war_armed: [bool; 2],
     // Disk-block-ID allocator (Phase 6.1.a, refactored). One global
     // allocator: a `disk_block_id` indexes the SAME logical position
     // across every layer's file, so allocation, refcount, and free list
@@ -125,6 +136,11 @@ impl HighSpeedSwap {
         let want_uma = std::env::var("ATLAS_KV_ZERO_COPY").ok().as_deref() == Some("1");
         let dims = ScratchDims {
             num_slots: cfg.resident_blocks,
+            // Two extra streaming planes (S_A, S_B) of one tile each for the
+            // tile pipeline's ping-pong double-buffer. The resident cache stays
+            // exactly `resident_blocks` slots; these planes are never entered
+            // into the cache maps (see ScratchDims::stream_slots).
+            stream_slots: 2 * cfg.resident_blocks,
             num_kv_heads: model.num_kv_heads,
             group_stride: group_layout.group_stride,
         };
@@ -206,6 +222,15 @@ impl HighSpeedSwap {
         let counts_dev = DeviceBuffer::new(4)?;
         let score_host_buf = vec![0.0_f32; model.max_blocks_per_layer as usize];
         let disk_state = DiskState::new();
+        let copy_stream = crate::cuda_min::create_stream()?;
+        let ev_read = [
+            crate::cuda_min::CudaEvent::new()?,
+            crate::cuda_min::CudaEvent::new()?,
+        ];
+        let ev_war = [
+            crate::cuda_min::CudaEvent::new()?,
+            crate::cuda_min::CudaEvent::new()?,
+        ];
         Ok(Self {
             cfg,
             model,
@@ -220,6 +245,10 @@ impl HighSpeedSwap {
             counts_dev,
             score_host_buf,
             disk_state,
+            copy_stream,
+            ev_read,
+            ev_war,
+            war_armed: [false, false],
         })
     }
 
@@ -288,6 +317,14 @@ impl HighSpeedSwap {
             scratch_pool_resident: self.pool.dims().num_slots,
             scratch_pool_free: self.pool.free_count(),
         }
+    }
+}
+
+impl Drop for HighSpeedSwap {
+    fn drop(&mut self) {
+        // Tear down the sibling copy stream. Declaration order already drops
+        // `backend` before `pool`; the copy stream is independent of both.
+        let _ = crate::cuda_min::destroy_stream(self.copy_stream);
     }
 }
 

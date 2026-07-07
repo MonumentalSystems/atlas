@@ -37,6 +37,12 @@ pub struct ResidentKey {
 #[derive(Clone, Copy, Debug)]
 pub struct ScratchDims {
     pub num_slots: u32,
+    /// Extra slots appended AFTER the `num_slots` resident-cache region, used
+    /// purely as a streaming ping-pong plane by the tile pipeline. They are
+    /// NEVER entered into `residents`/`free_list`/`lookup`, so cache residency
+    /// is byte-for-byte independent of this value. 0 = classic single-region
+    /// pool (all existing callers/tests).
+    pub stream_slots: u32,
     pub num_kv_heads: u16,
     pub group_stride: u64, // bytes per (block, kv_head) stripe
 }
@@ -46,7 +52,7 @@ impl ScratchDims {
         (2 * self.num_kv_heads as u64 * self.group_stride) as usize
     }
     pub fn pool_bytes(&self) -> usize {
-        self.num_slots as usize * self.slot_bytes()
+        (self.num_slots + self.stream_slots) as usize * self.slot_bytes()
     }
 }
 
@@ -170,6 +176,17 @@ impl ScratchPool {
             + (self.dims.num_kv_heads as u64 + kv_head as u64) * self.dims.group_stride
     }
 
+    /// Absolute slot index into the streaming plane `plane` (0 or 1) at packed
+    /// offset `j`. The streaming planes live immediately after the resident
+    /// cache region `[0, num_slots)`, each `num_slots` wide, so slot geometry
+    /// (slot_dev_ptr / slot_k_ptr / slot_v_ptr) addresses them identically to
+    /// cache slots. These indices are NEVER inserted into the cache maps, so
+    /// residency/eviction outcomes are unaffected. Requires `stream_slots >=
+    /// (plane + 1) * num_slots`.
+    pub fn stream_slot_abs(&self, plane: u32, j: u32) -> u32 {
+        self.dims.num_slots + plane * self.dims.num_slots + j
+    }
+
     pub fn lookup(&self, key: ResidentKey) -> Option<u32> {
         self.lookup.get(&key).copied()
     }
@@ -272,6 +289,7 @@ mod tests {
         let _ctx = ctx();
         let mut pool = ScratchPool::new(ScratchDims {
             num_slots: 4,
+            stream_slots: 0,
             num_kv_heads: 2,
             group_stride: 4096,
         })
@@ -308,6 +326,7 @@ mod tests {
         let _ctx = ctx();
         let pool = ScratchPool::new(ScratchDims {
             num_slots: 2,
+            stream_slots: 0,
             num_kv_heads: 4,
             group_stride: 4096,
         })
@@ -327,6 +346,7 @@ mod tests {
         let _ctx = ctx();
         let pool = ScratchPool::new_preferring_uma(ScratchDims {
             num_slots: 2,
+            stream_slots: 0,
             num_kv_heads: 4,
             group_stride: 4096,
         })

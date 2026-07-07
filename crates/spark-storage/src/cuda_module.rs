@@ -27,6 +27,7 @@ unsafe extern "C" {
     fn cuEventRecord(event: u64, stream: u64) -> i32;
     fn cuEventSynchronize(event: u64) -> i32;
     fn cuEventDestroy_v2(event: u64) -> i32;
+    fn cuStreamWaitEvent(stream: u64, event: u64, flags: u32) -> i32;
 }
 
 /// Loaded CUmodule with cached function lookups. Drop unloads.
@@ -99,6 +100,16 @@ impl CudaEvent {
         let s = unsafe { cuEventSynchronize(self.handle) };
         if s != 0 {
             bail!("cuEventSynchronize failed: {s}");
+        }
+        Ok(())
+    }
+    /// Device-side cross-stream wait: make `stream` block until this event
+    /// completes, without stalling the host (unlike `sync`). Used by the
+    /// tile pipeline to gate a compute-stream kernel on a copy-stream read.
+    pub fn wait(&self, stream: u64) -> Result<()> {
+        let s = unsafe { cuStreamWaitEvent(stream, self.handle, 0) };
+        if s != 0 {
+            bail!("cuStreamWaitEvent failed: {s}");
         }
         Ok(())
     }

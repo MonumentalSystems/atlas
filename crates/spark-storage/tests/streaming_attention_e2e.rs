@@ -109,6 +109,7 @@ fn run_streaming<B: StorageBackend + ?Sized>(
 ) -> Vec<bf16> {
     let mut pool = ScratchPool::new(ScratchDims {
         num_slots: tile_size as u32,
+        stream_slots: 0,
         num_kv_heads: NUM_KV_HEADS,
         group_stride,
     })

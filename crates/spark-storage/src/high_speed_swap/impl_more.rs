@@ -8,7 +8,9 @@ use std::ffi::c_void;
 use super::HighSpeedSwap;
 use crate::backend::ReadRequest;
 use crate::config::HighSpeedSwapConfig;
-use crate::cuda_min::{CudaCtx, copy_d_to_h_async, copy_h_to_d_async, stream_sync};
+use crate::cuda_min::{
+    CudaCtx, copy_d_to_d_async, copy_d_to_h_async, copy_h_to_d_async, stream_sync,
+};
 use crate::group::{GroupKey, KvKind};
 use crate::predictor::Predictor;
 use crate::scratch_pool::{ResidentKey, ScratchPool};
@@ -216,98 +218,194 @@ impl HighSpeedSwap {
         )?;
         stream_sync(stream)?;
 
-        // 3. Tile loop.
+        // 3. Tile loop — software-pipelined (depth-1 look-ahead). tile[t+1]'s
+        //    miss reads run on `copy_stream` (into a ping-pong streaming plane)
+        //    while tile[t]'s attention runs on `stream`; CUDA events gate the
+        //    RAW hazard (reads landed) and plane-reuse WAR hazard. The eviction
+        //    cache is untouched: planning runs in the SAME tile order as the
+        //    serial path, only the miss reads are redirected to the S plane,
+        //    then backfilled D2D into their assigned resident slot so cross-step
+        //    lookup-hits still read correct bytes.
         self.attn.begin_step_on_stream(stream, 1)?;
         let tile_cap = self.cfg.resident_blocks as usize;
-        let mut tile_idx = 0;
-        while tile_idx < seq_block_ids.len() {
-            let tile_end = (tile_idx + tile_cap).min(seq_block_ids.len());
-            let tile = &seq_block_ids[tile_idx..tile_end];
+        let n = seq_block_ids.len();
+        // Tile [start, end) ranges over the sequence's block list.
+        let mut tiles: Vec<(usize, usize)> = Vec::new();
+        let mut ti = 0;
+        while ti < n {
+            let te = (ti + tile_cap).min(n);
+            tiles.push((ti, te));
+            ti = te;
+        }
+        let num_tiles = tiles.len();
+        let (s_blk, s_tok, s_kvh) = self.attn.scratch_pool_strides();
+        let v_off = (self.model.num_kv_heads as u64)
+            * (self.model.block_size as u64)
+            * (self.model.head_dim as u64)
+            * 2;
+        let slot_bytes = self.pool.dims().slot_bytes();
+        if num_tiles > 0 {
+            // Pipeline fill: plan tile 0 into plane 0 and launch its reads.
+            let (t0s, t0e) = tiles[0];
+            let mut pending: Option<(Vec<i32>, Vec<(u64, u64)>)> =
+                Some(self.plan_and_read(layer, &seq_block_ids[t0s..t0e], 0)?);
+            for t in 0..num_tiles {
+                let (block_table, backfill) = pending.take().expect("pipeline slot filled");
+                let (ts, te) = tiles[t];
+                let tile_len = te - ts;
+                let half = t % 2;
 
-            // Pin slots already resident for tile blocks; mark them touched.
-            let mut block_table = vec![0_i32; tile_cap];
-            let mut pinned: Vec<u32> = Vec::new();
-            // First pass: identify which tile blocks are missing.
-            let mut missing: Vec<u32> = Vec::new();
-            for (i, &blk) in tile.iter().enumerate() {
-                let key = ResidentKey { layer, block: blk };
-                if let Some(slot) = self.pool.lookup(key) {
-                    block_table[i] = slot as i32;
-                    pinned.push(slot);
-                    self.eviction.touch(slot);
+                // Consume tile[t] on the compute stream.
+                // RAW: wait until tile[t]'s K/V reads have landed in S[half].
+                self.ev_read[half].wait(stream)?;
+                let counts = [tile_len as i32];
+                copy_h_to_d_async(
+                    self.block_table_dev.ptr,
+                    block_table.as_ptr() as *const c_void,
+                    tile_cap * 4,
+                    stream,
+                )?;
+                copy_h_to_d_async(
+                    self.counts_dev.ptr,
+                    counts.as_ptr() as *const c_void,
+                    4,
+                    stream,
+                )?;
+                // Causal mask: only apply on the FINAL tile of the seq's block
+                // list. Earlier tiles are full blocks of historical K/V.
+                let lbvs = if te == n {
+                    last_block_valid_slots
                 } else {
-                    missing.push(blk);
+                    self.model.block_size as i32
+                };
+                self.attn.step_tile_on_stream(
+                    stream,
+                    q_dev,
+                    self.pool.pool_dev_ptr(),
+                    self.pool.pool_dev_ptr() + v_off,
+                    self.block_table_dev.ptr,
+                    self.counts_dev.ptr,
+                    1,
+                    s_blk,
+                    s_tok,
+                    s_kvh,
+                    lbvs,
+                )?;
+                // Backfill each miss's S-plane slot into its assigned resident
+                // cache slot (D2D on the compute stream, AFTER step_tile so no
+                // resident hit slot is clobbered while step_tile still reads
+                // it). Makes R's bytes match what `lookup` claims is resident.
+                for &(r_ptr, s_ptr) in &backfill {
+                    copy_d_to_d_async(r_ptr, s_ptr, slot_bytes, stream)?;
                 }
-            }
-            // Second pass: assign + read missing blocks.
-            let mut reqs: Vec<ReadRequest> = Vec::new();
-            for &blk in &missing {
-                let key = ResidentKey { layer, block: blk };
-                let candidates = self.eviction.rank(&pinned);
-                let slot = self.pool.assign(key, &candidates)?;
-                pinned.push(slot);
-                self.eviction.touch(slot);
-                self.eviction
-                    .record_score(slot, self.score_host_buf[blk as usize]);
-                // Find this block's index in the tile so the block_table is right.
-                let idx = tile.iter().position(|&x| x == blk).unwrap();
-                block_table[idx] = slot as i32;
-                for kh in 0..self.model.num_kv_heads {
-                    reqs.push(ReadRequest {
-                        group: GroupKey::new(layer, blk, kh, KvKind::K),
-                        dst_dev_ptr: self.pool.slot_k_ptr(slot, kh),
-                    });
-                    reqs.push(ReadRequest {
-                        group: GroupKey::new(layer, blk, kh, KvKind::V),
-                        dst_dev_ptr: self.pool.slot_v_ptr(slot, kh),
-                    });
-                }
-            }
-            self.backend.read(&reqs, stream)?;
+                // WAR: plane[half] is free once step_tile + backfill have
+                // consumed it; the next refill of this plane waits on this.
+                self.ev_war[half].record(stream)?;
+                self.war_armed[half] = true;
 
-            // 4. Tiled attention launch.
-            let counts = [(tile.len()) as i32];
-            copy_h_to_d_async(
-                self.block_table_dev.ptr,
-                block_table.as_ptr() as *const c_void,
-                tile_cap * 4,
-                stream,
-            )?;
-            copy_h_to_d_async(
-                self.counts_dev.ptr,
-                counts.as_ptr() as *const c_void,
-                4,
-                stream,
-            )?;
-            let (s_blk, s_tok, s_kvh) = self.attn.scratch_pool_strides();
-            let v_off = (self.model.num_kv_heads as u64)
-                * (self.model.block_size as u64)
-                * (self.model.head_dim as u64)
-                * 2;
-            // Causal mask: only apply on the FINAL tile of the seq's block
-            // list. Earlier tiles are full blocks of historical K/V.
-            let lbvs = if tile_end == seq_block_ids.len() {
-                last_block_valid_slots
-            } else {
-                self.model.block_size as i32
-            };
-            self.attn.step_tile_on_stream(
-                stream,
-                q_dev,
-                self.pool.pool_dev_ptr(),
-                self.pool.pool_dev_ptr() + v_off,
-                self.block_table_dev.ptr,
-                self.counts_dev.ptr,
-                1,
-                s_blk,
-                s_tok,
-                s_kvh,
-                lbvs,
-            )?;
-            tile_idx = tile_end;
+                // Produce tile[t+1] on the copy stream (depth-1 look-ahead) so
+                // its reads overlap tile[t]'s attention above.
+                if t + 1 < num_tiles {
+                    let (ns, ne) = tiles[t + 1];
+                    let next_plane = ((t + 1) % 2) as u32;
+                    pending = Some(self.plan_and_read(layer, &seq_block_ids[ns..ne], next_plane)?);
+                }
+            }
         }
         self.attn.finalize_on_stream(stream, output_dev, 1)?;
         Ok(())
+    }
+
+    /// Plan one tile against the eviction cache (identical residency decisions
+    /// to the serial path) and emit the pipeline artifacts:
+    ///   - `block_table`: per-tile-position slot indices. HITs point at their
+    ///     resident `R` slot (unchanged); MISSes point at the streaming plane
+    ///     slot `stream_slot_abs(plane, j)` where the fresh read lands.
+    ///   - `reqs`: the miss reads, targeted at the S-plane slots.
+    ///   - `backfill`: `(resident_slot_ptr, s_plane_slot_ptr)` pairs so the
+    ///     caller can copy each freshly-read S slot into its assigned resident
+    ///     slot after attention consumes the tile.
+    ///
+    /// This mutates ONLY the cache (`pool` residents/lookup + `eviction`), in
+    /// the exact call order the serial loop used, so residency is bit-identical.
+    #[allow(clippy::type_complexity)]
+    fn plan_tile(
+        &mut self,
+        layer: u32,
+        tile: &[u32],
+        plane: u32,
+    ) -> Result<(Vec<i32>, Vec<ReadRequest>, Vec<(u64, u64)>)> {
+        let tile_cap = self.cfg.resident_blocks as usize;
+        let mut block_table = vec![0_i32; tile_cap];
+        let mut pinned: Vec<u32> = Vec::new();
+        // Pass 1: resident (cache-hit) blocks resolve to their R slot; touch LRU.
+        let mut missing: Vec<u32> = Vec::new();
+        for (i, &blk) in tile.iter().enumerate() {
+            let key = ResidentKey { layer, block: blk };
+            if let Some(slot) = self.pool.lookup(key) {
+                block_table[i] = slot as i32;
+                pinned.push(slot);
+                self.eviction.touch(slot);
+            } else {
+                missing.push(blk);
+            }
+        }
+        // Pass 2: assign a resident slot per miss (identical cache decisions to
+        // the serial path), but point the block_table at the ping-pong S plane
+        // where its fresh read will land, and record the S->R backfill.
+        let mut reqs: Vec<ReadRequest> = Vec::new();
+        let mut backfill: Vec<(u64, u64)> = Vec::new();
+        let mut j: u32 = 0;
+        for &blk in &missing {
+            let key = ResidentKey { layer, block: blk };
+            let candidates = self.eviction.rank(&pinned);
+            let slot = self.pool.assign(key, &candidates)?;
+            pinned.push(slot);
+            self.eviction.touch(slot);
+            self.eviction
+                .record_score(slot, self.score_host_buf[blk as usize]);
+            // Find this block's index in the tile so the block_table is right.
+            let idx = tile.iter().position(|&x| x == blk).unwrap();
+            let s_abs = self.pool.stream_slot_abs(plane, j);
+            block_table[idx] = s_abs as i32;
+            for kh in 0..self.model.num_kv_heads {
+                reqs.push(ReadRequest {
+                    group: GroupKey::new(layer, blk, kh, KvKind::K),
+                    dst_dev_ptr: self.pool.slot_k_ptr(s_abs, kh),
+                });
+                reqs.push(ReadRequest {
+                    group: GroupKey::new(layer, blk, kh, KvKind::V),
+                    dst_dev_ptr: self.pool.slot_v_ptr(s_abs, kh),
+                });
+            }
+            // Full-slot D2D backfill: S plane slot -> assigned resident slot.
+            backfill.push((self.pool.slot_dev_ptr(slot), self.pool.slot_dev_ptr(s_abs)));
+            j += 1;
+        }
+        Ok((block_table, reqs, backfill))
+    }
+
+    /// Plan `tile` into `plane`, then issue its miss reads on the copy stream
+    /// (no stream-sync) and record the read-done event. Returns the persistent
+    /// pipeline artifacts (block_table + backfill) the consume phase needs.
+    fn plan_and_read(
+        &mut self,
+        layer: u32,
+        tile: &[u32],
+        plane: u32,
+    ) -> Result<(Vec<i32>, Vec<(u64, u64)>)> {
+        let (block_table, reqs, backfill) = self.plan_tile(layer, tile, plane)?;
+        // WAR: don't refill this plane until its previous consumer (step_tile +
+        // backfill two tiles back) has finished reading it. Skipped the first
+        // time each plane is used (nothing has consumed it yet).
+        if self.war_armed[plane as usize] {
+            self.ev_war[plane as usize].wait(self.copy_stream)?;
+        }
+        // Latency-bound K/V reads run on the copy stream (no stream-sync); the
+        // read-done event lets the compute stream gate step_tile on completion.
+        self.backend.read_async(&reqs, self.copy_stream)?;
+        self.ev_read[plane as usize].record(self.copy_stream)?;
+        Ok((block_table, backfill))
     }
 
     /// Test/diag accessors.
