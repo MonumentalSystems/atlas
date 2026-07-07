@@ -400,6 +400,16 @@ impl HighSpeedSwap {
         Ok(())
     }
 
+    /// Phase 3: prefetch `layer`'s blocks on the internal **side stream** so the
+    /// H2D copies overlap the main stream's compute. Convenience over
+    /// `prefetch_layer_on_stream`. The scheduler calls this for the NEXT
+    /// attention layer's blocks while the intervening SSM+MoE layers' kernels
+    /// are enqueued on the main stream, hiding the tier read behind that compute.
+    pub fn prefetch_layer(&mut self, layer: u32, seq_block_ids: &[u32]) -> Result<()> {
+        let s = self.prefetch_stream;
+        self.prefetch_layer_on_stream(s, layer, seq_block_ids)
+    }
+
     /// Test/diag accessors.
     pub fn pool(&self) -> &ScratchPool {
         &self.pool

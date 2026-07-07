@@ -183,3 +183,16 @@ pub fn stream_sync(stream: u64) -> Result<()> {
     }
     Ok(())
 }
+
+/// Create a new CUDA stream on the current context. Used for a **side stream**
+/// so Phase-3 prefetch H2D copies run concurrently with the main stream's
+/// SSM/MoE compute (the copy and compute engines overlap on GB10). The caller
+/// owns the returned handle for its lifetime.
+pub fn create_stream() -> Result<u64> {
+    let mut stream = 0u64;
+    let s = unsafe { cuStreamCreate(&mut stream, 0) };
+    if s != 0 {
+        bail!("cuStreamCreate failed: {s}");
+    }
+    Ok(stream)
+}

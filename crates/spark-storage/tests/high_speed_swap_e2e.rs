@@ -203,11 +203,12 @@ fn orchestrator_multi_tile_with_eviction() {
     .unwrap();
     let seq_blocks: Vec<u32> = (0..SEQ_BLOCKS).collect();
 
-    // Phase 3: prefetch layer 0's blocks (reserve + load + PIN the first tile),
-    // so the attend below finds them resident and consumes+unpins them. The
+    // Phase 3: prefetch layer 0's blocks on the SIDE stream (reserve + load +
+    // PIN the first tile), so the main-stream attend below finds them resident
+    // and consumes+unpins them. The side-stream read self-syncs its H2D before
+    // returning, so the subsequent main-stream attend sees committed data. The
     // first block must be resident and pinned after prefetch.
-    hss.prefetch_layer_on_stream(ctx.stream, 0, &seq_blocks)
-        .unwrap();
+    hss.prefetch_layer(0, &seq_blocks).unwrap();
     let key0 = spark_storage::scratch_pool::ResidentKey { layer: 0, block: 0 };
     let slot0 = hss
         .pool()

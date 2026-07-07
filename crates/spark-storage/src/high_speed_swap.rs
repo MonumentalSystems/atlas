@@ -48,6 +48,13 @@ pub struct HighSpeedSwap {
     /// touches slot `i` under a barrier, a future pipeline can overlap slots.
     /// The shared `pool`/`backend`/`predictor`/`disk_state` stay single-owner.
     scratch: Vec<SeqScratch>,
+    /// Phase 3: a side CUDA stream for prefetch H2D copies. Running the prefetch
+    /// read on this stream (rather than the main compute stream) lets its H2D
+    /// copies overlap the main stream's SSM/MoE kernels — the copy and compute
+    /// engines run concurrently on GB10. The CPU still blocks in the io_uring
+    /// drain, but that block overlaps the already-enqueued main-stream compute,
+    /// which is where the read is hidden.
+    prefetch_stream: u64,
     // Disk-block-ID allocator (Phase 6.1.a, refactored). One global
     // allocator: a `disk_block_id` indexes the SAME logical position
     // across every layer's file, so allocation, refcount, and free list
@@ -242,6 +249,7 @@ impl HighSpeedSwap {
         // One scratch slot to start; `attend_layer` grows the Vec on first use
         // of each higher batch position (lazy — avoids plumbing max_batch_size).
         let scratch = vec![SeqScratch::new(&attn, &model, &cfg)?];
+        let prefetch_stream = crate::cuda_min::create_stream()?;
         let disk_state = DiskState::new();
         Ok(Self {
             cfg,
@@ -252,6 +260,7 @@ impl HighSpeedSwap {
             attn,
             eviction,
             scratch,
+            prefetch_stream,
             disk_state,
         })
     }
