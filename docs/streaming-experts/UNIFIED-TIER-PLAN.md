@@ -497,3 +497,44 @@ host orchestration so qwen was fine for it, but quality judgments need the trust
 **Recommendation:** land Inc 3 (union read + `step_tile(num_seqs=C)` wide launch, per the §Phase 5 plan
 + the H1 release-active plane-capacity bail that already guards it) as the next increment — that is where
 the measured `∝N` attention cost is actually attackable. Re-measure on Holo 3.1 35B.
+
+### Phase 5 Inc 3 — LANDED + GPU-validated (2026-07-07); C=8 NVMe measurement = read-bound, NO win (RDMA next)
+Wide `grid=(C,nq,1)` launch + union tier read (359591f). Kernel untouched: BatchScratch gains
+q_gather/o_gather `[C×nq×hd]` (the kernel reads `Q[(seq×nq+qh)×hd]` seq=0..C-1 but overflowed seqs
+sit at sparse batch positions → d2d-gather Q in, wide launch, finalize C rows, scatter O back; new
+`copy_d_to_d_async`). `attend_tile_phase_batched`: lockstep tiles, one union `backend.read` + one
+`step_tile(num_seqs=C)` per tile. Gated on `batch.is_some() && seqs.len()<=max_seqs` (else Inc-2 serial).
+Hazards held: H1 (begin_step release-active `n_q_slots` bail is the live guard now), H2 (pin ALL C per tile,
+unpin after), H3 (counts fresh `[0;C]`, exhausted seq → `counts[s]=0` no-op).
+
+**GPU-validated bitwise (dgx-00 GB10):** NEW `batched_wide_launch_matches_serial_multitile` — 3 ragged
+multi-tile seqs (32/20/8 blocks, tile_cap 8), pool = EXACTLY C×tile_cap=24 (every slot pinned per tile →
+H2 load-bearing) — wide launch == serial per-seq **bit-for-bit**. All parity suites pass; 71 unit tests;
+release spark-server green.
+
+**C=8 LIVE MEASUREMENT (same config/harness as the Inc-2 run, qwen3.6-35b-a3b, prefetch OFF,
+ATLAS_HSS_MAX_SEQS=8 sized): NO throughput win — read-bound.**
+- n=8, 197 steps: attn **median 133.6 ms / mean 153.1 ms** (vs Inc-2 ~140 ms) — **flat**. **tok/s 4.8,
+  unchanged.** Only 8/197 steps (4%) were <30 ms, and they are the FIRST 8 steps (early decode, little
+  overflow), NOT a wide-launch win; 89% of steps >120 ms; max step 2.65 s (disk stall).
+- **Mechanism: the C=8 overflow-decode attention is NVMe-read-bound** — each of the 8 seqs re-streams its
+  growing >128-tok KV history from NVMe every step. attn climbs with overflow volume (fast early → ~133 ms
+  once windows are full). Neither Inc 2 (sync-collapse) nor Inc 3 (wide launch + union read) reduces the
+  *bytes* read, so both are flat. The wide-launch GPU-occupancy win and union-read syscall win are real
+  mechanisms but immaterial while the GPU idles waiting on NVMe.
+
+**CORRECTION:** an initial read of the log *tail* suggested a 7.5× attn drop — that was wrong (those were a
+later batch's early low-overflow steps). The median/tok-s show no win. Reported straight per
+[[feedback-no-fudged-data]].
+
+**This is the expected result under [[streaming-experts-framework-first]] — KEEP the mechanism; the win is
+on the faster tier / at larger scale, not here.** Concretely, next:
+1. **RDMA tier measurement** (`ATLAS_KV_PEER=gx10`, ~11–24 GB/s vs NVMe ~2 GB/s): the read wall drops
+   ~6–12×, which should EXPOSE the wide-launch/union-read framework win. Requires an `atlas_rdma_verbs`
+   build + healthy CX7 to gx10. **This is the real test of the over-core thesis; the framework (Inc 1+2+3)
+   is now all in place + bitwise-validated to run it.**
+2. **Prefetch overlap** (Phase 3) to hide the read behind SSM/MoE compute — but the batched path currently
+   serial-falls-back under `ATLAS_KV_PREFETCH` (the WAR fix); the CudaEvent coexistence follow-up is the
+   prerequisite to combine batched + prefetch.
+3. Larger model / deeper over-core, where attention compute (which the wide launch does speed up on
+   resident steps) is a bigger fraction than the per-step KV re-read.
