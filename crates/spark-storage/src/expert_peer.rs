@@ -118,8 +118,8 @@ fn read_u32<R: std::io::Read>(r: &mut R) -> Result<u32> {
 }
 
 /// Frame N per-rail `VerbsServerParams` for the dual-rail expert tier: a leading
-/// `[u8 n_rails]` count followed by each rail's params — exactly how `kv_peer`
-/// frames its per-rail `KvServerParams`. Single-rail (`n == 1`) is the default,
+/// `[u8 n_rails]` count followed by each rail's params — exactly how `cache_peer`
+/// frames its per-rail `CacheServerParams`. Single-rail (`n == 1`) is the default,
 /// byte-for-byte the pre-dual-rail path plus the one-byte count prefix. This is
 /// pure wire logic, un-gated so it unit-tests on the metal/skip build with no
 /// rdma-core.

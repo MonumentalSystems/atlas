@@ -1,7 +1,7 @@
 # KV-tier benchmark harness
 
 A/B of the KV backends (normal HBM vs `--high-speed-swap` overflow to {local NVMe,
-RDMA peer}) under load, on GB10 (dgx-00) ↔ gx10 `atlas-kv-peer` over ConnectX-7.
+RDMA peer}) under load, on GB10 (dgx-00) ↔ gx10 `atlas-cache-peer` over ConnectX-7.
 
 ## Scripts
 - `bench_client.py` — fires C concurrent **streaming** chat requests, reports
@@ -14,7 +14,7 @@ RDMA peer}) under load, on GB10 (dgx-00) ↔ gx10 `atlas-kv-peer` over ConnectX-
   reasoning tokens and under-reports decode. Correctness from the response body.
 
 ## Peer (run on the other GB10)
-    atlas-kv-peer --listen 0.0.0.0:9920 --rail roceP2p1s0f1:3
+    atlas-cache-peer --listen 0.0.0.0:9920 --rail roceP2p1s0f1:3
 Client env: `ATLAS_KV_PEER=<peer-cx7-ip>:9920 ATLAS_EXPERT_RDMA_DEV=roceP2p1s0f1
 ATLAS_EXPERT_RDMA_GID=3`. See `../RDMA-KV-TIER.md` §4/§5.
 

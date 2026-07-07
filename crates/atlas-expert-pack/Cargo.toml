@@ -15,8 +15,8 @@ name = "atlas-expert-peer"
 path = "src/bin/expert_peer_main.rs"
 
 [[bin]]
-name = "atlas-kv-peer"
-path = "src/bin/kv_peer_main.rs"
+name = "atlas-cache-peer"
+path = "src/bin/cache_peer_main.rs"
 
 [[bin]]
 name = "atlas-weight-peer"

@@ -3,7 +3,7 @@
 // RdmaKvBackend — the KV cache overflow tier over one-sided RDMA.
 //
 // A drop-in `StorageBackend` (same trait the io_uring / posix NVMe backends
-// implement), except the store is a peer's RAM blade (`kv_peer`) reached over
+// implement), except the store is a peer's RAM blade (`cache_peer`) reached over
 // RoCE instead of a local file:
 //   * `write_from_host` (offload a cold group) -> `IBV_WR_RDMA_WRITE` the group
 //     into the peer at `base + group_id * group_stride`.
@@ -39,7 +39,7 @@ use crate::backend::{ReadRequest, StorageBackend};
 use crate::cuda_min::{PinnedBuffer, copy_h_to_d_async, stream_sync};
 use crate::expert_peer::{STATUS_OK, VerbsClientParams};
 use crate::group::{GroupKey, GroupLayout};
-use crate::kv_peer::KvServerParams;
+use crate::cache_peer::CacheServerParams;
 use crate::rdma_verbs::Verbs;
 
 /// One registered pinned bounce in a rail's pipeline ring.
@@ -277,9 +277,9 @@ impl RdmaKvBackend {
             bail!("peer granted {} rails, wanted {n_rails}", b1[0]);
         }
         let mut base = 0u64;
-        let mut server: Vec<KvServerParams> = Vec::with_capacity(n_rails);
+        let mut server: Vec<CacheServerParams> = Vec::with_capacity(n_rails);
         for _ in 0..n_rails {
-            let sp = KvServerParams::read_from(&mut stream).context("read kv server params")?;
+            let sp = CacheServerParams::read_from(&mut stream).context("read kv server params")?;
             base = sp.base_addr;
             server.push(sp);
         }
@@ -531,7 +531,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires GPU + live kv-peer at $ATLAS_KV_PEER"]
+    #[ignore = "requires GPU + live cache-peer at $ATLAS_KV_PEER"]
     fn rdma_kv_round_trip() {
         let _ctx = CudaCtx::new(0).expect("cuda init");
         let peer = std::env::var("ATLAS_KV_PEER").expect("set ATLAS_KV_PEER=host:port");
@@ -575,7 +575,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires GPU + live kv-peer at $ATLAS_KV_PEER"]
+    #[ignore = "requires GPU + live cache-peer at $ATLAS_KV_PEER"]
     fn rdma_kv_bandwidth() {
         let ctx = CudaCtx::new(0).expect("cuda init");
         let peer = std::env::var("ATLAS_KV_PEER").expect("set ATLAS_KV_PEER=host:port");

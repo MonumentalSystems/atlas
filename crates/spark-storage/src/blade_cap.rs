@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
-// A process-global commit ledger for the RDMA memory blades (`kv_peer`,
+// A process-global commit ledger for the RDMA memory blades (`cache_peer`,
 // `expert_peer`). Each peer server owns one `CommitLedger` (an `Arc`, cloned
 // into every per-connection thread) and, at the RDMA handshake — AFTER the
 // requested commit size is known but BEFORE any `mmap`/`reg_mr` pins RAM — a

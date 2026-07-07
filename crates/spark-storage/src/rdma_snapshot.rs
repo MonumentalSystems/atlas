@@ -2,13 +2,13 @@
 
 //! Phase 4b — offset-addressed RDMA arena for the SSM-snapshot spill tier.
 //!
-//! A minimal, **synchronous** transport over the same CX7 verbs + `atlas-kv-peer`
+//! A minimal, **synchronous** transport over the same CX7 verbs + `atlas-cache-peer`
 //! RW-blade protocol the KV overflow tier uses, but addressed by a flat byte
 //! **offset** (snapshots are keyed by an opaque id → arena slot) rather than the
 //! KV `GroupKey`/`group_stride` layout — reusing that layout would corrupt live
 //! KV (its `write_from_host` asserts `src.len()==group_bytes`).
 //!
-//! The `atlas-kv-peer` server is layout-agnostic (client sends `total_bytes`, the
+//! The `atlas-cache-peer` server is layout-agnostic (client sends `total_bytes`, the
 //! peer registers ONE RW MR and serves `base+offset`), so a **second peer
 //! instance** on its own port serves the snapshot arena with zero peer-side
 //! change. Each op is drained to completion before returning (one blob ~64 MB,
@@ -57,7 +57,7 @@ use anyhow::{Result, bail};
 
 use crate::cuda_min::PinnedBuffer;
 use crate::expert_peer::{STATUS_OK, VerbsClientParams};
-use crate::kv_peer::KvServerParams;
+use crate::cache_peer::CacheServerParams;
 use crate::rdma_verbs::Verbs;
 
 /// One rail: its QP + a single persistent registered bounce (`blob_bytes`).
@@ -76,7 +76,7 @@ struct ArenaInner {
     _stream: TcpStream, // keep the control connection alive for the QP's lifetime
 }
 
-/// Offset-addressed RDMA snapshot arena. Connect to an `atlas-kv-peer` sized for
+/// Offset-addressed RDMA snapshot arena. Connect to an `atlas-cache-peer` sized for
 /// `arena_slots × blob_bytes`; `write`/`read` move one `blob_bytes` blob to/from
 /// `base + offset`.
 pub struct RdmaSnapshotArena {
@@ -145,9 +145,9 @@ impl RdmaSnapshotArena {
             bail!("snapshot peer granted {} rails, wanted {n_rails}", b1[0]);
         }
         let mut base = 0u64;
-        let mut server: Vec<KvServerParams> = Vec::with_capacity(n_rails);
+        let mut server: Vec<CacheServerParams> = Vec::with_capacity(n_rails);
         for _ in 0..n_rails {
-            let sp = KvServerParams::read_from(&mut stream)?;
+            let sp = CacheServerParams::read_from(&mut stream)?;
             base = sp.base_addr;
             server.push(sp);
         }

@@ -16,7 +16,7 @@
 // Wire protocol (little-endian), connection-oriented:
 //   1. client -> [u64 total_bytes]  (num_groups * group_stride it will address)
 //   2. peer allocates + registers a RW MR of that size, replies with
-//      KvServerParams [u32 qpn][u32 psn][16 gid][u64 base_addr][u32 rkey]
+//      CacheServerParams [u32 qpn][u32 psn][16 gid][u64 base_addr][u32 rkey]
 //   3. client -> VerbsClientParams [u32 qpn][u32 psn][16 gid]
 //   4. peer connects its QP, replies [u8 STATUS_OK]
 //   5. client does one-sided WRITE/READ; peer idles until the client hangs up,
@@ -26,7 +26,7 @@ use anyhow::{Context, Result, bail};
 
 /// The peer's half of the KV handshake: its QP identity + the single RW MR.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct KvServerParams {
+pub struct CacheServerParams {
     pub qpn: u32,
     pub psn: u32,
     pub gid: [u8; 16],
@@ -34,7 +34,7 @@ pub struct KvServerParams {
     pub rkey: u32,
 }
 
-impl KvServerParams {
+impl CacheServerParams {
     pub fn write_to<W: std::io::Write>(&self, w: &mut W) -> Result<()> {
         w.write_all(&self.qpn.to_le_bytes())?;
         w.write_all(&self.psn.to_le_bytes())?;
@@ -99,13 +99,13 @@ mod server_impl {
     /// Serve a KV overflow blade on `addr` until interrupted. One thread per
     /// connection; each connection gets its own RW arena sized by the client.
     pub fn serve<A: ToSocketAddrs>(addr: A, rdma: RdmaConfig) -> Result<()> {
-        let listener = TcpListener::bind(addr).context("bind kv-peer listener")?;
+        let listener = TcpListener::bind(addr).context("bind cache-peer listener")?;
         let local = listener.local_addr().ok();
         // One process-global ledger, shared by every connection thread; a
         // connection reserves its arena size before it maps/registers any RAM.
         let ledger = std::sync::Arc::new(crate::blade_cap::CommitLedger::new(rdma.max_blade_bytes));
         tracing::info!(
-            "kv-peer (RW RDMA overflow blade) listening on {:?} (rails {:?}, cap {})",
+            "cache-peer (RW RDMA overflow blade) listening on {:?} (rails {:?}, cap {})",
             local,
             rdma.rails,
             if rdma.max_blade_bytes == 0 {
@@ -121,7 +121,7 @@ mod server_impl {
             let stream = match conn {
                 Ok(s) => s,
                 Err(e) => {
-                    tracing::warn!("kv-peer accept error: {e}");
+                    tracing::warn!("cache-peer accept error: {e}");
                     continue;
                 }
             };
@@ -129,7 +129,7 @@ mod server_impl {
             let ledger = ledger.clone();
             std::thread::spawn(move || {
                 if let Err(e) = handle_conn(stream, &rdma, &ledger) {
-                    tracing::warn!("kv-peer connection ended: {e}");
+                    tracing::warn!("cache-peer connection ended: {e}");
                 }
             });
         }
@@ -142,7 +142,7 @@ mod server_impl {
         _rdma: &RdmaConfig,
         _ledger: &std::sync::Arc<crate::blade_cap::CommitLedger>,
     ) -> Result<()> {
-        bail!("kv-peer needs a build with rdma-core (atlas_rdma_verbs)");
+        bail!("cache-peer needs a build with rdma-core (atlas_rdma_verbs)");
     }
 
     #[cfg(atlas_rdma_verbs)]
@@ -198,7 +198,7 @@ mod server_impl {
         // 2. Publish rail count + each rail's QP + rkey (shared base).
         stream.write_all(&[n_rails as u8]).context("send n_rails")?;
         for (v, rkey) in rails.iter().zip(&rkeys) {
-            KvServerParams {
+            CacheServerParams {
                 qpn: v.qpn(),
                 psn: v.psn(),
                 gid: v.gid(),
@@ -222,7 +222,7 @@ mod server_impl {
             .write_all(&[STATUS_OK])
             .context("send kv ready ack")?;
         tracing::info!(
-            "kv-peer client connected: {n_rails} rail(s), {:.1} GiB RW blade",
+            "cache-peer client connected: {n_rails} rail(s), {:.1} GiB RW blade",
             total as f64 / (1024.0 * 1024.0 * 1024.0),
         );
 
@@ -287,7 +287,7 @@ mod tests {
 
     #[test]
     fn kv_server_params_round_trip() {
-        let sp = KvServerParams {
+        let sp = CacheServerParams {
             qpn: 0x4242,
             psn: 0x0012_3456 & 0xff_ffff,
             gid: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 192, 168, 178, 12],
@@ -296,6 +296,6 @@ mod tests {
         };
         let mut buf = Vec::new();
         sp.write_to(&mut buf).unwrap();
-        assert_eq!(KvServerParams::read_from(&mut &buf[..]).unwrap(), sp);
+        assert_eq!(CacheServerParams::read_from(&mut &buf[..]).unwrap(), sp);
     }
 }

@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
-// atlas-kv-peer: a RW remote-RAM overflow blade for the high-speed-swap KV
+// atlas-cache-peer: a RW remote-RAM overflow blade for the high-speed-swap KV
 // cache. A dumb memory tier — a streaming client offloads cold K/V groups into
 // it via one-sided RDMA WRITE and restores them via RDMA READ; the peer CPU
 // never touches a byte. Faster-than-SSD KV overflow (peer RAM ~12 GB/s over CX7
 // vs ~2 GB/s USB SSD).
 //
-//   atlas-kv-peer [--listen 0.0.0.0:9910] [--rdma-dev <ibdev>] [--rdma-gid <idx>]
+//   atlas-cache-peer [--listen 0.0.0.0:9910] [--rdma-dev <ibdev>] [--rdma-gid <idx>]
 //
 // The client selects it with $ATLAS_KV_PEER=host:port. Arena size is set by the
 // client's GroupLayout at connect time (one RW MR per connection).
@@ -19,7 +19,7 @@ fn main() -> Result<()> {
         .init();
 
     let mut listen = String::from("0.0.0.0:9910");
-    let mut rdma = spark_storage::kv_peer::RdmaConfig::default();
+    let mut rdma = spark_storage::cache_peer::RdmaConfig::default();
     let mut custom_rails: Vec<(String, u32)> = Vec::new();
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
@@ -49,8 +49,8 @@ fn main() -> Result<()> {
             }
             "-h" | "--help" => {
                 eprintln!(
-                    "atlas-kv-peer — RW RDMA overflow blade for the KV cache\n\n\
-                     USAGE: atlas-kv-peer [--listen host:port] [--rail <dev>:<gid> ...]\n\
+                    "atlas-cache-peer — RW RDMA overflow blade for the KV cache\n\n\
+                     USAGE: atlas-cache-peer [--listen host:port] [--rail <dev>:<gid> ...]\n\
                      \x20                  [--max-blade-gb <g>]\n\
                      defaults: listen 0.0.0.0:9910, rails roceP2p1s0f1:3 rocep1s0f1:3\n\
                      --max-blade-gb <g>: cap total blade RAM (0/absent = unlimited)\n\
@@ -64,5 +64,5 @@ fn main() -> Result<()> {
     if !custom_rails.is_empty() {
         rdma.rails = custom_rails;
     }
-    spark_storage::kv_peer::serve(&listen, rdma)
+    spark_storage::cache_peer::serve(&listen, rdma)
 }

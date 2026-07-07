@@ -51,7 +51,7 @@ pub mod weight_peer;
 pub(crate) mod blade_cap;
 // KV cache overflow blade: RW remote-RAM tier (wire types always available; the
 // verbs server compiles under atlas_rdma_verbs). Faster-than-SSD KV overflow.
-pub mod kv_peer;
+pub mod cache_peer;
 // One-sided RDMA READ/WRITE verbs FFI (WS2 Phase B + KV overflow). CUDA-free so
 // BOTH the non-cuda peer servers and the cuda client tiers can use it. Compiled
 // only where the C shim is (build.rs emits `atlas_rdma_verbs` on Linux + rdma-core).
@@ -109,7 +109,7 @@ pub mod weight_lora_rdma;
 pub mod rdma_kv_backend;
 
 // Phase 4b: offset-addressed RDMA arena for the SSM-snapshot spill tier (reuses
-// the same verbs + kv-peer blade protocol, keyed by byte offset not GroupKey).
+// the same verbs + cache-peer blade protocol, keyed by byte offset not GroupKey).
 // Always available — the module provides a `connect`-errors stub when the real
 // transport (feature `cuda` + atlas_rdma_verbs) isn't built, so dependents can
 // reference `RdmaSnapshotArena` unconditionally and degrade to host-RAM.

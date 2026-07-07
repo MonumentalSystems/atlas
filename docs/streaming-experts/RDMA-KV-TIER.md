@@ -84,7 +84,7 @@ round-robin. Restore is pipelined (interleaved reap across rails) with an option
 zero-copy path. Group addressing is the flat `GroupLayout::group_id` space
 (simpler than experts — no per-layer files).
 
-**`kv_peer`** (`spark-storage/src/kv_peer.rs`) + `atlas-kv-peer` bin — a dumb
+**`kv_peer`** (`spark-storage/src/kv_peer.rs`) + `atlas-cache-peer` bin — a dumb
 RW **memory blade**: client sends `total_bytes`+`n_rails`; peer `mmap`s an
 anonymous arena and `ibv_reg_mr`s it **once per rail** (shared physical pages →
 NOT N× RAM), publishes `{qpn,psn,gid,base,rkey}` per rail, connects, idles. Peer
@@ -119,7 +119,7 @@ trait, so nothing else changed.
   --high-speed-swap-cache-blocks-per-seq <N>` (N blocks × block_size = HBM-resident
   tokens; the rest overflow to the tier).
 
-**Peer:** `atlas-kv-peer --listen 0.0.0.0:9910 --rail roceP2p1s0f1:3 --rail rocep1s0f1:3`
+**Peer:** `atlas-cache-peer --listen 0.0.0.0:9910 --rail roceP2p1s0f1:3 --rail rocep1s0f1:3`
 (repeat `--rail` per adapter).
 
 ---
@@ -128,7 +128,7 @@ trait, so nothing else changed.
 
 ```bash
 # 1. peer on gx10 (SSH is on the .1.177 MGMT ip, NOT the .178 CX7 link!):
-ssh 192.168.1.177 '/home/ms/atlas-kv-peer --listen 0.0.0.0:9916 \
+ssh 192.168.1.177 '/home/ms/atlas-cache-peer --listen 0.0.0.0:9916 \
   --rail roceP2p1s0f1:3 --rail rocep1s0f1:3'
 
 # 2. bit-identical round-trip + bandwidth (GPU + live peer):
@@ -205,7 +205,7 @@ secret at the start of a 17,137-token prompt (HBM cap 10,240) → correct
 - `crates/spark-storage/src/rdma_kv_backend.rs` — `RdmaKvBackend` (client, cuda +
   verbs); `Rail`, pipeline, dual-rail, zero-copy; round-trip + bandwidth tests.
 - `crates/spark-storage/src/kv_peer.rs` — RW blade server + wire protocol.
-- `crates/atlas-expert-pack/src/bin/kv_peer_main.rs` — `atlas-kv-peer` bin.
+- `crates/atlas-expert-pack/src/bin/kv_peer_main.rs` — `atlas-cache-peer` bin.
 - `crates/spark-storage/src/rdma_shim.c` / `rdma_verbs.rs` — verbs FFI (shared;
   `rs_post_write` + RW MR flags added here).
 - `crates/spark-storage/src/high_speed_swap.rs` — backend selection (the wiring).
