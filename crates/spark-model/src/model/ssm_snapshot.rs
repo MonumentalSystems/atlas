@@ -364,16 +364,43 @@ impl SsmSnapshotPool {
         self.free_slots.lock().push(snap_slot);
     }
 
-    /// Claim an immediately-free Marconi slot (no eviction). Used as the
-    /// fault-in target for a spilled snapshot (Phase 1b). `None` when the pool
-    /// is full — the caller then falls through to recompute (full-pool fault-in
-    /// via reclaim is a follow-up). The claimed slot must be `free`d if the
-    /// fault-in misses.
+    /// Claim an immediately-free Marconi slot (no eviction). `None` when the
+    /// pool is full. The claimed slot must be `free`d if the caller doesn't use
+    /// it (e.g. a fault-in miss).
     pub(super) fn try_pop_free_slot(&self) -> Option<usize> {
         if !self.is_enabled() {
             return None;
         }
         self.free_slots.lock().pop()
+    }
+
+    /// Acquire a Marconi slot for a **fault-in target** (Phase 1b), spilling a
+    /// resident victim to make room when the pool is full. Under a small pool +
+    /// heavy churn the free list is usually empty at warm-turn lookup time, so
+    /// without this the fault-in silently degrades to recompute (measured: only
+    /// 13 of 43 tiered hits completed a fault-in at `--ssm-cache-slots 4`).
+    ///
+    /// Order: pop a free slot; else spill the session-aware victim
+    /// (`evict_snapshot_to_tier` keeps its entry findable → still faultable
+    /// later) to free its slot, then pop that. The victim is always a RESIDENT
+    /// entry (`skip_tiered`), never the tiered entry we're about to fault in.
+    /// `None` only if nothing is resident to evict (every slot mid-flight).
+    pub(super) fn acquire_or_spill_slot(
+        &self,
+        prefix_cache: &dyn spark_runtime::prefix_cache::PrefixCache,
+        store: &dyn super::ssm_tier::SnapshotBlobStore,
+        gpu: &dyn GpuBackend,
+    ) -> Option<usize> {
+        if let Some(s) = self.try_pop_free_slot() {
+            return Some(s);
+        }
+        let (victim_slot, key) = prefix_cache.evict_snapshot_to_tier()?;
+        let stream = gpu.default_stream();
+        if let Err(e) = self.spill_slot(victim_slot, key, store, gpu, stream) {
+            tracing::warn!("SSM spill during fault-in acquire failed ({e:#}); freeing slot anyway");
+        }
+        self.free(victim_slot);
+        self.try_pop_free_slot()
     }
 
     /// Bytes in one slot's full spill blob: every SSM layer's `h` + `conv`
@@ -642,6 +669,39 @@ mod tier_tests {
         let gpu = MockGpuBackend::new();
         let p = pool(&gpu, 2, 5);
         assert_eq!(p.spill_blob_bytes(), 5 * (32 + 16));
+    }
+
+    /// Full-pool fault-in: when no slot is free, `acquire_or_spill_slot` spills a
+    /// resident victim (to the tier, keeping it faultable) and hands back its
+    /// freed slot — so a warm tiered hit isn't lost to a busy pool.
+    #[test]
+    fn acquire_or_spill_frees_a_slot_under_full_pool() {
+        use spark_runtime::prefix_cache::PrefixCache;
+        use spark_runtime::radix_tree::RadixTree;
+
+        let gpu = MockGpuBackend::new();
+        let p = pool(&gpu, /*slots*/ 2, /*layers*/ 2);
+        let store = MemBlobStore::new(0);
+        let tree = RadixTree::new();
+
+        // Register two resident snapshots (slots 0 and 1) for two prefixes, then
+        // drain the free list so the pool is full.
+        let toks_a: Vec<u32> = (0..16).collect();
+        let toks_b: Vec<u32> = (100..116).collect();
+        tree.insert_with_snapshot(&toks_a, &[10], &[], 16, /*slot*/ 0, /*sess*/ 7, 0, 0);
+        tree.insert_with_snapshot(&toks_b, &[20], &[], 16, /*slot*/ 1, /*sess*/ 9, 0, 0);
+        assert!(p.try_pop_free_slot().is_some());
+        assert!(p.try_pop_free_slot().is_some());
+        assert_eq!(p.try_pop_free_slot(), None, "pool is now full");
+
+        // Acquire must spill a victim and return its slot.
+        let slot = p
+            .acquire_or_spill_slot(&tree, &store, &gpu)
+            .expect("a resident victim exists to spill");
+        assert!(slot == 0 || slot == 1);
+        assert_eq!(store.len(), 1, "the evicted victim was spilled, not dropped");
+        // The other snapshot stays resident (drop path can still free it).
+        assert!(tree.evict_snapshot_lru().is_some());
     }
 
     /// The integration invariant: the tier is keyed by prefix, INDEPENDENT of

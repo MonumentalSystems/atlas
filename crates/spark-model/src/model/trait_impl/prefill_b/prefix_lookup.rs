@@ -115,18 +115,22 @@ impl TransformerModel {
             // original values (a non-bit-equal rewrite would poison them).
             // Phase 1b spill-tier fault-in: if the deepest anchor for this
             // prefix was SPILLED (ssm_snapshot is None but a tier key is
-            // present), fault its bytes into a fresh slot and treat it as
-            // resident for the restore below — converting a recompute into a
-            // tier-restore. Best-effort: only when a slot is immediately free
-            // (full-pool fault-in is a follow-up) and the tier still holds the
-            // blob; otherwise fall through to recompute (always correct).
+            // present), fault its bytes into a slot and treat it as resident for
+            // the restore below — converting a recompute into a tier-restore.
+            // `acquire_or_spill_slot` spills a resident victim to make room when
+            // the pool is full, so a warm hit isn't lost to a busy pool; only if
+            // the tier no longer holds the blob do we fall through to recompute.
             let mut faulted_snap: Option<usize> = None;
             if prefix_match.ssm_snapshot.is_none() {
                 if let (Some(store), Some(key)) = (
                     self.ssm_tier_store.as_deref(),
                     prefix_match.ssm_snapshot_tier_key,
                 ) {
-                    if let Some(slot) = self.ssm_snapshots.try_pop_free_slot() {
+                    if let Some(slot) = self.ssm_snapshots.acquire_or_spill_slot(
+                        self.prefix_cache.as_ref(),
+                        store,
+                        self.gpu.as_ref(),
+                    ) {
                         match self.ssm_snapshots.fault_in_slot(
                             slot,
                             key,
