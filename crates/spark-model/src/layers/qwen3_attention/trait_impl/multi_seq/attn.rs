@@ -200,7 +200,11 @@ impl Qwen3AttentionLayer {
         // rows get the same iWHT(out) as the batched rows — bit-identical to
         // serving the seq alone under single-seq HSS.
         if self.high_speed_swap_engaged(kv_cache) {
-            for (i, ds) in disk_states.iter_mut().enumerate() {
+            // Pass 1 (serial, semantics unchanged): offload EVERY HSS-engaged
+            // seq (non-empty disk_block_ids), NOT just overflowed ones — the
+            // per-layer cursor `disk_last_offloaded_per_layer[L]` must advance
+            // every step or the next window slide trips check_safe_to_evict.
+            for ds in disk_states.iter_mut() {
                 if ds.disk_block_ids.is_empty() {
                     continue;
                 }
@@ -215,25 +219,38 @@ impl Qwen3AttentionLayer {
                     hd,
                     bs as usize,
                 )?;
-                // Only overflowed seqs need streaming; resident seqs (disk ==
-                // block_table length) keep their complete-window batched row.
-                if ds.disk_block_ids.len() > ds.block_table.len() {
-                    let q_row = q_contiguous.offset(i * q_dim as usize * bf16);
-                    let out_row = attn_out.offset(i * q_dim as usize * bf16);
-                    spark_storage::with_local(|hss| {
-                        // Phase 2: `i` (the batch position) selects this seq's own
-                        // transient scratch so overlapping seqs don't clobber.
-                        hss.attend_layer_on_stream(
-                            i,
-                            stream,
-                            self.attn_layer_idx as u32,
-                            ds.disk_block_ids,
-                            q_row.0,
-                            out_row.0,
-                        )
-                    })
-                    .expect("local installed checked in high_speed_swap_engaged")?;
-                }
+            }
+            // Pass 2 (Phase 5 Inc 2): gather the overflowed rows — a possibly
+            // sparse subset of batch positions, each keeping its own row
+            // pointers — and re-serve them with ONE batched HSS attend that
+            // scores all of them before paying a single mid-attend
+            // stream_sync (C syncs per attn layer → 1). Only seqs whose disk
+            // history exceeds the HBM window enter the batch; resident seqs
+            // keep their complete-window batched CUTLASS row (never
+            // overwritten → batch not serialized). A batch of one takes the
+            // byte-identical single-seq path inside the orchestrator.
+            let overflowed: Vec<spark_storage::AttendSeqReq<'_>> = disk_states
+                .iter()
+                .enumerate()
+                .filter(|(_, ds)| ds.disk_block_ids.len() > ds.block_table.len())
+                .map(|(i, ds)| spark_storage::AttendSeqReq {
+                    // Phase 2: `i` (the batch position) selects this seq's own
+                    // transient scratch so overlapping seqs don't clobber.
+                    seq_slot: i,
+                    seq_block_ids: ds.disk_block_ids.as_slice(),
+                    q_dev: q_contiguous.offset(i * q_dim as usize * bf16).0,
+                    output_dev: attn_out.offset(i * q_dim as usize * bf16).0,
+                })
+                .collect();
+            if !overflowed.is_empty() {
+                spark_storage::with_local(|hss| {
+                    hss.attend_layer_batch_on_stream(
+                        stream,
+                        self.attn_layer_idx as u32,
+                        &overflowed,
+                    )
+                })
+                .expect("local installed checked in high_speed_swap_engaged")?;
             }
         }
 

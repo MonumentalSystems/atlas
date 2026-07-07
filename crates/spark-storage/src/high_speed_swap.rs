@@ -48,6 +48,18 @@ pub struct HighSpeedSwap {
     /// touches slot `i` under a barrier, a future pipeline can overlap slots.
     /// The shared `pool`/`backend`/`predictor`/`disk_state` stay single-owner.
     scratch: Vec<SeqScratch>,
+    /// Phase 5: C = max concurrent overflow-decode sequences one batched
+    /// attend pass may carry (`$ATLAS_HSS_MAX_SEQS`, default 1). Sizes the
+    /// scratch pool (`C × resident_blocks` slots), the shared
+    /// `TiledAttentionDims::max_seqs`, and `batch` below. C=1 keeps every
+    /// path byte-identical to the single-seq orchestrator.
+    max_seqs: usize,
+    /// Phase 5: shared batched-attend scratch, `None` when `max_seqs == 1`
+    /// (gating the extra allocations out keeps the C=1 constructor
+    /// byte-identical). Allocated in Inc 1 so the sizing lands with the
+    /// plumbing; the num_seqs=C attend pass (Inc 3) consumes it.
+    #[allow(dead_code)] // read by the batched attend (Phase 5 Inc 3)
+    batch: Option<BatchScratch>,
     /// Phase 3: a side CUDA stream for prefetch H2D copies. Running the prefetch
     /// read on this stream (rather than the main compute stream) lets its H2D
     /// copies overlap the main stream's SSM/MoE kernels — the copy and compute
@@ -55,6 +67,20 @@ pub struct HighSpeedSwap {
     /// drain, but that block overlaps the already-enqueued main-stream compute,
     /// which is where the read is hidden.
     prefetch_stream: u64,
+    /// Phase 5 Inc 2 safety gate: mirrors the scheduler's `ATLAS_KV_PREFETCH`
+    /// switch (read once at construction; decode_a2.rs gates the actual
+    /// prefetch on the same var). The batched sync-collapse (`attend_layer_
+    /// batch_on_stream`) removes the per-seq mid-attend `stream_sync`s that
+    /// pre-change incidentally drained each *prior* seq's `step_tile` before
+    /// the next began — the only thing keeping the side-stream prefetch (which
+    /// has NO CudaEvent ordering vs the main stream) from `assign`ing +
+    /// overwriting a slot whose `step_tile` is enqueued-but-unexecuted. When
+    /// prefetch is live we therefore fall back to the serial per-seq attend
+    /// (each with its own sync = the pre-change 1-seq in-flight window). Their
+    /// coexistence (a main-stream CudaEvent waited on `prefetch_stream`) is a
+    /// deferred follow-up; until then, sync-collapse and prefetch are mutually
+    /// exclusive rather than silently racy.
+    kv_prefetch_enabled: bool,
     // Disk-block-ID allocator (Phase 6.1.a, refactored). One global
     // allocator: a `disk_block_id` indexes the SAME logical position
     // across every layer's file, so allocation, refcount, and free list
@@ -81,6 +107,40 @@ struct SeqScratch {
     score_host_buf: Vec<f32>,
 }
 
+/// Phase 5: one sequence's inputs for the batched overflow-decode attend
+/// (`attend_layer_batch_on_stream`). The overflowed seqs are a possibly
+/// SPARSE subset of the batch positions, so each entry carries its own
+/// `seq_slot` and its own Q/output row pointers — the batched path must
+/// never assume dense rows 0..C of the caller's buffers.
+pub struct AttendSeqReq<'a> {
+    /// Batch position — selects this seq's `SeqScratch` (Phase 2 semantics,
+    /// identical to `attend_layer_on_stream`'s `seq_slot`).
+    pub seq_slot: usize,
+    /// This seq's full ordered disk-side block history.
+    pub seq_block_ids: &'a [u32],
+    /// Device ptr to this seq's `[num_q_heads × head_dim]` BF16 query row.
+    pub q_dev: u64,
+    /// Device ptr to this seq's `[num_q_heads × head_dim]` BF16 output row.
+    pub output_dev: u64,
+}
+
+/// Phase 5: batched-attend scratch shared across the C sequences of one
+/// `num_seqs = C` attend pass. The kernel reads per-seq state out of ONE
+/// contiguous buffer each (`tile_blocks[seq × tile_capacity + b]`,
+/// `counts[seq]`, m/l/o at `[seq × num_q_heads + qh]`), so C separate
+/// per-`SeqScratch` buffers cannot serve a batched launch.
+struct BatchScratch {
+    /// C-sized online-softmax accumulator planes.
+    #[allow(dead_code)] // consumed by the batched attend (Phase 5 Inc 3)
+    planes: TiledAttnPlanes,
+    /// Per-tile block table `[max_seqs × tile_capacity]` i32.
+    #[allow(dead_code)] // consumed by the batched attend (Phase 5 Inc 3)
+    block_table_dev: DeviceBuffer,
+    /// Per-tile per-seq counts `[max_seqs]` i32.
+    #[allow(dead_code)] // consumed by the batched attend (Phase 5 Inc 3)
+    counts_dev: DeviceBuffer,
+}
+
 impl SeqScratch {
     fn new(
         attn: &TiledAttention,
@@ -88,7 +148,15 @@ impl SeqScratch {
         cfg: &HighSpeedSwapConfig,
     ) -> anyhow::Result<Self> {
         Ok(Self {
-            planes: attn.new_planes()?,
+            // Per-seq planes stay sized for ONE sequence even when the shared
+            // `TiledAttention` dims carry `max_seqs = C` (Phase 5): each
+            // SeqScratch is only ever bound to `num_seqs = 1` launches (the
+            // kept single-seq/prefill path). The batched pass uses the
+            // C-sized `BatchScratch::planes` instead.
+            planes: TiledAttnPlanes::new(&TiledAttentionDims {
+                max_seqs: 1,
+                ..attn.dims()
+            })?,
             q_proj: DeviceBuffer::new(model.num_q_heads as usize * cfg.rank as usize * 2)?,
             block_scores_dev: DeviceBuffer::new(model.max_blocks_per_layer as usize * 4)?,
             block_table_dev: DeviceBuffer::new(cfg.resident_blocks as usize * 4)?,
@@ -126,6 +194,17 @@ impl HighSpeedSwap {
     /// per-step calls take their own stream argument.
     pub fn new_on_stream(stream: u64, cfg: HighSpeedSwapConfig, model: ModelDims) -> Result<Self> {
         cfg.validate_and_prepare()?;
+        // Phase 5: C = max concurrent overflow-decode seqs the orchestrator
+        // sizes its batched buffers for. Env-driven like the other ATLAS_KV_*
+        // switches; unset/1 = today's single-seq sizing, byte-identical.
+        let max_seqs: usize = std::env::var("ATLAS_HSS_MAX_SEQS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|c: &usize| (1..=1024).contains(c))
+            .unwrap_or(1);
+        if max_seqs > 1 {
+            tracing::info!("high-speed-swap: batched attend sized for max_seqs={max_seqs}");
+        }
         let group_layout = GroupLayout::new(
             model.num_layers,
             model.max_blocks_per_layer,
@@ -169,8 +248,22 @@ impl HighSpeedSwap {
         // byte-for-byte the prior behavior. `new_preferring_uma` self-falls-back
         // to device memory on a non-UMA host, so this is always safe.
         let want_uma = std::env::var("ATLAS_KV_ZERO_COPY").ok().as_deref() == Some("1");
+        // Phase 5 Inc 1: decouple pool capacity from the per-seq resident
+        // budget — C concurrent overflow seqs each keep a full tile budget
+        // resident, so num_slots = C × resident_blocks. The per-seq tile
+        // budget (`tile_capacity` below, and the tile loop's `tile_cap`)
+        // stays `cfg.resident_blocks` — the C=1 tile geometry is untouched.
+        let per_seq_budget = cfg.resident_blocks;
+        let num_slots = per_seq_budget
+            .checked_mul(max_seqs as u32)
+            .context("ATLAS_HSS_MAX_SEQS × resident_blocks overflows u32")?;
+        // The plan's invariant, spelled out: every concurrent seq must fit
+        // its full per-seq tile budget in the pool. Trivially equal today
+        // (num_slots is defined as the product); guards any future knob that
+        // sizes num_slots independently.
+        debug_assert!(max_seqs as u32 * per_seq_budget <= num_slots);
         let dims = ScratchDims {
-            num_slots: cfg.resident_blocks,
+            num_slots,
             num_kv_heads: model.num_kv_heads,
             group_stride: group_layout.group_stride,
         };
@@ -238,18 +331,47 @@ impl HighSpeedSwap {
             cfg.projection_seed,
         )?;
         let attn = TiledAttention::new(TiledAttentionDims {
-            max_seqs: 1, // single-seq for the orchestrator's first iteration
+            max_seqs, // Phase 5: C-wide batched attend (1 = single-seq, as before)
             num_q_heads: model.num_q_heads as usize,
             num_kv_heads: model.num_kv_heads as usize,
             head_dim: model.head_dim as usize,
             block_size: model.block_size as usize,
+            // DO NOT retarget to the grown `num_slots`: this is the PER-SEQ
+            // tile budget baked into the kernel's tile_blocks[seq*tcap+b]
+            // stride and the C=1 tile geometry.
             tile_capacity: cfg.resident_blocks as usize,
         })?;
-        let eviction = EvictionPolicy::new(cfg.resident_blocks);
+        // Eviction ranks POOL slots, so its capacity follows num_slots (the
+        // same resident_blocks==pool-capacity coupling decoupled above);
+        // leaving it at the per-seq budget would exhaust the grown pool early.
+        let eviction = EvictionPolicy::new(num_slots);
+        // Phase 5 Inc 1: shared batched-attend scratch, sized for one
+        // grid=(C, num_q_heads, 1) pass. Gated on C>1 so the C=1 constructor
+        // performs today's exact allocation sequence.
+        let batch = if max_seqs > 1 {
+            Some(BatchScratch {
+                planes: attn.new_planes()?, // dims.max_seqs == C ⇒ C-sized planes
+                block_table_dev: DeviceBuffer::new(
+                    max_seqs * attn.dims().tile_capacity * 4,
+                )?,
+                counts_dev: DeviceBuffer::new(max_seqs * 4)?,
+            })
+        } else {
+            None
+        };
         // One scratch slot to start; `attend_layer` grows the Vec on first use
         // of each higher batch position (lazy — avoids plumbing max_batch_size).
         let scratch = vec![SeqScratch::new(&attn, &model, &cfg)?];
         let prefetch_stream = crate::cuda_min::create_stream()?;
+        // Same var decode_a2.rs gates prefetch on; read once here so the
+        // batched attend can avoid the cross-stream WAR window (see field doc).
+        let kv_prefetch_enabled = std::env::var_os("ATLAS_KV_PREFETCH").is_some();
+        if kv_prefetch_enabled && max_seqs > 1 {
+            tracing::info!(
+                "high-speed-swap: ATLAS_KV_PREFETCH live → batched attend uses the serial \
+                 per-seq sync path (sync-collapse disabled to avoid the prefetch WAR race)"
+            );
+        }
         let disk_state = DiskState::new();
         Ok(Self {
             cfg,
@@ -260,9 +382,18 @@ impl HighSpeedSwap {
             attn,
             eviction,
             scratch,
+            max_seqs,
+            batch,
             prefetch_stream,
+            kv_prefetch_enabled,
             disk_state,
         })
+    }
+
+    /// Phase 5: C — the max concurrent overflow-decode sequences the batched
+    /// buffers are sized for (`$ATLAS_HSS_MAX_SEQS`, default 1).
+    pub fn max_seqs(&self) -> usize {
+        self.max_seqs
     }
 
     // ── Disk-block-ID allocator (Phase 6.1.a) ─────────────────────────

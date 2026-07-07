@@ -279,3 +279,166 @@ fn orchestrator_multi_tile_with_eviction() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// Phase 5 Inc 1: `$ATLAS_HSS_MAX_SEQS = C` grows the scratch pool to
+/// C × resident_blocks slots (the plan's `C × per_seq_budget ≤ num_slots`
+/// invariant, equality by construction) without touching the per-seq tile
+/// budget. C unset (every other test here) stays byte-identical single-seq.
+#[test]
+#[ignore = "requires GPU"]
+fn pool_sized_for_c_times_per_seq_budget() {
+    let dir = tempdir("batch-pool");
+    let ctx = CudaCtx::new(0).expect("cuda init");
+    // SAFETY: single-threaded within this #[ignore]d GPU test; restored
+    // before any other orchestrator is constructed.
+    unsafe { std::env::set_var("ATLAS_HSS_MAX_SEQS", "4") };
+    let cfg = HighSpeedSwapConfig {
+        dir: dir.clone(),
+        bytes: 1 << 30,
+        resident_blocks: SCRATCH_BLOCKS,
+        rank: 32,
+        qd: 8,
+        graph: false,
+        projection_seed: 0xCAFE_F00D,
+    };
+    let model = ModelDims {
+        num_layers: NUM_LAYERS,
+        max_blocks_per_layer: SEQ_BLOCKS,
+        num_q_heads: NUM_Q_HEADS,
+        num_kv_heads: NUM_KV_HEADS,
+        head_dim: HEAD_DIM,
+        block_size: BLOCK_SIZE,
+    };
+    let hss = HighSpeedSwap::new(&ctx, cfg, model);
+    unsafe { std::env::remove_var("ATLAS_HSS_MAX_SEQS") };
+    let hss = hss.unwrap();
+    assert_eq!(hss.max_seqs(), 4);
+    let diag = hss.diagnostic_summary();
+    assert_eq!(
+        diag.scratch_pool_resident,
+        4 * SCRATCH_BLOCKS,
+        "pool must hold C × per_seq_budget slots"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Phase 5 Inc 2: two sequences served by ONE `attend_layer_batch_on_stream`
+/// call (C score phases, a single mid-attend sync, serial tile phases) must
+/// produce bit-for-bit the same rows as two independent single-seq attends —
+/// the batched path re-orders host syncs only, never device math.
+#[test]
+#[ignore = "requires GPU"]
+fn batched_attend_matches_single_seq_bitwise() {
+    let dir = tempdir("batch-attend");
+    let ctx = CudaCtx::new(0).expect("cuda init");
+    let mut rng = ChaCha8Rng::seed_from_u64(0xBA7C);
+    let q_a = random_bf16(NUM_Q_HEADS as usize * HEAD_DIM as usize, &mut rng);
+    let q_b = random_bf16(NUM_Q_HEADS as usize * HEAD_DIM as usize, &mut rng);
+    let total =
+        SEQ_BLOCKS as usize * BLOCK_SIZE as usize * NUM_KV_HEADS as usize * HEAD_DIM as usize;
+    let k = random_bf16(total, &mut rng);
+    let v = random_bf16(total, &mut rng);
+
+    let cfg = HighSpeedSwapConfig {
+        dir: dir.clone(),
+        bytes: 1 << 30,
+        resident_blocks: SCRATCH_BLOCKS,
+        rank: 32,
+        qd: 8,
+        graph: false,
+        projection_seed: 0xCAFE_F00D,
+    };
+    let model = ModelDims {
+        num_layers: NUM_LAYERS,
+        max_blocks_per_layer: SEQ_BLOCKS,
+        num_q_heads: NUM_Q_HEADS,
+        num_kv_heads: NUM_KV_HEADS,
+        head_dim: HEAD_DIM,
+        block_size: BLOCK_SIZE,
+    };
+    let mut hss = HighSpeedSwap::new(&ctx, cfg, model).unwrap();
+
+    let block_floats = BLOCK_SIZE as usize * NUM_KV_HEADS as usize * HEAD_DIM as usize;
+    let block_bytes = block_floats * 2;
+    let k_block_dev = DeviceBuffer::new(block_bytes).unwrap();
+    for blk in 0..SEQ_BLOCKS {
+        let off = blk as usize * block_floats;
+        copy_h_to_d_async(
+            k_block_dev.ptr,
+            k[off..off + block_floats].as_ptr() as *const c_void,
+            block_bytes,
+            ctx.stream,
+        )
+        .unwrap();
+        stream_sync(ctx.stream).unwrap();
+        hss.offload_block(
+            &ctx,
+            0,
+            blk,
+            k_block_dev.ptr,
+            &k[off..off + block_floats],
+            &v[off..off + block_floats],
+        )
+        .unwrap();
+    }
+
+    let row = NUM_Q_HEADS as usize * HEAD_DIM as usize;
+    let qa_dev = DeviceBuffer::new(row * 2).unwrap();
+    let qb_dev = DeviceBuffer::new(row * 2).unwrap();
+    let out_a_dev = DeviceBuffer::new(row * 2).unwrap();
+    let out_b_dev = DeviceBuffer::new(row * 2).unwrap();
+    copy_h_to_d_async(qa_dev.ptr, q_a.as_ptr() as *const c_void, row * 2, ctx.stream).unwrap();
+    copy_h_to_d_async(qb_dev.ptr, q_b.as_ptr() as *const c_void, row * 2, ctx.stream).unwrap();
+    // Ragged histories: seq A streams the full list, seq B a shorter one.
+    let blocks_a: Vec<u32> = (0..SEQ_BLOCKS).collect();
+    let blocks_b: Vec<u32> = (0..SEQ_BLOCKS / 2).collect();
+
+    let download = |dev: &DeviceBuffer| {
+        let mut out = vec![bf16::from_f32(0.0); row];
+        copy_d_to_h_async(
+            out.as_mut_ptr() as *mut c_void,
+            dev.ptr,
+            row * 2,
+            ctx.stream,
+        )
+        .unwrap();
+        stream_sync(ctx.stream).unwrap();
+        out
+    };
+
+    // Reference: two independent single-seq attends (today's serial path).
+    hss.attend_layer(0, &ctx, 0, &blocks_a, qa_dev.ptr, out_a_dev.ptr)
+        .unwrap();
+    hss.attend_layer(1, &ctx, 0, &blocks_b, qb_dev.ptr, out_b_dev.ptr)
+        .unwrap();
+    let solo_a = download(&out_a_dev);
+    let solo_b = download(&out_b_dev);
+
+    // One batched call over both seqs.
+    let reqs = [
+        spark_storage::AttendSeqReq {
+            seq_slot: 0,
+            seq_block_ids: &blocks_a,
+            q_dev: qa_dev.ptr,
+            output_dev: out_a_dev.ptr,
+        },
+        spark_storage::AttendSeqReq {
+            seq_slot: 1,
+            seq_block_ids: &blocks_b,
+            q_dev: qb_dev.ptr,
+            output_dev: out_b_dev.ptr,
+        },
+    ];
+    hss.attend_layer_batch_on_stream(ctx.stream, 0, &reqs)
+        .unwrap();
+    let batch_a = download(&out_a_dev);
+    let batch_b = download(&out_b_dev);
+
+    for (i, (s, b)) in solo_a.iter().zip(&batch_a).enumerate() {
+        assert_eq!(s.to_bits(), b.to_bits(), "seq A differs at element {i}");
+    }
+    for (i, (s, b)) in solo_b.iter().zip(&batch_b).enumerate() {
+        assert_eq!(s.to_bits(), b.to_bits(), "seq B differs at element {i}");
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}

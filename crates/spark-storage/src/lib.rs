@@ -140,7 +140,7 @@ pub use expert_tier::{
 #[cfg(feature = "cuda")]
 pub use expert_tier_rdma::RdmaTier;
 #[cfg(feature = "cuda")]
-pub use high_speed_swap::{HighSpeedSwap, install_local, local_installed, with_local};
+pub use high_speed_swap::{AttendSeqReq, HighSpeedSwap, install_local, local_installed, with_local};
 #[cfg(all(feature = "cuda", atlas_rdma_verbs))]
 pub use rdma_kv_backend::RdmaKvBackend;
 #[cfg(feature = "cuda")]
@@ -156,7 +156,7 @@ pub use weight_tier_rdma::RdmaWeightLoader;
 #[cfg(not(feature = "cuda"))]
 mod stubs;
 #[cfg(not(feature = "cuda"))]
-pub use stubs::{HighSpeedSwap, install_local, local_installed, with_local};
+pub use stubs::{AttendSeqReq, HighSpeedSwap, install_local, local_installed, with_local};
 
 #[cfg(feature = "cuda")]
 pub use predictor::{Predictor, PredictorDims};

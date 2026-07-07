@@ -200,6 +200,134 @@ impl HighSpeedSwap {
         output_dev: u64,
         last_block_valid_slots: i32,
     ) -> Result<()> {
+        // Phase 5 Inc 2 recomposition: score phase → ONE stream_sync → tile
+        // phase. Identical op sequence, byte counts, and stream order as the
+        // pre-split single-seq body; the split only exists so the batched
+        // entry below can enqueue C score phases before paying one sync.
+        self.attend_score_phase(seq_slot, stream, layer, q_dev)?;
+        // The tile phase's eviction ranking reads `score_host_buf` on the
+        // HOST, so the async D2H score copy must have completed.
+        stream_sync(stream)?;
+        self.attend_tile_phase(
+            seq_slot,
+            stream,
+            layer,
+            seq_block_ids,
+            q_dev,
+            output_dev,
+            last_block_valid_slots,
+        )
+    }
+
+    /// Phase 5 Inc 2: batched overflow-decode attend. Enqueues ALL `seqs`'
+    /// score phases (project_q → score_blocks → async D2H into each seq's
+    /// own `score_host_buf` — disjoint per-slot buffers, no aliasing) with
+    /// NO interleaved sync, pays ONE `stream_sync`, then runs each seq's
+    /// tile phase serially on `stream`. Collapses the mid-attend syncs from
+    /// C per attention layer to 1 (~80 → ~10 per step at C=8).
+    ///
+    /// Decode-only: every seq shares `last_block_valid_slots = block_size`
+    /// (no causal mask — the active block's stale slots are zero-init).
+    /// Prefill keeps the per-seq `attend_layer_on_stream_with_q_pos`, whose
+    /// per-seq mask scalar a shared launch cannot express.
+    ///
+    /// H2 (cross-seq intra-tile WAR) is not regressed: the tile phases run
+    /// SEQUENTIALLY on ONE stream with today's per-tile pin/assign/read/
+    /// step_tile/unpin ordering, so a later seq's evict+overwrite of an
+    /// earlier seq's slot is enqueued after that slot was consumed.
+    pub fn attend_layer_batch_on_stream(
+        &mut self,
+        stream: u64,
+        layer: u32,
+        seqs: &[super::AttendSeqReq<'_>],
+    ) -> Result<()> {
+        if seqs.is_empty() {
+            return Ok(());
+        }
+        // Phase 5 Inc 2 safety gate: the sync-collapse below is unsafe to run
+        // concurrently with the Phase-3 side-stream KV prefetch. The per-seq
+        // mid-attend `stream_sync`s it removes were the only barrier draining
+        // each prior seq's `step_tile` before the next began; without them ALL
+        // C seqs' tiles are enqueued-but-unexecuted (and their slots unpinned)
+        // when `prefetch_layer` — on a separate stream with no CudaEvent
+        // ordering — `assign`s + overwrites the oldest-touched slots. That is a
+        // C-fold-widened cross-stream WAR → silent, timing-dependent KV
+        // corruption. When prefetch is live, serve each seq with the serial
+        // per-seq attend (its own score→sync→tile), restoring the pre-change
+        // 1-seq in-flight window prefetch was validated against. (A proper
+        // coexistence — a main-stream CudaEvent waited on `prefetch_stream` —
+        // is a tracked follow-up; see the `kv_prefetch_enabled` field doc.)
+        if self.kv_prefetch_enabled {
+            for s in seqs {
+                self.attend_layer_on_stream(
+                    s.seq_slot,
+                    stream,
+                    layer,
+                    s.seq_block_ids,
+                    s.q_dev,
+                    s.output_dev,
+                )?;
+            }
+            return Ok(());
+        }
+        // A batch of one IS the single-seq path — delegate so the C=1
+        // byte-identical guarantee is a shared code path, not a proof.
+        if let [s] = seqs {
+            return self.attend_layer_on_stream(
+                s.seq_slot,
+                stream,
+                layer,
+                s.seq_block_ids,
+                s.q_dev,
+                s.output_dev,
+            );
+        }
+        // Per-seq scratch is selected by `seq_slot`; a duplicate would make two
+        // seqs' score phases D2H into the same host buffer and share planes —
+        // silent wrong results. Hard-reject it (host-side O(C²), C≤~8, and the
+        // call already pays a stream_sync, so the cost is noise).
+        for (i, a) in seqs.iter().enumerate() {
+            for b in &seqs[i + 1..] {
+                if a.seq_slot == b.seq_slot {
+                    anyhow::bail!(
+                        "duplicate seq_slot {} in batched attend — per-seq scratch would alias",
+                        a.seq_slot
+                    );
+                }
+            }
+        }
+        for s in seqs {
+            self.attend_score_phase(s.seq_slot, stream, layer, s.q_dev)?;
+        }
+        // ONE sync for all C seqs — the Inc-2 win. It MUST precede every
+        // tile phase: eviction ranking reads each seq's host score buffer.
+        stream_sync(stream)?;
+        let lbvs = self.model.block_size as i32;
+        for s in seqs {
+            self.attend_tile_phase(
+                s.seq_slot,
+                stream,
+                layer,
+                s.seq_block_ids,
+                s.q_dev,
+                s.output_dev,
+                lbvs,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Phase 5 Inc 2 — score phase: project Q, score every block at `layer`,
+    /// and enqueue the async D2H copy of the scores into this seq's
+    /// `score_host_buf`. Does NOT sync — the caller must `stream_sync` before
+    /// any host read of the scores (i.e. before the tile phase).
+    fn attend_score_phase(
+        &mut self,
+        seq_slot: usize,
+        stream: u64,
+        layer: u32,
+        q_dev: u64,
+    ) -> Result<()> {
         // Phase 2: use this sequence's OWN transient scratch so concurrent seqs
         // don't clobber each other. Lazily grow the pool to cover `seq_slot`.
         while self.scratch.len() <= seq_slot {
@@ -235,8 +363,25 @@ impl HighSpeedSwap {
             hbuf_bytes,
             stream,
         )?;
-        stream_sync(stream)?;
+        Ok(())
+    }
 
+    /// Phase 5 Inc 2 — tile phase: the begin_step → step_tile* → finalize
+    /// loop over `seq_block_ids`, single-seq (`num_seqs = 1`) launches into
+    /// this seq's own planes. Precondition: `attend_score_phase(seq_slot, ..)`
+    /// ran and the stream has been synced since (eviction ranking reads the
+    /// host score buffer).
+    #[allow(clippy::too_many_arguments)]
+    fn attend_tile_phase(
+        &mut self,
+        seq_slot: usize,
+        stream: u64,
+        layer: u32,
+        seq_block_ids: &[u32],
+        q_dev: u64,
+        output_dev: u64,
+        last_block_valid_slots: i32,
+    ) -> Result<()> {
         // 3. Tile loop.
         self.attn
             .begin_step_on_stream(&self.scratch[seq_slot].planes, stream, 1)?;

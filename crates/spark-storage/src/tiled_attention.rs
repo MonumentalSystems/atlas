@@ -84,6 +84,13 @@ pub struct TiledAttnPlanes {
     pub m_state: DeviceBuffer,
     pub l_state: DeviceBuffer,
     pub o_state: DeviceBuffer,
+    /// Capacity in `(seq, q_head)` slots these planes were allocated for
+    /// (`dims.max_seqs × dims.num_q_heads` at the alloc site). The H1 OOB
+    /// guard: every launch asserts `num_seqs × num_q_heads` fits, because a
+    /// grid.x that exceeds the allocation is a *silent* device write past
+    /// the buffer (planes and launch dims can diverge — `new` accepts any
+    /// dims, and callers pass planes + `num_seqs` independently).
+    pub n_q_slots: usize,
 }
 
 impl TiledAttnPlanes {
@@ -93,6 +100,7 @@ impl TiledAttnPlanes {
             m_state: DeviceBuffer::new(dims.m_bytes())?,
             l_state: DeviceBuffer::new(dims.l_bytes())?,
             o_state: DeviceBuffer::new(dims.o_bytes())?,
+            n_q_slots: dims.n_q_slots(),
         })
     }
 }
@@ -156,6 +164,23 @@ impl TiledAttention {
                 "begin_step num_seqs {} > max_seqs {}",
                 num_seqs,
                 self.dims.max_seqs
+            );
+        }
+        // Release-active OOB guard (hazard H1). The `max_seqs` bail above
+        // checks the configured C, but the *actual* `planes` passed may be a
+        // smaller per-seq plane-set (per-seq `SeqScratch` planes are sized for
+        // 1 seq even when `dims.max_seqs = C`). A `num_seqs = C` launch bound
+        // to a 1-seq plane clears the `max_seqs` bail yet writes m/l/o C× past
+        // the allocation — silent HBM corruption, and precisely the mistake an
+        // Inc-3 `num_seqs = C` rewrite could introduce. Check against the plane
+        // buffer's own recorded capacity; runs once per layer, cost is noise.
+        if num_seqs * self.dims.num_q_heads > planes.n_q_slots {
+            bail!(
+                "begin_step num_seqs {} × num_q_heads {} exceeds plane capacity {} \
+                 (planes sized for fewer seqs than this launch)",
+                num_seqs,
+                self.dims.num_q_heads,
+                planes.n_q_slots
             );
         }
         let n_q = num_seqs * self.dims.num_q_heads;
@@ -251,6 +276,22 @@ impl TiledAttention {
         kvh_stride: i64,
         last_block_valid_slots: i32,
     ) -> Result<()> {
+        // H1 guard: grid.x = num_seqs and the kernel writes m/l/o at
+        // [seq × num_q_heads + qh] unconditionally — exceeding either the
+        // kernel dims or the plane allocation is a silent OOB device write.
+        debug_assert!(
+            num_seqs <= self.dims.max_seqs,
+            "step_tile num_seqs {} > max_seqs {}",
+            num_seqs,
+            self.dims.max_seqs
+        );
+        debug_assert!(
+            num_seqs * self.dims.num_q_heads <= planes.n_q_slots,
+            "step_tile num_seqs {} × num_q_heads {} exceeds plane capacity {}",
+            num_seqs,
+            self.dims.num_q_heads,
+            planes.n_q_slots
+        );
         let mut q_v = q;
         let mut k_v = k_pool;
         let mut v_v = v_pool;
@@ -317,6 +358,21 @@ impl TiledAttention {
         output: u64,
         num_seqs: usize,
     ) -> Result<()> {
+        // H1 guard (see `step_tile_on_stream`): finalize also launches
+        // grid.x = num_seqs over the same per-seq plane slots.
+        debug_assert!(
+            num_seqs <= self.dims.max_seqs,
+            "finalize num_seqs {} > max_seqs {}",
+            num_seqs,
+            self.dims.max_seqs
+        );
+        debug_assert!(
+            num_seqs * self.dims.num_q_heads <= planes.n_q_slots,
+            "finalize num_seqs {} × num_q_heads {} exceeds plane capacity {}",
+            num_seqs,
+            self.dims.num_q_heads,
+            planes.n_q_slots
+        );
         let mut l_v = planes.l_state.ptr;
         let mut o_v = planes.o_state.ptr;
         let mut out_v = output;

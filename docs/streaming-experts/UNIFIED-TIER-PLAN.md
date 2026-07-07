@@ -395,3 +395,65 @@ restore would garble them); no crash/error. **Correctness A/B**: same prompts at
 `ATLAS_SSM_TIER=0` vs `=1` should agree (greedy/temp-0 for an exact compare). Then, for the
 north-star perf read, run the #278 35B agentic wall and confirm `mean_recompute_on_hit` drops
 below the tail-protect+256 residual as `tier_hits` rises.
+
+### Phase 5 Inc 1+2 — LANDED code-complete + GPU-parity-validated (2026-07-07, ultracode fable)
+A 10-agent understand→implement→verify fable workflow (5 parallel readers de-staled the plan
+against current code, 1 implementer, 4 adversarial verifiers). Inc 1 (plumb `max_seqs=C`) +
+Inc 2 (score-only sync-collapse) landed in `spark-storage`; the batched `num_seqs=C` kernel path
+is now GPU-verified even though host orchestration (Inc 3) doesn't drive it yet.
+
+**Plan-staleness the readers caught (the plan was written from a prior reading):**
+- `block_table_dev`/`counts_dev`/`planes` are **per-seq inside `SeqScratch`** (a `Vec`), NOT single
+  buffers. The plan's "grow `block_table_dev` to `[C*tile_cap]`" only makes sense for a *shared*
+  batch buffer (the kernel indexes one contiguous `tile_blocks[seq*tile_cap+b]`/`counts[seq]`).
+  Realized as a new `BatchScratch {C-sized planes, [C×tile_cap] table, [C] counts}`, allocated only
+  when `C>1` (dead-code-gated until Inc 3), leaving per-seq scratch single-sized.
+- No `num_seqs` exists at the plane-alloc site (`TiledAttnPlanes::new`); the real unguarded OOB
+  launch sites are `step_tile_on_stream`/`finalize_on_stream`. Realized as: record plane capacity
+  (`n_q_slots`) at alloc + guards at all three launch fns.
+- `debug_assert!(num_seqs<=max_seqs)` already existed as a hard `bail!` in `begin_step`; but it
+  checks `dims.max_seqs`, not the *actual* plane capacity — a `num_seqs=C` launch bound to a
+  1-seq per-seq plane clears it and writes OOB. **Promoted to a release-active `bail!` on
+  `num_seqs*num_q_heads > planes.n_q_slots`** (the true H1 guard; the moment Inc 3 lands a wide
+  launch, a mis-pairing errors instead of silently corrupting HBM).
+
+**The adversarial pass earned its keep — one CONFIRMED `major` (cross-stream WAR, C-fold widened):**
+collapsing the C per-seq mid-attend `stream_sync`s removed the *only* barrier that incidentally
+drained each prior seq's `step_tile` before the next began. Without it, all C seqs' tiles are
+enqueued-but-unexecuted (slots unpinned at `step_tile` *enqueue*, `impl_more.rs`) when
+`prefetch_layer` — on a **separate stream with no CudaEvent ordering** — `assign`s + overwrites the
+oldest-touched slots. Reachable with `ATLAS_KV_PREFETCH=1` + C≥2 = silent, timing-dependent KV
+corruption. **Verified against the code by hand** (`unpin_key` at enqueue `impl_more.rs:453`;
+prefetch on `prefetch_stream` `impl_more.rs:523`, `assign` at `:493`, no event; the existing
+safety comment's "stream ordering makes it safe" only covers *same-stream* ops).
+- **Fix (landed):** `HighSpeedSwap` reads `ATLAS_KV_PREFETCH` once at construction
+  (`kv_prefetch_enabled`); `attend_layer_batch_on_stream` falls back to the **serial per-seq
+  attend** (each with its own `score→sync→tile`, restoring the pre-change 1-seq in-flight window)
+  whenever prefetch is live. Sync-collapse and prefetch are now *mutually exclusive*, not silently
+  racy. The default (prefetch off) still gets the full Inc-2 collapse.
+- **Deferred follow-up (Inc 3 prerequisite):** proper coexistence = record a CudaEvent on the main
+  stream at the end of the batched attend, `cuStreamWaitEvent` it on `prefetch_stream` before
+  prefetch `assign`/reads. Then the two can run together. Also flagged: `attend_tile_phase` calls
+  `backend.read` even on an empty `reqs` (io_uring/RDMA pay a terminal sync per tile) — the
+  `if !reqs.is_empty()` guard must land *with* the event fix (that empty-read sync is currently the
+  accidental io_uring WAR narrowing), and `score_host_buf` is pageable (D2H may sync-block) — pin it
+  if the C=8 measurement shows the collapse didn't materialize.
+
+**Minor hardening also landed:** duplicate-`seq_slot` in a batch is now a hard `bail!` (aliased
+per-seq scratch = silent wrong results; host O(C²), C≤~8, negligible).
+
+**GPU-validated on dgx-00 GB10 (all ignored parity tests pass):**
+- `tiled_attention_parity`: `batched_seqs_match_per_seq` (C=4 `num_seqs=4` pass matches each seq
+  solo, per-row tol<1e-2), **`counts_zero_tail_is_noop`** (H3 exact-no-op, bitwise) — 4/4 ok.
+- `high_speed_swap_e2e`: **`batched_attend_matches_single_seq_bitwise`** (two ragged seqs through
+  ONE `attend_layer_batch_on_stream` == two independent `attend_layer`, bit-for-bit per row — the
+  Inc-2 sync-collapse is output-identical), `pool_sized_for_c_times_per_seq_budget`
+  (`C*budget<=num_slots` by construction) — 3/3 ok.
+- `cargo build -p spark-storage --features cuda` + `cargo check --workspace` +
+  `cargo build --release -p spark-server --no-default-features --features cuda` all green;
+  71 storage unit tests pass.
+
+**Still open (operator live run, box permitting):** the C=8 sync-count / latency measurement —
+serve `ATLAS_HSS_MAX_SEQS=8` + 8 concurrent overflow prompts, `ATLAS_SSM_MS_PROFILE=1`, prefetch
+OFF, and confirm the mid-attend `stream_sync`s collapse (~80→~10/step) and `attn_us` scales
+sub-linearly in N. This quantifies the win; correctness is already GPU-verified above.

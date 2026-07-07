@@ -30,6 +30,15 @@ use crate::model_dims::ModelDims;
 
 pub struct HighSpeedSwap;
 
+/// Mirror of `high_speed_swap::AttendSeqReq` (Phase 5 batched attend) so
+/// non-cuda builds of the spark-model call sites type-check.
+pub struct AttendSeqReq<'a> {
+    pub seq_slot: usize,
+    pub seq_block_ids: &'a [u32],
+    pub q_dev: u64,
+    pub output_dev: u64,
+}
+
 #[allow(unused_variables)]
 impl HighSpeedSwap {
     pub fn alloc_disk_block_id(&mut self) -> Option<u32> {
@@ -67,6 +76,7 @@ impl HighSpeedSwap {
 
     pub fn attend_layer_on_stream(
         &mut self,
+        seq_slot: usize,
         stream: u64,
         layer: u32,
         seq_block_ids: &[u32],
@@ -76,8 +86,18 @@ impl HighSpeedSwap {
         unreachable!()
     }
 
+    pub fn attend_layer_batch_on_stream(
+        &mut self,
+        stream: u64,
+        layer: u32,
+        seqs: &[AttendSeqReq<'_>],
+    ) -> anyhow::Result<()> {
+        unreachable!()
+    }
+
     pub fn attend_layer_on_stream_with_q_pos(
         &mut self,
+        seq_slot: usize,
         stream: u64,
         layer: u32,
         seq_block_ids: &[u32],
