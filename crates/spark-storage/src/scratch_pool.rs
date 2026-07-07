@@ -77,6 +77,16 @@ pub struct ScratchPool {
     residents: Vec<Option<ResidentKey>>, // indexed by slot idx
     lookup: HashMap<ResidentKey, u32>,
     free_list: VecDeque<u32>,
+    /// Phase 3: persistent per-slot pin refcount, indexed by slot. A slot with
+    /// `pin_count > 0` is NEVER chosen as an eviction victim by `assign`, and the
+    /// pin SURVIVES across `attend` calls (unlike the per-call `pinned` list the
+    /// attend loop feeds to the eviction policy). This is what makes cross-layer
+    /// prefetch (Phase 3) safe: layer L pins the slots it is actively reading so
+    /// a concurrent layer-L+1 prefetch's `assign` can't evict them mid-attention
+    /// (silent wrong-layer corruption), and the prefetch pins its reserved L+1
+    /// slots so they aren't evicted before L+1 runs. Refcounted so a slot pinned
+    /// by two in-flight users (read + reservation) survives until both release.
+    pin_count: Vec<u32>,
 }
 
 impl ScratchPool {
@@ -135,6 +145,7 @@ impl ScratchPool {
         };
         let residents = vec![None; dims.num_slots as usize];
         let free_list = (0..dims.num_slots).collect();
+        let pin_count = vec![0u32; dims.num_slots as usize];
         Ok(Self {
             dims,
             mem,
@@ -143,6 +154,7 @@ impl ScratchPool {
             residents,
             lookup: HashMap::new(),
             free_list,
+            pin_count,
         })
     }
 
@@ -185,8 +197,45 @@ impl ScratchPool {
     pub fn invalidate(&mut self, key: ResidentKey) {
         if let Some(slot) = self.lookup.remove(&key) {
             self.residents[slot as usize] = None;
+            // The block is gone; any pin on this slot is now void.
+            self.pin_count[slot as usize] = 0;
             self.free_list.push_back(slot);
         }
+    }
+
+    /// Phase 3: pin a resident slot so `assign` never evicts it until unpinned.
+    /// Refcounted. No-op for an out-of-range slot.
+    pub fn pin(&mut self, slot: u32) {
+        if let Some(c) = self.pin_count.get_mut(slot as usize) {
+            *c += 1;
+        }
+    }
+
+    /// Release one pin on `slot` (saturating at 0).
+    pub fn unpin(&mut self, slot: u32) {
+        if let Some(c) = self.pin_count.get_mut(slot as usize) {
+            *c = c.saturating_sub(1);
+        }
+    }
+
+    /// Pin the slot currently holding `key`, if resident. Returns the slot so
+    /// the caller can `unpin` it later.
+    pub fn pin_key(&mut self, key: ResidentKey) -> Option<u32> {
+        let slot = self.lookup.get(&key).copied()?;
+        self.pin(slot);
+        Some(slot)
+    }
+
+    /// Release one pin on the slot holding `key`, if resident.
+    pub fn unpin_key(&mut self, key: ResidentKey) {
+        if let Some(slot) = self.lookup.get(&key).copied() {
+            self.unpin(slot);
+        }
+    }
+
+    /// Whether `slot` is currently pinned (has a live reservation / in-flight read).
+    pub fn is_pinned(&self, slot: u32) -> bool {
+        self.pin_count.get(slot as usize).copied().unwrap_or(0) > 0
     }
 
     pub fn capacity(&self) -> u32 {
@@ -211,18 +260,23 @@ impl ScratchPool {
                 // backed by a known key) and is not pinned.
                 let mut chosen = None;
                 for &c in evict_candidates {
-                    if self
-                        .residents
-                        .get(c as usize)
-                        .and_then(|r| r.as_ref())
-                        .is_some()
+                    // Never evict a pinned slot (Phase 3): a slot layer L is
+                    // actively reading, or a prefetch has reserved for L+1.
+                    if !self.is_pinned(c)
+                        && self
+                            .residents
+                            .get(c as usize)
+                            .and_then(|r| r.as_ref())
+                            .is_some()
                     {
                         chosen = Some(c);
                         break;
                     }
                 }
                 let s = chosen.ok_or_else(|| {
-                    anyhow::anyhow!("no slot available and no eviction candidate is resident")
+                    anyhow::anyhow!(
+                        "no slot available and no unpinned eviction candidate is resident"
+                    )
                 })?;
                 if let Some(prev) = self.residents[s as usize].take() {
                     self.lookup.remove(&prev);
@@ -250,6 +304,9 @@ impl ScratchPool {
         self.lookup.clear();
         for r in self.residents.iter_mut() {
             *r = None;
+        }
+        for c in self.pin_count.iter_mut() {
+            *c = 0;
         }
         self.free_list.clear();
         for s in 0..self.dims.num_slots {
@@ -300,6 +357,79 @@ mod tests {
             .unwrap();
         assert_eq!(evicted, s0); // s0 was the eviction candidate
         assert_eq!(pool.lookup(k0), None); // k0 displaced
+    }
+
+    #[test]
+    #[ignore = "requires GPU"]
+    fn pinned_slot_is_never_evicted() {
+        let _ctx = ctx();
+        let mut pool = ScratchPool::new(ScratchDims {
+            num_slots: 2,
+            num_kv_heads: 2,
+            group_stride: 4096,
+        })
+        .unwrap();
+        let ka = ResidentKey { layer: 0, block: 1 };
+        let kb = ResidentKey { layer: 0, block: 2 };
+        let sa = pool.assign(ka, &[]).unwrap();
+        let sb = pool.assign(kb, &[]).unwrap();
+        assert_eq!(pool.free_count(), 0, "pool full");
+
+        // Pin slot A (refcount 2), then B.
+        assert_eq!(pool.pin_key(ka), Some(sa));
+        pool.pin(sa); // now pinned twice
+        assert!(pool.is_pinned(sa));
+
+        // Assigning a new block with A as the ONLY candidate must FAIL — A is
+        // pinned, so it can't be evicted (the anti-corruption guarantee).
+        let kc = ResidentKey { layer: 1, block: 9 };
+        assert!(
+            pool.assign(kc, &[sa]).is_err(),
+            "a pinned slot must never be an eviction victim"
+        );
+        // A is still resident (not clobbered).
+        assert_eq!(pool.lookup(ka), Some(sa));
+
+        // With unpinned B as candidate, eviction proceeds normally.
+        let sc = pool.assign(kc, &[sb]).unwrap();
+        assert_eq!(sc, sb);
+        assert_eq!(pool.lookup(kb), None, "unpinned B displaced");
+
+        // Refcount: A was pinned twice; one unpin keeps it pinned.
+        pool.unpin(sa);
+        assert!(pool.is_pinned(sa), "still pinned after one of two unpins");
+        pool.unpin_key(ka);
+        assert!(!pool.is_pinned(sa), "unpinned after both releases");
+
+        // Now A is evictable again.
+        let kd = ResidentKey { layer: 2, block: 3 };
+        let sd = pool.assign(kd, &[sa]).unwrap();
+        assert_eq!(sd, sa);
+    }
+
+    #[test]
+    #[ignore = "requires GPU"]
+    fn invalidate_and_clear_reset_pins() {
+        let _ctx = ctx();
+        let mut pool = ScratchPool::new(ScratchDims {
+            num_slots: 2,
+            num_kv_heads: 2,
+            group_stride: 4096,
+        })
+        .unwrap();
+        let ka = ResidentKey { layer: 0, block: 1 };
+        let sa = pool.assign(ka, &[]).unwrap();
+        pool.pin(sa);
+        assert!(pool.is_pinned(sa));
+        // Invalidating a block voids its pin (the block is gone).
+        pool.invalidate(ka);
+        assert!(!pool.is_pinned(sa));
+        // clear() resets all pins too.
+        let kb = ResidentKey { layer: 0, block: 2 };
+        let sb = pool.assign(kb, &[]).unwrap();
+        pool.pin(sb);
+        pool.clear();
+        assert!(!pool.is_pinned(sb));
     }
 
     #[test]
