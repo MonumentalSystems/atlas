@@ -646,3 +646,72 @@ bounce-gather to one contiguous blob then reuse `RdmaKvBackend.write_from_host`/
 the current `MemBlobStore` D2H-gather/H2D-scatter — simplest, correctness-first); (b) extend landing
 registration to 60 per-layer MRs for zero-copy scatter (fastest, hardest). NEXT: an ultracode design pass
 to vet the approach (a new `RdmaSnapshotStore : SnapshotBlobStore` over the existing verbs) — see below.
+
+### Phase 4b — SSM-snapshot RDMA spill tier (ULTRACODE-DESIGNED 2026-07-07)
+> Design via a 5-phase ultracode workflow (5 readers CONFIRMED the key insight 5/5; synthesis produced this plan). The workflow's Design+Verify agent phases crashed (StructuredOutput schema cap), so the adversarial verification was done BY HAND against the code — CONFIRMED: (1) spill_slot builds ONE contiguous blob + leading synchronize (ssm_snapshot.rs:434-448); (2) fault_in_slot trailing synchronize before restore (:488); (3) reclaim_from_cache handles put->Ok(false) → free slot → miss-into-recompute (:565-581). The 3 load-bearing correctness claims hold.
+
+> **Thesis.** The Marconi snapshot pool (~20 GB HBM: 256 slots × 63.75 MB + decode-rollback) today spills evicted snapshots only to local host RAM (`MemBlobStore`, gated `ATLAS_SSM_TIER`). Give it a **second** `SnapshotBlobStore` implementation that ships the *already-contiguous* spill blob to the gx10 RAM blade over the existing CX7 RDMA transport. This scales warm-snapshot capacity past local LPDDR and frees ~16–20 GB HBM, converting the *expensive* loss (an SSM-prefix **recompute**, ~4,400 recompute-tok/hit at 16 slots, #278) into a cheap ~5–7 ms remote restore. Default-off ⇒ byte-identical to today.
+
+### Verified architectural ground (why this is the small increment, not the scary one)
+
+Confirmed against code before design — these are the load-bearing facts:
+
+- **The integration surface is exactly `put`/`get`.** `SnapshotBlobStore` is a **host-bytes** trait — `put(key:u64, bytes:&[u8])->Result<bool>`, `get(key:u64, out:&mut[u8])->Result<bool>`, `remove/len/bytes_resident` (`ssm_tier.rs:42-61`). An `RdmaSnapshotStore` never touches a device stream.
+- **The blob is one contiguous host `Vec`.** `spill_slot` (`ssm_snapshot.rs:435-448`) allocates `vec![0u8; spill_blob_bytes()]`, D2H-gathers the 60 scattered per-layer chunks into it in layout `[h₀ conv₀ h₁ conv₁ … h_{L-1} conv_{L-1}]`, then calls `store.put(key,&blob)`. `fault_in_slot` (`459-490`) does `store.get(key,&mut blob)` then H2D-scatters. **The "60 scattered device MRs" problem is already solved at the trait boundary** — no `register_landing_region`-to-60-MRs work is needed. Zero-copy is a later perf phase, not this increment.
+- **Both cross-stream ordering hazards are already discharged.** `spill_slot` does a leading `synchronize(stream)` (`ssm_snapshot.rs:434`) to drain the in-flight async save before the D2H read; `fault_in_slot` does a trailing `synchronize(stream)` (`488`) before the caller's `restore` reads the slot. A host-bytes store inherits both for free.
+- **The peer-full path is already correct.** `reclaim_from_cache` (`ssm_snapshot.rs:565-581`) handles `put→Ok(false)` by logging and freeing the slot; the index entry stays marked-tiered but holds no bytes, so a later `lookup_tiered`→fault-in cleanly **misses into recompute**. A *bounded* remote tier therefore ships correct with **zero new rollback logic**.
+- **The KV blade server is layout-agnostic.** `kv_peer` wire protocol (`kv_peer.rs:16-23`) is: client sends `[u64 total_bytes]` → peer allocates + registers ONE RW MR of that size → serves one-sided WRITE/READ at `base + offset`. **The peer knows nothing about `GroupLayout`** — all group addressing lives client-side in `RdmaKvBackend`. So a **second `kv_peer` instance** serves a snapshot arena with **zero peer-side code changes**; we only need a different client-side addressing scheme.
+- **KV `GroupKey` addressing is the wrong layout and would corrupt live KV.** `RdmaKvBackend::write_from_host` (`rdma_kv_backend.rs:485-509`) asserts `src.len() == group_bytes` and addresses `base + group_id*group_stride`. A 63.75 MB snapshot blob is neither group-sized nor group-addressable — reusing `GroupKey` is verified-broken. Snapshots need a **`u64 → arena offset` allocator**, not the KV group layout.
+
+### Mechanism
+
+**New type `RdmaSnapshotStore` (crate `spark-storage`) implementing `SnapshotBlobStore`.** Three parts:
+
+1. **Transport (reuse KV machinery, replace addressing).** Reuse `RdmaKvBackend`'s connection bring-up verbatim — the TCP handshake (`[u64 total_bytes][u8 n_rails]` → `KvServerParams` → `VerbsClientParams` → QP connect), dual-rail striping (`ATLAS_EXPERT_RDMA_DEV`/`GID` rail 0, `ATLAS_KV_RAIL2_DEV`/`GID` rail 1, `ATLAS_KV_DUAL_RAIL`), and pipeline depth. Extract the rail-set bring-up (`connect`'s rail-creation + handshake loop, `rdma_kv_backend.rs:214-322`) into a shared `RdmaRailSet::connect(addr, arena_bytes, bounce_bytes) -> Vec<Rail>` used by both backends, so the snapshot store gets dual-rail throughput without duplicating verbs setup. **Do not** reuse `GroupKey`/`group_stride`.
+
+2. **Peer arena + `u64 → offset` allocator.** The snapshot store connects to its **own** `kv_peer` instance (or a distinct port) with `total_bytes = arena_slots × blob_bytes`. Because every snapshot blob is the same fixed size (`spill_blob_bytes()`), the allocator is a trivial **fixed-slot arena**: a free-list of `arena_slots` offsets plus `HashMap<u64 key → slot_offset>`. `put(key,blob)`: if `key` already mapped, overwrite in place at its offset; else pop a free slot — **if none, return `Ok(false)`** (the graceful-drop contract; the entry misses into recompute). RDMA-WRITE the blob to `remote_base + slot_offset`, record the mapping, return `Ok(true)`. `get(key,out)`: look up the offset; absent ⇒ `Ok(false)`; `out.len() != blob_bytes` ⇒ `Ok(false)` (defensive, never scatter a wrong-sized blob); else RDMA-READ `remote_base + slot_offset` into `out`, return `Ok(true)`. `remove(key)`: return its slot to the free-list. `len`/`bytes_resident` from the map. **Grafted from design C:** carve the arena so per-snapshot offsets are STABLE and per-layer-addressable (offset + `i*(h_bytes+conv_bytes)`), so the future zero-copy path can register the same ~60 device pointers as MRs writing into the identical peer offsets — making zero-copy a drop-in write-path swap, not a re-architecture.
+
+3. **Persistent bounce MR (graft from C).** A 63.75 MB blob per op makes the KV-style depth-16 bounce ring (~1 GB pinned/rail) wasteful. Keep **one persistent registered bounce buffer of `blob_bytes` per rail** (or chunk the blob into pipeline-depth segments striped across rails — a perf tuning knob), reused across every spill/fault. This avoids per-spill `reg_mr` cost **without** giving up the byte-testable host boundary: `put` copies the blob into the persistent bounce and RDMA-WRITEs; `get` RDMA-READs into the bounce then `copy_from_slice` into `out`.
+
+**Plug-in point (`impl_a1.rs:~191`).** Today `ssm_tier_store: Option<Arc<dyn SnapshotBlobStore>>` is `Some(MemBlobStore::new(0))` when `ATLAS_SSM_TIER` + SSM layers. Extend the selector: when `ATLAS_SSM_RDMA_TIER=host:port` is *also* set, construct `Arc::new(RdmaSnapshotStore::connect(peer, spill_blob_bytes, arena_slots)?)` instead; on connect failure, **log and fall back** to `MemBlobStore` (never fail model init over an optional tier). `spill_blob_bytes()` and `arena_slots` (from `ATLAS_SSM_RDMA_ARENA_SLOTS`, default e.g. 512) size the arena. Everything downstream (`spill_slot`/`fault_in_slot`/`reclaim_from_cache`) is unchanged — they only see the trait.
+
+### Ordered, byte-identical increments
+
+- **4b-0 — Extract shared transport.** Factor the rail bring-up/handshake out of `RdmaKvBackend::connect` into `RdmaRailSet`. Pure refactor; KV path byte-identical (existing `#[ignore]` live KV round-trip test still passes). No new behavior.
+- **4b-1 — `RdmaSnapshotStore` + offset allocator, mock-validated.** Implement the trait against the shared transport with a **loopback / mock rail** (or an in-process `kv_peer` over TCP+loopback verbs where available). Unit test: `put`/`get`/`remove`/`len`/`bytes_resident` **parity with `MemBlobStore`** including the over-cap/full-arena `Ok(false)` and wrong-size-`get` `Ok(false)` cases. Not wired into the model yet ⇒ byte-identical.
+- **4b-2 — Gate wiring (default-off).** Add the `ATLAS_SSM_RDMA_TIER` selector at `impl_a1.rs:191` with connect-failure fallback to `MemBlobStore`. Unset ⇒ `None`/`MemBlobStore` exactly as today ⇒ byte-identical. Add a unit test that the selector returns `None` when the flag is absent and `MemBlobStore` when only `ATLAS_SSM_TIER` is set.
+- **4b-3 — Live gx10 peer validation.** Stand up a second `kv_peer` instance sized `arena_slots × blob_bytes`. `#[ignore]`-gated live test (mirrors `rdma_kv_round_trip`): reuse the existing pool-level `spill_then_fault_in_preserves_bytes` / `tier_survives_slot_recycling` invariants (`ssm_snapshot.rs:637-742`) but with `RdmaSnapshotStore` as the store — assert the spill→RDMA→fault round-trip is **bit-identical**, and that a full arena returns `Ok(false)` → graceful miss. Then a live agentic smoke (35B, `ATLAS_TARGET_MODEL=holo-3.1-35b-a3b`) confirming HBM freed and warm-turn fault-ins land.
+
+### Top hazards, with guards
+
+1. **Cross-stream ordering (half-written spill / premature restore).** *Guard:* inherited for free — `spill_slot`'s leading `synchronize` (`ssm_snapshot.rs:434`) drains the async save before the store ever sees bytes; `fault_in_slot`'s trailing `synchronize` (`488`) commits the H2D scatter before `restore`. The store operates purely on host bytes, so it cannot violate device ordering. Additionally, `put` must **fully drain its RDMA-WRITE completion before returning** (synchronous store contract), and `get` must drain its READ before copying to `out`.
+2. **Byte-identity (a corrupted restore garbles output).** *Guard:* the spill→RDMA→fault round-trip is unit-tested against `MemBlobStore` parity (4b-1) and bit-compared live (4b-3), reusing the pool's existing bit-for-bit invariants. The persistent-bounce copy is a `copy_nonoverlapping`/`copy_from_slice` of exactly `blob_bytes`.
+3. **Peer OOM (256+ snapshots × 64 MB × many sessions).** *Guard:* the **fixed-slot arena caps residency**; `put` returns `Ok(false)` when the free-list is empty. `reclaim_from_cache` (`569-580`) already handles the reject → free slot → miss-into-recompute. No per-connection budget needed beyond the arena size. (Bounded-tier index drop-on-reject is a *perf* follow-up, not correctness — the miss path is already safe.)
+4. **Addressing (must not be `GroupKey`).** *Guard:* the `u64 → slot-offset` allocator is a distinct scheme; the store never constructs a `GroupKey` and connects to a **separate arena/instance**, so it cannot collide with live KV groups.
+5. **Latency vs recompute (remote restore must stay a win).** *Guard:* correctness is flag-independent; as a **follow-up telemetry gate**, add a cost-aware fault-in-vs-recompute decision (CX7 ~64 MB restore ≈5–7 ms vs ~4,400 recompute-tok/hit) so a slow peer degrades to recompute rather than losing throughput. Not a blocker for default-off correctness.
+
+### DO NOT
+
+- **Do not** register the 60 per-layer device pointers as MRs (zero-copy scatter) in this increment — the host-mediated contiguous blob already exists and is bit-testable; zero-copy is a later perf swap (design C), enabled by the stable per-layer arena offsets we lay down now.
+- **Do not** reuse `RdmaKvBackend`'s `GroupKey`/`group_stride` addressing or its `write_from_host` (`src.len()==group_bytes` assert) — verified wrong layout, would corrupt live KV.
+- **Do not** make the tier fail hard on peer full, connect failure, or slow restore — always degrade (`Ok(false)` / fall back to `MemBlobStore` / recompute).
+- **Do not** change any default: no `ATLAS_SSM_RDMA_TIER` ⇒ existing `MemBlobStore`/drop path ⇒ byte-identical.
+
+### Flag / gating (default-off = byte-identical)
+
+- `ATLAS_SSM_TIER` (existing) — engages the spill tier at all. Unset ⇒ evictions drop exactly as before.
+- `ATLAS_SSM_RDMA_TIER=host:port` (new) — when set *with* `ATLAS_SSM_TIER`, selects `RdmaSnapshotStore` instead of `MemBlobStore`; connect failure logs and falls back to `MemBlobStore`.
+- `ATLAS_SSM_RDMA_ARENA_SLOTS` (new, default e.g. 512) — sizes the peer arena (`slots × spill_blob_bytes`).
+- Reuses KV transport env: `ATLAS_KV_DUAL_RAIL`, `ATLAS_EXPERT_RDMA_DEV`/`GID`, `ATLAS_KV_RAIL2_DEV`/`GID`, `ATLAS_KV_PIPELINE_DEPTH`.
+
+### Test strategy
+
+- **Unit (host, no GPU/NIC):** `RdmaSnapshotStore` over a loopback/mock rail — full `SnapshotBlobStore` parity with `MemBlobStore` (round-trip, absent-key miss, wrong-size-get refused, full-arena `Ok(false)`, `remove`, `bytes_resident`). Selector test at the `impl_a1` gate (absent flag ⇒ `None`; `ATLAS_SSM_TIER` only ⇒ `MemBlobStore`).
+- **Pool-level (mock GPU):** reuse `spill_then_fault_in_preserves_bytes` and `tier_survives_slot_recycling` (`ssm_snapshot.rs`) parameterized over the store — proves spill-not-drop end-to-end with the RDMA store's semantics.
+- **Live (gx10 peer, `#[ignore]`):** second `kv_peer` instance; bit-identical spill→RDMA→fault round-trip + full-arena graceful-miss; then a 35B agentic smoke confirming HBM freed and warm-turn fault-ins landing.
+
+### Follow-ups (out of scope for the correct default-off increment)
+
+- Cost-aware fault-in-vs-recompute telemetry gate (hazard 5).
+- Bounded-tier drop-on-reject index cleanup (perf; correctness already safe via miss-on-fault).
+- Zero-copy per-layer device-MR write path into the pre-stabilized arena offsets (design C drop-in).
