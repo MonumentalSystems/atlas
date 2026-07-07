@@ -183,6 +183,23 @@ impl TransformerModel {
             );
         }
 
+        // Phase 1b spill tier (ATLAS_SSM_TIER): an unbounded host-RAM blob store
+        // that catches evicted SSM snapshots so warm turns fault them back in
+        // instead of recomputing. Only when the model actually has SSM layers.
+        // Unbounded (cap=0) so `put` never rejects — a bounded tier would need
+        // drop-on-reject handling of the just-tiered index entry (follow-up).
+        let ssm_tier_store: Option<Arc<dyn super::ssm_tier::SnapshotBlobStore>> =
+            if super::ssm_tier::ssm_tier_enabled() && ssm_pool.num_ssm_layers > 0 {
+                tracing::info!(
+                    "SSM spill tier ENABLED (ATLAS_SSM_TIER): unbounded host-RAM blob store \
+                     ({} bytes/snapshot)",
+                    ssm_snapshots.spill_blob_bytes(),
+                );
+                Some(Arc::new(super::ssm_tier::MemBlobStore::new(0)))
+            } else {
+                None
+            };
+
         // Fixed metadata stride for CUDA graph compatibility
         let max_blocks_per_seq = (max_seq_len / kv_cache.block_size() + 1) as u32;
 
@@ -439,6 +456,7 @@ impl TransformerModel {
             ),
             ssm_pool,
             ssm_snapshots,
+            ssm_tier_store,
             max_blocks_per_seq,
             max_batch_size: max_batch_size as u32,
             dummy_kv_block,

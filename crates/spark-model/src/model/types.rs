@@ -107,6 +107,11 @@ pub struct TransformerModel {
     pub(super) ssm_pool: Arc<SsmStatePool>,
     /// SSM state snapshot pool for Marconi prefix caching.
     pub(super) ssm_snapshots: SsmSnapshotPool,
+    /// Phase 1b spill tier (`ATLAS_SSM_TIER`): when `Some`, an evicted Marconi
+    /// snapshot is SPILLED here (bytes moved off the pinned HBM slot) instead of
+    /// dropped, and a later warm turn faults it back in rather than recomputing
+    /// the SSM prefix. `None` (default) = drop-as-before, byte-identical.
+    pub(super) ssm_tier_store: Option<Arc<dyn super::ssm_tier::SnapshotBlobStore>>,
     /// Fixed max blocks per sequence (max_seq_len / block_size + 1).
     /// Used as constant stride in attention metadata for CUDA graph compatibility.
     pub(super) max_blocks_per_seq: u32,

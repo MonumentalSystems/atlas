@@ -98,7 +98,12 @@ impl TransformerModel {
             Ok(None) => {
                 if self
                     .ssm_snapshots
-                    .reclaim_from_cache(self.prefix_cache.as_ref(), &mut kv)
+                    .reclaim_from_cache(
+                        self.prefix_cache.as_ref(),
+                        &mut kv,
+                        self.ssm_tier_store.as_deref(),
+                        self.gpu.as_ref(),
+                    )
                 {
                     match self.ssm_snapshots.save(
                         seq.slot_idx,
@@ -206,7 +211,12 @@ impl TransformerModel {
             Ok(None) => {
                 if self
                     .ssm_snapshots
-                    .reclaim_from_cache(self.prefix_cache.as_ref(), &mut self.kv_cache.lock())
+                    .reclaim_from_cache(
+                        self.prefix_cache.as_ref(),
+                        &mut self.kv_cache.lock(),
+                        self.ssm_tier_store.as_deref(),
+                        self.gpu.as_ref(),
+                    )
                 {
                     let retry = self.ssm_snapshots.save(
                         seq.slot_idx,

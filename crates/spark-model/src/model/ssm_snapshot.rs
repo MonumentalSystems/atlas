@@ -364,6 +364,18 @@ impl SsmSnapshotPool {
         self.free_slots.lock().push(snap_slot);
     }
 
+    /// Claim an immediately-free Marconi slot (no eviction). Used as the
+    /// fault-in target for a spilled snapshot (Phase 1b). `None` when the pool
+    /// is full — the caller then falls through to recompute (full-pool fault-in
+    /// via reclaim is a follow-up). The claimed slot must be `free`d if the
+    /// fault-in misses.
+    pub(super) fn try_pop_free_slot(&self) -> Option<usize> {
+        if !self.is_enabled() {
+            return None;
+        }
+        self.free_slots.lock().pop()
+    }
+
     /// Bytes in one slot's full spill blob: every SSM layer's `h` + `conv`
     /// state, laid out `[h_0 conv_0 h_1 conv_1 … h_{L-1} conv_{L-1}]`.
     pub(super) fn spill_blob_bytes(&self) -> usize {
@@ -502,14 +514,47 @@ impl SsmSnapshotPool {
         Ok(())
     }
 
-    /// Try to reclaim a snapshot slot by evicting the LRU snapshot from the
-    /// prefix cache's snapshot index. Snapshots are decoupled from tree nodes,
-    /// so this directly frees a snapshot without needing to evict KV blocks.
+    /// Try to reclaim a snapshot slot by evicting a snapshot from the prefix
+    /// cache's snapshot index. Snapshots are decoupled from tree nodes, so this
+    /// directly frees a slot without evicting KV blocks.
+    ///
+    /// Phase 1b: when `tier` is `Some` (`ATLAS_SSM_TIER`), the victim is
+    /// **spilled** — its bytes moved to the tier and its index entry kept
+    /// (findable), so a warm turn faults it back instead of recomputing — before
+    /// the slot is freed for reuse. When `tier` is `None` the victim is dropped
+    /// exactly as before (byte-identical default path). Returns whether a slot
+    /// was reclaimed.
     pub(super) fn reclaim_from_cache(
         &self,
         prefix_cache: &dyn spark_runtime::prefix_cache::PrefixCache,
         _kv_cache: &mut PagedKvCache,
+        tier: Option<&dyn super::ssm_tier::SnapshotBlobStore>,
+        gpu: &dyn GpuBackend,
     ) -> bool {
+        if let Some(store) = tier {
+            // Spill-not-drop. Marconi saves are enqueued on the default stream,
+            // so draining it inside `spill_slot` guarantees we never D2H a
+            // half-written victim slot (the read half of the ordering hazard).
+            if let Some((slot, key)) = prefix_cache.evict_snapshot_to_tier() {
+                let stream = gpu.default_stream();
+                match self.spill_slot(slot, key, store, gpu, stream) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        // Unbounded tier never rejects; a bounded one could. The
+                        // entry is now marked tiered but holds no bytes → a later
+                        // fault-in cleanly misses (recompute). Bounded-tier
+                        // drop-on-reject is a follow-up.
+                        tracing::warn!("SSM spill tier refused a blob; entry will miss on fault-in");
+                    }
+                    Err(e) => {
+                        tracing::warn!("SSM spill failed ({e:#}); freeing slot, entry will miss");
+                    }
+                }
+                self.free(slot); // slot reusable regardless; bytes are (or aren't) in the tier
+                return true;
+            }
+            return false;
+        }
         if let Some(snap) = prefix_cache.evict_snapshot_lru() {
             self.free(snap);
             true

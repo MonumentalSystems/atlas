@@ -113,8 +113,51 @@ impl TransformerModel {
             // layer_kv_write_start floor (forward_layers.rs) skips writes below
             // cached_prefix_tokens, so the shared prefix-cache blocks keep the
             // original values (a non-bit-equal rewrite would poison them).
-            let mut skip = if let Some(snap_id) = prefix_match.ssm_snapshot {
-                let snap_tok = prefix_match.ssm_snapshot_tokens;
+            // Phase 1b spill-tier fault-in: if the deepest anchor for this
+            // prefix was SPILLED (ssm_snapshot is None but a tier key is
+            // present), fault its bytes into a fresh slot and treat it as
+            // resident for the restore below — converting a recompute into a
+            // tier-restore. Best-effort: only when a slot is immediately free
+            // (full-pool fault-in is a follow-up) and the tier still holds the
+            // blob; otherwise fall through to recompute (always correct).
+            let mut faulted_snap: Option<usize> = None;
+            if prefix_match.ssm_snapshot.is_none() {
+                if let (Some(store), Some(key)) = (
+                    self.ssm_tier_store.as_deref(),
+                    prefix_match.ssm_snapshot_tier_key,
+                ) {
+                    if let Some(slot) = self.ssm_snapshots.try_pop_free_slot() {
+                        match self.ssm_snapshots.fault_in_slot(
+                            slot,
+                            key,
+                            store,
+                            self.gpu.as_ref(),
+                            stream,
+                        ) {
+                            Ok(true) => {
+                                self.prefix_cache.promote_snapshot(key, slot);
+                                faulted_snap = Some(slot);
+                                tracing::info!(
+                                    "SSM tier fault-in: restored spilled snapshot at token {} \
+                                     into slot {slot}",
+                                    prefix_match.ssm_snapshot_tier_tokens,
+                                );
+                            }
+                            // Miss (blob gone) or error: return the slot, recompute.
+                            _ => self.ssm_snapshots.free(slot),
+                        }
+                    }
+                }
+            }
+            let eff_snapshot = prefix_match.ssm_snapshot.or(faulted_snap);
+            let eff_snapshot_tokens = if faulted_snap.is_some() {
+                prefix_match.ssm_snapshot_tier_tokens
+            } else {
+                prefix_match.ssm_snapshot_tokens
+            };
+
+            let mut skip = if let Some(snap_id) = eff_snapshot {
+                let snap_tok = eff_snapshot_tokens;
                 // Exact full-prompt hit on a hiddenless snapshot (finish
                 // leaves never stash a hidden): the exact-snap fixup cannot
                 // produce the first token's logits, so fall through to the

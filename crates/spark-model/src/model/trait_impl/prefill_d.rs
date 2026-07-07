@@ -109,7 +109,12 @@ impl TransformerModel {
                     // Pool exhausted — evict LRU entries to reclaim a slot
                     if self
                         .ssm_snapshots
-                        .reclaim_from_cache(self.prefix_cache.as_ref(), kv_cache)
+                        .reclaim_from_cache(
+                            self.prefix_cache.as_ref(),
+                            kv_cache,
+                            self.ssm_tier_store.as_deref(),
+                            self.gpu.as_ref(),
+                        )
                     {
                         self.ssm_snapshots
                             .save(
@@ -203,7 +208,12 @@ impl TransformerModel {
                     tracing::debug!("Snapshot pool full, reclaiming...");
                     if self
                         .ssm_snapshots
-                        .reclaim_from_cache(self.prefix_cache.as_ref(), kv_cache)
+                        .reclaim_from_cache(
+                            self.prefix_cache.as_ref(),
+                            kv_cache,
+                            self.ssm_tier_store.as_deref(),
+                            self.gpu.as_ref(),
+                        )
                     {
                         self.ssm_snapshots
                             .save(
