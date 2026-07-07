@@ -457,3 +457,43 @@ per-seq scratch = silent wrong results; host O(C²), C≤~8, negligible).
 serve `ATLAS_HSS_MAX_SEQS=8` + 8 concurrent overflow prompts, `ATLAS_SSM_MS_PROFILE=1`, prefetch
 OFF, and confirm the mid-attend `stream_sync`s collapse (~80→~10/step) and `attn_us` scales
 sub-linearly in N. This quantifies the win; correctness is already GPU-verified above.
+
+### Phase 5 Inc 1+2 — C=8 LIVE MEASUREMENT (2026-07-07): Inc 2 is NOT the win (redirects to Inc 3)
+Served Qwen3.6-35B-A3B on dgx-00 GB10 (scoped port 18997, torn down by PID), `ATLAS_HSS_MAX_SEQS=8`
+(`batched attend sized for max_seqs=8` confirmed in log), `ATLAS_MS_PROFILE=1`, **prefetch OFF** (so
+the Inc-2 sync-collapse path is live), `--high-speed-swap-cache-blocks-per-seq 8` (128-tok window),
+`--max-batch-size 8`, 8 concurrent ~500-tok overflow prompts. Steady state n=8 (197 profiled steps):
+
+| metric | this run (Inc 1+2) | pre-change baseline (prior session) |
+|---|---|---|
+| attn (10 layers) | **139.7 ms** | ~133 ms |
+| attn / seq | **17.4 ms** | ~16.6 ms |
+| attn % of decode | 79% | ~70% |
+| per-tok | 23.3 ms | — |
+| tok/s (8-way) | 4.8 | ~4 |
+
+**attn/seq is FLAT (17.4 vs 16.6 ms = within noise). The sync-collapse delivered no measurable decode
+speedup.** This is the important result, not a disappointment: it falsifies the prior session's inference
+that the `attn ∝ N` cost was CPU-sync-bound. The ~80 mid-attend `stream_sync`s → ~10 collapse has a
+theoretical ceiling of ~1% of the 140 ms attn wall (70 fewer syncs × ~20 µs); flat is exactly expected.
+The pegged core was CPU-busy **overlapped** with GPU+disk, not serially gating decode.
+
+**Where the `∝N` cost actually lives → Inc 3.** At C=8 each seq fires an **under-occupied
+`grid=(1,nq,1)` launch and waits on its own NVMe read, back-to-back on one stream** — 8 sequential
+under-occupied GPU launches + 8 sequential disk waits. That is what scales with N, and Inc 2 does not
+touch it. **Inc 3 (one wide `grid=(C,nq,1)` launch = 8× occupancy + a union disk read = one wait not 8)
+is the real lever.** Inc 2 remains the correct, GPU-validated structural prerequisite that makes the wide
+launch expressible; it is not a standalone throughput win.
+
+**Caveats (stated, not spun):** (1) baseline is cross-session, not a same-config HEAD A/B — the 16.6 vs
+17.4 gap is within run-to-run noise either way; a same-box HEAD-vs-branch A/B would make "no win" airtight
+but the ~1% ceiling already predicts flat. (2) `ATLAS_MS_PROFILE=1` perturbs the regime (forces eager /
+per-phase syncs; log also showed FP8-calibration re-enabling graphs mid-run), and wave-A n=1 emitted no
+profile lines (ran during the graph/calibration transition) so no clean per-N scaling curve from this run.
+(3) Per [[feedback-test-models]], **future Phase 5 validation (esp. Inc 3 correctness + any quality A/B)
+should serve Holo 3.1 35B**, not qwen3.6-35b-a3b — the sync-collapse being timed here is model-agnostic
+host orchestration so qwen was fine for it, but quality judgments need the trusted-baseline model.
+
+**Recommendation:** land Inc 3 (union read + `step_tile(num_seqs=C)` wide launch, per the §Phase 5 plan
++ the H1 release-active plane-capacity bail that already guards it) as the next increment — that is where
+the measured `∝N` attention cost is actually attackable. Re-measure on Holo 3.1 35B.
