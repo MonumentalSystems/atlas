@@ -271,6 +271,21 @@ pub fn build_model(
     if hss_cache_blocks_per_seq.is_some() {
         kv_summary::log_hss_kv_summary(&kv_config);
     }
+    // issue #33/#35 fold (b): HSS KV-overflow streaming is NOT hooked for MLA.
+    // `ms_mla_decode` (multi_seq/mla.rs) never routes through
+    // `ms_phase_paged_decode` where the streaming hook lives, so an MLA model
+    // under --high-speed-swap would silently ignore its offloaded disk history
+    // and mis-recall on overflow. Fail LOUD at construction — before any token —
+    // rather than degrade silently. `kv_lora_rank > 0` is the MLA test (matches
+    // `is_mla_dispatch`). The condition precisely spares MLA-without-HSS and
+    // HSS-without-MLA. `bail` is not imported here, so fully-qualify.
+    if hss_cache_blocks_per_seq.is_some() && config.kv_lora_rank > 0 {
+        anyhow::bail!(
+            "--high-speed-swap + MLA (kv_lora_rank>0) is not supported: ms_mla_decode bypasses \
+             ms_phase_paged_decode, so KV overflow would silently mis-recall. Drop \
+             --high-speed-swap for MLA models, or run a non-MLA model."
+        );
+    }
     // ── gpu_memory_utilization as fraction of TOTAL GPU memory ──
     //
     // User-facing contract (matches vLLM / sparkrun convention):
