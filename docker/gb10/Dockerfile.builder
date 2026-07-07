@@ -37,7 +37,8 @@ ARG CUTLASS_DSL_VER
 RUN apt-get update -qq && \
     apt-get install -y -qq --no-install-recommends \
       curl ca-certificates build-essential pkg-config git cmake libclang-dev \
-      python3 python3-pip && \
+      python3 python3-pip \
+      libibverbs-dev librdmacm-dev libnccl-dev && \
     rm -rf /var/lib/apt/lists/*
 
 # Rust (stable — overrides rust-toolchain.toml's 1.85 pin; libloading 0.9 needs >=1.88).
@@ -62,9 +63,7 @@ RUN git clone --filter=blob:none https://github.com/flashinfer-ai/flashinfer.git
 # CuTe-DSL runtime for the GDN AOT kernel (provides libcute_dsl_runtime.so).
 # Discover its location and expose it on the linker/loader path.
 RUN pip3 install --no-cache-dir --break-system-packages "nvidia-cutlass-dsl[cu13]==${CUTLASS_DSL_VER}" && \
-    CUTE_RT=$(python3 -c "import importlib.util,os,glob; \
-      base=os.path.dirname(importlib.util.find_spec('cutlass').origin); \
-      print(next(iter(glob.glob(base+'/**/libcute_dsl_runtime.so', recursive=True)), ''))") && \
+    CUTE_RT=$(find /usr/local/lib -name libcute_dsl_runtime.so 2>/dev/null | head -1) && \
     test -n "$CUTE_RT" && ln -sf "$CUTE_RT" /usr/local/lib/libcute_dsl_runtime.so && \
     echo "cute runtime: $CUTE_RT"
 ENV LD_LIBRARY_PATH=/usr/local/lib:/usr/local/cuda/compat:${LD_LIBRARY_PATH}
@@ -81,10 +80,21 @@ COPY jinja-templates/ jinja-templates/
 COPY 3rdparty_patches/ 3rdparty_patches/
 
 ENV ATLAS_TARGET_HW=gb10
-ENV ATLAS_TARGET_MODEL=*
-ENV ATLAS_TARGET_QUANT=*
+# Model/quant selection. Default `*` builds kernels for every model (canonical
+# image); override for a much faster single-model build, e.g.
+#   --build-arg ATLAS_TARGET_MODEL=qwen3.6-35b-a3b --build-arg ATLAS_TARGET_QUANT=nvfp4
+ARG ATLAS_TARGET_MODEL=*
+ENV ATLAS_TARGET_MODEL=${ATLAS_TARGET_MODEL}
+ARG ATLAS_TARGET_QUANT=*
+ENV ATLAS_TARGET_QUANT=${ATLAS_TARGET_QUANT}
 # Native FP4 GEMM + cuBLASLt BF16 prefill projections on by default (matches prod).
 ENV ATLAS_CUTLASS_NVFP4_GEMM=1
+
+# vendored cudarc 0.19.2 only knows CUDA up to 13.1; the 13.2 toolkit trips its
+# "Unsupported cuda toolkit version" panic. cudarc uses dynamic-loading (dlopen at
+# runtime) so the minor only gates the API surface, stable across 13.x — force the
+# 13.1 ABI (format {maj}0{min}0). Proper fix = bump cudarc to a 13.2-aware version.
+ENV CUDARC_CUDA_VERSION=13010
 
 RUN cargo build --release -p spark-server
 
