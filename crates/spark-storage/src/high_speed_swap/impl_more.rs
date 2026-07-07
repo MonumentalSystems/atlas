@@ -8,7 +8,7 @@ use std::ffi::c_void;
 use super::HighSpeedSwap;
 use crate::backend::ReadRequest;
 use crate::config::HighSpeedSwapConfig;
-use crate::cuda_min::{CudaCtx, copy_d_to_h_async, copy_h_to_d_async, stream_sync};
+use crate::cuda_min::{CudaCtx, CudaEvent, copy_d_to_h_async, copy_h_to_d_async};
 use crate::group::{GroupKey, KvKind};
 use crate::predictor::Predictor;
 use crate::scratch_pool::{ResidentKey, ScratchPool};
@@ -214,7 +214,18 @@ impl HighSpeedSwap {
             self.score_host_buf.len() * 4,
             stream,
         )?;
-        stream_sync(stream)?;
+        // SYNC#1 deferral: instead of a blocking `stream_sync` here (a per-layer
+        // CPU round-trip on the token critical path), record an event on the
+        // score D2H and only CPU-wait on it lazily — right before the first
+        // `rank()` that can actually consult a score (a firing eviction, i.e.
+        // free_count()==0), else once at loop end. `record_score` calls are
+        // stashed in `pending_scores` and flushed at those points. The recorded
+        // VALUES are identical (same D2H copy); only the host-visibility TIMING
+        // moves — so residency stays bit-identical.
+        let score_evt = CudaEvent::new()?;
+        score_evt.record(stream)?;
+        let mut score_ready = false;
+        let mut pending_scores: Vec<(u32, u32)> = Vec::new();
 
         // 3. Tile loop.
         self.attn.begin_step_on_stream(stream, 1)?;
@@ -243,12 +254,29 @@ impl HighSpeedSwap {
             let mut reqs: Vec<ReadRequest> = Vec::new();
             for &blk in &missing {
                 let key = ResidentKey { layer, block: blk };
+                // The score host buffer is only consumed when `assign` must
+                // evict (free_count()==0 => rank()'s result is used). Flush the
+                // deferred scores just before EVERY firing rank() so `last_score`
+                // is host-valid exactly when it can affect a victim choice. The
+                // event is CPU-waited only once (score_ready); the drain runs on
+                // each firing rank so a later tile's eviction can never rank a
+                // prior tile's slot against a still-deferred score (bit-identical
+                // to the original inline record in the multi-tile case too).
+                if self.pool.free_count() == 0 && !pending_scores.is_empty() {
+                    if !score_ready {
+                        score_evt.sync()?;
+                        score_ready = true;
+                    }
+                    for (s, b) in pending_scores.drain(..) {
+                        self.eviction
+                            .record_score(s, self.score_host_buf[b as usize]);
+                    }
+                }
                 let candidates = self.eviction.rank(&pinned);
                 let slot = self.pool.assign(key, &candidates)?;
                 pinned.push(slot);
                 self.eviction.touch(slot);
-                self.eviction
-                    .record_score(slot, self.score_host_buf[blk as usize]);
+                pending_scores.push((slot, blk));
                 // Find this block's index in the tile so the block_table is right.
                 let idx = tile.iter().position(|&x| x == blk).unwrap();
                 block_table[idx] = slot as i32;
@@ -305,6 +333,17 @@ impl HighSpeedSwap {
                 lbvs,
             )?;
             tile_idx = tile_end;
+        }
+        // Flush any scores not already flushed by a firing eviction, so
+        // `last_score` is correct for FUTURE steps' rank() decisions.
+        if !pending_scores.is_empty() {
+            if !score_ready {
+                score_evt.sync()?;
+            }
+            for (s, b) in pending_scores.drain(..) {
+                self.eviction
+                    .record_score(s, self.score_host_buf[b as usize]);
+            }
         }
         self.attn.finalize_on_stream(stream, output_dev, 1)?;
         Ok(())

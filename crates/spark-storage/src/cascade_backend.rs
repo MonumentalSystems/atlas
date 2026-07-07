@@ -137,8 +137,10 @@ impl StorageBackend for CascadeBackend {
         }
         // Misses fall through to backing (peer RDMA or SSD). Non-promoting: a
         // miss is NOT pulled up into T1 (smaller correctness surface; write-back
-        // populates T1). backing.read syncs the stream for its own dsts; the
-        // trailing stream_sync also covers the hit copy_h2d above.
+        // populates T1). Under the relaxed StorageBackend::read contract (#34)
+        // backing.read is only STREAM-ORDERED, not CPU-synced; CascadeBackend
+        // provides host-completion via its OWN trailing stream_sync below (which
+        // also covers the hit copy_h2d above).
         if !misses.is_empty() {
             let miss_reqs: Vec<ReadRequest> = misses.iter().map(|&i| requests[i]).collect();
             self.backing.read(&miss_reqs, stream)?;

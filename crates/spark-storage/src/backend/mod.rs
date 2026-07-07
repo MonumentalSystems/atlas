@@ -26,11 +26,15 @@ pub struct ReadRequest {
 }
 
 pub trait StorageBackend: Send + Sync {
-    /// Synchronously fulfil all `requests`, returning when the corresponding
-    /// HBM destinations are populated and visible on `stream`. The backend
-    /// chooses how to schedule (blocking POSIX `pread`, batched `io_uring`,
-    /// etc.). At return, the `stream` has been synchronised so the caller
-    /// can issue subsequent kernels that depend on the data.
+    /// Fulfil all `requests`, landing each into its HBM destination. The
+    /// backend chooses how to schedule (blocking POSIX `pread`, batched
+    /// `io_uring`, RDMA, etc.). At return, the reads are stream-ordered before
+    /// any subsequent work issued on the SAME `stream` (the caller may enqueue
+    /// dependent kernels on `stream` without extra sync), but the CPU is NOT
+    /// guaranteed to have observed completion and a consumer on a DIFFERENT
+    /// stream must synchronise itself. Bounce/staging buffers are recycled
+    /// lazily via per-buffer CUDA events, so callers must keep issuing on the
+    /// same stream.
     fn read(&mut self, requests: &[ReadRequest], stream: u64) -> Result<()>;
 
     /// One-shot sequential write — used at offload time to populate disk

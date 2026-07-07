@@ -345,7 +345,11 @@ impl RdmaKvBackend {
         // consumers of these slots first — else zero-copy restore under eviction
         // pressure silently corrupts KV. This restores the bounce path's implicit
         // barrier. (RAW is already safe: the poll below means the bytes have
-        // landed before the next kernel that reads them is queued.)
+        // landed before the next kernel that reads them is queued.) This leading
+        // WAR sync is intentionally RETAINED under the relaxed StorageBackend::read
+        // contract: the off-stream NIC DMA is not stream-ordered against the prior
+        // kernel, so it needs an explicit CPU-visible fence that same-stream
+        // ordering cannot provide.
         stream_sync(stream)?;
         let n = self.rails.len();
         let depth = self.rails[0].bounces.len(); // in-flight cap per rail

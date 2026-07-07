@@ -11,7 +11,7 @@ use std::ffi::c_void;
 use std::os::fd::RawFd;
 
 use super::{ReadRequest, StorageBackend};
-use crate::cuda_min::{CudaEvent, PinnedBuffer, copy_h_to_d_async, stream_sync};
+use crate::cuda_min::{CudaEvent, PinnedBuffer, copy_h_to_d_async};
 use crate::group::GroupKey;
 use crate::layout::Layout;
 
@@ -171,13 +171,13 @@ impl StorageBackend for IoUringBackend {
                 completed += 1;
             }
         }
-        // After all reads have produced device data, finalise the stream
-        // (matches PosixBackend semantics: at return, the stream is synced).
-        stream_sync(stream)?;
-        // Drop now-completed events; they are useful only across calls.
-        for slot in self.events.iter_mut() {
-            *slot = None;
-        }
+        // No terminal `stream_sync` here: per the relaxed StorageBackend::read
+        // contract, all copy_h_to_d_async D2H copies are already enqueued on
+        // `stream` before return, so a same-stream consumer kernel is correctly
+        // RAW-ordered without a CPU fence. The per-buffer events recorded above
+        // PERSIST across calls; `wait_buffer_free` (:82) event-syncs each bounce
+        // buffer lazily before its next reuse — a finer-grained recycle than the
+        // old blanket per-call stream_sync, with the same safety.
         Ok(())
     }
 
@@ -210,7 +210,7 @@ impl StorageBackend for IoUringBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cuda_min::{CudaCtx, DeviceBuffer, copy_d_to_h_async};
+    use crate::cuda_min::{CudaCtx, DeviceBuffer, copy_d_to_h_async, stream_sync};
     use crate::group::{GroupKey, GroupLayout, KvKind};
     use std::path::PathBuf;
 
