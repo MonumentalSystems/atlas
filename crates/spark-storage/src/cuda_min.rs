@@ -24,6 +24,7 @@ unsafe extern "C" {
     fn cuMemHostGetDevicePointer_v2(pdptr: *mut u64, p: *mut c_void, flags: u32) -> i32;
     fn cuMemcpyHtoDAsync_v2(dst: u64, src: *const c_void, bytes: usize, stream: u64) -> i32;
     fn cuMemcpyDtoHAsync_v2(dst: *mut c_void, src: u64, bytes: usize, stream: u64) -> i32;
+    fn cuMemcpyDtoDAsync_v2(dst: u64, src: u64, bytes: usize, stream: u64) -> i32;
     fn cuMemGetInfo_v2(free: *mut usize, total: *mut usize) -> i32;
     fn cuStreamCreate(phStream: *mut u64, flags: u32) -> i32;
     fn cuStreamDestroy_v2(stream: u64) -> i32;
@@ -172,6 +173,17 @@ pub fn copy_d_to_h_async(dst: *mut c_void, src: u64, bytes: usize, stream: u64) 
     let s = unsafe { cuMemcpyDtoHAsync_v2(dst, src, bytes, stream) };
     if s != 0 {
         bail!("cuMemcpyDtoHAsync_v2 failed: {s}");
+    }
+    Ok(())
+}
+
+/// Device→device async copy (Phase 5 Inc 3: gather per-seq Q into a contiguous
+/// `[C×nq×hd]` buffer for the wide `num_seqs=C` launch, and scatter the
+/// contiguous outputs back to each seq's destination). Stream-ordered.
+pub fn copy_d_to_d_async(dst: u64, src: u64, bytes: usize, stream: u64) -> Result<()> {
+    let s = unsafe { cuMemcpyDtoDAsync_v2(dst, src, bytes, stream) };
+    if s != 0 {
+        bail!("cuMemcpyDtoDAsync_v2 failed: {s}");
     }
     Ok(())
 }

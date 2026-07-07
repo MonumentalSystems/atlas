@@ -8,7 +8,9 @@ use std::ffi::c_void;
 use super::{HighSpeedSwap, SeqScratch};
 use crate::backend::ReadRequest;
 use crate::config::HighSpeedSwapConfig;
-use crate::cuda_min::{CudaCtx, copy_d_to_h_async, copy_h_to_d_async, stream_sync};
+use crate::cuda_min::{
+    CudaCtx, copy_d_to_d_async, copy_d_to_h_async, copy_h_to_d_async, stream_sync,
+};
 use crate::group::{GroupKey, KvKind};
 use crate::predictor::Predictor;
 use crate::scratch_pool::{ResidentKey, ScratchPool};
@@ -303,15 +305,210 @@ impl HighSpeedSwap {
         // tile phase: eviction ranking reads each seq's host score buffer.
         stream_sync(stream)?;
         let lbvs = self.model.block_size as i32;
-        for s in seqs {
-            self.attend_tile_phase(
-                s.seq_slot,
-                stream,
-                layer,
-                s.seq_block_ids,
+        // Phase 5 Inc 3: fuse the C per-seq tile phases into ONE
+        // grid=(C, nq, 1) launch per tile with a union tier read, when the
+        // C-sized BatchScratch exists (ATLAS_HSS_MAX_SEQS>1 sized the pool for
+        // C×tile_cap) and the batch fits it. Otherwise keep the Inc-2 serial
+        // tile phases (num_seqs=1 each) — correct, just unfused; this covers
+        // the env-unset default (max_seqs==1, no BatchScratch) and any batch
+        // wider than the configured C (pool can't hold C×tile_cap for it).
+        if self.batch.is_some() && seqs.len() <= self.max_seqs {
+            self.attend_tile_phase_batched(stream, layer, seqs, lbvs)?;
+        } else {
+            for s in seqs {
+                self.attend_tile_phase(
+                    s.seq_slot,
+                    stream,
+                    layer,
+                    s.seq_block_ids,
+                    s.q_dev,
+                    s.output_dev,
+                    lbvs,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Phase 5 Inc 3 — batched tile phase: process all C seqs in lockstep
+    /// tiles through ONE `grid=(C, num_q_heads, 1)` launch per tile, with a
+    /// **union** tier read across every seq's missing blocks. Replaces the C
+    /// serial `num_seqs=1` launches (Inc 2) — attacking the real `attn ∝ N`
+    /// cost the C=8 measurement found (8 under-occupied launches + 8 serial
+    /// tier waits → one wide launch + one union read).
+    ///
+    /// Preconditions: `attend_score_phase` ran for every seq and the stream
+    /// has been synced since (eviction ranking reads each seq's host score
+    /// buffer); `self.batch` is `Some` (`max_seqs > 1`) and `seqs.len() <=
+    /// max_seqs` (checked by the caller). Decode-only: every seq shares
+    /// `lbvs` (= block_size); ragged tails are expressed purely via
+    /// per-seq `counts` (an exhausted seq presents `counts[s]=0`, an exact
+    /// kernel no-op — hazard H3).
+    fn attend_tile_phase_batched(
+        &mut self,
+        stream: u64,
+        layer: u32,
+        seqs: &[super::AttendSeqReq<'_>],
+        lbvs: i32,
+    ) -> Result<()> {
+        let c = seqs.len();
+        let tile_cap = self.cfg.resident_blocks as usize;
+        let q_row_elems = self.model.num_q_heads as usize * self.model.head_dim as usize;
+        let q_row_bytes = q_row_elems * 2; // BF16
+        // Device ptrs of the shared batch buffers (Copy u64 — extracted up
+        // front so the &mut self.pool/eviction/backend calls below don't clash
+        // with a live borrow of self.batch).
+        let (bt_ptr, ct_ptr, qg_ptr, og_ptr) = {
+            let b = self.batch.as_ref().expect("batch present (checked by caller)");
+            (
+                b.block_table_dev.ptr,
+                b.counts_dev.ptr,
+                b.q_gather_dev.ptr,
+                b.o_gather_dev.ptr,
+            )
+        };
+
+        // Gather each seq's Q into contiguous row c of q_gather (the kernel
+        // reads Q[(seq×nq+qh)×hd] with seq=0..C-1, but the seqs sit at their
+        // original, possibly sparse, batch positions).
+        for (c_idx, s) in seqs.iter().enumerate() {
+            copy_d_to_d_async(
+                qg_ptr + (c_idx * q_row_bytes) as u64,
                 s.q_dev,
-                s.output_dev,
+                q_row_bytes,
+                stream,
+            )?;
+        }
+
+        self.attn.begin_step_on_stream(
+            &self.batch.as_ref().expect("batch present").planes,
+            stream,
+            c,
+        )?;
+
+        let max_tiles = seqs
+            .iter()
+            .map(|s| s.seq_block_ids.len().div_ceil(tile_cap))
+            .max()
+            .unwrap_or(0);
+        let (s_blk, s_tok, s_kvh) = self.attn.scratch_pool_strides();
+        let v_off = (self.model.num_kv_heads as u64)
+            * (self.model.block_size as u64)
+            * (self.model.head_dim as u64)
+            * 2;
+
+        for t in 0..max_tiles {
+            // H1: block_table sized C×tile_cap, counts sized C. H3: counts
+            // rebuilt fresh [0;C] every tile — an exhausted seq presents 0 and
+            // its (zero-init) block_table row is a kernel no-op.
+            let mut block_table = vec![0_i32; c * tile_cap];
+            let mut counts = vec![0_i32; c];
+            // H2: pin EVERY slot assigned/resident across ALL C seqs for this
+            // tile before the single step_tile, unpin after. A later seq's
+            // assign therefore can't evict an earlier seq's just-placed,
+            // not-yet-consumed slot (`rank(&pinned)` excludes them).
+            let mut pinned: Vec<u32> = Vec::new();
+            let mut reqs: Vec<ReadRequest> = Vec::new();
+
+            for (c_idx, s) in seqs.iter().enumerate() {
+                let blocks = s.seq_block_ids;
+                let start = t * tile_cap;
+                if start >= blocks.len() {
+                    continue; // seq exhausted — counts[c_idx] stays 0 (H3)
+                }
+                let end = (start + tile_cap).min(blocks.len());
+                let tile = &blocks[start..end];
+                counts[c_idx] = tile.len() as i32;
+                let row = c_idx * tile_cap;
+                for (i, &blk) in tile.iter().enumerate() {
+                    let key = ResidentKey { layer, block: blk };
+                    if let Some(slot) = self.pool.lookup(key) {
+                        block_table[row + i] = slot as i32;
+                        pinned.push(slot);
+                        self.eviction.touch(slot);
+                    } else {
+                        let candidates = self.eviction.rank(&pinned);
+                        let slot = self.pool.assign(key, &candidates)?;
+                        pinned.push(slot);
+                        self.eviction.touch(slot);
+                        self.eviction.record_score(
+                            slot,
+                            self.scratch[s.seq_slot].score_host_buf[blk as usize],
+                        );
+                        block_table[row + i] = slot as i32;
+                        for kh in 0..self.model.num_kv_heads {
+                            reqs.push(ReadRequest {
+                                group: GroupKey::new(layer, blk, kh, KvKind::K),
+                                dst_dev_ptr: self.pool.slot_k_ptr(slot, kh),
+                            });
+                            reqs.push(ReadRequest {
+                                group: GroupKey::new(layer, blk, kh, KvKind::V),
+                                dst_dev_ptr: self.pool.slot_v_ptr(slot, kh),
+                            });
+                        }
+                    }
+                }
+            }
+
+            // ONE union read for the whole C-wide tile (empty on a fully
+            // resident/prefetched tile — the backend skips a no-op batch).
+            self.backend.read(&reqs, stream)?;
+
+            copy_h_to_d_async(
+                bt_ptr,
+                block_table.as_ptr() as *const c_void,
+                c * tile_cap * 4,
+                stream,
+            )?;
+            copy_h_to_d_async(ct_ptr, counts.as_ptr() as *const c_void, c * 4, stream)?;
+
+            // ONE wide launch across all C seqs.
+            self.attn.step_tile_on_stream(
+                &self.batch.as_ref().expect("batch present").planes,
+                stream,
+                qg_ptr,
+                self.pool.pool_dev_ptr(),
+                self.pool.pool_dev_ptr() + v_off,
+                bt_ptr,
+                ct_ptr,
+                c,
+                s_blk,
+                s_tok,
+                s_kvh,
                 lbvs,
+            )?;
+
+            // Unpin this tile's blocks across all C seqs (Phase 3 pin release —
+            // stream-ordered, so a later same-stream evict+overwrite is safe;
+            // the cross-STREAM prefetch case is handled by the serial fallback
+            // gate on `kv_prefetch_enabled` above).
+            for s in seqs {
+                let blocks = s.seq_block_ids;
+                let start = t * tile_cap;
+                if start >= blocks.len() {
+                    continue;
+                }
+                let end = (start + tile_cap).min(blocks.len());
+                for &blk in &blocks[start..end] {
+                    self.pool.unpin_key(ResidentKey { layer, block: blk });
+                }
+            }
+        }
+
+        // finalize(num_seqs=C) writes all C rows into o_gather; scatter each
+        // row back to its seq's destination.
+        self.attn.finalize_on_stream(
+            &self.batch.as_ref().expect("batch present").planes,
+            stream,
+            og_ptr,
+            c,
+        )?;
+        for (c_idx, s) in seqs.iter().enumerate() {
+            copy_d_to_d_async(
+                s.output_dev,
+                og_ptr + (c_idx * q_row_bytes) as u64,
+                q_row_bytes,
+                stream,
             )?;
         }
         Ok(())

@@ -131,14 +131,21 @@ pub struct AttendSeqReq<'a> {
 /// per-`SeqScratch` buffers cannot serve a batched launch.
 struct BatchScratch {
     /// C-sized online-softmax accumulator planes.
-    #[allow(dead_code)] // consumed by the batched attend (Phase 5 Inc 3)
     planes: TiledAttnPlanes,
     /// Per-tile block table `[max_seqs × tile_capacity]` i32.
-    #[allow(dead_code)] // consumed by the batched attend (Phase 5 Inc 3)
     block_table_dev: DeviceBuffer,
     /// Per-tile per-seq counts `[max_seqs]` i32.
-    #[allow(dead_code)] // consumed by the batched attend (Phase 5 Inc 3)
     counts_dev: DeviceBuffer,
+    /// Phase 5 Inc 3: contiguous `[max_seqs × num_q_heads × head_dim]` BF16
+    /// Q-gather buffer. The kernel reads `Q[(seq×nq+qh)×hd]` with seq=0..C-1,
+    /// but the overflowed seqs sit at their (possibly sparse) original batch
+    /// positions — so each seq's Q is d2d-copied into row c here before the
+    /// wide launch, keeping the kernel untouched.
+    q_gather_dev: DeviceBuffer,
+    /// Phase 5 Inc 3: contiguous `[max_seqs × num_q_heads × head_dim]` BF16
+    /// output buffer. `finalize(num_seqs=C)` writes all C rows here; each row
+    /// is then d2d-scattered back to its seq's `output_dev`.
+    o_gather_dev: DeviceBuffer,
 }
 
 impl SeqScratch {
@@ -355,6 +362,13 @@ impl HighSpeedSwap {
                     max_seqs * attn.dims().tile_capacity * 4,
                 )?,
                 counts_dev: DeviceBuffer::new(max_seqs * 4)?,
+                // [C × nq × hd] BF16 each (gather Q in / scatter O out).
+                q_gather_dev: DeviceBuffer::new(
+                    max_seqs * model.num_q_heads as usize * model.head_dim as usize * 2,
+                )?,
+                o_gather_dev: DeviceBuffer::new(
+                    max_seqs * model.num_q_heads as usize * model.head_dim as usize * 2,
+                )?,
             })
         } else {
             None

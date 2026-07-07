@@ -442,3 +442,131 @@ fn batched_attend_matches_single_seq_bitwise() {
     }
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// Phase 5 Inc 3: the WIDE `grid=(C, nq, 1)` launch + union read. With
+/// `ATLAS_HSS_MAX_SEQS=3` the batched entry fuses C ragged multi-tile seqs
+/// into ONE launch per tile (vs Inc 2's C serial `num_seqs=1` launches). Each
+/// seq's output must match its single-seq serial attend bit-for-bit: the wide
+/// launch does the SAME per-seq arithmetic (same block order into that seq's
+/// own plane rows), only the host orchestration (gather Q, one union read, one
+/// launch, scatter O) differs. Exercises: multi-tile (32 blocks / tile_cap 8 =
+/// 4 tiles), ragged tails (seqs exhaust at different tiles → `counts[s]=0`
+/// no-ops, hazard H3), and a pool sized to EXACTLY C×tile_cap = 24 slots so
+/// every slot is pinned within a tile (hazard H2 pin-across-C is load-bearing:
+/// one mis-eviction would corrupt a peer seq's just-placed block).
+#[test]
+#[ignore = "requires GPU"]
+fn batched_wide_launch_matches_serial_multitile() {
+    let dir = tempdir("batch-wide");
+    let ctx = CudaCtx::new(0).expect("cuda init");
+    let mut rng = ChaCha8Rng::seed_from_u64(0x5EED_1237);
+    let total =
+        SEQ_BLOCKS as usize * BLOCK_SIZE as usize * NUM_KV_HEADS as usize * HEAD_DIM as usize;
+    let k = random_bf16(total, &mut rng);
+    let v = random_bf16(total, &mut rng);
+
+    // Three ragged histories: 32 (4 tiles), 20 (3 tiles: 8+8+4), 8 (1 tile).
+    let blocks: [Vec<u32>; 3] = [
+        (0..SEQ_BLOCKS).collect(),
+        (0..20).collect(),
+        (0..SCRATCH_BLOCKS).collect(),
+    ];
+    let row = NUM_Q_HEADS as usize * HEAD_DIM as usize;
+    let qs: Vec<Vec<bf16>> = (0..3).map(|_| random_bf16(row, &mut rng)).collect();
+
+    unsafe { std::env::set_var("ATLAS_HSS_MAX_SEQS", "3") };
+    let cfg = HighSpeedSwapConfig {
+        dir: dir.clone(),
+        bytes: 1 << 30,
+        resident_blocks: SCRATCH_BLOCKS,
+        rank: 32,
+        qd: 8,
+        graph: false,
+        projection_seed: 0xCAFE_F00D,
+    };
+    let model = ModelDims {
+        num_layers: NUM_LAYERS,
+        max_blocks_per_layer: SEQ_BLOCKS,
+        num_q_heads: NUM_Q_HEADS,
+        num_kv_heads: NUM_KV_HEADS,
+        head_dim: HEAD_DIM,
+        block_size: BLOCK_SIZE,
+    };
+    let mut hss = HighSpeedSwap::new(&ctx, cfg, model).unwrap();
+    unsafe { std::env::remove_var("ATLAS_HSS_MAX_SEQS") };
+    assert_eq!(hss.max_seqs(), 3);
+
+    // Offload all blocks to disk.
+    let block_floats = BLOCK_SIZE as usize * NUM_KV_HEADS as usize * HEAD_DIM as usize;
+    let block_bytes = block_floats * 2;
+    let k_block_dev = DeviceBuffer::new(block_bytes).unwrap();
+    for blk in 0..SEQ_BLOCKS {
+        let off = blk as usize * block_floats;
+        copy_h_to_d_async(
+            k_block_dev.ptr,
+            k[off..off + block_floats].as_ptr() as *const c_void,
+            block_bytes,
+            ctx.stream,
+        )
+        .unwrap();
+        stream_sync(ctx.stream).unwrap();
+        hss.offload_block(
+            &ctx,
+            0,
+            blk,
+            k_block_dev.ptr,
+            &k[off..off + block_floats],
+            &v[off..off + block_floats],
+        )
+        .unwrap();
+    }
+
+    let q_devs: Vec<DeviceBuffer> = qs
+        .iter()
+        .map(|q| {
+            let d = DeviceBuffer::new(row * 2).unwrap();
+            copy_h_to_d_async(d.ptr, q.as_ptr() as *const c_void, row * 2, ctx.stream).unwrap();
+            d
+        })
+        .collect();
+    let out_devs: Vec<DeviceBuffer> = (0..3).map(|_| DeviceBuffer::new(row * 2).unwrap()).collect();
+
+    let download = |dev: &DeviceBuffer| {
+        let mut out = vec![bf16::from_f32(0.0); row];
+        copy_d_to_h_async(out.as_mut_ptr() as *mut c_void, dev.ptr, row * 2, ctx.stream).unwrap();
+        stream_sync(ctx.stream).unwrap();
+        out
+    };
+
+    // Reference: three independent single-seq serial attends.
+    let solo: Vec<Vec<bf16>> = (0..3)
+        .map(|i| {
+            hss.attend_layer(i, &ctx, 0, &blocks[i], q_devs[i].ptr, out_devs[i].ptr)
+                .unwrap();
+            download(&out_devs[i])
+        })
+        .collect();
+
+    // One batched call — the wide num_seqs=3 launch path (Inc 3).
+    let reqs: Vec<spark_storage::AttendSeqReq> = (0..3)
+        .map(|i| spark_storage::AttendSeqReq {
+            seq_slot: i,
+            seq_block_ids: &blocks[i],
+            q_dev: q_devs[i].ptr,
+            output_dev: out_devs[i].ptr,
+        })
+        .collect();
+    hss.attend_layer_batch_on_stream(ctx.stream, 0, &reqs).unwrap();
+
+    for (i, out_dev) in out_devs.iter().enumerate() {
+        let batched = download(out_dev);
+        for (j, (s, b)) in solo[i].iter().zip(&batched).enumerate() {
+            assert_eq!(
+                s.to_bits(),
+                b.to_bits(),
+                "seq {i} wide-launch differs from serial at element {j}"
+            );
+        }
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
