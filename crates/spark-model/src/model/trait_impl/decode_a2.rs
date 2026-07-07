@@ -383,6 +383,31 @@ impl TransformerModel {
                 Vec::new()
             };
 
+            // Phase 3 (ATLAS_KV_PREFETCH): while the SSM+MoE layers between two
+            // attention layers run, prefetch the NEXT attention layer's
+            // overflowed KV blocks on the HSS side stream so the tier read is
+            // hidden behind that compute. Byte-identical to prefetch-off (the
+            // same blocks are attended; only the read timing moves earlier). The
+            // prefetch pins the reserved slots; the matching attend consumes +
+            // unpins them per-tile. `attn_idx_of[g]` = the attn_layer_idx of
+            // global layer `g` when it is a full-attention layer.
+            let kv_prefetch = hss_engaged && std::env::var_os("ATLAS_KV_PREFETCH").is_some();
+            let attn_idx_of: Vec<Option<u32>> = if kv_prefetch {
+                let mut v = Vec::with_capacity(self.layers.len());
+                let mut a = 0u32;
+                for g in 0..self.layers.len() {
+                    if self.config.layer_type(g) == LayerType::FullAttention {
+                        v.push(Some(a));
+                        a += 1;
+                    } else {
+                        v.push(None);
+                    }
+                }
+                v
+            } else {
+                Vec::new()
+            };
+
             // Layer loop for padded_n sequences
             let mut ssm_us: u128 = 0;
             let mut attn_us: u128 = 0;
@@ -415,6 +440,25 @@ impl TransformerModel {
                         attn_us += dt;
                     }
                 }
+
+                // Phase 3: if the NEXT layer is a full-attention layer, prefetch
+                // its overflowed-seq KV now (side stream) — hidden behind the
+                // compute already enqueued on the main stream. Only overflowed
+                // seqs (disk history exceeds resident HBM) need the tier read.
+                if kv_prefetch {
+                    if let Some(Some(next_attn)) = attn_idx_of.get(layer_idx + 1).copied() {
+                        spark_storage::with_local(|hss| {
+                            for ds in disk_states.iter() {
+                                if ds.disk_block_ids.len() > ds.block_table.len() {
+                                    hss.prefetch_layer(next_attn, ds.disk_block_ids)?;
+                                }
+                            }
+                            anyhow::Ok(())
+                        })
+                        .expect("local installed checked in hss_engaged")?;
+                    }
+                }
+
                 if conc_hsd {
                     let _ = dump_hidden(&format!("after_L{:02}", layer_idx), stream);
                 }
