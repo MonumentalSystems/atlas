@@ -202,8 +202,30 @@ fn orchestrator_multi_tile_with_eviction() {
     )
     .unwrap();
     let seq_blocks: Vec<u32> = (0..SEQ_BLOCKS).collect();
+
+    // Phase 3: prefetch layer 0's blocks (reserve + load + PIN the first tile),
+    // so the attend below finds them resident and consumes+unpins them. The
+    // first block must be resident and pinned after prefetch.
+    hss.prefetch_layer_on_stream(ctx.stream, 0, &seq_blocks)
+        .unwrap();
+    let key0 = spark_storage::scratch_pool::ResidentKey { layer: 0, block: 0 };
+    let slot0 = hss
+        .pool()
+        .lookup(key0)
+        .expect("prefetched block 0 must be resident");
+    assert!(
+        hss.pool().is_pinned(slot0),
+        "prefetched block must be pinned until the attend consumes it"
+    );
+
     hss.attend_layer(0, &ctx, 0, &seq_blocks, q_dev.ptr, out_dev.ptr)
         .unwrap();
+
+    // The attend consumed the prefetched tile → its pin is released.
+    assert!(
+        !hss.pool().is_pinned(slot0),
+        "attend must unpin the prefetched block after consuming it"
+    );
 
     let mut out = vec![bf16::from_f32(0.0); NUM_Q_HEADS as usize * HEAD_DIM as usize];
     copy_d_to_h_async(

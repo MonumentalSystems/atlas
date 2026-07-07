@@ -327,10 +327,76 @@ impl HighSpeedSwap {
                 s_kvh,
                 lbvs,
             )?;
+            // Phase 3: this tile's blocks have now been consumed by step_tile
+            // (enqueued on `stream`), so release any prefetch pin on them —
+            // freeing the slots for LATER tiles' on-demand reads and for the
+            // next layer's prefetch. Stream ordering makes a subsequent
+            // evict+overwrite of one of these slots safe (its read is enqueued
+            // after this step_tile). `unpin_key` is a saturating no-op for
+            // blocks read on-demand (never prefetched), so the non-prefetch
+            // path is unaffected.
+            for &blk in tile {
+                self.pool.unpin_key(ResidentKey { layer, block: blk });
+            }
             tile_idx = tile_end;
         }
         self.attn
             .finalize_on_stream(&self.scratch[seq_slot].planes, stream, output_dev, 1)?;
+        Ok(())
+    }
+
+    /// Phase 3: **prefetch** (reserve + load + PIN) every block of `layer` into
+    /// the scratch pool WITHOUT attending, so a later `attend_layer` for the
+    /// same `layer` finds them resident (no on-demand read) and just consumes +
+    /// unpins them. Issue on a SIDE stream to overlap the NVMe/tier read with
+    /// the SSM+MoE compute between two attention layers — the Phase-3 win.
+    ///
+    /// The pins protect the reserved slots from eviction (by another seq's
+    /// attend, or offload `invalidate`) during that compute window. Best-effort:
+    /// if the pool can't fit more (every candidate is pinned), it stops early —
+    /// the un-prefetched tail is simply read on-demand by `attend_layer`, still
+    /// correct, just unhidden. The caller MUST pair this with an `attend_layer`
+    /// for the same `layer` (which releases the pins); an unmatched prefetch
+    /// leaks pins.
+    pub fn prefetch_layer_on_stream(
+        &mut self,
+        stream: u64,
+        layer: u32,
+        seq_block_ids: &[u32],
+    ) -> Result<()> {
+        // Score order for eviction victims; `assign` skips already-pinned slots.
+        let candidates = self.eviction.rank(&[]);
+        let mut reqs: Vec<ReadRequest> = Vec::new();
+        for &blk in seq_block_ids {
+            let key = ResidentKey { layer, block: blk };
+            if let Some(slot) = self.pool.lookup(key) {
+                // Already resident (prior step / earlier tile) — pin to protect,
+                // no re-read.
+                self.pool.pin(slot);
+                self.eviction.touch(slot);
+                continue;
+            }
+            let slot = match self.pool.assign(key, &candidates) {
+                Ok(s) => s,
+                // Pool exhausted by pins: stop prefetching; attend reads the rest.
+                Err(_) => break,
+            };
+            self.pool.pin(slot);
+            self.eviction.touch(slot);
+            for kh in 0..self.model.num_kv_heads {
+                reqs.push(ReadRequest {
+                    group: GroupKey::new(layer, blk, kh, KvKind::K),
+                    dst_dev_ptr: self.pool.slot_k_ptr(slot, kh),
+                });
+                reqs.push(ReadRequest {
+                    group: GroupKey::new(layer, blk, kh, KvKind::V),
+                    dst_dev_ptr: self.pool.slot_v_ptr(slot, kh),
+                });
+            }
+        }
+        if !reqs.is_empty() {
+            self.backend.read(&reqs, stream)?;
+        }
         Ok(())
     }
 
