@@ -298,7 +298,12 @@ pub struct ServeArgs {
     /// Number of SSM state snapshot slots for Marconi prefix caching.
     /// Each slot stores SSM h_state + conv_state for all SSM layers,
     /// enabling full prefix skip (KV + SSM) on cache hits.
-    /// 0 = disabled. 16 = recommended for repeated-prefix and multi-turn workloads.
+    /// 0 = disabled. 16 = light repeated-prefix / short multi-turn.
+    /// **Deep concurrent agentic (8+ sessions, 32K context): use 256** — the
+    /// resident pool must hold each live conversation's whole checkpoint chain
+    /// or warm turns thrash and re-recompute the SSM prefix (PR #278: 16→256 +
+    /// `ATLAS_SSM_TAIL_PROTECT=1` cut the 35B agentic wall 2765→1364s). See
+    /// docs/streaming-experts/UNIFIED-TIER-PLAN.md.
     /// Intermediate checkpoints (--ssm-checkpoint-interval) require extra slots:
     /// ~(max_context / checkpoint_interval_tokens) per cached sequence.
     #[arg(long, default_value_t = 16)]
