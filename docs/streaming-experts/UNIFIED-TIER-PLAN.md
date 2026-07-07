@@ -186,7 +186,19 @@ overflowed seqs into ONE `num_seqs=C` pass is a **pure host-orchestration rewrit
 locking, `unsafe impl Sync` (rdma_kv_backend.rs:209) untouched. Collapses C mid-attend `stream_sync`s
 (impl_more.rs:238) → 1, and C under-occupied `grid=(1,nq,1)` launches → one `grid=(C,nq,1)`.
 
-**Sequence: MEASURE → BATCH → (stop).**
+**MEASUREMENT DONE (2026-07-07) — CONFIRMS the bottleneck, green-lights batching.** C=8 concurrent
+overflow decode (Qwen3.6-35B-A3B, `--high-speed-swap-cache-blocks-per-seq 8` = 128-tok window,
+`--max-batch-size 8`, `ATLAS_MS_PROFILE=1`): **attention dominates decode (~70%)** — `attn≈133ms(10L)`
+vs `ssm≈40ms(30L)` at n=8. Attention is the **one part not batching**: it scales ~linearly with N
+(n=2→8: attn 35→133ms = 3.8× for 4× batch, ~16.6ms/seq) while SSM/MoE batch well (per-tok DROPS
+29.8→23ms as N grows). A core **pegs to 100% in bursts** (the "spiky" symptom) from the ~80 mid-attend
+`stream_sync`s/step (10 attn layers × 8 seqs, impl_more.rs:238). So the per-seq-serial attend is the real
+cost; batching it (collapse ~80 syncs→~10 + one wide `num_seqs=8` launch) should bring attn in line with
+how SSM/MoE already batch. **Green light for the plan below.** (The exact gain needs the implementation
+to measure; batching helps the CPU-orchestration/sync/launch fraction of the 133ms, not the GPU-kernel or
+disk-read fraction.)
+
+**Sequence: MEASURE ✅ → BATCH → (stop).**
 1. **Measure** (mandatory): serve `--high-speed-swap --high-speed-swap-cache-blocks-per-seq 8
    --max-batch-size 8`, 8 concurrent long (>128-tok/window) prompts, `ATLAS_SSM_MS_PROFILE=1`.
    **Triad, all three must agree = CPU-serial confirmed:** (a) `attn_us ∝ N` (decode_a2.rs profile line)
