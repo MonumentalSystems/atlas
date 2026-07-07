@@ -431,6 +431,8 @@ impl SsmSnapshotPool {
         if !self.is_enabled() {
             return Ok(false);
         }
+        let timing = std::env::var_os("ATLAS_SSM_TIER_TIMING").is_some();
+        let t0 = std::time::Instant::now();
         gpu.synchronize(stream)?; // drain the pending save into this slot
         let mut blob = vec![0u8; self.spill_blob_bytes()];
         let per_layer = self.h_bytes + self.conv_bytes;
@@ -445,7 +447,18 @@ impl SsmSnapshotPool {
                 &mut blob[off + self.h_bytes..off + per_layer],
             )?;
         }
-        store.put(key, &blob)
+        let t_put = std::time::Instant::now();
+        let r = store.put(key, &blob)?;
+        if timing {
+            tracing::info!(
+                "SSM spill: {} B  gather+sync={}us  store.put={}us  total={}us",
+                blob.len(),
+                t_put.duration_since(t0).as_micros(),
+                t_put.elapsed().as_micros(),
+                t0.elapsed().as_micros(),
+            );
+        }
+        Ok(r)
     }
 
     /// **Fault in** a spilled snapshot for `key` into Marconi slot `snap_slot`:
@@ -467,8 +480,12 @@ impl SsmSnapshotPool {
         if !self.is_enabled() {
             return Ok(false);
         }
+        let timing = std::env::var_os("ATLAS_SSM_TIER_TIMING").is_some();
+        let t0 = std::time::Instant::now();
         let mut blob = vec![0u8; self.spill_blob_bytes()];
-        if !store.get(key, &mut blob)? {
+        let hit = store.get(key, &mut blob)?;
+        let get_us = t0.elapsed().as_micros();
+        if !hit {
             return Ok(false);
         }
         let per_layer = self.h_bytes + self.conv_bytes;
@@ -486,6 +503,15 @@ impl SsmSnapshotPool {
             )?;
         }
         gpu.synchronize(stream)?; // commit before caller's restore reads the slot
+        if timing {
+            tracing::info!(
+                "SSM fault-in: {} B  store.get(RDMA read)={}us  scatter+sync={}us  total={}us",
+                blob.len(),
+                get_us,
+                t0.elapsed().as_micros() - get_us,
+                t0.elapsed().as_micros(),
+            );
+        }
         Ok(true)
     }
 
