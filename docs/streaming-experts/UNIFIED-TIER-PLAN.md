@@ -7,12 +7,19 @@
 >
 > **Live smoke result** (Qwen3.6-35B-A3B-NVFP4 on dgx-00 GB10, `--ssm-cache-slots 4`,
 > 6 interleaved multi-turn sessions, 72 requests): **72/72 OK, 0 errors, coherent output
-> throughout** (fault-in restores are correct — no state corruption). My `ssm-snap-stats`
-> telemetry: **`tier_spills=154`, `evictions(drops)=0`** (every eviction became a spill),
-> **`tier_hits=43`, `tier_fault_ins=13`**, `hit_rate=0.67`, **`mean_recompute_on_hit=15 tok`**
-> (vs the #278 ~4400-tok recompute baseline). The full serving path — `evict_to_tier` →
-> `spill_slot` (D2H) → tier → `lookup_tiered` → `fault_in_slot` (H2D) → `promote` → restore —
-> executes correctly under concurrent graph replay on real hardware. Phases 2–6 unstarted.
+> throughout** (fault-in restores are correct — no state corruption). The full serving path —
+> `evict_to_tier` → `spill_slot` (D2H) → tier → `lookup_tiered` → `fault_in_slot` (H2D) →
+> `promote` → restore — executes correctly under concurrent graph replay on real hardware, with
+> **`evictions(drops)=0`** (every eviction became a spill) and **`mean_recompute_on_hit=15 tok`**
+> (vs the #278 ~4400-tok recompute baseline).
+> - initial fault-in (immediate-free-slot only): `tier_hits=43`, **`tier_fault_ins=13`**,
+>   hit_rate 0.67 — 30 warm hits lost to a busy 4-slot pool → recompute.
+> - **+ full-pool fault-in** (`acquire_or_spill_slot` spills a victim to make room):
+>   `tier_hits=58`, **`tier_fault_ins=57`**, **hit_rate 0.91**, `tier_spills=274`,
+>   `resident=4` (now correctly = slots). Nearly every warm hit now tier-restores instead of
+>   recomputing.
+>
+> Phases 2–6 unstarted.
 
 **Architecture: one spill tier for BOTH KV blocks and SSM snapshots.** Route both
 through the *already-shipped* byte-agnostic `StorageBackend` cascade
@@ -218,10 +225,10 @@ tier-aware path degenerates to the resident-only lookup).
   → `promote_snapshot` → restore uniformly. Ordering: Marconi saves run on the **default
   stream**, so `spill_slot`'s `synchronize` drains them before the D2H (no half-written spill);
   `fault_in_slot` `synchronize`s after the H2D before restore reads the slot.
-- **Follow-ups** (documented, not blocking): full-pool fault-in (reclaim-to-free during lookup;
-  currently best-effort on an immediately-free slot → else recompute), bounded-tier
-  drop-on-reject, cost-aware fault-vs-recompute depth guard, and wiring `prefill_a`/`prefill_c`
-  (they ignore the tier key → recompute, which is correct just unoptimized).
+- **Follow-ups**: full-pool fault-in ✅ DONE + live-validated (`acquire_or_spill_slot` — see
+  above, 13→57 fault-ins). Remaining (documented, not blocking): bounded-tier drop-on-reject,
+  cost-aware fault-vs-recompute depth guard, and wiring `prefill_a`/`prefill_c` (they ignore the
+  tier key → recompute, which is correct just unoptimized).
 - **CPU-validated**: `test_spill_tier_lookup_transitions` drives resident→spilled→resident
   through the real `RadixTree`; pool byte-mover + slot-recycling on `MockGpuBackend`.
 
