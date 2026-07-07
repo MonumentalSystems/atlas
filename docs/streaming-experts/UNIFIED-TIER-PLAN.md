@@ -19,7 +19,24 @@
 >   `resident=4` (now correctly = slots). Nearly every warm hit now tier-restores instead of
 >   recomputing.
 >
-> Phases 2–6 unstarted.
+> **Phase 2 (per-seq orchestrator isolation) ✅ LANDED** (2026-07-07, GB10-validated). Phases 3–6 remain.
+
+### Phase 2 — LANDED (2026-07-07): per-seq orchestrator scratch
+A contained **scratch/accumulator split**, not a wholesale HSS-per-seq (the scoping corrected the
+plan's model: HSS has no `copy_stream`/CUDA-events/`war_armed`/bounce-ring — those were phantoms).
+- **2a** (`6b4b6ac`): split `TiledAttention` into shared kernel handles + an external
+  `TiledAttnPlanes` (m/l/o) passed as a param to begin_step/step_tile/finalize.
+- **2b** (`47160d2`): the 6 transient HSS fields (planes + q_proj/block_scores/block_table/counts/
+  score_host_buf) → a per-seq `SeqScratch`, held as `Vec<SeqScratch>` indexed by `seq_slot` (the
+  batch position), lazily grown (no `max_batch_size` plumbing). `attend_layer` takes `seq_slot`;
+  `multi_seq/attn.rs` passes the batch index `i` (the real per-seq site). Shared
+  pool/backend/predictor/eviction/disk_state stay single-owner (seq-agnostic / global by design —
+  honoring the `RdmaKvBackend` `unsafe impl Sync` single-owner assumption).
+- **Ships NO perf** on its own (serial path still barriers per seq) — it's purely the enabler that
+  lets Phase 3/5 overlap sequences without the 6/8 C=8 softmax-clobber race.
+- **Byte-identical, GB10-validated**: `tiled_attention_parity` 2/2, `streaming_attention_e2e` 3/3,
+  `high_speed_swap_e2e` 1/1 **+ a new slot-0-vs-slot-1 bit-identical equivalence assertion** (proves
+  per-seq scratch is equivalence-preserving and lazy-grow works). Full single-GPU serve links.
 
 **Architecture: one spill tier for BOTH KV blocks and SSM snapshots.** Route both
 through the *already-shipped* byte-agnostic `StorageBackend` cascade
@@ -105,7 +122,7 @@ from recompute → fault-in.
 |---|---|---|---|
 | **0** ✅ | Instrument + enlarge Marconi pool | Measure the SSM thrash + realistic baseline; prove pool-size (not a bug) is the loss. Sweep `ssm_cache_slots` (16→128), add hit-rate / warm-TTFT / read-bytes / CPU telemetry. **Cheapest lever first.** | very low (config+telemetry; watch HBM OOM) |
 | **1** ✅ | **SSM snapshots onto the cascade — spill-not-drop** — DONE + LIVE-VALIDATED on GB10 (154 spills / 0 drops / 13 fault-ins over 72 requests, 0 errors, recompute-on-hit 4400→15 tok). 1a byte-mover+tier · 1b-core state-machine · 1b-integration serving-wiring. | *Headline win.* Second cascade instance (`GroupLayout num_layers=1`, synthetic elem so `group_stride == num_ssm_layers×(h+conv)`) reusing every hardened byte-mover — zero change to trait/GroupKey/ScratchPool/KV-attn. `SnapshotEntry` → `Location{Hbm(slot)｜Tier(key)}`; evict **spills** not drops; prefix-lookup faults back in. Gated `$ATLAS_SSM_TIER` (default off = byte-identical). | low-med — **cross-stream ordering** vs `wait_snapshot_saves_dispatch` (a fault-in reading a half-written snapshot = silent state corruption); pin slots during fault-in |
-| **2** | **Per-seq orchestrator isolation** | Move transient orchestrator state (copy_stream, S-planes, events, `war_armed`) off the shared thread-local `HighSpeedSwap` into a per-seq context. Ships no perf; **unblocks 3 & 5**. Re-state the `unsafe Sync` soundness. | med — under-scoping reintroduces the exact 6/8 C=8 race that killed the tile-pipeline |
+| **2** ✅ | **Per-seq orchestrator isolation** | Move transient orchestrator state (copy_stream, S-planes, events, `war_armed`) off the shared thread-local `HighSpeedSwap` into a per-seq context. Ships no perf; **unblocks 3 & 5**. Re-state the `unsafe Sync` soundness. | med — under-scoping reintroduces the exact 6/8 C=8 race that killed the tile-pipeline |
 | **3** | Cross-layer prefetch (deep lever A) | Hide tier reads behind the **SSM+MoE/FFN compute between two attention layers** (not the thin within-layer slice the pipeline tried) — for both KV and SSM fault-ins. The only overlap with enough compute. | med — a pin bug silently corrupts attention (wrong-layer blocks); must be measured at the agentic regime not cap=8 |
 | **4** | Reduce read volume — **native-quant tier storage** (deep lever B) | Stop the BF16 inflation: `decode/high_speed_swap.rs:232-289` dequants FP8/NVFP4/4-bit → BF16 *before* `write_from_host`, so quantized history is stored + re-read at **2–4×**. Store native-quant bytes; dequant on read. **Biggest concrete byte cut.** | med — wide per-format correctness surface (FP8/NVFP4/Turbo3/4/8); needs a per-format numeric-diff harness |
 | **5** | Parallel per-seq CPU orchestration (deep lever C) | De-serialize the `multi_seq/attn.rs:203` per-seq loop **without dropping the cache** — kills the observed **2-cores-pegged / spiky-throughput** symptom under C=8. | med-high — highest concurrency risk; breaks `unsafe Sync` if widened silently (UB, not just a race); thread-pool footgun on the shared box |
