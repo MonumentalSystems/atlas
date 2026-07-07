@@ -179,6 +179,43 @@ pub(crate) fn ssm_tier_enabled() -> bool {
     std::env::var_os("ATLAS_SSM_TIER").is_some()
 }
 
+/// Build the SSM spill-tier store (called only when `ssm_tier_enabled()`).
+/// `ATLAS_SSM_RDMA_TIER=host:port` selects the RDMA arena
+/// ([`RdmaSnapshotStore`] over a peer blade, `ATLAS_SSM_RDMA_ARENA_SLOTS` slots,
+/// default 512); otherwise the host-RAM [`MemBlobStore`]. A connect failure (or
+/// a build without RDMA verbs) LOGS and falls back to host-RAM — the tier is
+/// optional, never a hard model-init error. With `ATLAS_SSM_RDMA_TIER` unset the
+/// result is exactly `MemBlobStore::new(0)` as before ⇒ byte-identical.
+pub(crate) fn build_tier_store(blob_bytes: usize) -> std::sync::Arc<dyn SnapshotBlobStore> {
+    use std::sync::Arc;
+    if let Some(peer) = std::env::var("ATLAS_SSM_RDMA_TIER")
+        .ok()
+        .filter(|s| !s.is_empty())
+    {
+        let slots: usize = std::env::var("ATLAS_SSM_RDMA_ARENA_SLOTS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(512);
+        let arena_bytes = slots as u64 * blob_bytes as u64;
+        // `connect` errors (and we fall back) both on a real connect failure and
+        // in a build without the RDMA verbs (the stub arena always errors).
+        match spark_storage::RdmaSnapshotArena::connect(&peer, arena_bytes, blob_bytes) {
+            Ok(arena) => {
+                tracing::info!(
+                    "SSM spill tier = RDMA peer {peer} ({slots} slots × {blob_bytes} B = \
+                     {:.2} GiB arena)",
+                    arena_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+                );
+                return Arc::new(RdmaSnapshotStore::new(Box::new(arena), blob_bytes, slots));
+            }
+            Err(e) => tracing::warn!(
+                "SSM RDMA tier connect to {peer} failed ({e:#}); falling back to host-RAM"
+            ),
+        }
+    }
+    Arc::new(MemBlobStore::new(0))
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 // Phase 4b — RDMA snapshot spill tier (`RdmaSnapshotStore`)
 //
@@ -238,6 +275,19 @@ impl SnapshotTransport for MockSnapshotTransport {
         let off = offset as usize;
         out.copy_from_slice(&a[off..off + out.len()]);
         Ok(())
+    }
+}
+
+// Phase 4b Inc 2: the real transport is spark-storage's offset-addressed
+// `RdmaSnapshotArena` (CX7 verbs + kv-peer blade; a `connect`-errors stub when
+// verbs aren't built). We own `SnapshotTransport` here, so implementing it for
+// the foreign type is allowed (no orphan rule).
+impl SnapshotTransport for spark_storage::RdmaSnapshotArena {
+    fn write_blob(&self, offset: u64, bytes: &[u8]) -> Result<()> {
+        self.write(offset, bytes)
+    }
+    fn read_blob(&self, offset: u64, out: &mut [u8]) -> Result<()> {
+        self.read(offset, out)
     }
 }
 
@@ -518,5 +568,23 @@ mod tests {
         let mut o = [0u8; BLOB];
         assert!(s.get(1, &mut o).unwrap());
         assert_eq!(o, [2; BLOB], "reads the overwritten value");
+    }
+
+    #[test]
+    fn build_tier_store_defaults_to_host_ram_unbounded() {
+        // With ATLAS_SSM_RDMA_TIER absent (the byte-identical default), the
+        // selector yields the unbounded host-RAM store. Guarded on the var being
+        // unset so a concurrent env-setting test can't flake this.
+        if std::env::var_os("ATLAS_SSM_RDMA_TIER").is_none() {
+            let s = build_tier_store(4);
+            assert!(s.put(1, &[1, 2, 3, 4]).unwrap());
+            let mut o = [0u8; 4];
+            assert!(s.get(1, &mut o).unwrap());
+            assert_eq!(o, [1, 2, 3, 4]);
+            for k in 0..1000u64 {
+                assert!(s.put(k, &[0; 4]).unwrap(), "unbounded: nothing dropped");
+            }
+            assert_eq!(s.len(), 1000);
+        }
     }
 }

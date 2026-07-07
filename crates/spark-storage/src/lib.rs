@@ -107,6 +107,13 @@ pub mod weight_lora_rdma;
 // copy_h2d) and the verbs shim.
 #[cfg(all(feature = "cuda", atlas_rdma_verbs))]
 pub mod rdma_kv_backend;
+
+// Phase 4b: offset-addressed RDMA arena for the SSM-snapshot spill tier (reuses
+// the same verbs + kv-peer blade protocol, keyed by byte offset not GroupKey).
+// Always available — the module provides a `connect`-errors stub when the real
+// transport (feature `cuda` + atlas_rdma_verbs) isn't built, so dependents can
+// reference `RdmaSnapshotArena` unconditionally and degrade to host-RAM.
+pub mod rdma_snapshot;
 // T1 write-back cache composite (wraps any StorageBackend). cuda but not verbs.
 #[cfg(feature = "cuda")]
 pub mod cascade_backend;
@@ -143,6 +150,7 @@ pub use expert_tier_rdma::RdmaTier;
 pub use high_speed_swap::{AttendSeqReq, HighSpeedSwap, install_local, local_installed, with_local};
 #[cfg(all(feature = "cuda", atlas_rdma_verbs))]
 pub use rdma_kv_backend::RdmaKvBackend;
+pub use rdma_snapshot::RdmaSnapshotArena;
 #[cfg(feature = "cuda")]
 pub use weight_lora_rdma::{LoraAbKind, LoraLandTarget, RdmaLoraLoader};
 pub use weight_peer::{WeightManifest, WeightTensorRecord};

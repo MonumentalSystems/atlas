@@ -191,11 +191,15 @@ impl TransformerModel {
         let ssm_tier_store: Option<Arc<dyn super::ssm_tier::SnapshotBlobStore>> =
             if super::ssm_tier::ssm_tier_enabled() && ssm_pool.num_ssm_layers > 0 {
                 tracing::info!(
-                    "SSM spill tier ENABLED (ATLAS_SSM_TIER): unbounded host-RAM blob store \
-                     ({} bytes/snapshot)",
+                    "SSM spill tier ENABLED (ATLAS_SSM_TIER): {} bytes/snapshot",
                     ssm_snapshots.spill_blob_bytes(),
                 );
-                Some(Arc::new(super::ssm_tier::MemBlobStore::new(0)))
+                // Host-RAM by default; ATLAS_SSM_RDMA_TIER=host:port routes spills
+                // to a remote blade instead (Phase 4b). Falls back to host-RAM on
+                // connect failure — never a hard model-init error.
+                Some(super::ssm_tier::build_tier_store(
+                    ssm_snapshots.spill_blob_bytes(),
+                ))
             } else {
                 None
             };
