@@ -41,6 +41,33 @@ mod upload_meta;
 mod upload_paged;
 
 impl TransformerModel {
+    /// Ordered, block-aligned cut points at which to split the deep last chunk
+    /// so `prefill_b_save_checkpoint` stashes a snapshot at each (its
+    /// `on_interval`/`is_prompt_tail` gates fire at these boundaries). All cuts
+    /// are strict multiples of `block_size` — the radix walk matches at block
+    /// granularity, so an anchor stamped at a non-block token is rejected by the
+    /// `snap_tok <= matched` lookup filter (measured: exact-stamped finish-leaf
+    /// snapshots at 15,283-15,360 never hit; only the block-aligned intermediate
+    /// ones did). Always includes the issue-#15 tail cut (one block below the
+    /// last boundary under `total`); when `ladder_n > 0`, additionally spreads up
+    /// to `ladder_n` interval-aligned rungs across the prefix so no match point
+    /// is more than one stride from an anchor.
+    fn prefill_ssm_checkpoint_cuts(
+        &self,
+        chunk_start: usize,
+        total: usize,
+        bs: usize,
+        ladder_n: usize,
+    ) -> Vec<usize> {
+        ssm_checkpoint_cuts(
+            chunk_start,
+            total,
+            bs,
+            ladder_n,
+            self.ssm_checkpoint_interval,
+        )
+    }
+
     pub(super) fn prefill_chunk_dispatch(
         &self,
         tokens: &[u32],
@@ -97,26 +124,49 @@ impl TransformerModel {
             && !self.tokens_have_vision_pad(tokens)
         {
             let bs = self.kv_cache.lock().block_size();
-            // One block below the last block boundary strictly under `total`.
-            let cut = ((total.saturating_sub(1) / bs) * bs).saturating_sub(bs);
             let ep_active = self.comm.is_some() && self.config.ep_world_size > 1;
-            if cut > chunk_start
-                && cut < total
-                && (ep_active
-                    || self
-                        .prefix_cache
-                        .peek_matched_tokens(tokens, bs, seq.adapter_id)
-                        > 0)
-            {
-                self.prefill_chunk_dispatch(
-                    tokens,
-                    seq,
-                    chunk_start,
-                    cut - chunk_start,
-                    false,
-                    stream,
-                )?;
-                return self.prefill_chunk_dispatch(tokens, seq, cut, total - cut, true, stream);
+            // Ladder mode (ATLAS_SSM_PREFILL_CHECKPOINTS=N, N>0): checkpoint the
+            // deep prefix at N block-aligned interval boundaries THROUGHOUT the
+            // last chunk, including on the COLD turn. Rationale (measured
+            // 2026-07-07): the single tail cut below anchors only the last two
+            // blocks under `total`, so a warm turn whose radix match lands more
+            // than a block below the prompt tail (or a fresh session matching
+            // only the shared system prefix) finds no snapshot <= its match
+            // point and recomputes the ENTIRE deep SSM state (~3.2s at 15k). A
+            // ladder bounds recompute-on-miss to <= one stride and, crucially,
+            // it fires on the cold turn (no peek gate) so turn 2 has anchors to
+            // hit. Off by default (0) to preserve single-shot prefill tok/s;
+            // the cost is one snapshot save + one extra prefill pass per rung.
+            let ladder_n = std::env::var("ATLAS_SSM_PREFILL_CHECKPOINTS")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(0);
+            let cuts = self.prefill_ssm_checkpoint_cuts(chunk_start, total, bs, ladder_n);
+            // Gate: the single tail cut still requires an existing prefix (so
+            // single-shot requests never pay); the explicit ladder overrides
+            // that — it is opt-in and needs cold-turn checkpoints to be useful.
+            let hit_possible = ep_active
+                || ladder_n > 0
+                || self
+                    .prefix_cache
+                    .peek_matched_tokens(tokens, bs, seq.adapter_id)
+                    > 0;
+            if hit_possible && !cuts.is_empty() {
+                let mut start = chunk_start;
+                for cut in cuts {
+                    if cut > start && cut < total {
+                        self.prefill_chunk_dispatch(
+                            tokens,
+                            seq,
+                            start,
+                            cut - start,
+                            false,
+                            stream,
+                        )?;
+                        start = cut;
+                    }
+                }
+                return self.prefill_chunk_dispatch(tokens, seq, start, total - start, true, stream);
             }
         }
 
@@ -314,5 +364,126 @@ impl TransformerModel {
             )?;
             Ok(DevicePtr::NULL)
         }
+    }
+}
+
+/// Pure cut-point computation for the deep-prefix SSM checkpoint ladder (see
+/// `TransformerModel::prefill_ssm_checkpoint_cuts`). Split out so the boundary
+/// arithmetic is unit-testable without a GPU model. Returns strictly-increasing,
+/// deduped, block-aligned token offsets in `(chunk_start, total)` at which the
+/// last prefill chunk should be cut so a snapshot is stashed at each.
+///
+/// - `bs`: KV block size (radix match granularity).
+/// - `ladder_n`: max interval-aligned rungs to spread across the prefix (0 = the
+///   issue-#15 tail cut only, preserving pre-ladder behavior).
+/// - `interval_blocks`: `--ssm-checkpoint-interval`; rung boundaries are whole
+///   multiples of `interval_blocks * bs` so `prefill_b_save_checkpoint`'s
+///   `on_interval` gate fires at each.
+fn ssm_checkpoint_cuts(
+    chunk_start: usize,
+    total: usize,
+    bs: usize,
+    ladder_n: usize,
+    interval_blocks: usize,
+) -> Vec<usize> {
+    let mut cuts: Vec<usize> = Vec::new();
+    if bs == 0 || total <= bs {
+        return cuts;
+    }
+    // Interval-aligned ladder rungs across the prefix (cold-turn anchors).
+    let interval_blocks = interval_blocks.max(1);
+    let interval_tok = interval_blocks * bs;
+    if ladder_n > 0 && total > interval_tok * 2 {
+        // Stride sized to yield at most `ladder_n` rungs, rounded UP to a whole
+        // interval so every rung lands on an `on_interval` boundary.
+        let total_intervals = total / interval_tok;
+        let stride_intervals = total_intervals.div_ceil(ladder_n).max(1);
+        let stride_tok = stride_intervals * interval_tok;
+        let mut c = stride_tok;
+        while c + bs < total {
+            if c > chunk_start {
+                cuts.push(c);
+            }
+            c += stride_tok;
+        }
+    }
+    // Issue-#15 tail cut: one block below the last full-block boundary strictly
+    // under `total` — <= both possible warm-match points, caught by
+    // `is_prompt_tail` regardless of `--ssm-checkpoint-interval`.
+    let tail_cut = ((total.saturating_sub(1) / bs) * bs).saturating_sub(bs);
+    if tail_cut > chunk_start && tail_cut < total {
+        cuts.push(tail_cut);
+    }
+    cuts.sort_unstable();
+    cuts.dedup();
+    cuts
+}
+
+#[cfg(test)]
+mod ladder_tests {
+    use super::ssm_checkpoint_cuts;
+
+    const BS: usize = 16;
+
+    // Every cut is a strict multiple of the block size — a non-block-aligned
+    // anchor is rejected by the `snap_tok <= matched` lookup filter.
+    fn assert_block_aligned(cuts: &[usize]) {
+        for &c in cuts {
+            assert_eq!(c % BS, 0, "cut {c} not block-aligned");
+        }
+    }
+
+    #[test]
+    fn ladder_off_is_tail_cut_only() {
+        // ladder_n = 0 preserves the pre-ladder single tail cut.
+        let total = 15_307;
+        let cuts = ssm_checkpoint_cuts(0, total, BS, 0, 16);
+        let last_boundary = ((total - 1) / BS) * BS; // 15_296
+        assert_eq!(cuts, vec![last_boundary - BS]); // 15_280
+    }
+
+    #[test]
+    fn ladder_spreads_capped_rungs_through_prefix() {
+        let total = 15_307;
+        let ladder_n = 8;
+        let cuts = ssm_checkpoint_cuts(0, total, BS, ladder_n, 16);
+        assert_block_aligned(&cuts);
+        // Strictly increasing, all interior.
+        assert!(cuts.windows(2).all(|w| w[0] < w[1]));
+        assert!(cuts.iter().all(|&c| c > 0 && c < total));
+        // Rungs (excluding the tail cut) are bounded by ladder_n and land on
+        // interval*bs (=256) multiples so `on_interval` fires.
+        let tail_cut = ((total - 1) / BS) * BS - BS;
+        for &c in cuts.iter().filter(|&&c| c != tail_cut) {
+            assert_eq!(c % (16 * BS), 0, "rung {c} not on a 256-tok interval");
+        }
+        assert!(cuts.len() <= ladder_n + 1);
+        // The deep prefix is actually anchored below the tail region: at least
+        // one rung sits in the first half.
+        assert!(cuts.iter().any(|&c| c < total / 2));
+    }
+
+    #[test]
+    fn short_prompt_no_ladder_explosion() {
+        // Below 2 intervals: only the tail cut (if any), never a rung storm.
+        let total = 200; // < interval_tok*2 (=512)
+        let cuts = ssm_checkpoint_cuts(0, total, BS, 8, 16);
+        assert!(cuts.len() <= 1);
+        assert_block_aligned(&cuts);
+    }
+
+    #[test]
+    fn respects_chunk_start_floor() {
+        // Cuts at or below an already-processed chunk_start are dropped.
+        let total = 15_307;
+        let cuts = ssm_checkpoint_cuts(14_000, total, BS, 8, 16);
+        assert!(cuts.iter().all(|&c| c > 14_000));
+        assert_block_aligned(&cuts);
+    }
+
+    #[test]
+    fn tiny_total_is_empty() {
+        assert!(ssm_checkpoint_cuts(0, BS, BS, 8, 16).is_empty());
+        assert!(ssm_checkpoint_cuts(0, 0, BS, 8, 16).is_empty());
     }
 }
