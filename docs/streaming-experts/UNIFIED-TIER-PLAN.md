@@ -573,3 +573,31 @@ the read entirely (needs the CudaEvent coexistence fix so batched + prefetch com
 bigger models where the per-step re-read is a smaller fraction. Peer now runs as a durable systemd service
 on gx10 ([[atlas-kv-peer-service]]). Production tok/s (graphs-on, no profiling) still TODO — all numbers
 here are profiling floors.
+
+### Phase 5 — HONEST PRODUCTION tok/s (2026-07-07, graphs-on, SLAI@100ms, verified via runtime log)
+Correct flag set THIS time (verified in the STARTUP LOG, not just --help): `--scheduling-policy slai
+--tbt-deadline-ms 100 --ssm-cache-slots 256 --enable-prefix-caching --max-seq-len 32768 --max-batch-size 8
+--lm-head-dtype bf16 --gpu-memory-utilization 0.70`, graphs ON (no ATLAS_MS_PROFILE). Log confirmed
+`Scheduling policy: SLAI (TBT deadline=100ms)` + `Marconi 256 slots` + `Prefix caching: ENABLED`.
+~2K-tok prompts, 8-way. (Prior tok/s were profiling floors AND FIFO — both wrong; discard them.)
+
+| config | 1-concurrent (peak) | 8-concurrent (per-req / aggregate) |
+|---|---|---|
+| **native** | **64.8 tok/s** | 15.0 / **120.2 tok/s** |
+| **HSS-resident** (window 2048=32K, NO overflow) | **19.3 tok/s** | 12.8 / 102.6 tok/s |
+
+**RETRACTION: HSS is NOT "free when resident."** Earlier this session I claimed the batched machinery is
+dormant/free when the working set fits — the measurement refutes it: HSS-enabled is **3.4× slower
+single-stream** (19.3 vs 64.8) and ~15% slower at 8-way, even sized to hold everything resident (no
+overflow). There is a real standing per-step cost in the `--high-speed-swap` path that native doesn't pay.
+Candidate causes (VERIFY before asserting): (a) the per-step offload stripe-repack (impl_more.rs:117-133,
+runs per HSS seq per step regardless of overflow — the Inc 4 target); (b) host-side FP8 KV dequant (startup
+log: "10 attn layers FP8 … host dequant for FP8/NVFP4"). Single-stream hit hardest ⇒ fixed per-step CPU
+overhead that doesn't amortize at low concurrency.
+
+**Implications:** native production is healthy (~65 single-stream, ~120 aggregate @8-way, SLAI@100ms).
+Enable HSS ONLY for genuine over-core (context > HBM), not as an always-on layer — for in-HBM contexts
+native is much faster. Reframes Phase 5: the batched attention (Inc 1+2+3) optimizes the STREAMING path,
+which inherently costs more than native; the value is enabling over-core at all + minimizing that cost.
+**NEXT: pin down the HSS standing-cost source** (offload stripe-repack vs host FP8 dequant) — likely the
+highest-leverage remaining lever, ahead of the RDMA zero-copy work.
