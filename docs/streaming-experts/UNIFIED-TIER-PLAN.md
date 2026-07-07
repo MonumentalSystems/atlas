@@ -169,8 +169,64 @@ from recompute → fault-in.
 | **2** ✅ | **Per-seq orchestrator isolation** | Move transient orchestrator state (copy_stream, S-planes, events, `war_armed`) off the shared thread-local `HighSpeedSwap` into a per-seq context. Ships no perf; **unblocks 3 & 5**. Re-state the `unsafe Sync` soundness. | med — under-scoping reintroduces the exact 6/8 C=8 race that killed the tile-pipeline |
 | **3** ✅ | Cross-layer prefetch (deep lever A) — **LANDED + live-validated correct** (3a pin + 3b-i prefetch + 3b-ii side-stream + decode-loop trigger, gated `ATLAS_KV_PREFETCH`). **No perf gain on fast local NVMe** (read not the bottleneck there); the overlap pays off for slow tiers (NFS/RDMA) / deep overflow. | Hide tier reads behind the **SSM+MoE/FFN compute between two attention layers**. | med — a pin bug silently corrupts attention (wrong-layer blocks); must be measured at the agentic regime not cap=8 |
 | **4** | Reduce read volume — **native-quant tier storage** (deep lever B) | Stop the BF16 inflation: `decode/high_speed_swap.rs:232-289` dequants FP8/NVFP4/4-bit → BF16 *before* `write_from_host`, so quantized history is stored + re-read at **2–4×**. Store native-quant bytes; dequant on read. **Biggest concrete byte cut.** | med — wide per-format correctness surface (FP8/NVFP4/Turbo3/4/8); needs a per-format numeric-diff harness |
-| **5** | Parallel per-seq CPU orchestration (deep lever C) | De-serialize the `multi_seq/attn.rs:203` per-seq loop **without dropping the cache** — kills the observed **2-cores-pegged / spiky-throughput** symptom under C=8. | med-high — highest concurrency risk; breaks `unsafe Sync` if widened silently (UB, not just a race); thread-pool footgun on the shared box |
+| **5** 📋 | Parallel per-seq CPU orchestration (deep lever C) — **ultracode-designed 2026-07-07: BATCHING, not threads** (see plan below) | De-serialize the `multi_seq/attn.rs:203` per-seq loop **without dropping the cache** — kills the observed **2-cores-pegged / spiky-throughput** symptom under C=8. | med-high — highest concurrency risk; breaks `unsafe Sync` if widened silently (UB, not just a race); thread-pool footgun on the shared box |
 | **6** | *(optional capstone)* one namespaced `BlobKey` space | Permanently kill KV/SSM re-divergence: one address space, one policy, per-namespace budgets. Only if cross-arbitration / shared budget proves worthwhile. | med — addressing/off-by-one cross-write hazard (KV over SSM bytes); pure hygiene, zero new user value |
+
+## Phase 5 — vetted plan (ultracode workflow, 2026-07-07): BATCH, don't thread
+
+A 14-agent understand→design→verify→synthesize workflow. **All four threaded/sharded designs came
+back "risky"/unsound** under adversarial review; the unanimous low-risk winner is **single-owner
+BATCHING, gated on measurement.** Threads chase overlapping N NVMe reads — I/O that this session
+*proved* is not the bottleneck on local NVMe — and every threaded shape trips a real UB/liveness hazard.
+
+**Grounding finding:** `kernels/gb10/.../paged_decode_attn_tiled.cu` is ALREADY batch-native
+(seq=blockIdx.x, per-seq Q `[seq*nq+qh]`, `tile_blocks[seq*tile_cap+b]`, `counts[seq]`, per-seq m/l/o,
+`grid=(num_seqs,nq,1)`), and `step_tile`/`begin_step`/`finalize` already take `num_seqs`. Batching the C
+overflowed seqs into ONE `num_seqs=C` pass is a **pure host-orchestration rewrite** — no threads, no
+locking, `unsafe impl Sync` (rdma_kv_backend.rs:209) untouched. Collapses C mid-attend `stream_sync`s
+(impl_more.rs:238) → 1, and C under-occupied `grid=(1,nq,1)` launches → one `grid=(C,nq,1)`.
+
+**Sequence: MEASURE → BATCH → (stop).**
+1. **Measure** (mandatory): serve `--high-speed-swap --high-speed-swap-cache-blocks-per-seq 8
+   --max-batch-size 8`, 8 concurrent long (>128-tok/window) prompts, `ATLAS_SSM_MS_PROFILE=1`.
+   **Triad, all three must agree = CPU-serial confirmed:** (a) `attn_us ∝ N` (decode_a2.rs profile line)
+   while GPU paged-decode is ~flat in N; (b) `mpstat -P ALL` shows ~2 cores pegged, rest idle; (c) tok/s
+   plateaus over C=1,2,4,8. If GPU/bandwidth-bound instead → Phase 5 can't help, **stop**.
+2. **Batch** (only if confirmed). Incremental, each byte-identical + GPU-testable:
+   - **Inc 1** — plumb `max_seqs:1`→C (high_speed_swap.rs:241): size batched `TiledAttnPlanes` +
+     `block_table_dev[C*tile_cap]` + `counts_dev[C]`; decouple `num_slots` from `resident_blocks`
+     (hss.rs:173), grow to `C*per_seq_budget`. `debug_assert!(num_seqs<=max_seqs)` **at the plane-alloc
+     site**. C=1 path byte-identical.
+   - **Inc 2** — score-only batching (lowest blast radius, the actual sync win): per-seq
+     `project_q`/`score_blocks` into `SeqScratch[s]` with NO interleaved sync, then ONE `stream_sync`.
+     Land independently; should recover most of the symptom.
+   - **Inc 3** — union read + wide launch: union all C seqs' missing blocks into one `backend.read`;
+     `[C×tile_cap]` block_table + `[C]` counts; `step_tile(num_seqs=C)`. **Pin every slot assigned across
+     all C for the tile, unpin after `step_tile`**; enforce `C*per_seq_budget<=num_slots`.
+   - **Inc 4** (separate track) — the serial offload stripe-repack (impl_more.rs:117-133, nested
+     bs×nkv×hd per-element `to_le_bytes`, runs for EVERY HSS seq every step, attn.rs:207) is a prime
+     suspect for a pegged core batching doesn't touch — vectorize or move to GPU.
+   - **Inc 5** (only if rank dominates) — `eviction.rank()` full-sorts `num_slots` per missing block; the
+     grown pool × C× missing blocks can make it the new peg (~64× host work at C=8). Incremental/heap.
+3. Keep `attend_layer_on_stream_with_q_pos` for prefill (per-seq `last_block_valid_slots` can't share one
+   scalar). **C=1 MUST keep `budget==num_slots`** so the single-seq golden path stays bitwise-identical.
+
+**Top 3 hazards** (all in batched attend): (1) **OOB device write** — planes sized `max_seqs=1` but
+`grid.x=C` writes `m/l/o[seq*nq+…]` past the buffer = silent HBM corruption → rebuild planes for C +
+the plane-alloc assert; (2) **cross-seq intra-tile WAR** — one union read fills all C seqs' slots, s2's
+`assign` mustn't evict s1's just-placed unconsumed slot → pin-on-assign-across-C, unpin after step_tile;
+(3) **ragged-tail stale counts** — an exhausted seq must present `counts[s]=0` every later tile → rebuild
+`counts_host = vec![0;C]` fresh each tile, never carry.
+
+**Do NOT:** `Arc<Mutex<ScratchPool>>` (unsound cross-stream torn-KV via enqueue-gated `unpin_key` +
+non-live single-seq-sized pool → `assign` Err → decode abort); per-worker io_uring backends (`setup_sqpoll`
+io_uring.rs:32 → busy-spinning SQPOLL kernel threads on the shared GB10 co-running Holo/hyades — *worsens*
+the peg); a blanket `read_on_stream` dropping the terminal sync (UB for RDMA — reap frees bounce with no
+CudaEvent, zero-copy NIC write isn't CUDA-stream-ordered — and posix single shared bounce; io_uring-only if
+ever); parallelize before the triad confirms CPU-bound; change the C=1 tile budget.
+
+Tests: extend the ignored-GPU `tiled_attention` tests — C seqs batched, each row within tolerance of the
+per-seq result (float non-associativity ⇒ NOT bitwise for C>1); `counts=0` tail = no-op; `C*budget<=num_slots`.
 
 ## Key open questions
 - **Snapshot capacity sizing**: how many warm snapshots/session must survive to convert
