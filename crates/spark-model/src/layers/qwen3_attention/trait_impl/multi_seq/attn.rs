@@ -200,7 +200,13 @@ impl Qwen3AttentionLayer {
         // rows get the same iWHT(out) as the batched rows — bit-identical to
         // serving the seq alone under single-seq HSS.
         if self.high_speed_swap_engaged(kv_cache) {
-            for (i, ds) in disk_states.iter_mut().enumerate() {
+            // Offload half: serial + unconditional for EVERY HSS seq with a
+            // non-empty disk history, in program order. This preserves the
+            // per-layer cursor invariant (`disk_last_offloaded_per_layer[L]`
+            // advances every step, gating check_safe_to_evict) and makes newly
+            // overflowed blocks visible before the batched read below (same
+            // decode stream). Unchanged from issue #33.
+            for ds in disk_states.iter_mut() {
                 if ds.disk_block_ids.is_empty() {
                     continue;
                 }
@@ -215,22 +221,44 @@ impl Qwen3AttentionLayer {
                     hd,
                     bs as usize,
                 )?;
-                // Only overflowed seqs need streaming; resident seqs (disk ==
-                // block_table length) keep their complete-window batched row.
-                if ds.disk_block_ids.len() > ds.block_table.len() {
+            }
+
+            // ── issue #35: de-serialize the overflowed-row streaming ──
+            // The serial per-seq attend loop (issue #33) gated the whole batch
+            // decode step. Collect the overflowed rows (disk history longer than
+            // the HBM window) and serve them in ONE batched orchestrator sweep:
+            // per tile-step it issues one rail-saturating combined read across
+            // all lanes + one num_seqs=n kernel launch, instead of a serial sum
+            // of N per-seq attends. Each lane attends ONLY its own disk history
+            // into its own DISJOINT q/out row (same per-i offsets as the serial
+            // path) → bit-identical output. Resident rows keep their complete-
+            // window batched CUTLASS result (never overwritten), so a mixed
+            // batch's resident seqs are no longer paced by the overflow rows.
+            //
+            // Offload writes precede this read on the SAME decode stream, and the
+            // batched call completes before the iWHT bookend below — so
+            // overwritten rows get the same iWHT(out) as the batched rows.
+            let overflow: Vec<(&[u32], u64, u64)> = disk_states
+                .iter()
+                .enumerate()
+                .filter(|(_, ds)| ds.disk_block_ids.len() > ds.block_table.len())
+                .map(|(i, ds)| {
                     let q_row = q_contiguous.offset(i * q_dim as usize * bf16);
                     let out_row = attn_out.offset(i * q_dim as usize * bf16);
-                    spark_storage::with_local(|hss| {
-                        hss.attend_layer_on_stream(
-                            stream,
-                            self.attn_layer_idx as u32,
-                            ds.disk_block_ids,
-                            q_row.0,
-                            out_row.0,
-                        )
-                    })
-                    .expect("local installed checked in high_speed_swap_engaged")?;
-                }
+                    (ds.disk_block_ids.as_slice(), q_row.0, out_row.0)
+                })
+                .collect();
+            if !overflow.is_empty() {
+                let layer = self.attn_layer_idx as u32;
+                spark_storage::with_local(|hss| {
+                    // Chunk on the orchestrator's cap so n never exceeds max_seqs.
+                    let cap = hss.max_batch();
+                    for chunk in overflow.chunks(cap) {
+                        hss.attend_layer_batched_on_stream(stream, layer, chunk)?;
+                    }
+                    Ok(())
+                })
+                .expect("local installed checked in high_speed_swap_engaged")?;
             }
         }
 

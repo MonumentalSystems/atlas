@@ -24,7 +24,8 @@ use super::super::ssm_pool::SsmStatePool;
 use super::super::ssm_snapshot::SsmSnapshotPool;
 use super::super::types::{PinnedMetaStaging, TransformerModel};
 use crate::layer::{
-    AttnMetadataDev, ForwardContext, GdnPrefillBuffers, LayerState, SsmLayerState, TransformerLayer,
+    AttnMetadataDev, ForwardContext, GdnPrefillBuffers, LayerState, SeqDiskState, SsmLayerState,
+    TransformerLayer,
 };
 use crate::layers::ops;
 use crate::speculative::DraftProposer;
@@ -366,6 +367,33 @@ impl TransformerModel {
         let (seq_lens, block_tables, mut all_layer_states) =
             self.mixed_build_decode_layer_states(decode_seqs, padded_n, n_decode)?;
 
+        // issue #33 fold (a): thread the REAL disk states for the decode half of
+        // the fused (SLAI) step so a seq DECODING inside a fused mixed forward is
+        // HSS-streamed on KV overflow (the old `&mut []` silently skipped it —
+        // latent mis-recall not caught by steady-state kv_sweep, which uses the
+        // hooked decode_a2 path). `mixed_build_decode_layer_states` mem::takes
+        // only `layer_states`, leaving the three disk fields borrowable; borrow
+        // them directly (len = n_decode REAL seqs) exactly as decode_a2 does.
+        // Dropped right after the fused layer loop so the restore re-borrow and
+        // post-update are legal. graph_capture is false on the fused path, so the
+        // eager per-seq offload/attend is legal.
+        let hss_engaged = kv_cache.config().cache_blocks_per_seq.is_some();
+        let mut disk_states: Vec<SeqDiskState> = if hss_engaged {
+            decode_seqs
+                .iter_mut()
+                .map(|s| {
+                    let s: &mut SequenceState = &mut **s;
+                    SeqDiskState {
+                        block_table: &s.block_table,
+                        disk_block_ids: &mut s.disk_block_ids,
+                        disk_last_offloaded_per_layer: &mut s.disk_last_offloaded_per_layer,
+                    }
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
         // ── 6. Fused layer loop ──
         //
         // For each layer: process decode portion then prefill portion.
@@ -412,7 +440,7 @@ impl TransformerModel {
                 &mut kv_cache,
                 &seq_lens,
                 &block_tables,
-                &mut [], // issue #33: fused SLAI decode is not the HSS oracle target
+                &mut disk_states, // issue #33 fold (a): stream overflowed decoding seqs
                 &decode_ctx,
                 stream,
             )?;
@@ -433,6 +461,11 @@ impl TransformerModel {
                 stream,
             )?;
         }
+
+        // Release the per-seq disk-state borrow of `decode_seqs` before the
+        // post-loop layer-state restore (decode_seqs.iter_mut()) and the
+        // Phase-8 token push can re-borrow. (issue #33 fold (a))
+        drop(disk_states);
 
         // ── Step 0 (spec blocker B1): per-chunk SSM state normalize ──
         //

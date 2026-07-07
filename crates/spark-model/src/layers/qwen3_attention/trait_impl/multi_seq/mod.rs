@@ -77,6 +77,19 @@ impl Qwen3AttentionLayer {
         // MLA models (Mistral-Small-4) take the dedicated absorbed-MLA
         // batched path (issue #84). The standard `ms_phase_qkv` reads
         // `attn.q_proj`, a NULL stub for MLA loaders — see `mla.rs`.
+        //
+        // issue #33/#35 fold (b): defense-in-depth. `ms_mla_decode` ignores
+        // `disk_states` (it bypasses `ms_phase_paged_decode` where the HSS
+        // streaming hook lives). `disk_states` is non-empty exactly when HSS is
+        // engaged with real seqs — refuse rather than silently mis-recall on KV
+        // overflow. build.rs already blocks HSS+MLA at construction; this
+        // backstops any future MLA+HSS wiring. `bail` is not imported here.
+        if self.mla.is_some() && !disk_states.is_empty() {
+            anyhow::bail!(
+                "HSS KV-overflow streaming + MLA decode not supported: ms_mla_decode ignores \
+                 disk_states / bypasses ms_phase_paged_decode"
+            );
+        }
         let o_out = if let Some(ref _mla) = self.mla {
             self.ms_mla_decode(&c, kv_cache, meta)?
         } else {
@@ -212,6 +225,15 @@ impl Qwen3AttentionLayer {
             .expect("attention layer requires metadata");
 
         // ── Phases 2-6: attention ──
+        // issue #33/#35 fold (b): defense-in-depth — MLA decode ignores
+        // disk_states / bypasses ms_phase_paged_decode; refuse HSS+MLA rather
+        // than silently mis-recall (build.rs blocks it at construction too).
+        if self.mla.is_some() && !disk_states.is_empty() {
+            anyhow::bail!(
+                "HSS KV-overflow streaming + MLA decode not supported: ms_mla_decode ignores \
+                 disk_states / bypasses ms_phase_paged_decode"
+            );
+        }
         let o_out = if let Some(ref _mla) = self.mla {
             self.ms_mla_decode(&c, kv_cache, meta)?
         } else {

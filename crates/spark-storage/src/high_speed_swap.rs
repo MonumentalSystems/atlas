@@ -38,11 +38,18 @@ pub struct HighSpeedSwap {
     pool: ScratchPool,
     attn: TiledAttention,
     eviction: EvictionPolicy,
+    // Concurrent-decode batch cap for the batched attend path (issue #35).
+    // The single-seq path uses max_batch=... sub-ranges of the buffers below.
+    max_batch: usize,
     // Reusable scratch buffers.
     q_proj: DeviceBuffer,
     block_scores_dev: DeviceBuffer, // [max_blocks] f32
-    block_table_dev: DeviceBuffer,  // [tile_capacity] i32
-    counts_dev: DeviceBuffer,       // [1] i32 (single seq)
+    block_table_dev: DeviceBuffer,  // [max_batch * tile_capacity] i32
+    counts_dev: DeviceBuffer,       // [max_batch] i32
+    // Batched attend (issue #35): contiguous [max_batch * num_q_heads * head_dim]
+    // BF16 gather/scatter buffers for the per-lane Q rows and output rows.
+    q_batch_dev: DeviceBuffer,
+    out_batch_dev: DeviceBuffer,
     score_host_buf: Vec<f32>,
     // Disk-block-ID allocator (Phase 6.1.a, refactored). One global
     // allocator: a `disk_block_id` indexes the SAME logical position
@@ -80,6 +87,16 @@ impl HighSpeedSwap {
     /// per-step calls take their own stream argument.
     pub fn new_on_stream(stream: u64, cfg: HighSpeedSwapConfig, model: ModelDims) -> Result<Self> {
         cfg.validate_and_prepare()?;
+        // Issue #35: concurrent-decode batch cap for the batched attend path.
+        // Derived from the engine's max decode batch (padded to [2,4,8]) — 8 by
+        // default — rather than a new CLI/config field, overridable for HBM
+        // tuning (the resident pool grows ~max_batch×: num_slots = max_batch ×
+        // resident_blocks so each lane owns a disjoint slot arena). Clamped ≥ 1.
+        let max_batch: usize = std::env::var("ATLAS_HSS_MAX_BATCH")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&b| b >= 1)
+            .unwrap_or(8);
         let group_layout = GroupLayout::new(
             model.num_layers,
             model.max_blocks_per_layer,
@@ -123,8 +140,13 @@ impl HighSpeedSwap {
         // byte-for-byte the prior behavior. `new_preferring_uma` self-falls-back
         // to device memory on a non-UMA host, so this is always safe.
         let want_uma = std::env::var("ATLAS_KV_ZERO_COPY").ok().as_deref() == Some("1");
+        // Issue #35: the batched attend path gives each of `max_batch` lanes a
+        // DISJOINT slot arena of `resident_blocks` slots (lane k owns
+        // [k*resident_blocks, (k+1)*resident_blocks)), so the pool grows to
+        // max_batch × resident_blocks slots. The single-seq path still uses the
+        // whole pool via assign/evict — unaffected.
         let dims = ScratchDims {
-            num_slots: cfg.resident_blocks,
+            num_slots: cfg.resident_blocks * max_batch as u32,
             num_kv_heads: model.num_kv_heads,
             group_stride: group_layout.group_stride,
         };
@@ -191,24 +213,38 @@ impl HighSpeedSwap {
             },
             cfg.projection_seed,
         )?;
+        // max_seqs = max_batch so m/l/o + block_table + counts are sized for the
+        // batched attend path; the single-seq path passes num_seqs=1 sub-ranges.
+        // tile_capacity stays = resident_blocks (per-lane tile == per-lane arena).
         let attn = TiledAttention::new(TiledAttentionDims {
-            max_seqs: 1, // single-seq for the orchestrator's first iteration
+            max_seqs: max_batch,
             num_q_heads: model.num_q_heads as usize,
             num_kv_heads: model.num_kv_heads as usize,
             head_dim: model.head_dim as usize,
             block_size: model.block_size as usize,
             tile_capacity: cfg.resident_blocks as usize,
         })?;
-        let eviction = EvictionPolicy::new(cfg.resident_blocks);
+        // Issue #35: the pool grew to resident_blocks × max_batch slots, so the
+        // eviction policy MUST cover the whole pool — else the single-seq path
+        // (assigns/evicts over the full pool) can hand out a slot index the policy
+        // can't address. Output is bit-identical (eviction only affects HBM cache
+        // reuse, not the attention result — a fresh disk read holds byte-identical
+        // K/V to a cached slot).
+        let eviction = EvictionPolicy::new(cfg.resident_blocks * max_batch as u32);
         let q_proj = DeviceBuffer::new(model.num_q_heads as usize * cfg.rank as usize * 2)?;
         let block_scores_dev = DeviceBuffer::new(model.max_blocks_per_layer as usize * 4)?;
-        let block_table_dev = DeviceBuffer::new(cfg.resident_blocks as usize * 4)?;
-        let counts_dev = DeviceBuffer::new(4)?;
+        let block_table_dev = DeviceBuffer::new(max_batch * cfg.resident_blocks as usize * 4)?;
+        let counts_dev = DeviceBuffer::new(max_batch * 4)?;
+        // Batched gather/scatter buffers: [max_batch, num_q_heads*head_dim] BF16.
+        let q_dim_bytes = model.num_q_heads as usize * model.head_dim as usize * 2;
+        let q_batch_dev = DeviceBuffer::new(max_batch * q_dim_bytes)?;
+        let out_batch_dev = DeviceBuffer::new(max_batch * q_dim_bytes)?;
         let score_host_buf = vec![0.0_f32; model.max_blocks_per_layer as usize];
         let disk_state = DiskState::new();
         Ok(Self {
             cfg,
             model,
+            max_batch,
             predictor,
             backend,
             pool,
@@ -218,6 +254,8 @@ impl HighSpeedSwap {
             block_scores_dev,
             block_table_dev,
             counts_dev,
+            q_batch_dev,
+            out_batch_dev,
             score_host_buf,
             disk_state,
         })

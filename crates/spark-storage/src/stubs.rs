@@ -87,6 +87,19 @@ impl HighSpeedSwap {
     ) -> anyhow::Result<()> {
         unreachable!()
     }
+
+    pub fn attend_layer_batched_on_stream(
+        &mut self,
+        stream: u64,
+        layer: u32,
+        seqs: &[(&[u32], u64, u64)],
+    ) -> anyhow::Result<()> {
+        unreachable!()
+    }
+
+    pub fn max_batch(&self) -> usize {
+        0
+    }
 }
 
 pub fn local_installed() -> bool {
