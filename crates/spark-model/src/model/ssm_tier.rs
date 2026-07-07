@@ -179,6 +179,202 @@ pub(crate) fn ssm_tier_enabled() -> bool {
     std::env::var_os("ATLAS_SSM_TIER").is_some()
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// Phase 4b — RDMA snapshot spill tier (`RdmaSnapshotStore`)
+//
+// A second `SnapshotBlobStore` that ships the (already-contiguous) spill blob to
+// a remote RAM blade over RDMA instead of local host RAM. Scales warm-snapshot
+// capacity past local LPDDR and frees ~16-20 GB HBM; converts an SSM-prefix
+// *recompute* into a ~5-7 ms remote restore. Default-off ⇒ byte-identical.
+//
+// The blob gather/scatter and ALL device ordering (leading/trailing
+// `synchronize`) already happen in `SsmSnapshotPool::{spill_slot,fault_in_slot}`
+// before/after the store is called, so a transport only ever moves HOST bytes —
+// the "60 scattered device pointers" problem is solved at the trait boundary.
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Transport seam for the RDMA snapshot tier: a flat remote byte arena addressed
+/// by absolute offset. The RDMA implementation (Phase 4b Inc 2, behind
+/// `atlas_rdma_verbs`) ships each contiguous spill blob to a peer RAM blade over
+/// CX7; `MockSnapshotTransport` is an in-process arena for unit tests. Snapshots
+/// must NOT reuse the KV `RdmaKvBackend` `GroupKey`/`group_stride` addressing
+/// (wrong layout — would corrupt live KV); this arena is offset-addressed only.
+#[allow(dead_code)] // real (RDMA) transport + gate wiring land in Inc 2/3
+pub(crate) trait SnapshotTransport: Send + Sync {
+    /// Write `bytes` to the arena at absolute `offset`. The caller
+    /// (`RdmaSnapshotStore`) guarantees `offset + bytes.len()` is within
+    /// capacity and drains the op's completion before returning.
+    fn write_blob(&self, offset: u64, bytes: &[u8]) -> Result<()>;
+    /// Read `out.len()` bytes from the arena at absolute `offset` into `out`.
+    fn read_blob(&self, offset: u64, out: &mut [u8]) -> Result<()>;
+}
+
+/// In-process arena transport — the unit-test / no-NIC backing for
+/// `RdmaSnapshotStore`. Byte-for-byte faithful to the RDMA transport contract (a
+/// flat offset-addressed arena) so store-level tests exercise the real store.
+#[allow(dead_code)] // used by tests now; by the RDMA transport swap in Inc 2
+pub(crate) struct MockSnapshotTransport {
+    arena: Mutex<Vec<u8>>,
+}
+
+#[allow(dead_code)]
+impl MockSnapshotTransport {
+    pub(crate) fn new(capacity_bytes: usize) -> Self {
+        Self {
+            arena: Mutex::new(vec![0u8; capacity_bytes]),
+        }
+    }
+}
+
+impl SnapshotTransport for MockSnapshotTransport {
+    fn write_blob(&self, offset: u64, bytes: &[u8]) -> Result<()> {
+        let mut a = self.arena.lock();
+        let off = offset as usize;
+        a[off..off + bytes.len()].copy_from_slice(bytes);
+        Ok(())
+    }
+    fn read_blob(&self, offset: u64, out: &mut [u8]) -> Result<()> {
+        let a = self.arena.lock();
+        let off = offset as usize;
+        out.copy_from_slice(&a[off..off + out.len()]);
+        Ok(())
+    }
+}
+
+/// RDMA snapshot spill tier: a `SnapshotBlobStore` over a remote byte arena.
+/// Because every snapshot blob is the SAME fixed size (`spill_blob_bytes()`),
+/// the allocator is a trivial **fixed-slot arena**: slot `i` lives at offset
+/// `i * blob_bytes`; a free-list of slot indices + a `key → slot` map track
+/// residency. A full arena makes `put` return `Ok(false)` — the graceful-drop
+/// contract `reclaim_from_cache` already handles (free the pool slot; the entry
+/// misses into recompute). All map/free-list mutation is `Mutex`-guarded; the
+/// (blocking) transport op runs outside the lock and rolls the allocator back on
+/// failure so a half-written slot is never left mapped (never read as garbage).
+#[allow(dead_code)] // constructed by the Inc-3 gate wiring (impl_a1 selector)
+pub(crate) struct RdmaSnapshotStore {
+    transport: Box<dyn SnapshotTransport>,
+    blob_bytes: usize,
+    inner: Mutex<RdmaInner>,
+    pub stats: BlobStoreStats,
+}
+
+struct RdmaInner {
+    /// key → slot index (byte offset = slot × blob_bytes).
+    map: HashMap<u64, usize>,
+    /// Free slot indices (LIFO reuse).
+    free: Vec<usize>,
+}
+
+#[allow(dead_code)]
+impl RdmaSnapshotStore {
+    /// Build a store over `transport` with `arena_slots` fixed slots of
+    /// `blob_bytes` each. The transport's arena must cover
+    /// `arena_slots × blob_bytes` bytes.
+    pub(crate) fn new(
+        transport: Box<dyn SnapshotTransport>,
+        blob_bytes: usize,
+        arena_slots: usize,
+    ) -> Self {
+        let free: Vec<usize> = (0..arena_slots).rev().collect();
+        Self {
+            transport,
+            blob_bytes,
+            inner: Mutex::new(RdmaInner {
+                map: HashMap::new(),
+                free,
+            }),
+            stats: BlobStoreStats::default(),
+        }
+    }
+
+    #[inline]
+    fn offset_of(&self, slot: usize) -> u64 {
+        (slot * self.blob_bytes) as u64
+    }
+}
+
+impl SnapshotBlobStore for RdmaSnapshotStore {
+    fn put(&self, key: u64, bytes: &[u8]) -> Result<bool> {
+        // Fixed-slot arena: only the snapshot blob size fits. A size mismatch is
+        // a caller bug — refuse gracefully rather than corrupt a slot.
+        if bytes.len() != self.blob_bytes {
+            self.stats.put_rejects.fetch_add(1, Ordering::Relaxed);
+            return Ok(false);
+        }
+        // Pick the slot under the lock, but DON'T commit a new mapping until the
+        // write succeeds (so a failed write never leaves a garbage slot mapped).
+        let (slot, was_new) = {
+            let mut g = self.inner.lock();
+            match g.map.get(&key) {
+                Some(&slot) => (slot, false), // overwrite in place
+                None => {
+                    let Some(slot) = g.free.pop() else {
+                        // Arena full → graceful drop (entry misses → recompute).
+                        self.stats.put_rejects.fetch_add(1, Ordering::Relaxed);
+                        return Ok(false);
+                    };
+                    (slot, true)
+                }
+            }
+        };
+        match self.transport.write_blob(self.offset_of(slot), bytes) {
+            Ok(()) => {
+                if was_new {
+                    self.inner.lock().map.insert(key, slot);
+                }
+                self.stats.puts.fetch_add(1, Ordering::Relaxed);
+                Ok(true)
+            }
+            Err(e) => {
+                // Roll back: a new slot returns to the free-list (nothing
+                // mapped); an overwrite drops the mapping AND frees the slot —
+                // its bytes may be half-overwritten, so a later `get` must miss
+                // (recompute), never read a corrupted slot.
+                let mut g = self.inner.lock();
+                if was_new {
+                    g.free.push(slot);
+                } else if let Some(s) = g.map.remove(&key) {
+                    g.free.push(s);
+                }
+                Err(e)
+            }
+        }
+    }
+
+    fn get(&self, key: u64, out: &mut [u8]) -> Result<bool> {
+        // Defensive: never scatter a wrong-sized blob into a slot.
+        if out.len() != self.blob_bytes {
+            self.stats.get_misses.fetch_add(1, Ordering::Relaxed);
+            return Ok(false);
+        }
+        let slot = match self.inner.lock().map.get(&key) {
+            Some(&slot) => slot,
+            None => {
+                self.stats.get_misses.fetch_add(1, Ordering::Relaxed);
+                return Ok(false);
+            }
+        };
+        self.transport.read_blob(self.offset_of(slot), out)?;
+        self.stats.get_hits.fetch_add(1, Ordering::Relaxed);
+        Ok(true)
+    }
+
+    fn remove(&self, key: u64) {
+        let mut g = self.inner.lock();
+        if let Some(slot) = g.map.remove(&key) {
+            g.free.push(slot);
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.inner.lock().map.len()
+    }
+
+    fn bytes_resident(&self) -> usize {
+        self.inner.lock().map.len() * self.blob_bytes
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -238,5 +434,89 @@ mod tests {
         assert!(!s.put(1, &[0; 8]).unwrap(), "over-cap blob refused, not partial");
         assert_eq!(s.len(), 0);
         assert_eq!(s.stats.put_rejects.load(Ordering::Relaxed), 1);
+    }
+
+    // ── Phase 4b: RdmaSnapshotStore (over MockSnapshotTransport) ──────────
+    // Fixed blob size (BLOB) + finite arena (SLOTS) so full-arena / slot-reuse
+    // paths are exercised. These mirror the MemBlobStore contract above.
+    const BLOB: usize = 4;
+    fn rdma_store(slots: usize) -> RdmaSnapshotStore {
+        let t = Box::new(MockSnapshotTransport::new(slots * BLOB));
+        RdmaSnapshotStore::new(t, BLOB, slots)
+    }
+
+    #[test]
+    fn rdma_put_get_round_trip_bit_identical() {
+        let s = rdma_store(4);
+        assert!(s.put(42, &[1, 2, 3, 4]).unwrap());
+        let mut out = [0u8; BLOB];
+        assert!(s.get(42, &mut out).unwrap());
+        assert_eq!(out, [1, 2, 3, 4], "spill->arena->fault is bit-identical");
+        assert_eq!(s.len(), 1);
+        assert_eq!(s.bytes_resident(), BLOB);
+    }
+
+    #[test]
+    fn rdma_get_absent_is_miss_not_error() {
+        let s = rdma_store(4);
+        let mut out = [0u8; BLOB];
+        assert!(!s.get(7, &mut out).unwrap());
+        assert_eq!(s.stats.get_misses.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn rdma_wrong_size_get_refused_out_untouched() {
+        let s = rdma_store(4);
+        s.put(1, &[9; BLOB]).unwrap();
+        let mut out = [0u8; BLOB + 4]; // mismatched
+        assert!(!s.get(1, &mut out).unwrap(), "never scatter a wrong-sized blob");
+        assert_eq!(out, [0u8; BLOB + 4], "out left untouched on refusal");
+    }
+
+    #[test]
+    fn rdma_wrong_size_put_refused() {
+        let s = rdma_store(4);
+        assert!(!s.put(1, &[0; BLOB + 1]).unwrap(), "off-size blob refused, not corrupt");
+        assert_eq!(s.len(), 0);
+    }
+
+    #[test]
+    fn rdma_full_arena_put_returns_false_not_err() {
+        let s = rdma_store(2);
+        assert!(s.put(1, &[1; BLOB]).unwrap());
+        assert!(s.put(2, &[2; BLOB]).unwrap());
+        // Third key, no free slot → graceful Ok(false), NOT Err, NOT overwrite.
+        assert!(!s.put(3, &[3; BLOB]).unwrap());
+        assert_eq!(s.len(), 2);
+        assert_eq!(s.stats.put_rejects.load(Ordering::Relaxed), 1);
+        // The two resident keys are intact.
+        let mut o = [0u8; BLOB];
+        assert!(s.get(1, &mut o).unwrap() && o == [1; BLOB]);
+        assert!(s.get(2, &mut o).unwrap() && o == [2; BLOB]);
+    }
+
+    #[test]
+    fn rdma_remove_frees_slot_for_reuse() {
+        let s = rdma_store(1); // single slot
+        assert!(s.put(1, &[1; BLOB]).unwrap());
+        assert!(!s.put(2, &[2; BLOB]).unwrap(), "arena full");
+        s.remove(1);
+        assert!(s.put(2, &[2; BLOB]).unwrap(), "freed slot reused");
+        let mut o = [0u8; BLOB];
+        assert!(s.get(2, &mut o).unwrap() && o == [2; BLOB]);
+        assert!(!s.get(1, &mut o).unwrap(), "removed key gone");
+        assert_eq!(s.len(), 1);
+    }
+
+    #[test]
+    fn rdma_overwrite_in_place_no_slot_leak() {
+        let s = rdma_store(1); // single slot forces in-place overwrite
+        assert!(s.put(1, &[1; BLOB]).unwrap());
+        assert!(s.put(1, &[2; BLOB]).unwrap(), "overwrite reuses the same slot");
+        assert_eq!(s.len(), 1);
+        assert_eq!(s.bytes_resident(), BLOB);
+        let mut o = [0u8; BLOB];
+        assert!(s.get(1, &mut o).unwrap());
+        assert_eq!(o, [2; BLOB], "reads the overwritten value");
     }
 }
