@@ -1,5 +1,16 @@
 # Unified Tiered Cache — roadmap for the next ultracode push (2026-07-07)
 
+> **Status @ 2026-07-07 (this push):** Phase 0 ✅ · Phase 1a ✅ · Phase 1b-core ✅ — all
+> landed, gated `ATLAS_SSM_TIER`/`ATLAS_SSM_TAIL_PROTECT` (default off = byte-identical),
+> `#![deny(warnings)]`-clean, **21 new unit tests green, zero regressions**. The headline
+> **spill-not-drop mechanism + index `Location{Hbm｜Tier}` state machine are complete and
+> exhaustively CPU-tested** (byte-fidelity round-trip + slot-recycling invariant + full state
+> machine). **Remaining: Phase 1b-integration** (serving-path wiring) is *precisely scoped* but
+> deliberately **not wired blind** — no cheap e2e validation exists (the only server test runs
+> `ssm_cache_slots=0`; no toy CPU SSM model), and the plan exists *because* 3 prior
+> untested-at-scale attempts failed. It is held for a live SSM-model run (a small
+> GatedDeltaNet model suffices — nothing is size-specific). Phases 2–6 unstarted.
+
 **Architecture: one spill tier for BOTH KV blocks and SSM snapshots.** Route both
 through the *already-shipped* byte-agnostic `StorageBackend` cascade
 (`CascadeBackend` local-pinned-RAM → `RdmaKvBackend` peer → `IoUringBackend` NVMe)

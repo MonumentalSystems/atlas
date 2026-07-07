@@ -598,4 +598,41 @@ mod tier_tests {
         let p = pool(&gpu, 2, 5);
         assert_eq!(p.spill_blob_bytes(), 5 * (32 + 16));
     }
+
+    /// The integration invariant: the tier is keyed by prefix, INDEPENDENT of
+    /// HBM slot lifecycle. Spill snapshot A from slot 0, recycle slot 0 for a
+    /// different snapshot B, spill B under its own key, then fault BOTH back —
+    /// each must recover its own bytes. This is exactly what the Phase-1b
+    /// serving wiring creates: `evict_to_tier` frees a slot that `save` then
+    /// reuses, and a later warm turn faults the spilled key into a fresh slot.
+    #[test]
+    fn tier_survives_slot_recycling() {
+        let gpu = MockGpuBackend::new();
+        let p = pool(&gpu, /*slots*/ 3, /*layers*/ 2);
+        let store = MemBlobStore::new(0);
+        let (key_a, key_b) = (0xAAAA, 0xBBBB);
+
+        // Snapshot A lives in slot 0; spill it.
+        write_pattern(&p, &gpu, 0);
+        let want_a = read_slot(&p, &gpu, 0);
+        assert!(p.spill_slot(0, key_a, &store, &gpu, 0).unwrap());
+
+        // Recycle slot 0 for a DIFFERENT snapshot B (distinct bytes), spill it.
+        for i in 0..p.num_ssm_layers {
+            let h = vec![0xEE; p.h_bytes];
+            let c = vec![0xDD; p.conv_bytes];
+            gpu.copy_h2d(&h, p.h_snapshots[i].offset(0)).unwrap();
+            gpu.copy_h2d(&c, p.conv_snapshots[i].offset(0)).unwrap();
+        }
+        let want_b = read_slot(&p, &gpu, 0);
+        assert_ne!(want_a, want_b, "B must differ from A for the test to bite");
+        assert!(p.spill_slot(0, key_b, &store, &gpu, 0).unwrap());
+        assert_eq!(store.len(), 2);
+
+        // Fault each key into fresh slots — bytes recovered independently.
+        assert!(p.fault_in_slot(1, key_a, &store, &gpu, 0).unwrap());
+        assert!(p.fault_in_slot(2, key_b, &store, &gpu, 0).unwrap());
+        assert_eq!(read_slot(&p, &gpu, 1), want_a, "key A recovered after slot recycle");
+        assert_eq!(read_slot(&p, &gpu, 2), want_b, "key B recovered");
+    }
 }
