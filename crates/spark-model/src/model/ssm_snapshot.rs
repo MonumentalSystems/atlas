@@ -364,6 +364,92 @@ impl SsmSnapshotPool {
         self.free_slots.lock().push(snap_slot);
     }
 
+    /// Bytes in one slot's full spill blob: every SSM layer's `h` + `conv`
+    /// state, laid out `[h_0 conv_0 h_1 conv_1 … h_{L-1} conv_{L-1}]`.
+    pub(super) fn spill_blob_bytes(&self) -> usize {
+        self.num_ssm_layers * (self.h_bytes + self.conv_bytes)
+    }
+
+    /// **Spill** Marconi slot `snap_slot` to the byte tier (Phase 1,
+    /// spill-not-drop): gather the slot's scattered per-layer `(h,conv)` device
+    /// chunks D2H into one host blob and `put` it under `key` (the snapshot's
+    /// prefix hash). Returns whether the tier accepted the blob — `false` (tier
+    /// full / disabled pool) means the caller should fall back to a plain drop.
+    ///
+    /// Ordering: a single `synchronize(stream)` first drains any in-flight D2D
+    /// `save` into this slot (which the caller enqueued on `stream`) before the
+    /// D2H read, so we never spill a half-written snapshot — the read-direction
+    /// half of the cross-stream hazard the plan flags. (The caller still owns
+    /// ordering the *slot reuse* after this spill; see Phase 1b.)
+    pub(super) fn spill_slot(
+        &self,
+        snap_slot: usize,
+        key: u64,
+        store: &dyn super::ssm_tier::SnapshotBlobStore,
+        gpu: &dyn GpuBackend,
+        stream: u64,
+    ) -> Result<bool> {
+        if !self.is_enabled() {
+            return Ok(false);
+        }
+        gpu.synchronize(stream)?; // drain the pending save into this slot
+        let mut blob = vec![0u8; self.spill_blob_bytes()];
+        let per_layer = self.h_bytes + self.conv_bytes;
+        for i in 0..self.num_ssm_layers {
+            let off = i * per_layer;
+            gpu.copy_d2h(
+                self.h_snapshots[i].offset(snap_slot * self.h_bytes),
+                &mut blob[off..off + self.h_bytes],
+            )?;
+            gpu.copy_d2h(
+                self.conv_snapshots[i].offset(snap_slot * self.conv_bytes),
+                &mut blob[off + self.h_bytes..off + per_layer],
+            )?;
+        }
+        store.put(key, &blob)
+    }
+
+    /// **Fault in** a spilled snapshot for `key` into Marconi slot `snap_slot`:
+    /// fetch the host blob and scatter it H2D back into the slot's per-layer
+    /// `(h,conv)` chunks. Returns `false` if the tier has no blob for `key`
+    /// (caller recomputes) — the correct miss degradation.
+    ///
+    /// A trailing `synchronize(stream)` guarantees the H2D scatter has
+    /// committed before the caller issues a `restore` (D2D slot→main pool) that
+    /// reads this slot — the write-direction half of the ordering hazard.
+    pub(super) fn fault_in_slot(
+        &self,
+        snap_slot: usize,
+        key: u64,
+        store: &dyn super::ssm_tier::SnapshotBlobStore,
+        gpu: &dyn GpuBackend,
+        stream: u64,
+    ) -> Result<bool> {
+        if !self.is_enabled() {
+            return Ok(false);
+        }
+        let mut blob = vec![0u8; self.spill_blob_bytes()];
+        if !store.get(key, &mut blob)? {
+            return Ok(false);
+        }
+        let per_layer = self.h_bytes + self.conv_bytes;
+        for i in 0..self.num_ssm_layers {
+            let off = i * per_layer;
+            gpu.copy_h2d_async(
+                &blob[off..off + self.h_bytes],
+                self.h_snapshots[i].offset(snap_slot * self.h_bytes),
+                stream,
+            )?;
+            gpu.copy_h2d_async(
+                &blob[off + self.h_bytes..off + per_layer],
+                self.conv_snapshots[i].offset(snap_slot * self.conv_bytes),
+                stream,
+            )?;
+        }
+        gpu.synchronize(stream)?; // commit before caller's restore reads the slot
+        Ok(true)
+    }
+
     /// Stash the last-token post-final-norm hidden (`hidden_bytes`, BF16)
     /// for a leaf snapshot slot. Used so an exact full-prompt hit can emit
     /// the first token's logits via `lm_head` without re-running the last
@@ -430,5 +516,86 @@ impl SsmSnapshotPool {
         } else {
             false
         }
+    }
+}
+
+#[cfg(test)]
+mod tier_tests {
+    use super::*;
+    use crate::model::ssm_tier::{MemBlobStore, SnapshotBlobStore};
+    use spark_runtime::gpu::mock::MockGpuBackend;
+
+    /// Build a small Marconi-only pool (no decode-rollback region).
+    fn pool(gpu: &dyn GpuBackend, slots: usize, layers: usize) -> SsmSnapshotPool {
+        SsmSnapshotPool::new(
+            slots, /*h_bytes*/ 32, /*conv_bytes*/ 16, layers, /*decode_ring*/ 0,
+            /*decode_max_seqs*/ 0, /*hidden_bytes*/ 8, gpu,
+        )
+        .unwrap()
+    }
+
+    /// Fill slot `s`'s per-layer (h,conv) device chunks with a pattern unique
+    /// per (layer, field) so a mis-scatter would be caught.
+    fn write_pattern(p: &SsmSnapshotPool, gpu: &dyn GpuBackend, s: usize) {
+        for i in 0..p.num_ssm_layers {
+            let h = vec![(0x10 + i) as u8; p.h_bytes];
+            let c = vec![(0x80 + i) as u8; p.conv_bytes];
+            gpu.copy_h2d(&h, p.h_snapshots[i].offset(s * p.h_bytes)).unwrap();
+            gpu.copy_h2d(&c, p.conv_snapshots[i].offset(s * p.conv_bytes)).unwrap();
+        }
+    }
+
+    fn read_slot(p: &SsmSnapshotPool, gpu: &dyn GpuBackend, s: usize) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
+        let mut hs = Vec::new();
+        let mut cs = Vec::new();
+        for i in 0..p.num_ssm_layers {
+            let mut h = vec![0u8; p.h_bytes];
+            let mut c = vec![0u8; p.conv_bytes];
+            gpu.copy_d2h(p.h_snapshots[i].offset(s * p.h_bytes), &mut h).unwrap();
+            gpu.copy_d2h(p.conv_snapshots[i].offset(s * p.conv_bytes), &mut c).unwrap();
+            hs.push(h);
+            cs.push(c);
+        }
+        (hs, cs)
+    }
+
+    /// The headline invariant: spill a slot's scattered state to the tier, then
+    /// fault it back into a DIFFERENT slot — the recurrent state is bit-for-bit
+    /// preserved. This is "spill-not-drop" proven end-to-end at the pool layer.
+    #[test]
+    fn spill_then_fault_in_preserves_bytes() {
+        let gpu = MockGpuBackend::new();
+        let p = pool(&gpu, /*slots*/ 4, /*layers*/ 3);
+        let store = MemBlobStore::new(0);
+        let key = 0xABCD_1234;
+
+        write_pattern(&p, &gpu, /*src*/ 1);
+        let want = read_slot(&p, &gpu, 1);
+
+        assert!(p.spill_slot(1, key, &store, &gpu, 0).unwrap());
+        assert_eq!(store.len(), 1);
+        assert_eq!(store.bytes_resident(), p.spill_blob_bytes());
+
+        // Fault into slot 2 (which is still zeroed) and compare to slot 1.
+        assert!(p.fault_in_slot(2, key, &store, &gpu, 0).unwrap());
+        let got = read_slot(&p, &gpu, 2);
+        assert_eq!(got, want, "faulted-in slot must equal the spilled slot bit-for-bit");
+    }
+
+    /// Faulting an absent key is a clean miss (caller recomputes), not an error.
+    #[test]
+    fn fault_in_absent_key_is_miss() {
+        let gpu = MockGpuBackend::new();
+        let p = pool(&gpu, 4, 2);
+        let store = MemBlobStore::new(0);
+        assert!(!p.fault_in_slot(0, /*absent*/ 999, &store, &gpu, 0).unwrap());
+    }
+
+    /// Blob size accounts for every layer's h+conv.
+    #[test]
+    fn spill_blob_bytes_matches_layout() {
+        let gpu = MockGpuBackend::new();
+        let p = pool(&gpu, 2, 5);
+        assert_eq!(p.spill_blob_bytes(), 5 * (32 + 16));
     }
 }

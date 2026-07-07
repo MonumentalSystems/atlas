@@ -83,7 +83,7 @@ from recompute → fault-in.
 | # | phase | goal | risk |
 |---|---|---|---|
 | **0** ✅ | Instrument + enlarge Marconi pool | Measure the SSM thrash + realistic baseline; prove pool-size (not a bug) is the loss. Sweep `ssm_cache_slots` (16→128), add hit-rate / warm-TTFT / read-bytes / CPU telemetry. **Cheapest lever first.** | very low (config+telemetry; watch HBM OOM) |
-| **1** | **SSM snapshots onto the cascade — spill-not-drop** | *Headline win.* Second cascade instance (`GroupLayout num_layers=1`, synthetic elem so `group_stride == num_ssm_layers×(h+conv)`) reusing every hardened byte-mover — zero change to trait/GroupKey/ScratchPool/KV-attn. `SnapshotEntry` → `Location{Hbm(slot)｜Tier(key)}`; evict **spills** not drops; prefix-lookup faults back in. Gated `$ATLAS_SSM_TIER` (default off = byte-identical). | low-med — **cross-stream ordering** vs `wait_snapshot_saves_dispatch` (a fault-in reading a half-written snapshot = silent state corruption); pin slots during fault-in |
+| **1** 🔨 | **SSM snapshots onto the cascade — spill-not-drop** (1a byte-mover+tier LANDED; 1b index wiring NEXT) | *Headline win.* Second cascade instance (`GroupLayout num_layers=1`, synthetic elem so `group_stride == num_ssm_layers×(h+conv)`) reusing every hardened byte-mover — zero change to trait/GroupKey/ScratchPool/KV-attn. `SnapshotEntry` → `Location{Hbm(slot)｜Tier(key)}`; evict **spills** not drops; prefix-lookup faults back in. Gated `$ATLAS_SSM_TIER` (default off = byte-identical). | low-med — **cross-stream ordering** vs `wait_snapshot_saves_dispatch` (a fault-in reading a half-written snapshot = silent state corruption); pin slots during fault-in |
 | **2** | **Per-seq orchestrator isolation** | Move transient orchestrator state (copy_stream, S-planes, events, `war_armed`) off the shared thread-local `HighSpeedSwap` into a per-seq context. Ships no perf; **unblocks 3 & 5**. Re-state the `unsafe Sync` soundness. | med — under-scoping reintroduces the exact 6/8 C=8 race that killed the tile-pipeline |
 | **3** | Cross-layer prefetch (deep lever A) | Hide tier reads behind the **SSM+MoE/FFN compute between two attention layers** (not the thin within-layer slice the pipeline tried) — for both KV and SSM fault-ins. The only overlap with enough compute. | med — a pin bug silently corrupts attention (wrong-layer blocks); must be measured at the agentic regime not cap=8 |
 | **4** | Reduce read volume — **native-quant tier storage** (deep lever B) | Stop the BF16 inflation: `decode/high_speed_swap.rs:232-289` dequants FP8/NVFP4/4-bit → BF16 *before* `write_from_host`, so quantized history is stored + re-read at **2–4×**. Store native-quant bytes; dequant on read. **Biggest concrete byte cut.** | med — wide per-format correctness surface (FP8/NVFP4/Turbo3/4/8); needs a per-format numeric-diff harness |
@@ -140,3 +140,44 @@ Code in `crates/spark-runtime/src/radix_tree/snapshot.rs` (+ `serve_args.rs` gui
 - **OPEN (needs GPU)**: the live 256-slot + tail-protect re-measure of *residual* recompute
   (the number Phase 1 targets). Deferred — dgx-00 is a shared prod box; will run a scoped
   35B agentic pass when headroom is clear, or fold into the Phase-1 validation.
+
+### Phase 1a — LANDED (2026-07-07): spill/fault byte-mover + host-RAM tier
+The mechanism that turns *drop* into *spill* — tested end-to-end at the pool layer.
+- **`crates/spark-model/src/model/ssm_tier.rs`** (new): `SnapshotBlobStore` trait +
+  `MemBlobStore` (bounded host-RAM tier, FIFO evict, byte-budget + telemetry). On GB10 UMA
+  this is a *real* T1 tier, not a stand-in: spilling frees a scarce pinned snapshot-pool
+  slot while bytes live in abundant LPDDR. Gate helper `ssm_tier_enabled()` (`ATLAS_SSM_TIER`,
+  default off = byte-identical drop).
+- **`ssm_snapshot.rs`**: `spill_slot` (gather scattered per-layer `(h,conv)` D2H → one blob →
+  `store.put`) and `fault_in_slot` (`store.get` → scatter H2D into a slot). Both close their
+  half of the **cross-stream ordering hazard**: spill `synchronize(stream)`s to drain the
+  in-flight `save` before reading (no half-written spill); fault-in `synchronize`s after the
+  H2D so the caller's `restore` can't read an un-committed slot.
+- **Tests (9 green)**: headline **spill→fault-into-a-different-slot is bit-for-bit identical**
+  (on `MockGpuBackend`, no GPU needed); absent-key = clean miss; wrong-size = refused;
+  cap-FIFO evict; over-cap blob refused; overwrite reclaims bytes.
+- **DESIGN DECISION (learning)**: **host-mediated**, not zero-copy device-landing. Snapshot
+  state is scattered across `2×num_ssm_layers` device allocs, but `StorageBackend::read` lands
+  ONE contiguous blob at ONE ptr — mismatched. And `MockGpuBackend::copy_d2d` is a no-op, so a
+  D2D-scatter path couldn't be byte-tested at all. Host-mediation (D2H-gather / H2D-scatter) is
+  correct, matches the plan's "bounce first / 60 destinations" open question, *and* is fully
+  CPU-unit-testable. Zero-copy landing stays a later perf optimization, not a correctness need.
+- **ANTI-PATTERN avoided**: did NOT half-wire spill-on-evict without fault-in-on-lookup — a
+  spill nothing ever reads back is pure wasted I/O. Spill and fault-in must land together in the
+  index (Phase 1b), so 1a ships the *mechanism* proven end-to-end and defers the atomic wiring.
+
+### Phase 1b — NEXT (index `Location` state machine + wiring)
+Wire the 1a mechanism into the snapshot index atomically:
+- `SnapshotEntry` gains `Location{ Hbm(slot) | Tier(key) }`. `evict_lru` in spill mode
+  **keeps** the entry (flip Hbm→Tier via `spill_slot`) instead of `swap_remove`-ing it; the
+  freed HBM slot returns to `free_slots`.
+- `lookup` hit on a `Tier` entry → claim/reclaim a free slot → `fault_in_slot` → flip back to
+  `Hbm`. Cost-aware guard (plan open q): for shallow prefixes a 60-destination fault may cost
+  more than recomputing a few SSM layers → keep a depth threshold.
+- Reconcile ownership: the store is `Arc`-shared on `TransformerModel`; the index lives behind
+  the `PrefixCache` trait; `SsmSnapshotPool` holds the device ptrs — plumb a store handle to the
+  eviction/lookup sites (`reclaim_from_cache`, `prefill_*` prefix-lookup, the 4 exhaustion
+  branches in `save_checkpoint`/`decode_checkpoint`/`finalize_last`/`prefill_d`).
+- Order against `wait_snapshot_saves_dispatch` (`async_chkpt.rs:166`) — the real construct, not
+  the plan's phantom `war_armed`.
+- Validate: GPU-gated e2e + the 35B agentic residual-recompute drop (recompute→fault-in).
