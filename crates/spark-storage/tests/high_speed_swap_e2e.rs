@@ -57,6 +57,7 @@ fn run_in_hbm_reference(ctx: &CudaCtx, q: &[bf16], k: &[bf16], v: &[bf16]) -> Ve
         tile_capacity: SEQ_BLOCKS as usize,
     };
     let attn = TiledAttention::new(dims).unwrap();
+    let planes = attn.new_planes().unwrap();
     let q_dev = DeviceBuffer::new(q.len() * 2).unwrap();
     let k_dev = DeviceBuffer::new(k.len() * 2).unwrap();
     let v_dev = DeviceBuffer::new(v.len() * 2).unwrap();
@@ -100,9 +101,9 @@ fn run_in_hbm_reference(ctx: &CudaCtx, q: &[bf16], k: &[bf16], v: &[bf16]) -> Ve
         ctx.stream,
     )
     .unwrap();
-    attn.begin_step(ctx, 1).unwrap();
+    attn.begin_step(&planes, ctx, 1).unwrap();
     let (s_blk, s_tok, s_kvh) = attn.paged_strides();
-    attn.step_tile(
+    attn.step_tile(&planes, 
         ctx,
         q_dev.ptr,
         k_dev.ptr,
@@ -116,7 +117,7 @@ fn run_in_hbm_reference(ctx: &CudaCtx, q: &[bf16], k: &[bf16], v: &[bf16]) -> Ve
         BLOCK_SIZE as i32,
     )
     .unwrap();
-    attn.finalize(ctx, out_dev.ptr, 1).unwrap();
+    attn.finalize(&planes, ctx, out_dev.ptr, 1).unwrap();
     let mut out = vec![bf16::from_f32(0.0); NUM_Q_HEADS as usize * HEAD_DIM as usize];
     copy_d_to_h_async(
         out.as_mut_ptr() as *mut c_void,

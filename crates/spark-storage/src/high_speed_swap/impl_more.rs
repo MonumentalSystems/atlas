@@ -217,7 +217,8 @@ impl HighSpeedSwap {
         stream_sync(stream)?;
 
         // 3. Tile loop.
-        self.attn.begin_step_on_stream(stream, 1)?;
+        self.attn
+            .begin_step_on_stream(&self.attn_planes, stream, 1)?;
         let tile_cap = self.cfg.resident_blocks as usize;
         let mut tile_idx = 0;
         while tile_idx < seq_block_ids.len() {
@@ -292,6 +293,7 @@ impl HighSpeedSwap {
                 self.model.block_size as i32
             };
             self.attn.step_tile_on_stream(
+                &self.attn_planes,
                 stream,
                 q_dev,
                 self.pool.pool_dev_ptr(),
@@ -306,7 +308,8 @@ impl HighSpeedSwap {
             )?;
             tile_idx = tile_end;
         }
-        self.attn.finalize_on_stream(stream, output_dev, 1)?;
+        self.attn
+            .finalize_on_stream(&self.attn_planes, stream, output_dev, 1)?;
         Ok(())
     }
 

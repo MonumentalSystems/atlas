@@ -172,9 +172,10 @@ fn issue_decode_body(ctx: &CudaCtx, b: &Bundle) -> anyhow::Result<()> {
         b.scores.ptr,
         NUM_BLOCKS,
     )?;
-    b.attn.begin_step(ctx, NUM_SEQS)?;
+    let planes = b.attn.new_planes()?;
+    b.attn.begin_step(&planes, ctx, NUM_SEQS)?;
     let (s_blk, s_tok, s_kvh) = b.attn.paged_strides();
-    b.attn.step_tile(
+    b.attn.step_tile(&planes, 
         ctx,
         b.q.ptr,
         b.k.ptr,
@@ -187,7 +188,7 @@ fn issue_decode_body(ctx: &CudaCtx, b: &Bundle) -> anyhow::Result<()> {
         s_kvh,
         BLOCK_SIZE as i32,
     )?;
-    b.attn.finalize(ctx, b.output.ptr, NUM_SEQS)?;
+    b.attn.finalize(&planes, ctx, b.output.ptr, NUM_SEQS)?;
     Ok(())
 }
 

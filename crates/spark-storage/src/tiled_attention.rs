@@ -71,9 +71,30 @@ pub struct TiledAttention {
     _modules: Vec<CudaModule>,
     f_step: u64,
     f_finalize: u64,
+}
+
+/// Online-softmax accumulator planes (`m`, `l`, `o`) carried across a tile
+/// loop. Phase 2: split OUT of [`TiledAttention`] (which now holds only the
+/// shared, immutable kernel handles) so each concurrent sequence can own its
+/// own planes — two sequences sharing one plane-set clobber each other's
+/// partial softmax state (the C=8 race that killed the tile-pipeline attempt).
+/// The kernels are stateless w.r.t. these: `begin_step`/`step_tile`/`finalize`
+/// take the planes to operate on as a parameter.
+pub struct TiledAttnPlanes {
     pub m_state: DeviceBuffer,
     pub l_state: DeviceBuffer,
     pub o_state: DeviceBuffer,
+}
+
+impl TiledAttnPlanes {
+    /// Allocate planes sized for `dims` (`max_seqs × num_q_heads` slots).
+    pub fn new(dims: &TiledAttentionDims) -> Result<Self> {
+        Ok(Self {
+            m_state: DeviceBuffer::new(dims.m_bytes())?,
+            l_state: DeviceBuffer::new(dims.l_bytes())?,
+            o_state: DeviceBuffer::new(dims.o_bytes())?,
+        })
+    }
 }
 
 const NEG_INF_F32_BITS: u32 = 0xFF800000;
@@ -104,27 +125,32 @@ impl TiledAttention {
         if f_step == 0 || f_finalize == 0 {
             bail!("tiled-attention PTX modules missing");
         }
-        let m_state = DeviceBuffer::new(dims.m_bytes())?;
-        let l_state = DeviceBuffer::new(dims.l_bytes())?;
-        let o_state = DeviceBuffer::new(dims.o_bytes())?;
         Ok(Self {
             dims,
             _modules: modules,
             f_step,
             f_finalize,
-            m_state,
-            l_state,
-            o_state,
         })
+    }
+
+    /// Allocate a plane-set matching this kernel's dims (convenience for
+    /// single-plane callers and tests).
+    pub fn new_planes(&self) -> Result<TiledAttnPlanes> {
+        TiledAttnPlanes::new(&self.dims)
     }
 
     /// Reset (m, l, o) for `num_seqs` sequences. Call once at the start of
     /// each decode step before the first `step_tile`.
-    pub fn begin_step(&self, ctx: &CudaCtx, num_seqs: usize) -> Result<()> {
-        self.begin_step_on_stream(ctx.stream, num_seqs)
+    pub fn begin_step(&self, planes: &TiledAttnPlanes, ctx: &CudaCtx, num_seqs: usize) -> Result<()> {
+        self.begin_step_on_stream(planes, ctx.stream, num_seqs)
     }
 
-    pub fn begin_step_on_stream(&self, stream: u64, num_seqs: usize) -> Result<()> {
+    pub fn begin_step_on_stream(
+        &self,
+        planes: &TiledAttnPlanes,
+        stream: u64,
+        num_seqs: usize,
+    ) -> Result<()> {
         if num_seqs > self.dims.max_seqs {
             bail!(
                 "begin_step num_seqs {} > max_seqs {}",
@@ -135,15 +161,15 @@ impl TiledAttention {
         let n_q = num_seqs * self.dims.num_q_heads;
         let n_o = n_q * self.dims.head_dim;
         unsafe {
-            let s = cuMemsetD32Async(self.m_state.ptr, NEG_INF_F32_BITS, n_q, stream);
+            let s = cuMemsetD32Async(planes.m_state.ptr, NEG_INF_F32_BITS, n_q, stream);
             if s != 0 {
                 bail!("cuMemsetD32Async m_state failed: {s}");
             }
-            let s = cuMemsetD32Async(self.l_state.ptr, 0, n_q, stream);
+            let s = cuMemsetD32Async(planes.l_state.ptr, 0, n_q, stream);
             if s != 0 {
                 bail!("cuMemsetD32Async l_state failed: {s}");
             }
-            let s = cuMemsetD32Async(self.o_state.ptr, 0, n_o, stream);
+            let s = cuMemsetD32Async(planes.o_state.ptr, 0, n_o, stream);
             if s != 0 {
                 bail!("cuMemsetD32Async o_state failed: {s}");
             }
@@ -180,6 +206,7 @@ impl TiledAttention {
     #[allow(clippy::too_many_arguments)]
     pub fn step_tile(
         &self,
+        planes: &TiledAttnPlanes,
         ctx: &CudaCtx,
         q: u64,
         k_pool: u64,
@@ -193,6 +220,7 @@ impl TiledAttention {
         last_block_valid_slots: i32,
     ) -> Result<()> {
         self.step_tile_on_stream(
+            planes,
             ctx.stream,
             q,
             k_pool,
@@ -210,6 +238,7 @@ impl TiledAttention {
     #[allow(clippy::too_many_arguments)]
     pub fn step_tile_on_stream(
         &self,
+        planes: &TiledAttnPlanes,
         stream: u64,
         q: u64,
         k_pool: u64,
@@ -227,9 +256,9 @@ impl TiledAttention {
         let mut v_v = v_pool;
         let mut tb = tile_blocks;
         let mut tc = tile_block_counts;
-        let mut m_v = self.m_state.ptr;
-        let mut l_v = self.l_state.ptr;
-        let mut o_v = self.o_state.ptr;
+        let mut m_v = planes.m_state.ptr;
+        let mut l_v = planes.l_state.ptr;
+        let mut o_v = planes.o_state.ptr;
         let mut nq = self.dims.num_q_heads as i32;
         let mut nk = self.dims.num_kv_heads as i32;
         let mut hd = self.dims.head_dim as i32;
@@ -271,13 +300,25 @@ impl TiledAttention {
     }
 
     /// Divide o_state by l_state and store as BF16 in `output`.
-    pub fn finalize(&self, ctx: &CudaCtx, output: u64, num_seqs: usize) -> Result<()> {
-        self.finalize_on_stream(ctx.stream, output, num_seqs)
+    pub fn finalize(
+        &self,
+        planes: &TiledAttnPlanes,
+        ctx: &CudaCtx,
+        output: u64,
+        num_seqs: usize,
+    ) -> Result<()> {
+        self.finalize_on_stream(planes, ctx.stream, output, num_seqs)
     }
 
-    pub fn finalize_on_stream(&self, stream: u64, output: u64, num_seqs: usize) -> Result<()> {
-        let mut l_v = self.l_state.ptr;
-        let mut o_v = self.o_state.ptr;
+    pub fn finalize_on_stream(
+        &self,
+        planes: &TiledAttnPlanes,
+        stream: u64,
+        output: u64,
+        num_seqs: usize,
+    ) -> Result<()> {
+        let mut l_v = planes.l_state.ptr;
+        let mut o_v = planes.o_state.ptr;
         let mut out_v = output;
         let mut nq = self.dims.num_q_heads as i32;
         let mut hd = self.dims.head_dim as i32;

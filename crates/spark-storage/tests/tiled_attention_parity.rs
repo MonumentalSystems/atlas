@@ -60,6 +60,7 @@ fn upload_i32(dst: u64, host: &[i32], stream: u64) {
 fn run_gpu(tile_size: usize, q: &[bf16], k: &[bf16], v: &[bf16], block_table: &[i32]) -> Vec<bf16> {
     let ctx = CudaCtx::new(0).expect("cuda init");
     let attn = TiledAttention::new(dims(tile_size)).unwrap();
+    let planes = attn.new_planes().unwrap();
     let q_dev = DeviceBuffer::new(q.len() * 2).unwrap();
     let k_dev = DeviceBuffer::new(k.len() * 2).unwrap();
     let v_dev = DeviceBuffer::new(v.len() * 2).unwrap();
@@ -69,7 +70,7 @@ fn run_gpu(tile_size: usize, q: &[bf16], k: &[bf16], v: &[bf16], block_table: &[
     upload_bf16(q_dev.ptr, q, ctx.stream);
     upload_bf16(k_dev.ptr, k, ctx.stream);
     upload_bf16(v_dev.ptr, v, ctx.stream);
-    attn.begin_step(&ctx, NUM_SEQS).unwrap();
+    attn.begin_step(&planes, &ctx, NUM_SEQS).unwrap();
 
     let n_tiles = block_table.len().div_ceil(tile_size);
     for t in 0..n_tiles {
@@ -83,7 +84,7 @@ fn run_gpu(tile_size: usize, q: &[bf16], k: &[bf16], v: &[bf16], block_table: &[
         upload_i32(tile_blocks_dev.ptr, &tile, ctx.stream);
         upload_i32(tile_counts_dev.ptr, &counts, ctx.stream);
         let (s_blk, s_tok, s_kvh) = attn.paged_strides();
-        attn.step_tile(
+        attn.step_tile(&planes, 
             &ctx,
             q_dev.ptr,
             k_dev.ptr,
@@ -98,7 +99,7 @@ fn run_gpu(tile_size: usize, q: &[bf16], k: &[bf16], v: &[bf16], block_table: &[
         )
         .unwrap();
     }
-    attn.finalize(&ctx, output_dev.ptr, NUM_SEQS).unwrap();
+    attn.finalize(&planes, &ctx, output_dev.ptr, NUM_SEQS).unwrap();
     let mut out = vec![bf16::from_f32(0.0); NUM_SEQS * NUM_Q_HEADS * HEAD_DIM];
     copy_d_to_h_async(
         out.as_mut_ptr() as *mut c_void,

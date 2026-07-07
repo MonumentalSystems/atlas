@@ -234,6 +234,7 @@ fn run_in_hbm(
         tile_capacity: blocks as usize,
     };
     let attn = TiledAttention::new(dims)?;
+    let planes = attn.new_planes()?;
     let q_dev = DeviceBuffer::new(q.len() * 2)?;
     let k_dev = DeviceBuffer::new(k.len() * 2)?;
     let v_dev = DeviceBuffer::new(v.len() * 2)?;
@@ -275,8 +276,8 @@ fn run_in_hbm(
     let (s_blk, s_tok, s_kvh) = attn.paged_strides();
     // Warmup.
     for _ in 0..2 {
-        attn.begin_step(ctx, 1)?;
-        attn.step_tile(
+        attn.begin_step(&planes, ctx, 1)?;
+        attn.step_tile(&planes, 
             ctx,
             q_dev.ptr,
             k_dev.ptr,
@@ -289,13 +290,13 @@ fn run_in_hbm(
             s_kvh,
             BLOCK_SIZE as i32,
         )?;
-        attn.finalize(ctx, out_dev.ptr, 1)?;
+        attn.finalize(&planes, ctx, out_dev.ptr, 1)?;
     }
     stream_sync(ctx.stream)?;
     let t = Instant::now();
     for _ in 0..steps {
-        attn.begin_step(ctx, 1)?;
-        attn.step_tile(
+        attn.begin_step(&planes, ctx, 1)?;
+        attn.step_tile(&planes, 
             ctx,
             q_dev.ptr,
             k_dev.ptr,
@@ -308,7 +309,7 @@ fn run_in_hbm(
             s_kvh,
             BLOCK_SIZE as i32,
         )?;
-        attn.finalize(ctx, out_dev.ptr, 1)?;
+        attn.finalize(&planes, ctx, out_dev.ptr, 1)?;
     }
     stream_sync(ctx.stream)?;
     let dt = t.elapsed().as_secs_f64();

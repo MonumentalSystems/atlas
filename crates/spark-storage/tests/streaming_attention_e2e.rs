@@ -28,6 +28,7 @@ fn run_in_hbm_reference(ctx: &CudaCtx, q: &[bf16], k: &[bf16], v: &[bf16]) -> Ve
         tile_capacity: NUM_BLOCKS as usize,
     };
     let attn = TiledAttention::new(dims).unwrap();
+    let planes = attn.new_planes().unwrap();
     let q_dev = DeviceBuffer::new(q.len() * 2).unwrap();
     let k_dev = DeviceBuffer::new(k.len() * 2).unwrap();
     let v_dev = DeviceBuffer::new(v.len() * 2).unwrap();
@@ -71,9 +72,9 @@ fn run_in_hbm_reference(ctx: &CudaCtx, q: &[bf16], k: &[bf16], v: &[bf16]) -> Ve
         ctx.stream,
     )
     .unwrap();
-    attn.begin_step(ctx, NUM_SEQS).unwrap();
+    attn.begin_step(&planes, ctx, NUM_SEQS).unwrap();
     let (s_blk, s_tok, s_kvh) = attn.paged_strides();
-    attn.step_tile(
+    attn.step_tile(&planes, 
         ctx,
         q_dev.ptr,
         k_dev.ptr,
@@ -87,7 +88,7 @@ fn run_in_hbm_reference(ctx: &CudaCtx, q: &[bf16], k: &[bf16], v: &[bf16]) -> Ve
         BLOCK_SIZE as i32,
     )
     .unwrap();
-    attn.finalize(ctx, out_dev.ptr, NUM_SEQS).unwrap();
+    attn.finalize(&planes, ctx, out_dev.ptr, NUM_SEQS).unwrap();
     let mut out = vec![bf16::from_f32(0.0); NUM_SEQS * NUM_Q_HEADS * HEAD_DIM as usize];
     copy_d_to_h_async(
         out.as_mut_ptr() as *mut c_void,
@@ -122,6 +123,7 @@ fn run_streaming<B: StorageBackend + ?Sized>(
         tile_capacity: tile_size,
     };
     let attn = TiledAttention::new(dims).unwrap();
+    let planes = attn.new_planes().unwrap();
     let q_dev = DeviceBuffer::new(q.len() * 2).unwrap();
     let bt_dev = DeviceBuffer::new(NUM_SEQS * tile_size * 4).unwrap();
     let counts_dev = DeviceBuffer::new(NUM_SEQS * 4).unwrap();
@@ -133,7 +135,7 @@ fn run_streaming<B: StorageBackend + ?Sized>(
         ctx.stream,
     )
     .unwrap();
-    attn.begin_step(ctx, NUM_SEQS).unwrap();
+    attn.begin_step(&planes, ctx, NUM_SEQS).unwrap();
 
     let n_tiles = (NUM_BLOCKS as usize).div_ceil(tile_size);
     for t in 0..n_tiles {
@@ -181,7 +183,7 @@ fn run_streaming<B: StorageBackend + ?Sized>(
         .unwrap();
         let (s_blk, s_tok, s_kvh) = attn.scratch_pool_strides();
         let v_offset_bytes = (NUM_KV_HEADS as u64) * (BLOCK_SIZE as u64) * (HEAD_DIM as u64) * 2;
-        attn.step_tile(
+        attn.step_tile(&planes, 
             ctx,
             q_dev.ptr,
             pool.pool_dev_ptr(),
@@ -196,7 +198,7 @@ fn run_streaming<B: StorageBackend + ?Sized>(
         )
         .unwrap();
     }
-    attn.finalize(ctx, out_dev.ptr, NUM_SEQS).unwrap();
+    attn.finalize(&planes, ctx, out_dev.ptr, NUM_SEQS).unwrap();
     let mut out = vec![bf16::from_f32(0.0); NUM_SEQS * NUM_Q_HEADS * HEAD_DIM as usize];
     copy_d_to_h_async(
         out.as_mut_ptr() as *mut c_void,

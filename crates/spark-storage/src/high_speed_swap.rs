@@ -15,7 +15,7 @@ use crate::group::GroupLayout;
 use crate::layout::Layout;
 use crate::predictor::{Predictor, PredictorDims};
 use crate::scratch_pool::{ScratchDims, ScratchPool};
-use crate::tiled_attention::{TiledAttention, TiledAttentionDims};
+use crate::tiled_attention::{TiledAttention, TiledAttentionDims, TiledAttnPlanes};
 
 // `ModelDims` lives in `crate::model_dims` so it stays available on
 // non-cuda builds where the swap orchestrator below isn't compiled.
@@ -37,6 +37,10 @@ pub struct HighSpeedSwap {
     backend: Box<dyn crate::backend::StorageBackend>,
     pool: ScratchPool,
     attn: TiledAttention,
+    /// Online-softmax accumulator planes (Phase 2: split out of `attn` so they
+    /// can go per-seq in `SeqScratch`). Single shared plane-set for now; the
+    /// per-seq `Vec` follows once `attend_layer` is seq-indexed.
+    attn_planes: TiledAttnPlanes,
     eviction: EvictionPolicy,
     // Reusable scratch buffers.
     q_proj: DeviceBuffer,
@@ -199,6 +203,7 @@ impl HighSpeedSwap {
             block_size: model.block_size as usize,
             tile_capacity: cfg.resident_blocks as usize,
         })?;
+        let attn_planes = attn.new_planes()?;
         let eviction = EvictionPolicy::new(cfg.resident_blocks);
         let q_proj = DeviceBuffer::new(model.num_q_heads as usize * cfg.rank as usize * 2)?;
         let block_scores_dev = DeviceBuffer::new(model.max_blocks_per_layer as usize * 4)?;
@@ -213,6 +218,7 @@ impl HighSpeedSwap {
             backend,
             pool,
             attn,
+            attn_planes,
             eviction,
             q_proj,
             block_scores_dev,
