@@ -1,15 +1,17 @@
 # Unified Tiered Cache — roadmap for the next ultracode push (2026-07-07)
 
-> **Status @ 2026-07-07 (this push):** Phase 0 ✅ · Phase 1a ✅ · Phase 1b-core ✅ — all
-> landed, gated `ATLAS_SSM_TIER`/`ATLAS_SSM_TAIL_PROTECT` (default off = byte-identical),
-> `#![deny(warnings)]`-clean, **21 new unit tests green, zero regressions**. The headline
-> **spill-not-drop mechanism + index `Location{Hbm｜Tier}` state machine are complete and
-> exhaustively CPU-tested** (byte-fidelity round-trip + slot-recycling invariant + full state
-> machine). **Remaining: Phase 1b-integration** (serving-path wiring) is *precisely scoped* but
-> deliberately **not wired blind** — no cheap e2e validation exists (the only server test runs
-> `ssm_cache_slots=0`; no toy CPU SSM model), and the plan exists *because* 3 prior
-> untested-at-scale attempts failed. It is held for a live SSM-model run (a small
-> GatedDeltaNet model suffices — nothing is size-specific). Phases 2–6 unstarted.
+> **Status @ 2026-07-07 (this push):** **Phase 1 (spill-not-drop) is CODE-COMPLETE** —
+> Phase 0 ✅ · 1a ✅ · 1b-core ✅ · 1b-integration ✅ (serving path fully wired). All gated
+> `ATLAS_SSM_TIER`/`ATLAS_SSM_TAIL_PROTECT` (default off = byte-identical), full single-GPU
+> build **links**, `#![deny(warnings)]`-clean, **~25 new tests green, zero regressions**.
+> Validated at every layer testable without a live model: byte-fidelity spill↔fault round-trip
+> + slot-recycling (mock GPU), index `Location{Hbm｜Tier}` state machine, and the **full
+> resident→spilled→resident transition through the real `RadixTree` `PrefixCache`**.
+> **The ONE remaining step is a live-CUDA serving smoke** (stream-ordering under concurrent
+> graph replay + live fault-in during prefill) — see the recipe at the bottom. It needs a
+> kernel-target-matched build (`ATLAS_TARGET_MODEL=qwen3.6-35b-a3b`) + a served SSM model, so it
+> belongs to the operator's live-validation harness. **Do not recommend `ATLAS_SSM_TIER` on
+> until that smoke passes.** Phases 2–6 unstarted.
 
 **Architecture: one spill tier for BOTH KV blocks and SSM snapshots.** Route both
 through the *already-shipped* byte-agnostic `StorageBackend` cascade
@@ -94,7 +96,7 @@ from recompute → fault-in.
 | # | phase | goal | risk |
 |---|---|---|---|
 | **0** ✅ | Instrument + enlarge Marconi pool | Measure the SSM thrash + realistic baseline; prove pool-size (not a bug) is the loss. Sweep `ssm_cache_slots` (16→128), add hit-rate / warm-TTFT / read-bytes / CPU telemetry. **Cheapest lever first.** | very low (config+telemetry; watch HBM OOM) |
-| **1** 🔨 | **SSM snapshots onto the cascade — spill-not-drop** (1a byte-mover+tier ✅ · 1b-core index state-machine ✅ · 1b-integration serving-wiring NEXT, needs live 35B) | *Headline win.* Second cascade instance (`GroupLayout num_layers=1`, synthetic elem so `group_stride == num_ssm_layers×(h+conv)`) reusing every hardened byte-mover — zero change to trait/GroupKey/ScratchPool/KV-attn. `SnapshotEntry` → `Location{Hbm(slot)｜Tier(key)}`; evict **spills** not drops; prefix-lookup faults back in. Gated `$ATLAS_SSM_TIER` (default off = byte-identical). | low-med — **cross-stream ordering** vs `wait_snapshot_saves_dispatch` (a fault-in reading a half-written snapshot = silent state corruption); pin slots during fault-in |
+| **1** ✅ | **SSM snapshots onto the cascade — spill-not-drop** — CODE-COMPLETE (1a byte-mover+tier · 1b-core index state-machine · 1b-integration serving-wiring all landed+gated). Live-CUDA smoke pending (recipe below). | *Headline win.* Second cascade instance (`GroupLayout num_layers=1`, synthetic elem so `group_stride == num_ssm_layers×(h+conv)`) reusing every hardened byte-mover — zero change to trait/GroupKey/ScratchPool/KV-attn. `SnapshotEntry` → `Location{Hbm(slot)｜Tier(key)}`; evict **spills** not drops; prefix-lookup faults back in. Gated `$ATLAS_SSM_TIER` (default off = byte-identical). | low-med — **cross-stream ordering** vs `wait_snapshot_saves_dispatch` (a fault-in reading a half-written snapshot = silent state corruption); pin slots during fault-in |
 | **2** | **Per-seq orchestrator isolation** | Move transient orchestrator state (copy_stream, S-planes, events, `war_armed`) off the shared thread-local `HighSpeedSwap` into a per-seq context. Ships no perf; **unblocks 3 & 5**. Re-state the `unsafe Sync` soundness. | med — under-scoping reintroduces the exact 6/8 C=8 race that killed the tile-pipeline |
 | **3** | Cross-layer prefetch (deep lever A) | Hide tier reads behind the **SSM+MoE/FFN compute between two attention layers** (not the thin within-layer slice the pipeline tried) — for both KV and SSM fault-ins. The only overlap with enough compute. | med — a pin bug silently corrupts attention (wrong-layer blocks); must be measured at the agentic regime not cap=8 |
 | **4** | Reduce read volume — **native-quant tier storage** (deep lever B) | Stop the BF16 inflation: `decode/high_speed_swap.rs:232-289` dequants FP8/NVFP4/4-bit → BF16 *before* `write_from_host`, so quantized history is stored + re-read at **2–4×**. Store native-quant bytes; dequant on read. **Biggest concrete byte cut.** | med — wide per-format correctness surface (FP8/NVFP4/Turbo3/4/8); needs a per-format numeric-diff harness |
@@ -196,23 +198,50 @@ is unset, so every default path is unchanged and the existing 45 radix tests sti
   `snapshot_id` is stale, so freeing it would return an already-free slot (double-free /
   slot-aliasing). `skip_tiered` enforces this; a test asserts `evict_lru` frees only the resident.
 
-### Phase 1b-integration — NEXT (serving-path wiring; needs live 35B validation)
-The tested core (1a mechanism + 1b state machine) is complete; this is the plumbing that makes
-it fire in serving, all gated `ATLAS_SSM_TIER` (default off = byte-identical, so it can merge
-and be validated opt-in — the same shipping model #278 used for tail-protect):
-- Own an `Arc<dyn SnapshotBlobStore>` on `TransformerModel`; expose spill/fault through the
-  `PrefixCache` trait (or a thin sibling) so `reclaim_from_cache` calls `evict_to_tier` →
-  `pool.spill_slot(freed, key, store, gpu, stream)` instead of `free`, and the prefill
-  prefix-lookup site calls `lookup_tiered`; on a `Tier` hit → claim a slot →
-  `pool.fault_in_slot(slot, key, store, gpu, stream)` → `promote(key, slot)` → restore as usual.
-- Thread store+gpu+stream into `reclaim_from_cache` and the 4 exhaustion branches
-  (`save_checkpoint`/`decode_checkpoint`/`finalize_last`/`prefill_d`) + the prefill lookup.
-- **Cost-aware guard** (plan open q): for shallow prefixes a 60-destination fault may cost more
-  than recomputing a few SSM layers → depth threshold before faulting.
-- Order against `wait_snapshot_saves_dispatch` (`async_chkpt.rs:166`) — the real construct, not
-  the plan's phantom `war_armed`. (1a's `spill_slot`/`fault_in_slot` already `synchronize` their
-  own half; the integration must additionally not spill a slot whose save event is unrecorded.)
-- **Validate**: gated 35B agentic pass — the `ssm-snap-stats` line should show `tier_hits` rising
-  and `mean_recompute_on_hit` dropping toward the tail-protect+256 residual. **Held for GPU
-  headroom** on the shared dgx-00 (Holo/AEON/hub co-resident); wiring blind without this live
-  read would repeat the plan's own anti-pattern (3 prior untested-at-scale attempts failed).
+### Phase 1b-integration — LANDED code-complete (2026-07-07): serving path wired
+All gated `ATLAS_SSM_TIER` (default off = byte-identical; verified: flag-off never tiers an
+entry, `reclaim` takes the drop branch, the fault-in block is skipped, and `RadixTree::lookup`'s
+tier-aware path degenerates to the resident-only lookup).
+- `TransformerModel` owns `Option<Arc<dyn SnapshotBlobStore>>` (`types.rs`), built in `impl_a1`
+  as an **unbounded** host-RAM `MemBlobStore` when `ATLAS_SSM_TIER` set AND the model has SSM
+  layers. Unbounded ⇒ `put` never rejects (bounded-tier drop-on-reject is a follow-up).
+- `PrefixCache` trait gained `evict_snapshot_to_tier()` + `promote_snapshot()` (default None/false;
+  `RadixTree` delegates to the index). `PrefixMatch` gained additive `ssm_snapshot_tier_key` +
+  `ssm_snapshot_tier_tokens`. `RadixTree::lookup` routes through `lookup_tiered` (one call, no
+  telemetry double-count).
+- `reclaim_from_cache(prefix_cache, kv, tier, gpu)`: with a tier, spill the victim
+  (`evict_snapshot_to_tier` → `spill_slot` → `free`) instead of dropping. **All 6 exhaustion
+  call sites** (`save_checkpoint`/`decode_checkpoint`×2/`finalize_last`/`prefill_d`×2) pass the
+  tier, so every path spills via this one choke point.
+- `prefill_b` prefix-lookup: on a spilled deepest anchor, `try_pop_free_slot` → `fault_in_slot`
+  → `promote_snapshot` → restore uniformly. Ordering: Marconi saves run on the **default
+  stream**, so `spill_slot`'s `synchronize` drains them before the D2H (no half-written spill);
+  `fault_in_slot` `synchronize`s after the H2D before restore reads the slot.
+- **Follow-ups** (documented, not blocking): full-pool fault-in (reclaim-to-free during lookup;
+  currently best-effort on an immediately-free slot → else recompute), bounded-tier
+  drop-on-reject, cost-aware fault-vs-recompute depth guard, and wiring `prefill_a`/`prefill_c`
+  (they ignore the tier key → recompute, which is correct just unoptimized).
+- **CPU-validated**: `test_spill_tier_lookup_transitions` drives resident→spilled→resident
+  through the real `RadixTree`; pool byte-mover + slot-recycling on `MockGpuBackend`.
+
+### Live-validation recipe (the ONE remaining step — operator's harness)
+Build kernels for the SSM target, then serve with a **tiny** pool to force spill+fault-in:
+```
+# rebuild so kernels match the served model (default target is qwen3-next-80b-a3b)
+ATLAS_TARGET_MODEL=qwen3.6-35b-a3b cargo build --release -p spark-server \
+  --no-default-features --features cuda
+# serve (spare port; scoped; tear down by port, never blanket-pkill)
+CKPT=~/.cache/huggingface/hub/models--AEON-7--Qwen3.6-35B-A3B-heretic-NVFP4/snapshots/*/
+ATLAS_SSM_TIER=1 ATLAS_SSM_TAIL_PROTECT=1 ATLAS_SSM_SNAP_STATS=1 RUST_LOG=info \
+  ./target/release/spark serve --model-from-path $CKPT --model-name a3b --port 18999 \
+  --lm-head-dtype bf16 --gpu-memory-utilization 0.35 --max-seq-len 8192 --max-batch-size 2 \
+  --enable-prefix-caching --ssm-cache-slots 4 --ssm-checkpoint-interval 16
+# workload: a few multi-turn repeated-prefix chats across 2-3 sessions (scripts/dev/agentic_test.py
+# or curl) so the 4-slot pool overflows → spill, and warm turns re-hit → fault-in.
+```
+**Pass gate**: log shows `SSM spill tier ENABLED`; `ssm-snap-stats` shows `tier_spills>0` AND
+`tier_hits>0` with `tier_fault_ins>0`; warm-turn outputs are coherent (a corrupted fault-in
+restore would garble them); no crash/error. **Correctness A/B**: same prompts at
+`ATLAS_SSM_TIER=0` vs `=1` should agree (greedy/temp-0 for an exact compare). Then, for the
+north-star perf read, run the #278 35B agentic wall and confirm `mean_recompute_on_hit` drops
+below the tail-protect+256 residual as `tier_hits` rises.
