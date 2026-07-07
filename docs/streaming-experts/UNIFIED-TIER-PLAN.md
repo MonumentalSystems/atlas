@@ -601,3 +601,48 @@ native is much faster. Reframes Phase 5: the batched attention (Inc 1+2+3) optim
 which inherently costs more than native; the value is enabling over-core at all + minimizing that cost.
 **NEXT: pin down the HSS standing-cost source** (offload stripe-repack vs host FP8 dequant) — likely the
 highest-leverage remaining lever, ahead of the RDMA zero-copy work.
+
+### ISL/OSL baseline (container CUDA 13.2 + CUTLASS, native resident, 2026-07-07)
+Reasonable resident buffers (256 SSM snapshot slots, KV in HBM, gpu-mem 0.70 → 83.8 GB free after weights,
+NOTHING spilling), SLAI@100ms, graphs-on, batch=1, cold. Via bench/bench_isl_osl.py:
+
+| ISL/OSL | TTFT | prefill tok/s | decode TPOT | decode tok/s |
+|---|---|---|---|---|
+| 1024/128 | 2.5s | 411 | 6.7ms | 148 |
+| 4096/128 | 3.7s | 1107 | 7.6ms | 132 |
+| 8192/128 | 4.2s | 1932 | 9.3ms | 107 |
+| 16384/128 | 8.6s | 1914 | 11.7ms | 85 |
+| 32768/128 | 17.4s | 1883 | 17.0ms | 59 |
+| 32768/1024 | 26.7s | — | 19.8ms | 51 |
+
+Prefill throughput plateaus ~1900 tok/s at 8K+ (chunked prefill, no cliff to 32K); decode degrades
+148→51 tok/s as KV attention grows with context (TPOT 6.7→19.8ms). This is the pure-compute resident
+baseline on the CUTLASS+13.2 binary (decode +14% at concurrency vs the CUDA-13.0/no-cutlass host floor).
+
+### SSM-tier map — CORRECTION + the SSM→RDMA reframing (2026-07-07)
+Earlier I said "SSM only spills to host-RAM" — WRONG. SSM state has TWO landed disk/tier paths, plus the
+KV tier, and one gap:
+
+| what | trigger | destination | status |
+|---|---|---|---|
+| Sequence (KV+SSM) swap-out | seq preempted to free HBM | **NVMe** (swap file, `sequence.rs` Ph3, `--swap-space-gb`) | landed ✓ |
+| SSM **snapshot** spill (Marconi) | prefix-cache pool full | **host-RAM** (`MemBlobStore`, `ATLAS_SSM_TIER`) | landed ✓ |
+| KV **overflow** | over-core resident window | NVMe *or* **RDMA peer** (HSS) | landed ✓ |
+| **SSM snapshot → RDMA** | pool full + local tier full (deep agentic) | remote peer | **NOT wired** |
+
+**Why SSM→RDMA is the high-value next increment (the operator's reframing):** SSM snapshots are the
+*expensive* resource, in two senses neither KV path shares. (1) **Recompute-on-loss is compute-bound**:
+lose a KV block → re-*read* it (I/O, cheap); lose an SSM snapshot → **recompute the entire SSM prefix**
+(sequential recurrent scan over every prior token — #278: ~4400 recompute-tok/hit at 16 slots). (2) **HBM
+footprint is huge**: this run's log = `Marconi 256 slots (16320 MB)` + `decode-rollback (4080 MB)` ≈
+**20 GB HBM** for SSM state, often > the KV cache. So spilling snapshots to a *remote* tier both frees
+~16 GB HBM for resident KV/context AND scales warm-snapshot capacity past local LPDDR/NVMe — converting
+expensive recomputes into cheap remote restores for deep concurrent agentic.
+
+**The engineering catch (open question, now the increment):** KV is contiguous blocks (trivial zero-copy
+RDMA); SSM snapshot state is **scattered across ~60 per-layer device pointers** (`h_state`/`conv_state` ×
+30 SSM layers), so `register_landing_region`'s one-contiguous-UMA-pool assumption breaks. Options: (a)
+bounce-gather to one contiguous blob then reuse `RdmaKvBackend.write_from_host`/read (host-mediated, matches
+the current `MemBlobStore` D2H-gather/H2D-scatter — simplest, correctness-first); (b) extend landing
+registration to 60 per-layer MRs for zero-copy scatter (fastest, hardest). NEXT: an ultracode design pass
+to vet the approach (a new `RdmaSnapshotStore : SnapshotBlobStore` over the existing verbs) — see below.
