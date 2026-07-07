@@ -17,7 +17,7 @@ use spark_runtime::gpu::DevicePtr;
 use spark_runtime::kv_cache::PagedKvCache;
 
 use super::super::Qwen3AttentionLayer;
-use crate::layer::{ForwardContext, LayerState};
+use crate::layer::{ForwardContext, LayerState, SeqDiskState};
 use crate::layers::ops;
 
 mod attn;
@@ -38,6 +38,7 @@ impl Qwen3AttentionLayer {
         kv_cache: &mut PagedKvCache,
         _seq_lens: &[usize],
         _block_tables: &[Vec<u32>],
+        disk_states: &mut [SeqDiskState],
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
@@ -51,7 +52,7 @@ impl Qwen3AttentionLayer {
 
         // DeepSeek-V4: Manifold-Constrained Hyper-Connections (mHC).
         if self.hc.is_some() {
-            return self.decode_multi_seq_inner_hc(c, kv_cache, ctx, stream);
+            return self.decode_multi_seq_inner_hc(c, kv_cache, disk_states, ctx, stream);
         }
 
         // ── Phase 1: RMS norm + residual for N tokens ──
@@ -89,7 +90,7 @@ impl Qwen3AttentionLayer {
             self.ms_phase_cache_write(&c, kv_cache, meta)?;
 
             // ── Phase 5: paged decode attention (batched) ──
-            let attn_out = self.ms_phase_paged_decode(&c, kv_cache, meta)?;
+            let attn_out = self.ms_phase_paged_decode(&c, kv_cache, meta, disk_states)?;
 
             // ── Phase 6: gate multiply + O projection ──
             self.ms_phase_o_proj(&c, attn_out)?
@@ -122,6 +123,7 @@ impl Qwen3AttentionLayer {
         &self,
         c: ctx::MultiSeqCtx<'_>,
         kv_cache: &mut PagedKvCache,
+        disk_states: &mut [SeqDiskState],
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
@@ -216,7 +218,7 @@ impl Qwen3AttentionLayer {
             self.ms_phase_qkv(&c)?;
             self.ms_phase_rope(&c, meta)?;
             self.ms_phase_cache_write(&c, kv_cache, meta)?;
-            let attn_out = self.ms_phase_paged_decode(&c, kv_cache, meta)?;
+            let attn_out = self.ms_phase_paged_decode(&c, kv_cache, meta, disk_states)?;
             self.ms_phase_o_proj(&c, attn_out)?
         };
 

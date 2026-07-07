@@ -440,6 +440,7 @@ impl TransformerModel {
             ssm_pool,
             ssm_snapshots,
             max_blocks_per_seq,
+            max_batch_size: max_batch_size as u32,
             dummy_kv_block,
             profile,
             profile_first_pending: std::sync::atomic::AtomicBool::new(profile_first),

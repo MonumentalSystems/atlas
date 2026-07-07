@@ -82,3 +82,54 @@ fn capacity_exhaustion_then_recovery() {
     assert!(ids[..3].contains(&r));
     assert_eq!(hss.disk_free_count(), 2);
 }
+
+/// Pure-arithmetic guard for the single capacity lever (meta.rs:42):
+/// `max_blocks_per_seq.saturating_mul(max_batch_size.max(1))`. No GPU needed.
+#[test]
+fn widening_formula() {
+    // C=1: capacity unchanged (byte-identical single-seq path).
+    assert_eq!(8u32.saturating_mul(1u32.max(1)), 8);
+    // max_batch_size=0 is clamped to 1 → still C=1 capacity.
+    assert_eq!(8u32.saturating_mul(0u32.max(1)), 8);
+    // C=4: capacity widens to per_seq × batch.
+    assert_eq!(8u32.saturating_mul(4u32.max(1)), 32);
+    // Overflow saturates instead of panicking.
+    assert_eq!(u32::MAX.saturating_mul(2u32.max(1)), u32::MAX);
+}
+
+/// dims() with the widened per-layer capacity (per_seq 8 × batch 4 = 32),
+/// mirroring what meta.rs:42 now feeds the allocator under concurrency.
+fn dims_batch() -> ModelDims {
+    ModelDims {
+        max_blocks_per_layer: 8 * 4,
+        ..dims()
+    }
+}
+
+#[test]
+#[ignore = "requires GPU"]
+fn capacity_scales_with_batch() {
+    let _ctx = CudaCtx::new(0).expect("cuda init");
+    let mut hss = HighSpeedSwap::new(&_ctx, cfg("cap-batch"), dims_batch()).unwrap();
+    // (a) 32 successive allocs succeed and equal 0..32.
+    let ids: Vec<u32> = (0..32).map(|_| hss.alloc_disk_block_id().unwrap()).collect();
+    assert_eq!(ids, (0..32).collect::<Vec<_>>());
+    // (b) the 33rd is None (capacity exhausted at per_seq × batch).
+    assert!(hss.alloc_disk_block_id().is_none());
+    // (c) diagnostic reports the widened capacity.
+    assert_eq!(hss.diagnostic_summary().disk_block_capacity, 32);
+    // (d) two disjoint 8-id runs never overlap while both are live. Free the
+    // first run, alloc a second run, and confirm no live id appears twice.
+    for &id in &ids[..8] {
+        hss.dec_disk_ref(id);
+    }
+    let run_b: Vec<u32> = (0..8).map(|_| hss.alloc_disk_block_id().unwrap()).collect();
+    // run_b draws from the freed first run (LIFO); the still-live ids[8..32]
+    // are disjoint from run_b.
+    for id in &run_b {
+        assert!(
+            !ids[8..].contains(id),
+            "reallocated id {id} collides with a still-live id"
+        );
+    }
+}

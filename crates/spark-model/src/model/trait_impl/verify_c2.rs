@@ -236,6 +236,7 @@ impl TransformerModel {
                             &mut kv_cache,
                             &seq_lens_vec,
                             &block_tables_vec,
+                            &mut [], // issue #33: MTP verify is not the HSS oracle target
                             &ctx,
                             stream,
                         )?;

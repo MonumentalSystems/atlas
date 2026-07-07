@@ -6,7 +6,8 @@ use spark_runtime::kv_cache::PagedKvCache;
 
 use super::Qwen3AttentionLayer;
 use crate::layer::{
-    BatchedAttnMetadata, EmptyLayerState, ForwardContext, LayerState, TransformerLayer,
+    BatchedAttnMetadata, EmptyLayerState, ForwardContext, LayerState, SeqDiskState,
+    TransformerLayer,
 };
 use crate::layers::FfnComponent;
 
@@ -199,6 +200,7 @@ impl TransformerLayer for Qwen3AttentionLayer {
         kv_cache: &mut PagedKvCache,
         seq_lens: &[usize],
         block_tables: &[Vec<u32>],
+        disk_states: &mut [SeqDiskState],
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
@@ -210,6 +212,7 @@ impl TransformerLayer for Qwen3AttentionLayer {
             kv_cache,
             seq_lens,
             block_tables,
+            disk_states,
             ctx,
             stream,
         )

@@ -19,7 +19,7 @@ use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 use spark_runtime::kv_cache::PagedKvCache;
 
 use crate::layer::{
-    ForwardContext, GdnPrefillBuffers, LayerState, SsmLayerState, TransformerLayer,
+    ForwardContext, GdnPrefillBuffers, LayerState, SeqDiskState, SsmLayerState, TransformerLayer,
 };
 use crate::layers::FfnComponent;
 use crate::layers::ops;
@@ -267,6 +267,8 @@ impl TransformerLayer for Qwen3SsmLayer {
         kv_cache: &mut PagedKvCache,
         seq_lens: &[usize],
         block_tables: &[Vec<u32>],
+        // SSM layers never offload KV to disk — ignored.
+        _disk_states: &mut [SeqDiskState],
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {

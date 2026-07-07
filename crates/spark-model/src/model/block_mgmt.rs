@@ -296,7 +296,8 @@ pub(crate) fn ensure_blocks_through_decode(
                 hss.alloc_disk_block_id().ok_or_else(|| {
                     anyhow::anyhow!(
                         "high-speed-swap: disk-block-id pool exhausted; \
-                         increase --high-speed-swap-bytes or shorten --max-seq-len"
+                         reduce --max-batch-size or shorten --max-seq-len \
+                         (pool is sized max_blocks_per_seq × max-batch-size)"
                     )
                 })
             })
@@ -375,7 +376,8 @@ pub(crate) fn ensure_blocks_through_prefill(
                 hss.alloc_disk_block_id().ok_or_else(|| {
                     anyhow::anyhow!(
                         "high-speed-swap: disk-block-id pool exhausted; \
-                         increase --high-speed-swap-bytes or shorten --max-seq-len"
+                         reduce --max-batch-size or shorten --max-seq-len \
+                         (pool is sized max_blocks_per_seq × max-batch-size)"
                     )
                 })
             })

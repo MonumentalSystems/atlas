@@ -16,7 +16,7 @@ use spark_runtime::gpu::{DevicePtr, GpuBackend};
 
 use super::super::block_mgmt::{ensure_blocks_through_decode, extract_layer_refs};
 use super::super::types::TransformerModel;
-use crate::layer::{ForwardContext, LayerState, SsmLayerState};
+use crate::layer::{ForwardContext, LayerState, SeqDiskState, SsmLayerState};
 use crate::layers::ops;
 use crate::traits::{Model, SequenceState};
 
@@ -181,6 +181,13 @@ impl TransformerModel {
 
         // 1c. Allocate KV blocks for active sequences
         let mut kv_cache = self.kv_cache.lock();
+        // issue #33: when --high-speed-swap is engaged the batched attention
+        // does per-seq host D2H/dequant offload + a host stream_sync inside
+        // attend_layer_on_stream — both illegal under CUDA-graph capture
+        // (status 900). Force eager (see use_graphs below) and thread each
+        // real seq's disk state into decode_multi_seq so overflowed seqs can
+        // stream their own history.
+        let hss_engaged = kv_cache.config().cache_blocks_per_seq.is_some();
         let bs = kv_cache.block_size();
         for seq in seqs.iter_mut() {
             let blocks_needed = (seq.seq_len / bs) + 1;
@@ -222,6 +229,7 @@ impl TransformerModel {
         let lora_eager = self.lora.is_some() && crate::lora::lora_eager_env();
         let use_graphs = !ms_profile
             && !lora_eager
+            && !hss_engaged
             && std::env::var("ATLAS_DECODE_GRAPHS_MULTISEQ")
                 .ok()
                 .as_deref()
@@ -350,6 +358,31 @@ impl TransformerModel {
 
             dump_hidden("post_embed", stream)?;
 
+            // issue #33: per-REAL-seq (len == n, NOT padded_n) HSS disk state,
+            // borrowing disjoint fields of each SequenceState directly so the
+            // per-layer offload cursor mutation persists across steps with no
+            // writeback. Safe to hold across the layer loop: nothing between the
+            // std::mem::take above and the post-loop restore/push touches `seqs`.
+            // Dropped right after the loop so the restore's seqs.iter_mut() and
+            // the Phase-3 token push can re-borrow. Empty when HSS is off (the
+            // layer's guarded streaming loop is then skipped). use_graphs is
+            // forced false under HSS, so the graph-replay early-return above is
+            // never reached and the eager per-seq host offload/attend is legal.
+            let mut disk_states: Vec<SeqDiskState> = if hss_engaged {
+                seqs.iter_mut()
+                    .map(|s| {
+                        let s: &mut SequenceState = &mut **s;
+                        SeqDiskState {
+                            block_table: &s.block_table,
+                            disk_block_ids: &mut s.disk_block_ids,
+                            disk_last_offloaded_per_layer: &mut s.disk_last_offloaded_per_layer,
+                        }
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+
             // Layer loop for padded_n sequences
             let mut ssm_us: u128 = 0;
             let mut attn_us: u128 = 0;
@@ -369,6 +402,7 @@ impl TransformerModel {
                     &mut kv_cache,
                     &seq_lens,
                     &block_tables,
+                    &mut disk_states,
                     &ctx,
                     stream,
                 )?;
@@ -385,6 +419,9 @@ impl TransformerModel {
                     let _ = dump_hidden(&format!("after_L{:02}", layer_idx), stream);
                 }
             }
+            // Release the per-seq borrow of `seqs` before the post-loop
+            // layer-state restore (seqs.iter_mut()) and Phase-3 token push.
+            drop(disk_states);
             if ms_profile {
                 self.gpu.synchronize(stream).ok();
             }

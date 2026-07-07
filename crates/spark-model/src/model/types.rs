@@ -110,6 +110,10 @@ pub struct TransformerModel {
     /// Fixed max blocks per sequence (max_seq_len / block_size + 1).
     /// Used as constant stride in attention metadata for CUDA graph compatibility.
     pub(super) max_blocks_per_seq: u32,
+    /// Scheduler concurrency bound; used ONLY to size the HSS disk-id namespace
+    /// (max_blocks_per_seq × max_batch_size). NOT a kernel/graph stride — that
+    /// stays max_blocks_per_seq.
+    pub(super) max_batch_size: u32,
     /// Permanent KV cache block for padding sequences in batched decode.
     pub(super) dummy_kv_block: u32,
     /// Profile mode: skip graphs, sync+time each layer. Set ATLAS_PROFILE=1.

@@ -39,7 +39,16 @@ impl TransformerModel {
         // gated by the user's --high-speed-swap CLI choice.
         Some(spark_storage::ModelDims {
             num_layers: self.config.num_hidden_layers as u32,
-            max_blocks_per_layer: self.max_blocks_per_seq,
+            // SINGLE CAPACITY LEVER for the HSS disk-id namespace: widen the
+            // per-layer id space to hold every concurrent sequence's worth of
+            // blocks (max_blocks_per_seq × max_batch_size). Every storage-tier
+            // size (allocator cap, GroupLayout.num_blocks → NVMe fallocate +
+            // RDMA total_bytes handshake, predictor/score buffers) derives from
+            // this one field, so they all grow in lockstep. C=1 (max_batch_size
+            // 1) leaves this == max_blocks_per_seq → byte-identical path.
+            max_blocks_per_layer: self
+                .max_blocks_per_seq
+                .saturating_mul(self.max_batch_size.max(1)),
             num_q_heads: self.config.num_attention_heads as u16,
             num_kv_heads: self.config.num_key_value_heads as u16,
             head_dim: self.config.head_dim as u16,

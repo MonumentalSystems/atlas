@@ -412,6 +412,7 @@ impl TransformerModel {
                 &mut kv_cache,
                 &seq_lens,
                 &block_tables,
+                &mut [], // issue #33: fused SLAI decode is not the HSS oracle target
                 &decode_ctx,
                 stream,
             )?;

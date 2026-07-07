@@ -14,7 +14,7 @@ use spark_runtime::buffers::BufferArena;
 use spark_runtime::gpu::{DevicePtr, GpuBackend};
 
 mod transformer_layer;
-pub use transformer_layer::TransformerLayer;
+pub use transformer_layer::{SeqDiskState, TransformerLayer};
 
 /// Per-layer persistent state tracked across decode steps.
 ///

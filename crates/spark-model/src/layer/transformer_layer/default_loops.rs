@@ -9,7 +9,7 @@ use anyhow::Result;
 use spark_runtime::gpu::DevicePtr;
 use spark_runtime::kv_cache::PagedKvCache;
 
-use super::TransformerLayer;
+use super::{SeqDiskState, TransformerLayer};
 use crate::layer::{ForwardContext, LayerState};
 
 #[allow(clippy::too_many_arguments)]
@@ -94,6 +94,9 @@ pub(super) fn decode_multi_seq_default<'a, 'b: 'a>(
     kv_cache: &mut PagedKvCache,
     seq_lens: &[usize],
     block_tables: &[Vec<u32>],
+    // Sequential fallback never streams offloaded KV (each seq is served by a
+    // full per-token `decode`); the disk state is unused here.
+    _disk_states: &mut [SeqDiskState],
     ctx: &ForwardContext,
     stream: u64,
 ) -> Result<()> {

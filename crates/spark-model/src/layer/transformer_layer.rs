@@ -11,6 +11,24 @@ use super::{BatchedAttnMetadata, ForwardContext, GdnPrefillBuffers, LayerState};
 
 mod default_loops;
 
+/// Per-REAL-seq (`len == n`, not `padded_n`) `--high-speed-swap` disk state
+/// threaded into `decode_multi_seq` so the batched attention can stream each
+/// concurrent sequence's OWN offloaded KV history (issue #33).
+///
+/// Borrows directly into the caller's `SequenceState` (disjoint fields), so
+/// the per-layer offload cursor mutation in
+/// `disk_last_offloaded_per_layer` persists across decode steps with no
+/// writeback. Empty slice when HSS is off or the caller does not support
+/// streaming (the batched attention's guarded loop is then skipped).
+pub struct SeqDiskState<'a> {
+    /// Read-only view of this seq's HBM block table (the capped window).
+    pub block_table: &'a Vec<u32>,
+    /// This seq's full ordered disk-side history (streamed by the attend).
+    pub disk_block_ids: &'a mut Vec<u32>,
+    /// This seq's per-layer offload cursor (advanced by the offload).
+    pub disk_last_offloaded_per_layer: &'a mut Vec<u32>,
+}
+
 pub trait TransformerLayer: Send + Sync {
     /// `&mut dyn Any` downcast hook for post-construction weight overlays (e.g.
     /// the LoRA install walk). Default `None`; overlay-capable layers override.
@@ -476,6 +494,9 @@ pub trait TransformerLayer: Send + Sync {
         kv_cache: &mut PagedKvCache,
         seq_lens: &[usize],
         block_tables: &[Vec<u32>],
+        // Per-REAL-seq (len==n, not padded_n) HSS disk state; empty slice when
+        // HSS is off or the caller does not support streaming.
+        disk_states: &mut [SeqDiskState],
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
@@ -488,6 +509,7 @@ pub trait TransformerLayer: Send + Sync {
             kv_cache,
             seq_lens,
             block_tables,
+            disk_states,
             ctx,
             stream,
         )

@@ -8,7 +8,7 @@ use spark_runtime::gpu::DevicePtr;
 use spark_runtime::kv_cache::PagedKvCache;
 
 use super::ctx::MultiSeqCtx;
-use crate::layer::AttnMetadataDev;
+use crate::layer::{AttnMetadataDev, SeqDiskState};
 use crate::layers::ops;
 use crate::layers::qwen3_attention::Qwen3AttentionLayer;
 
@@ -103,6 +103,8 @@ impl Qwen3AttentionLayer {
         c: &MultiSeqCtx<'_>,
         kv_cache: &mut PagedKvCache,
         meta: AttnMetadataDev,
+        // Per-REAL-seq (len == real n) HSS disk state. Empty when HSS off.
+        disk_states: &mut [SeqDiskState],
     ) -> Result<DevicePtr> {
         let MultiSeqCtx {
             fwd,
@@ -180,6 +182,58 @@ impl Qwen3AttentionLayer {
             fwd.buffers.splitk_workspace(),
             stream,
         )?;
+
+        // ── issue #33: per-seq HSS KV-overflow streaming ──
+        // run_paged_decode above filled ALL rows from the HBM block_table. For
+        // sequences whose KV history has overflowed HBM (disk_block_ids.len() >
+        // block_table.len()), that row is INCOMPLETE — it only saw the capped
+        // window. Re-serve those rows with the byte-identical single-seq HSS
+        // pair (offload → attend_layer_on_stream over the FULL disk history),
+        // overwriting only their attn_out row. Rows fully resident in HBM keep
+        // the fast batched CUTLASS result (never overwritten → batch not
+        // serialized). The offload runs for EVERY HSS-engaged seq (guarded only
+        // on non-empty disk_block_ids), NOT just overflowed ones: the per-layer
+        // cursor `disk_last_offloaded_per_layer[L]` must advance every step or
+        // the next window slide trips check_safe_to_evict. Because SeqDiskState
+        // borrows the SequenceState directly, that cursor mutation persists with
+        // no writeback. This runs BEFORE the iWHT bookend below, so overwritten
+        // rows get the same iWHT(out) as the batched rows — bit-identical to
+        // serving the seq alone under single-seq HSS.
+        if self.high_speed_swap_engaged(kv_cache) {
+            for (i, ds) in disk_states.iter_mut().enumerate() {
+                if ds.disk_block_ids.is_empty() {
+                    continue;
+                }
+                self.high_speed_swap_offload_new_blocks(
+                    kv_cache,
+                    ds.block_table,
+                    ds.disk_block_ids,
+                    ds.disk_last_offloaded_per_layer,
+                    fwd,
+                    stream,
+                    nkv,
+                    hd,
+                    bs as usize,
+                )?;
+                // Only overflowed seqs need streaming; resident seqs (disk ==
+                // block_table length) keep their complete-window batched row.
+                if ds.disk_block_ids.len() > ds.block_table.len() {
+                    let q_row = q_contiguous.offset(i * q_dim as usize * bf16);
+                    let out_row = attn_out.offset(i * q_dim as usize * bf16);
+                    spark_storage::with_local(|hss| {
+                        hss.attend_layer_on_stream(
+                            stream,
+                            self.attn_layer_idx as u32,
+                            ds.disk_block_ids,
+                            q_row.0,
+                            out_row.0,
+                        )
+                    })
+                    .expect("local installed checked in high_speed_swap_engaged")?;
+                }
+            }
+        }
+
         if v_is_turbo && wht_runtime_active && self.wht_bf16_k_inv.0 != 0 {
             use spark_runtime::kernel_args::KernelLaunch;
             KernelLaunch::new(fwd.gpu, self.wht_bf16_k_inv)
