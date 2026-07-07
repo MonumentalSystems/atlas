@@ -19,7 +19,33 @@
 >   `resident=4` (now correctly = slots). Nearly every warm hit now tier-restores instead of
 >   recomputing.
 >
-> **Phase 2 (per-seq orchestrator isolation) ✅ LANDED** (2026-07-07, GB10-validated). Phases 3–6 remain.
+> **Phase 2 ✅ LANDED. Phase 3 foundation ✅ LANDED** (3a persistent pin + 3b-i prefetch mechanism,
+> GB10-tested); Phase 3b-ii integration OPEN (see below). Phases 4–6 remain.
+
+### Phase 3 — foundation LANDED (2026-07-07), integration OPEN
+Cross-layer prefetch: hide the tier read for attention layer L+1 behind the SSM+MoE compute
+between L and L+1. Built + GB10-tested the correctness-critical foundation:
+- **3a** (`fe5274d`): **persistent refcounted slot-pin** in `ScratchPool`/`EvictionPolicy`,
+  honored by `assign`'s victim scan. This is the guard against the plan's headline hazard —
+  without it a prefetch's `assign` could evict a slot layer L is *actively reading* → silent
+  wrong-layer attention corruption. Unused by existing paths ⇒ byte-identical. 2 GPU tests.
+- **3b-i** (`11c7683`): `prefetch_layer_on_stream` (reserve + load + PIN a layer's blocks, no
+  attend) + `attend_layer` unpins **per-tile** after `step_tile` (frees slots for later tiles +
+  next-layer prefetch; avoids a full-pinned-tile deadlock; stream-ordered so evict+overwrite is
+  safe). GB10-tested: prefetch pins block 0 → attend consumes it → byte-correct output → block
+  unpinned.
+- **3b-ii — OPEN, architecturally significant.** The scoping surfaced a real constraint: HSS is a
+  **thread-local `RefCell` singleton** and `backend.read` is **CPU-blocking**. A prefetch issued
+  from the scheduler thread therefore overlaps only kernels *already enqueued* (L's FFN), NOT the
+  SSM layers the same single CPU thread enqueues *after* the prefetch call — so triggering
+  prefetch inline gives little real overlap. **Meaningful overlap needs a dedicated I/O thread +
+  making HSS shareable across threads** (Arc/Mutex or per-seq contexts — revisiting the
+  `RdmaKvBackend` `unsafe impl Sync` single-owner assumption), plus a side-stream + event
+  (`stream_wait_event`) so L+1's attend waits on the prefetch's H2D. This is a distinct
+  architectural change requiring live agentic-regime measurement (the existing
+  `long_context_bench` measures `attend` in isolation and won't show the hidden-behind-compute
+  win — a decode-tail bench must be built). Held for a dedicated push; the foundation above makes
+  it safe to build on. Phases 4–6 remain.
 
 ### Phase 2 — LANDED (2026-07-07): per-seq orchestrator scratch
 A contained **scratch/accumulator split**, not a wholesale HSS-per-seq (the scoping corrected the
@@ -123,7 +149,7 @@ from recompute → fault-in.
 | **0** ✅ | Instrument + enlarge Marconi pool | Measure the SSM thrash + realistic baseline; prove pool-size (not a bug) is the loss. Sweep `ssm_cache_slots` (16→128), add hit-rate / warm-TTFT / read-bytes / CPU telemetry. **Cheapest lever first.** | very low (config+telemetry; watch HBM OOM) |
 | **1** ✅ | **SSM snapshots onto the cascade — spill-not-drop** — DONE + LIVE-VALIDATED on GB10 (154 spills / 0 drops / 13 fault-ins over 72 requests, 0 errors, recompute-on-hit 4400→15 tok). 1a byte-mover+tier · 1b-core state-machine · 1b-integration serving-wiring. | *Headline win.* Second cascade instance (`GroupLayout num_layers=1`, synthetic elem so `group_stride == num_ssm_layers×(h+conv)`) reusing every hardened byte-mover — zero change to trait/GroupKey/ScratchPool/KV-attn. `SnapshotEntry` → `Location{Hbm(slot)｜Tier(key)}`; evict **spills** not drops; prefix-lookup faults back in. Gated `$ATLAS_SSM_TIER` (default off = byte-identical). | low-med — **cross-stream ordering** vs `wait_snapshot_saves_dispatch` (a fault-in reading a half-written snapshot = silent state corruption); pin slots during fault-in |
 | **2** ✅ | **Per-seq orchestrator isolation** | Move transient orchestrator state (copy_stream, S-planes, events, `war_armed`) off the shared thread-local `HighSpeedSwap` into a per-seq context. Ships no perf; **unblocks 3 & 5**. Re-state the `unsafe Sync` soundness. | med — under-scoping reintroduces the exact 6/8 C=8 race that killed the tile-pipeline |
-| **3** | Cross-layer prefetch (deep lever A) | Hide tier reads behind the **SSM+MoE/FFN compute between two attention layers** (not the thin within-layer slice the pipeline tried) — for both KV and SSM fault-ins. The only overlap with enough compute. | med — a pin bug silently corrupts attention (wrong-layer blocks); must be measured at the agentic regime not cap=8 |
+| **3** 🔨 | Cross-layer prefetch (deep lever A) — **foundation landed** (3a pin + 3b-i prefetch mechanism, GB10-tested); 3b-ii decode-loop async integration OPEN (needs an I/O thread — see below) | Hide tier reads behind the **SSM+MoE/FFN compute between two attention layers** (not the thin within-layer slice the pipeline tried) — for both KV and SSM fault-ins. The only overlap with enough compute. | med — a pin bug silently corrupts attention (wrong-layer blocks); must be measured at the agentic regime not cap=8 |
 | **4** | Reduce read volume — **native-quant tier storage** (deep lever B) | Stop the BF16 inflation: `decode/high_speed_swap.rs:232-289` dequants FP8/NVFP4/4-bit → BF16 *before* `write_from_host`, so quantized history is stored + re-read at **2–4×**. Store native-quant bytes; dequant on read. **Biggest concrete byte cut.** | med — wide per-format correctness surface (FP8/NVFP4/Turbo3/4/8); needs a per-format numeric-diff harness |
 | **5** | Parallel per-seq CPU orchestration (deep lever C) | De-serialize the `multi_seq/attn.rs:203` per-seq loop **without dropping the cache** — kills the observed **2-cores-pegged / spiky-throughput** symptom under C=8. | med-high — highest concurrency risk; breaks `unsafe Sync` if widened silently (UB, not just a race); thread-pool footgun on the shared box |
 | **6** | *(optional capstone)* one namespaced `BlobKey` space | Permanently kill KV/SSM re-divergence: one address space, one policy, per-namespace budgets. Only if cross-arbitration / shared budget proves worthwhile. | med — addressing/off-by-one cross-write hazard (KV over SSM bytes); pure hygiene, zero new user value |
