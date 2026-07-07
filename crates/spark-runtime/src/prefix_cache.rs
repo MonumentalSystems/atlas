@@ -79,6 +79,16 @@ pub struct PrefixMatch {
     /// checkpoints it may be less — the caller must recompute SSM state for
     /// tokens between `ssm_snapshot_tokens` and `matched_tokens`.
     pub ssm_snapshot_tokens: usize,
+    /// Phase 1b spill tier: when the deepest anchor for this prefix is SPILLED
+    /// (not resident in HBM), `ssm_snapshot` is `None` and this holds the tier
+    /// key (prefix hash). The caller faults the bytes into a fresh snapshot slot
+    /// (`SsmSnapshotPool::fault_in_slot`), `promote_snapshot`s the entry, then
+    /// restores. `None` whenever nothing is tiered (i.e. `ATLAS_SSM_TIER` off) —
+    /// so this field is inert on the default path.
+    pub ssm_snapshot_tier_key: Option<u64>,
+    /// Token depth covered by `ssm_snapshot_tier_key` (analogue of
+    /// `ssm_snapshot_tokens` for a tiered anchor).
+    pub ssm_snapshot_tier_tokens: usize,
 }
 
 impl PrefixMatch {
@@ -90,6 +100,8 @@ impl PrefixMatch {
             matched_tokens: 0,
             ssm_snapshot: None,
             ssm_snapshot_tokens: 0,
+            ssm_snapshot_tier_key: None,
+            ssm_snapshot_tier_tokens: 0,
         }
     }
 
@@ -243,6 +255,23 @@ pub trait PrefixCache: Send + Sync {
     /// Evict the least-recently-used SSM snapshot from the snapshot index.
     /// Returns the snapshot ID so the caller can free it in `SsmSnapshotPool`.
     fn evict_snapshot_lru(&self) -> Option<usize>;
+
+    /// Phase 1b spill tier: pick a spill victim (same policy as
+    /// `evict_snapshot_lru`, HBM-resident only), **keep** its index entry
+    /// (findable so a warm turn faults it back), and return `(freed_slot, key)`
+    /// so the caller moves its bytes to the tier and reuses the slot. `None`
+    /// when nothing resident remains. Default: `None` (caches without a tier).
+    fn evict_snapshot_to_tier(&self) -> Option<(usize, u64)> {
+        None
+    }
+
+    /// Phase 1b spill tier: after the caller faulted a spilled snapshot's bytes
+    /// into `new_slot`, re-home its index entry to HBM. Returns `false` if the
+    /// key is unknown. Default: `false`.
+    fn promote_snapshot(&self, key: u64, new_slot: usize) -> bool {
+        let _ = (key, new_slot);
+        false
+    }
 
     /// Number of SSM snapshots currently stored in the snapshot index.
     fn snapshot_count(&self) -> usize;

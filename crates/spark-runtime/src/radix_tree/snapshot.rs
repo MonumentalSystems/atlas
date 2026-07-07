@@ -28,9 +28,6 @@ pub(super) struct SnapshotEntry {
 }
 
 /// Where a matched snapshot's state currently lives (Phase 1b).
-// Consumed by `lookup_tiered`; the serving-path wiring that calls it lands with
-// the Phase-1b integration (gated ATLAS_SSM_TIER). Allow until then.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum SnapLoc {
     /// Resident in the HBM snapshot pool at this slot — restore directly.
@@ -42,7 +39,6 @@ pub(super) enum SnapLoc {
 
 /// A tier-aware snapshot match (Phase 1b): the deepest anchor for a prefix plus
 /// where its state currently lives.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct SnapMatch {
     pub token_count: usize,
@@ -145,6 +141,11 @@ impl SsmSnapshotIndex {
     /// Find deepest snapshot matching session within matched_tokens range.
     /// Task #24: `adapter_id` is folded into the recomputed prefix hash so a
     /// snapshot registered under one adapter never matches another's lookup.
+    ///
+    /// Resident-only (skips tiered entries). The serving path uses the
+    /// tier-aware `lookup_tiered`; this is retained as the reference for the
+    /// pre-tier contract and exercised by focused unit tests.
+    #[allow(dead_code)]
     pub(super) fn lookup(
         &mut self,
         tokens: &[u32],
@@ -368,11 +369,8 @@ impl SsmSnapshotIndex {
     // resident (`tiered == false`, state at `snapshot_id`) or spilled
     // (`tiered == true`, state at `prefix_hash` in the byte tier). Only reached
     // when the caller has ATLAS_SSM_TIER on; the default path never tiers.
-    //
-    // Unit-tested state machine; the serving-path callers (reclaim/prefix-lookup
-    // spill+fault-in wiring) land with the gated Phase-1b integration. `allow`
-    // until then so the tested core can merge without its consumers.
-    #[allow(dead_code)]
+    // Consumed via the `PrefixCache` trait (`evict_snapshot_to_tier`,
+    // `promote_snapshot`) and `RadixTree::lookup`'s tier-aware sub-lookup.
 
     /// **Spill victim selection** (replaces `evict_lru`'s drop when the tier is
     /// engaged). Pick the same session-aware/tail-protected victim as the drop
@@ -400,7 +398,6 @@ impl SsmSnapshotIndex {
     /// Returns the deepest matching anchor and where its state lives, so the
     /// caller either restores from HBM or faults in from the tier. Feeds the
     /// same Phase-0 telemetry as `lookup`, plus `tier_hits`.
-    #[allow(dead_code)]
     pub(super) fn lookup_tiered(
         &mut self,
         tokens: &[u32],
@@ -464,7 +461,6 @@ impl SsmSnapshotIndex {
     /// **Promote** a spilled entry back to HBM after the caller faulted its
     /// bytes into `new_slot`. Flips `tiered → false` and re-homes `snapshot_id`.
     /// Returns `false` if `prefix_hash` is unknown (entry evicted meanwhile).
-    #[allow(dead_code)]
     pub(super) fn promote(&mut self, prefix_hash: u64, new_slot: usize) -> bool {
         for e in &mut self.entries {
             if e.prefix_hash == prefix_hash {

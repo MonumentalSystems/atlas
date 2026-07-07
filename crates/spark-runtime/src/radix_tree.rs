@@ -88,16 +88,31 @@ impl PrefixCache for RadixTree {
             }
             (blocks, disk, matched)
         };
-        // Phase 2: snapshot lookup (lock snapshot_index, inner NOT held)
-        let (ssm_snapshot, ssm_snapshot_tokens) = if matched_tokens > 0 {
+        // Phase 2: snapshot lookup (lock snapshot_index, inner NOT held).
+        // Tier-aware: `lookup_tiered` returns the deepest anchor across resident
+        // AND spilled entries. A resident hit populates `ssm_snapshot` (restore
+        // directly); a spilled hit populates `ssm_snapshot_tier_key` (caller
+        // faults it in). When nothing is spilled (ATLAS_SSM_TIER off) this is
+        // byte-identical to the old resident-only lookup.
+        let mut ssm_snapshot = None;
+        let mut ssm_snapshot_tokens = 0;
+        let mut ssm_snapshot_tier_key = None;
+        let mut ssm_snapshot_tier_tokens = 0;
+        if matched_tokens > 0 {
             let mut idx = self.snapshot_index.lock();
-            match idx.lookup(tokens, matched_tokens, session_hash, adapter_id) {
-                Some((snap_id, tok_count)) => (Some(snap_id), tok_count),
-                None => (None, 0),
+            if let Some(m) = idx.lookup_tiered(tokens, matched_tokens, session_hash, adapter_id) {
+                match m.loc {
+                    snapshot::SnapLoc::Hbm(slot) => {
+                        ssm_snapshot = Some(slot);
+                        ssm_snapshot_tokens = m.token_count;
+                    }
+                    snapshot::SnapLoc::Tier(key) => {
+                        ssm_snapshot_tier_key = Some(key);
+                        ssm_snapshot_tier_tokens = m.token_count;
+                    }
+                }
             }
-        } else {
-            (None, 0)
-        };
+        }
         // Filter disk_block_ids to MAX-free entries when HSS isn't in use, so
         // the caller can check `!matched_disk_block_ids.is_empty()` as the
         // HSS-engaged signal. When HSS *is* in use every entry should be a
@@ -113,6 +128,8 @@ impl PrefixCache for RadixTree {
             matched_tokens,
             ssm_snapshot,
             ssm_snapshot_tokens,
+            ssm_snapshot_tier_key,
+            ssm_snapshot_tier_tokens,
         }
     }
 
@@ -202,6 +219,14 @@ impl PrefixCache for RadixTree {
 
     fn evict_snapshot_lru(&self) -> Option<usize> {
         self.snapshot_index.lock().evict_lru()
+    }
+
+    fn evict_snapshot_to_tier(&self) -> Option<(usize, u64)> {
+        self.snapshot_index.lock().evict_to_tier()
+    }
+
+    fn promote_snapshot(&self, key: u64, new_slot: usize) -> bool {
+        self.snapshot_index.lock().promote(key, new_slot)
     }
 
     fn snapshot_count(&self) -> usize {
