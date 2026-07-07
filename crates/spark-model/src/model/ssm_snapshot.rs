@@ -359,9 +359,28 @@ impl SsmSnapshotPool {
     }
 
     /// Return a snapshot slot to the free list.
+    ///
+    /// Clears the slot's `session_tags` entry: a freed slot has no owner, and a
+    /// spilled-then-reacquired slot must NOT carry the victim's stale session
+    /// tag. Without this, `fault_in_slot` scatters the correct bytes into the
+    /// reused slot but `session_matches` then compares the *previous* occupant's
+    /// tag against the faulting session, rejects, and the restore silently
+    /// degrades to a full recompute (measured: 0 completed tier restores at
+    /// `--ssm-cache-slots 4` despite fault-ins firing).
     pub(super) fn free(&self, snap_slot: usize) {
         self.slot_has_hidden.lock().remove(&snap_slot);
+        self.session_tags.lock().remove(&snap_slot);
         self.free_slots.lock().push(snap_slot);
+    }
+
+    /// Tag a slot with the session that now owns its state — used after a
+    /// `fault_in_slot` re-homes a spilled snapshot into a fresh slot, so the
+    /// subsequent `session_matches` gate (and any later lookup landing on this
+    /// slot) sees the correct owner rather than an untagged/stale slot.
+    pub(super) fn tag_session(&self, snap_slot: usize, session_hash: u64) {
+        if session_hash != 0 {
+            self.session_tags.lock().insert(snap_slot, session_hash);
+        }
     }
 
     /// Claim an immediately-free Marconi slot (no eviction). `None` when the
@@ -678,6 +697,33 @@ mod tier_tests {
         assert!(p.fault_in_slot(2, key, &store, &gpu, 0).unwrap());
         let got = read_slot(&p, &gpu, 2);
         assert_eq!(got, want, "faulted-in slot must equal the spilled slot bit-for-bit");
+    }
+
+    /// Regression: `free` must clear the slot's session tag, and a fault-in must
+    /// re-tag it — otherwise a spilled-then-reacquired slot carries the victim's
+    /// stale owner and `session_matches` wrongly rejects the just-faulted state,
+    /// silently degrading every tier restore to a full recompute.
+    #[test]
+    fn free_clears_session_tag_then_faultin_retags() {
+        let gpu = MockGpuBackend::new();
+        let p = pool(&gpu, 4, 2);
+
+        // Slot 1 owned by session A.
+        p.tag_session(1, 0xAAAA);
+        assert!(p.session_matches(1, 0xAAAA));
+        assert!(!p.session_matches(1, 0xBBBB), "stale tag rejects a different session");
+
+        // Spill frees the slot → owner must be cleared (untagged ⇒ allowed).
+        p.free(1);
+        assert!(
+            p.session_matches(1, 0xBBBB),
+            "freed slot must be untagged so a fault-in for any session is usable"
+        );
+
+        // Fault-in re-homes session B's state into this slot → now owned by B.
+        p.tag_session(1, 0xBBBB);
+        assert!(p.session_matches(1, 0xBBBB));
+        assert!(!p.session_matches(1, 0xAAAA), "re-homed slot rejects the previous owner");
     }
 
     /// Faulting an absent key is a clean miss (caller recomputes), not an error.

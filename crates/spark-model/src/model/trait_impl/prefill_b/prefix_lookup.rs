@@ -140,6 +140,14 @@ impl TransformerModel {
                         ) {
                             Ok(true) => {
                                 self.prefix_cache.promote_snapshot(key, slot);
+                                // Re-home the session owner onto the fresh slot.
+                                // Without this the slot is untagged (or carries a
+                                // spill victim's stale tag) and the
+                                // `session_matches` gate below rejects the
+                                // just-faulted state → full recompute. lookup_tiered
+                                // already filtered by session, so seq.session_hash
+                                // is the rightful owner.
+                                self.ssm_snapshots.tag_session(slot, seq.session_hash);
                                 faulted_snap = Some(slot);
                                 tracing::info!(
                                     "SSM tier fault-in: restored spilled snapshot at token {} \
