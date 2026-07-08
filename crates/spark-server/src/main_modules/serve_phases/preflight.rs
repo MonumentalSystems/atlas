@@ -16,6 +16,34 @@ pub(crate) struct ReservePreflight {
     pub(crate) max_batch_tokens_pre: usize,
 }
 
+/// Operator hint: a large resident Marconi SSM pool with the spill tier OFF is
+/// holding every live conversation's whole checkpoint chain in HBM. With
+/// `ATLAS_SSM_TIER=1` (host-RAM or RDMA spill) the resident pool becomes a hot
+/// cache and can shrink to a small size, reclaiming most of that HBM. Returns
+/// the hint when it applies (SSM model, tier off, pool ≥ `HINT_SLOTS`); pure so
+/// the threshold + arithmetic are unit-tested.
+fn ssm_pool_shrink_hint(
+    ssm_layers: usize,
+    slots: usize,
+    per_slot_bytes: usize,
+    tier_enabled: bool,
+) -> Option<String> {
+    const HINT_SLOTS: usize = 64; // at/below this the pool is already small
+    const SHRINK_TARGET: usize = 16;
+    if ssm_layers == 0 || tier_enabled || slots < HINT_SLOTS {
+        return None;
+    }
+    let mb = |s: usize| s * per_slot_bytes / (1024 * 1024);
+    Some(format!(
+        "resident Marconi SSM pool = {slots} slots ({} MB) with the spill tier OFF \
+         (ATLAS_SSM_TIER unset). Enabling the tier makes the pool a hot cache — shrink to \
+         --ssm-cache-slots ~{SHRINK_TARGET} to reclaim ~{} MB HBM (the tier holds the \
+         overflow and faults back on warm hits; --ssm-fault-min-tokens guards shallow prefixes).",
+        mb(slots),
+        mb(slots.saturating_sub(SHRINK_TARGET)),
+    ))
+}
+
 pub(crate) fn preflight_reserve(
     args: &cli::ServeArgs,
     config: &ModelConfig,
@@ -162,6 +190,14 @@ pub(crate) fn preflight_reserve(
         buffer_arena_bytes / (1024 * 1024),
         free_mem as f64 / (1024.0 * 1024.0 * 1024.0),
     );
+    if let Some(hint) = ssm_pool_shrink_hint(
+        config.num_ssm_layers(),
+        args.ssm_cache_slots,
+        config.num_ssm_layers() * (h_state_bytes + conv_state_bytes),
+        std::env::var_os("ATLAS_SSM_TIER").is_some(),
+    ) {
+        tracing::info!("SSM pool right-sizing: {hint}");
+    }
     // Q09: per-component breakdown so future MTP/spec-decode reserve
     // jumps are diagnosable from the log alone. Each line is dropped at
     // debug to avoid noise on hot startup paths; flip to info if you
@@ -310,4 +346,31 @@ pub(crate) fn post_load_memory_audit(
         inference_reserve / (1024 * 1024),
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod ssm_hint_tests {
+    use super::ssm_pool_shrink_hint;
+    const PER_SLOT: usize = 64 * 1024 * 1024; // ~64 MB/slot (Holo 35B scale)
+
+    #[test]
+    fn fires_for_large_pool_tier_off() {
+        let h = ssm_pool_shrink_hint(48, 256, PER_SLOT, false).expect("should hint");
+        assert!(h.contains("256 slots (16384 MB)"), "{h}");
+        // reclaim ~ (256-16) * 64 MB = 15360 MB
+        assert!(h.contains("15360 MB"), "{h}");
+    }
+    #[test]
+    fn silent_when_tier_on() {
+        assert!(ssm_pool_shrink_hint(48, 256, PER_SLOT, true).is_none());
+    }
+    #[test]
+    fn silent_when_pool_already_small() {
+        assert!(ssm_pool_shrink_hint(48, 16, PER_SLOT, false).is_none());
+        assert!(ssm_pool_shrink_hint(48, 63, PER_SLOT, false).is_none());
+    }
+    #[test]
+    fn silent_for_non_ssm_model() {
+        assert!(ssm_pool_shrink_hint(0, 256, PER_SLOT, false).is_none());
+    }
 }

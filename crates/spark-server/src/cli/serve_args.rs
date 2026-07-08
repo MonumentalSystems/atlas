@@ -308,11 +308,18 @@ pub struct ServeArgs {
     /// Each slot stores SSM h_state + conv_state for all SSM layers,
     /// enabling full prefix skip (KV + SSM) on cache hits.
     /// 0 = disabled. 16 = light repeated-prefix / short multi-turn.
-    /// **Deep concurrent agentic (8+ sessions, 32K context): use 256** — the
-    /// resident pool must hold each live conversation's whole checkpoint chain
-    /// or warm turns thrash and re-recompute the SSM prefix (PR #278: 16→256 +
-    /// `ATLAS_SSM_TAIL_PROTECT=1` cut the 35B agentic wall 2765→1364s). See
-    /// docs/streaming-experts/UNIFIED-TIER-PLAN.md.
+    /// **Deep concurrent agentic (8+ sessions, 32K context) WITHOUT the spill
+    /// tier: use 256** — the resident pool must then hold each live
+    /// conversation's whole checkpoint chain or warm turns thrash and
+    /// re-recompute the SSM prefix (PR #278: 16→256 + `ATLAS_SSM_TAIL_PROTECT=1`
+    /// cut the 35B agentic wall 2765→1364s).
+    /// **WITH the spill tier (`ATLAS_SSM_TIER=1`): keep this small (~16).** The
+    /// resident pool becomes a hot cache in front of the infinite-depth tier
+    /// (host-RAM / RDMA) — the overflow spills and faults back on warm hits,
+    /// so 256 is no longer needed. Measured on Holo-3.1-35B: 256→16 slots drops
+    /// the Marconi pool 16320→1020 MB (~15 GB HBM reclaimed) with the tier
+    /// enabled, warm recall intact. `--ssm-fault-min-tokens` guards shallow
+    /// prefixes cheaper to recompute. See docs/streaming-experts/UNIFIED-TIER-PLAN.md.
     /// Intermediate checkpoints (--ssm-checkpoint-interval) require extra slots:
     /// ~(max_context / checkpoint_interval_tokens) per cached sequence.
     #[arg(long, default_value_t = 16)]

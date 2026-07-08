@@ -109,6 +109,20 @@ point for a fresh session to blast out the remaining greenlit tasks. See memory:
 - **#13 — graphs-on production tok/s.** Every number so far is a profiling floor.
   Gotcha: spark serve wedges on SIGTERM → `kill -9` measurement servers.
 
+### Resident Marconi pool shrink — VALIDATED on the real model (2026-07-08)
+- **Proven live on Holo-3.1-35B:** `--ssm-cache-slots 16` + `ATLAS_SSM_TIER=1`
+  (host-RAM spill, no peer needed) boots and serves — `SSM snapshot pool: Marconi
+  16 slots (1020 MB)` vs baseline `256 slots (16320 MB)` = **~15.3 GB HBM
+  reclaimed** (per-slot 63.75 MB × 30 SSM layers), spill tier `ENABLED
+  (66846720 bytes/snapshot)`, warm repeated-prefix recall intact. `MemBlobStore`
+  cap 0 = unbounded, so `ATLAS_SSM_TIER=1` alone gives an infinite-depth host-RAM
+  tier — the RDMA peer (`ATLAS_SSM_RDMA_TIER=…:9920`) is an optional upgrade, not
+  required for the shrink. Preflight now emits an INFO "SSM pool right-sizing"
+  hint when a large pool runs with the tier off (`ssm_pool_shrink_hint`,
+  unit-tested); `--ssm-cache-slots` docstring updated with the tier caveat.
+  NOTE: the decode-rollback ring (4080 MB here) is separate (#12) and does NOT
+  shrink with this.
+
 ### Resident Marconi pool shrink (UNBLOCKED — eviction pin is live)
 - With the tier + the GET→RDMA-read eviction pin deployed, the resident Marconi
   pool is a hot cache in front of the infinite-depth spill tier — it no longer
