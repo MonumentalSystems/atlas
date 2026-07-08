@@ -448,6 +448,16 @@ impl TransformerModel {
                 if kv_prefetch {
                     if let Some(Some(next_attn)) = attn_idx_of.get(layer_idx + 1).copied() {
                         spark_storage::with_local(|hss| {
+                            // #11: record the WAR fence on the MAIN stream at the
+                            // prefetch boundary, BEFORE the side-stream fan-out.
+                            // The main stream is in-order, so this dominates every
+                            // `step_tile` KV read enqueued so far this step (all
+                            // prior attention layers) regardless of the internal
+                            // attend shape (C=1 delegate, C≥2 fused, C≥2 serial).
+                            // Each `prefetch_layer` below waits it on
+                            // `prefetch_stream` before its overwriting H2D, closing
+                            // the cross-stream WAR without a full sync.
+                            hss.record_kv_read_event(stream)?;
                             for ds in disk_states.iter() {
                                 if ds.disk_block_ids.len() > ds.block_table.len() {
                                     hss.prefetch_layer(next_attn, ds.disk_block_ids)?;

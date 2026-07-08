@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
 
 use crate::backend::IoUringBackend;
 use crate::config::HighSpeedSwapConfig;
-use crate::cuda_min::{CudaCtx, DeviceBuffer};
+use crate::cuda_min::{CudaCtx, CudaEvent, DeviceBuffer};
 use crate::eviction::EvictionPolicy;
 use crate::group::GroupLayout;
 use crate::layout::Layout;
@@ -67,19 +67,37 @@ pub struct HighSpeedSwap {
     /// drain, but that block overlaps the already-enqueued main-stream compute,
     /// which is where the read is hidden.
     prefetch_stream: u64,
-    /// Phase 5 Inc 2 safety gate: mirrors the scheduler's `ATLAS_KV_PREFETCH`
-    /// switch (read once at construction; decode_a2.rs gates the actual
-    /// prefetch on the same var). The batched sync-collapse (`attend_layer_
-    /// batch_on_stream`) removes the per-seq mid-attend `stream_sync`s that
-    /// pre-change incidentally drained each *prior* seq's `step_tile` before
-    /// the next began — the only thing keeping the side-stream prefetch (which
-    /// has NO CudaEvent ordering vs the main stream) from `assign`ing +
-    /// overwriting a slot whose `step_tile` is enqueued-but-unexecuted. When
-    /// prefetch is live we therefore fall back to the serial per-seq attend
-    /// (each with its own sync = the pre-change 1-seq in-flight window). Their
-    /// coexistence (a main-stream CudaEvent waited on `prefetch_stream`) is a
-    /// deferred follow-up; until then, sync-collapse and prefetch are mutually
-    /// exclusive rather than silently racy.
+    /// #11: orders the side-stream prefetch overwrite AFTER the main stream's
+    /// KV-slot reads (the batched `step_tile`s) complete. Recorded on the main
+    /// stream by the decode loop at each prefetch boundary
+    /// (`record_kv_read_event`), before the prefetch fan-out; waited on
+    /// `prefetch_stream` (`prefetch_layer_on_stream`) immediately before the
+    /// overwriting evict-victim H2D. In-order main-stream execution ⇒ this
+    /// event dominates every `step_tile` KV read enqueued so far this step
+    /// (all prior attention layers), so the side-stream overwrite cannot land
+    /// on a slot a pending `step_tile` still reads — the cross-stream WAR is
+    /// closed without a full sync, letting batched sync-collapse and prefetch
+    /// run together. A single event suffices: record and its waits issue from
+    /// the same compute thread in fixed host order per boundary, and
+    /// `cuStreamWaitEvent` captures the recorded state at enqueue time, so a
+    /// later re-record cannot perturb an already-enqueued wait. RAII `Drop`
+    /// destroys it. FOLLOW-UP (out of scope for #11): the mirror RAW —
+    /// attend(L+1) reading prefetched slots before the H2D lands — stays
+    /// closed today by the trailing host `stream_sync` inside
+    /// `IoUringBackend::read`; when that host sync is dropped for genuinely
+    /// async prefetch, a symmetric prefetch-completion event (record on
+    /// `prefetch_stream` after the read, wait on the main stream before the
+    /// next attend) becomes mandatory.
+    kv_war_event: CudaEvent,
+    /// #11: mirrors the scheduler's `ATLAS_KV_PREFETCH` switch (read once at
+    /// construction; decode_a2.rs gates the actual prefetch on the same var).
+    /// Now used ONLY to gate the empty-read skip in the batched-attend union
+    /// reads: `IoUringBackend::read` issues an unconditional trailing
+    /// `stream_sync` even for zero requests, so on a fully-prefetched tile the
+    /// union read collapses to a bare main-stream drain — an accidental
+    /// WAR-narrowing barrier. That no-op read is skipped ONLY when prefetch is
+    /// live (the run where the `kv_war_event` fence replaces it); prefetch-off
+    /// keeps the unconditional read+sync for byte-for-byte op-identity.
     kv_prefetch_enabled: bool,
     // Disk-block-ID allocator (Phase 6.1.a, refactored). One global
     // allocator: a `disk_block_id` indexes the SAME logical position
@@ -377,15 +395,15 @@ impl HighSpeedSwap {
         // of each higher batch position (lazy — avoids plumbing max_batch_size).
         let scratch = vec![SeqScratch::new(&attn, &model, &cfg)?];
         let prefetch_stream = crate::cuda_min::create_stream()?;
-        // Same var decode_a2.rs gates prefetch on; read once here so the
-        // batched attend can avoid the cross-stream WAR window (see field doc).
+        // #11: WAR fence event, created unconditionally (like `prefetch_stream`).
+        // Inert when prefetch is off (never recorded/waited), so it cannot
+        // perturb bytes; unconditional creation avoids a second Option branch.
+        // HSS is only built when a swap pool exists, so a CUDA context is live.
+        let kv_war_event = CudaEvent::new()?;
+        // Same var decode_a2.rs gates prefetch on; read once here so the batched
+        // attend can skip io_uring's unconditional empty-read drain only when the
+        // event fence replaces it (see field docs).
         let kv_prefetch_enabled = std::env::var_os("ATLAS_KV_PREFETCH").is_some();
-        if kv_prefetch_enabled && max_seqs > 1 {
-            tracing::info!(
-                "high-speed-swap: ATLAS_KV_PREFETCH live → batched attend uses the serial \
-                 per-seq sync path (sync-collapse disabled to avoid the prefetch WAR race)"
-            );
-        }
         let disk_state = DiskState::new();
         Ok(Self {
             cfg,
@@ -399,6 +417,7 @@ impl HighSpeedSwap {
             max_seqs,
             batch,
             prefetch_stream,
+            kv_war_event,
             kv_prefetch_enabled,
             disk_state,
         })

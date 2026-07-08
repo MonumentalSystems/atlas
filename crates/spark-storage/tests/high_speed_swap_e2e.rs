@@ -570,3 +570,340 @@ fn batched_wide_launch_matches_serial_multitile() {
     }
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// #11: batched sync-collapse + Phase-3 side-stream KV prefetch running
+/// TOGETHER must still match the serial single-seq reference bit-for-bit. This
+/// is the correctness gate for the WAR fence (`kv_war_event`): with the fence
+/// removed, the side-stream `prefetch` overwrite (evict-victim H2D) races the
+/// main-stream `step_tile` KV reads still in flight and silently corrupts one
+/// or more K/V bytes, diverging the batched rows from serial. The race is
+/// timing-dependent, so we interleave over many iterations to raise the odds a
+/// corrupted byte surfaces if the fence regresses; with the fence it is
+/// deterministically clean.
+///
+/// Layout mirrors `batched_wide_launch_matches_serial_multitile`: C=3 ragged
+/// multi-tile histories (32/20/8 blocks vs tile_cap 8) and a pool sized to
+/// EXACTLY C×tile_cap = 24 slots, so eviction pressure is forced and any hot
+/// slot is a legal prefetch victim — the precondition that makes the WAR a
+/// real hazard rather than a theoretical one.
+#[test]
+#[ignore = "requires GPU"]
+fn batched_prefetch_coexist_matches_serial_bitwise() {
+    let dir = tempdir("batch-prefetch-coexist");
+    let ctx = CudaCtx::new(0).expect("cuda init");
+    let mut rng = ChaCha8Rng::seed_from_u64(0x11_C0_E5_15);
+    let total =
+        SEQ_BLOCKS as usize * BLOCK_SIZE as usize * NUM_KV_HEADS as usize * HEAD_DIM as usize;
+    let k = random_bf16(total, &mut rng);
+    let v = random_bf16(total, &mut rng);
+
+    // Three ragged histories: 32 (4 tiles), 20 (3 tiles: 8+8+4), 8 (1 tile).
+    let blocks: [Vec<u32>; 3] = [
+        (0..SEQ_BLOCKS).collect(),
+        (0..20).collect(),
+        (0..SCRATCH_BLOCKS).collect(),
+    ];
+    let row = NUM_Q_HEADS as usize * HEAD_DIM as usize;
+    let qs: Vec<Vec<bf16>> = (0..3).map(|_| random_bf16(row, &mut rng)).collect();
+
+    // Prefetch LIVE (the run the fence guards) + C=3 fused batched attend.
+    // SAFETY: single-threaded within this #[ignore]d GPU test; both vars are
+    // read once in the ctor and removed immediately after.
+    unsafe { std::env::set_var("ATLAS_KV_PREFETCH", "1") };
+    unsafe { std::env::set_var("ATLAS_HSS_MAX_SEQS", "3") };
+    let cfg = HighSpeedSwapConfig {
+        dir: dir.clone(),
+        bytes: 1 << 30,
+        resident_blocks: SCRATCH_BLOCKS,
+        rank: 32,
+        qd: 8,
+        graph: false,
+        projection_seed: 0xCAFE_F00D,
+    };
+    let model = ModelDims {
+        num_layers: NUM_LAYERS,
+        max_blocks_per_layer: SEQ_BLOCKS,
+        num_q_heads: NUM_Q_HEADS,
+        num_kv_heads: NUM_KV_HEADS,
+        head_dim: HEAD_DIM,
+        block_size: BLOCK_SIZE,
+    };
+    let mut hss = HighSpeedSwap::new(&ctx, cfg, model).unwrap();
+    unsafe { std::env::remove_var("ATLAS_HSS_MAX_SEQS") };
+    unsafe { std::env::remove_var("ATLAS_KV_PREFETCH") };
+    assert_eq!(hss.max_seqs(), 3);
+
+    // Offload all blocks to disk.
+    let block_floats = BLOCK_SIZE as usize * NUM_KV_HEADS as usize * HEAD_DIM as usize;
+    let block_bytes = block_floats * 2;
+    let k_block_dev = DeviceBuffer::new(block_bytes).unwrap();
+    for blk in 0..SEQ_BLOCKS {
+        let off = blk as usize * block_floats;
+        copy_h_to_d_async(
+            k_block_dev.ptr,
+            k[off..off + block_floats].as_ptr() as *const c_void,
+            block_bytes,
+            ctx.stream,
+        )
+        .unwrap();
+        stream_sync(ctx.stream).unwrap();
+        hss.offload_block(
+            &ctx,
+            0,
+            blk,
+            k_block_dev.ptr,
+            &k[off..off + block_floats],
+            &v[off..off + block_floats],
+        )
+        .unwrap();
+    }
+
+    let q_devs: Vec<DeviceBuffer> = qs
+        .iter()
+        .map(|q| {
+            let d = DeviceBuffer::new(row * 2).unwrap();
+            copy_h_to_d_async(d.ptr, q.as_ptr() as *const c_void, row * 2, ctx.stream).unwrap();
+            d
+        })
+        .collect();
+    let out_devs: Vec<DeviceBuffer> = (0..3).map(|_| DeviceBuffer::new(row * 2).unwrap()).collect();
+
+    let download = |dev: &DeviceBuffer| {
+        let mut out = vec![bf16::from_f32(0.0); row];
+        copy_d_to_h_async(out.as_mut_ptr() as *mut c_void, dev.ptr, row * 2, ctx.stream).unwrap();
+        stream_sync(ctx.stream).unwrap();
+        out
+    };
+
+    // Clean serial reference: three independent single-seq attends, no
+    // concurrent prefetch → the uncorrupted golden output.
+    let solo: Vec<Vec<bf16>> = (0..3)
+        .map(|i| {
+            hss.attend_layer(i, &ctx, 0, &blocks[i], q_devs[i].ptr, out_devs[i].ptr)
+                .unwrap();
+            download(&out_devs[i])
+        })
+        .collect();
+
+    let reqs: Vec<spark_storage::AttendSeqReq> = (0..3)
+        .map(|i| spark_storage::AttendSeqReq {
+            seq_slot: i,
+            seq_block_ids: &blocks[i],
+            q_dev: q_devs[i].ptr,
+            output_dev: out_devs[i].ptr,
+        })
+        .collect();
+
+    // Interleave, per iteration, exactly as the decode loop does: the batched
+    // attend enqueues its C `step_tile` KV reads on the MAIN stream, we then
+    // record the WAR fence on that stream, then fan out the prefetch on the
+    // SIDE stream (each `prefetch_layer` waits the fence before its overwriting
+    // H2D). The N iterations keep enough side-stream overwrite ↔ main-stream
+    // read overlap in flight that a regressed (absent/mis-ordered) fence
+    // surfaces as a bit divergence.
+    const ITERS: usize = 256;
+    for _ in 0..ITERS {
+        hss.attend_layer_batch_on_stream(ctx.stream, 0, &reqs).unwrap();
+        hss.record_kv_read_event(ctx.stream).unwrap();
+        for blk in blocks.iter() {
+            // Only overflowed seqs (history > resident budget) prefetch — the
+            // same filter the decode loop applies. The non-overflowed seq is
+            // still attended (above), just read on-demand.
+            if blk.len() > SCRATCH_BLOCKS as usize {
+                hss.prefetch_layer(0, blk).unwrap();
+            }
+        }
+        for (i, out_dev) in out_devs.iter().enumerate() {
+            let got = download(out_dev);
+            for (j, (s, b)) in solo[i].iter().zip(&got).enumerate() {
+                assert_eq!(
+                    s.to_bits(),
+                    b.to_bits(),
+                    "seq {i} batched+prefetch differs from serial at element {j} \
+                     (WAR fence regression?)"
+                );
+            }
+        }
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// #11 regression lock for the exact hole that decided this design: recording
+/// the fence inside the batched attend (at the C≥2 fused site) would MISS a
+/// C=1 batch, which early-returns to the single-seq delegate before that
+/// record — leaving the fence holding a stale record and reopening the WAR at
+/// C=1. Because the decode loop records the fence at the prefetch BOUNDARY
+/// (irrespective of the internal attend shape), a batch that alternates size 1
+/// and size ≥2 across iterations must stay bit-identical to serial with
+/// prefetch live. Under the rejected in-attend record this test would corrupt.
+#[test]
+#[ignore = "requires GPU"]
+fn prefetch_coexist_c1_mixed_matches_serial_bitwise() {
+    let dir = tempdir("batch-prefetch-c1mixed");
+    let ctx = CudaCtx::new(0).expect("cuda init");
+    let mut rng = ChaCha8Rng::seed_from_u64(0xC1_A1_5ED_7);
+    let total =
+        SEQ_BLOCKS as usize * BLOCK_SIZE as usize * NUM_KV_HEADS as usize * HEAD_DIM as usize;
+    let k = random_bf16(total, &mut rng);
+    let v = random_bf16(total, &mut rng);
+
+    // Two overflowed multi-tile histories (both > tile_cap so both prefetch).
+    let blocks: [Vec<u32>; 2] = [(0..SEQ_BLOCKS).collect(), (0..20).collect()];
+    let row = NUM_Q_HEADS as usize * HEAD_DIM as usize;
+    let qs: Vec<Vec<bf16>> = (0..2).map(|_| random_bf16(row, &mut rng)).collect();
+
+    unsafe { std::env::set_var("ATLAS_KV_PREFETCH", "1") };
+    unsafe { std::env::set_var("ATLAS_HSS_MAX_SEQS", "2") };
+    let cfg = HighSpeedSwapConfig {
+        dir: dir.clone(),
+        bytes: 1 << 30,
+        resident_blocks: SCRATCH_BLOCKS,
+        rank: 32,
+        qd: 8,
+        graph: false,
+        projection_seed: 0xCAFE_F00D,
+    };
+    let model = ModelDims {
+        num_layers: NUM_LAYERS,
+        max_blocks_per_layer: SEQ_BLOCKS,
+        num_q_heads: NUM_Q_HEADS,
+        num_kv_heads: NUM_KV_HEADS,
+        head_dim: HEAD_DIM,
+        block_size: BLOCK_SIZE,
+    };
+    let mut hss = HighSpeedSwap::new(&ctx, cfg, model).unwrap();
+    unsafe { std::env::remove_var("ATLAS_HSS_MAX_SEQS") };
+    unsafe { std::env::remove_var("ATLAS_KV_PREFETCH") };
+    assert_eq!(hss.max_seqs(), 2);
+
+    let block_floats = BLOCK_SIZE as usize * NUM_KV_HEADS as usize * HEAD_DIM as usize;
+    let block_bytes = block_floats * 2;
+    let k_block_dev = DeviceBuffer::new(block_bytes).unwrap();
+    for blk in 0..SEQ_BLOCKS {
+        let off = blk as usize * block_floats;
+        copy_h_to_d_async(
+            k_block_dev.ptr,
+            k[off..off + block_floats].as_ptr() as *const c_void,
+            block_bytes,
+            ctx.stream,
+        )
+        .unwrap();
+        stream_sync(ctx.stream).unwrap();
+        hss.offload_block(
+            &ctx,
+            0,
+            blk,
+            k_block_dev.ptr,
+            &k[off..off + block_floats],
+            &v[off..off + block_floats],
+        )
+        .unwrap();
+    }
+
+    let q_devs: Vec<DeviceBuffer> = qs
+        .iter()
+        .map(|q| {
+            let d = DeviceBuffer::new(row * 2).unwrap();
+            copy_h_to_d_async(d.ptr, q.as_ptr() as *const c_void, row * 2, ctx.stream).unwrap();
+            d
+        })
+        .collect();
+    let out_devs: Vec<DeviceBuffer> = (0..2).map(|_| DeviceBuffer::new(row * 2).unwrap()).collect();
+
+    let download = |dev: &DeviceBuffer| {
+        let mut out = vec![bf16::from_f32(0.0); row];
+        copy_d_to_h_async(out.as_mut_ptr() as *mut c_void, dev.ptr, row * 2, ctx.stream).unwrap();
+        stream_sync(ctx.stream).unwrap();
+        out
+    };
+
+    // Clean serial reference.
+    let solo: Vec<Vec<bf16>> = (0..2)
+        .map(|i| {
+            hss.attend_layer(i, &ctx, 0, &blocks[i], q_devs[i].ptr, out_devs[i].ptr)
+                .unwrap();
+            download(&out_devs[i])
+        })
+        .collect();
+
+    let mk_req = |i: usize| spark_storage::AttendSeqReq {
+        seq_slot: i,
+        seq_block_ids: &blocks[i],
+        q_dev: q_devs[i].ptr,
+        output_dev: out_devs[i].ptr,
+    };
+
+    const ITERS: usize = 256;
+    for it in 0..ITERS {
+        // Fence recorded at the boundary regardless of batch shape.
+        hss.record_kv_read_event(ctx.stream).unwrap();
+        for blk in blocks.iter() {
+            hss.prefetch_layer(0, blk).unwrap();
+        }
+        // Alternate a C=1 batch (delegates to the single-seq path, which the
+        // in-attend record would skip) with a C=2 fused batch.
+        if it % 2 == 0 {
+            let req = [mk_req(0)];
+            hss.attend_layer_batch_on_stream(ctx.stream, 0, &req).unwrap();
+            let got = download(&out_devs[0]);
+            for (j, (s, b)) in solo[0].iter().zip(&got).enumerate() {
+                assert_eq!(
+                    s.to_bits(),
+                    b.to_bits(),
+                    "C=1 batched+prefetch differs from serial at element {j} \
+                     (boundary-record regression?)"
+                );
+            }
+            // Release the pin on seq 1's prefetched blocks (its attend was
+            // skipped this iteration) so pins don't leak into the next.
+            let req1 = [mk_req(1)];
+            hss.attend_layer_batch_on_stream(ctx.stream, 0, &req1).unwrap();
+            let _ = download(&out_devs[1]);
+        } else {
+            let reqs = [mk_req(0), mk_req(1)];
+            hss.attend_layer_batch_on_stream(ctx.stream, 0, &reqs).unwrap();
+            for (i, out_dev) in out_devs.iter().enumerate() {
+                let got = download(out_dev);
+                for (j, (s, b)) in solo[i].iter().zip(&got).enumerate() {
+                    assert_eq!(
+                        s.to_bits(),
+                        b.to_bits(),
+                        "C=2 batched+prefetch differs from serial at element {j}"
+                    );
+                }
+            }
+        }
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// #11 lifecycle/FFI gate: exercise the new `cuStreamWaitEvent` binding
+/// directly. `record` on one stream, `wait` on another, then a host `sync` —
+/// every call must return `Ok`. This deterministically catches a broken FFI
+/// signature/ABI (wrong arg order/types → nonzero `CUresult` → `bail!`), which
+/// the probabilistic parity race could otherwise mask. Also asserts `wait` on
+/// a freshly-created (never-recorded) event is `Ok` — the benign first-boundary
+/// no-op the design relies on. Streams/events are unmodeled off-GPU, so this
+/// is inherently `#[ignore = "requires GPU"]`.
+#[test]
+#[ignore = "requires GPU"]
+fn kv_war_event_cross_stream_wait_roundtrips() {
+    use spark_storage::cuda_min::{CudaEvent, create_stream};
+    let ctx = CudaCtx::new(0).expect("cuda init");
+    let stream_a = ctx.stream;
+    let stream_b = create_stream().expect("create side stream");
+
+    let ev = CudaEvent::new().expect("cuEventCreate");
+    // wait before any record: a fresh event is treated as already-complete.
+    ev.wait(stream_b).expect("wait on never-recorded event is a no-op Ok");
+    // record on A, wait on B, host-sync the event.
+    ev.record(stream_a).expect("cuEventRecord");
+    ev.wait(stream_b).expect("cuStreamWaitEvent after record");
+    ev.sync().expect("cuEventSynchronize");
+    // A second record→wait round-trip: enqueue-time capture means the second
+    // wait sees the second record, both return Ok.
+    ev.record(stream_a).expect("cuEventRecord (2)");
+    ev.wait(stream_a).expect("cuStreamWaitEvent same-stream (2)");
+    stream_sync(stream_a).expect("drain");
+    stream_sync(stream_b).expect("drain side");
+}

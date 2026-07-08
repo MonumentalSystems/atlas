@@ -107,6 +107,17 @@ impl HighSpeedSwap {
     ) -> anyhow::Result<()> {
         unreachable!()
     }
+
+    // Phase-3 prefetch surface, referenced by decode_a2.rs's `with_local`
+    // closure whose body is type-checked against this stub on non-cuda builds.
+    pub fn prefetch_layer(&mut self, _layer: u32, _seq_block_ids: &[u32]) -> anyhow::Result<()> {
+        unreachable!()
+    }
+
+    // #11: WAR-fence record, ditto.
+    pub fn record_kv_read_event(&self, _stream: u64) -> anyhow::Result<()> {
+        unreachable!()
+    }
 }
 
 pub fn local_installed() -> bool {

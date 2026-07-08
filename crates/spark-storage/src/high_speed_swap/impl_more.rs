@@ -246,32 +246,15 @@ impl HighSpeedSwap {
         if seqs.is_empty() {
             return Ok(());
         }
-        // Phase 5 Inc 2 safety gate: the sync-collapse below is unsafe to run
-        // concurrently with the Phase-3 side-stream KV prefetch. The per-seq
-        // mid-attend `stream_sync`s it removes were the only barrier draining
-        // each prior seq's `step_tile` before the next began; without them ALL
-        // C seqs' tiles are enqueued-but-unexecuted (and their slots unpinned)
-        // when `prefetch_layer` — on a separate stream with no CudaEvent
-        // ordering — `assign`s + overwrites the oldest-touched slots. That is a
-        // C-fold-widened cross-stream WAR → silent, timing-dependent KV
-        // corruption. When prefetch is live, serve each seq with the serial
-        // per-seq attend (its own score→sync→tile), restoring the pre-change
-        // 1-seq in-flight window prefetch was validated against. (A proper
-        // coexistence — a main-stream CudaEvent waited on `prefetch_stream` —
-        // is a tracked follow-up; see the `kv_prefetch_enabled` field doc.)
-        if self.kv_prefetch_enabled {
-            for s in seqs {
-                self.attend_layer_on_stream(
-                    s.seq_slot,
-                    stream,
-                    layer,
-                    s.seq_block_ids,
-                    s.q_dev,
-                    s.output_dev,
-                )?;
-            }
-            return Ok(());
-        }
+        // #11: the Phase-3 side-stream KV prefetch now coexists with the
+        // sync-collapse below. The cross-stream WAR (prefetch `assign`+overwrite
+        // racing an enqueued-but-unexecuted `step_tile` read) is closed by the
+        // `kv_war_event` fence: the decode loop records it on THIS (main) stream
+        // at each prefetch boundary — after every attend enqueued so far this
+        // step — and `prefetch_layer_on_stream` waits it on `prefetch_stream`
+        // before the overwriting H2D. So the former serial-fallback gate is
+        // gone; batched + prefetch run together.
+        //
         // A batch of one IS the single-seq path — delegate so the C=1
         // byte-identical guarantee is a shared code path, not a proof.
         if let [s] = seqs {
@@ -450,9 +433,15 @@ impl HighSpeedSwap {
                 }
             }
 
-            // ONE union read for the whole C-wide tile (empty on a fully
-            // resident/prefetched tile — the backend skips a no-op batch).
-            self.backend.read(&reqs, stream)?;
+            // ONE union read for the whole C-wide tile. #11: skip the no-op
+            // read ONLY when prefetch is live — that is the run where
+            // io_uring's unconditional trailing `stream_sync` (an accidental
+            // WAR-narrowing barrier) is now replaced by the `kv_war_event`
+            // fence. Prefetch-off keeps the unconditional read+sync for
+            // byte-for-byte op-identity.
+            if !self.kv_prefetch_enabled || !reqs.is_empty() {
+                self.backend.read(&reqs, stream)?;
+            }
 
             copy_h_to_d_async(
                 bt_ptr,
@@ -480,8 +469,8 @@ impl HighSpeedSwap {
 
             // Unpin this tile's blocks across all C seqs (Phase 3 pin release —
             // stream-ordered, so a later same-stream evict+overwrite is safe;
-            // the cross-STREAM prefetch case is handled by the serial fallback
-            // gate on `kv_prefetch_enabled` above).
+            // the cross-STREAM prefetch overwrite is ordered after these
+            // `step_tile` reads by the `kv_war_event` fence — #11).
             for s in seqs {
                 let blocks = s.seq_block_ids;
                 let start = t * tile_cap;
@@ -627,7 +616,12 @@ impl HighSpeedSwap {
                     });
                 }
             }
-            self.backend.read(&reqs, stream)?;
+            // #11: skip the no-op read ONLY when prefetch is live (see the
+            // fused path and the `kv_prefetch_enabled` field doc). Prefetch-off
+            // keeps the unconditional read+sync for byte-for-byte op-identity.
+            if !self.kv_prefetch_enabled || !reqs.is_empty() {
+                self.backend.read(&reqs, stream)?;
+            }
 
             // 4. Tiled attention launch.
             let counts = [(tile.len()) as i32];
@@ -737,9 +731,26 @@ impl HighSpeedSwap {
             }
         }
         if !reqs.is_empty() {
+            // #11: order this evict-victim H2D AFTER the main stream's
+            // `step_tile` reads (recorded by the decode loop via
+            // `record_kv_read_event`). `stream` here is `prefetch_stream`; the
+            // CPU does not block. `reqs` non-empty ⟺ ≥1 `assign` ⟺ ≥1 slot
+            // about to be overwritten — exactly when the fence is needed. A
+            // pins-only prefetch (empty `reqs`) never waits.
+            self.kv_war_event.wait(stream)?;
             self.backend.read(&reqs, stream)?;
         }
         Ok(())
+    }
+
+    /// #11: record the WAR fence event on the MAIN compute stream. The decode
+    /// loop calls this at each prefetch boundary, before issuing prefetch on
+    /// the side stream. In-order stream execution ⇒ this event dominates every
+    /// `step_tile` KV read enqueued so far this step (all prior attention
+    /// layers), so a subsequent `prefetch_layer` (which `wait`s it on
+    /// `prefetch_stream`) cannot overwrite a slot a pending `step_tile` reads.
+    pub fn record_kv_read_event(&self, stream: u64) -> Result<()> {
+        self.kv_war_event.record(stream)
     }
 
     /// Phase 3: prefetch `layer`'s blocks on the internal **side stream** so the

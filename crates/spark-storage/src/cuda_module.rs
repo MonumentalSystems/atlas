@@ -25,6 +25,7 @@ unsafe extern "C" {
     ) -> i32;
     fn cuEventCreate(event: *mut u64, flags: u32) -> i32;
     fn cuEventRecord(event: u64, stream: u64) -> i32;
+    fn cuStreamWaitEvent(stream: u64, event: u64, flags: u32) -> i32;
     fn cuEventSynchronize(event: u64) -> i32;
     fn cuEventDestroy_v2(event: u64) -> i32;
 }
@@ -92,6 +93,18 @@ impl CudaEvent {
         let s = unsafe { cuEventRecord(self.handle, stream) };
         if s != 0 {
             bail!("cuEventRecord failed: {s}");
+        }
+        Ok(())
+    }
+    /// Device-side cross-stream wait: makes future work on `stream` wait for
+    /// this event's most-recent `record` to complete. The CPU does NOT block
+    /// (unlike `sync`). Wait semantics are captured at enqueue time — a later
+    /// re-record does not affect an already-enqueued wait. No-op if never
+    /// recorded (a fresh event is treated as already-complete).
+    pub fn wait(&self, stream: u64) -> Result<()> {
+        let s = unsafe { cuStreamWaitEvent(stream, self.handle, 0) };
+        if s != 0 {
+            bail!("cuStreamWaitEvent failed: {s}");
         }
         Ok(())
     }
