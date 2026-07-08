@@ -527,6 +527,164 @@ impl SnapshotBlobStore for RdmaSnapshotStore {
     }
 }
 
+/// The fixed-slot offset-addressed arena store ([`RdmaSnapshotStore`]) is
+/// transport-agnostic — it runs equally over the RDMA arena or a local file
+/// (see [`FileSnapshotArena`]). `ArenaSnapshotStore` is the transport-neutral
+/// name the decode rolling tier selects; `RdmaSnapshotStore` remains as an alias
+/// for the existing Marconi call sites.
+pub(crate) type ArenaSnapshotStore = RdmaSnapshotStore;
+
+// ─────────────────────────────────────────────────────────────────────────
+// Local-NVMe transport for the decode rolling tier (`FileSnapshotArena`)
+//
+// The decode cold tier needs a HOST-LOCAL NVMe destination as an alternative to
+// the RDMA paging peer. `spark-storage`'s `StorageBackend` lands bytes directly
+// at a *device* pointer and is KV-`Layout`-coupled — the wrong contract here,
+// where the pool has already gathered host bytes and wants a flat u64→bytes
+// arena. So we plug a `pwrite`/`pread`-at-offset file into the SAME fixed-slot
+// `ArenaSnapshotStore` the RDMA path uses. O_DIRECT is deferred (a pinned bounce
+// like `posix.rs` is a later optimization); a plain buffered file is correct.
+// ─────────────────────────────────────────────────────────────────────────
+
+/// A flat offset-addressed NVMe arena backing the decode cold tier. One
+/// pre-sized file; slot `i`'s blob lives at `i * blob_bytes`. `pwrite`/`pread`
+/// via `FileExt::{write_at,read_at}` are offset-absolute (no shared cursor), so
+/// the store's `Mutex`-guarded allocator is the only serialization needed and
+/// the (blocking) I/O runs on the caller's thread — for the decode tier that is
+/// always the async spill worker, never the decode critical path.
+#[allow(dead_code)]
+pub(crate) struct FileSnapshotArena {
+    file: std::fs::File,
+    capacity: u64,
+}
+
+#[allow(dead_code)]
+impl FileSnapshotArena {
+    /// Create/truncate a backing file of exactly `capacity` bytes under `dir`.
+    /// The file name embeds the pid so two servers on one box never share a
+    /// backing store (decode blobs are ephemeral, never recovered across runs).
+    pub(crate) fn create(dir: &str, capacity: u64) -> Result<Self> {
+        std::fs::create_dir_all(dir)?;
+        let path = std::path::Path::new(dir)
+            .join(format!("atlas-decode-ring.{}.arena", std::process::id()));
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(true)
+            .open(&path)?;
+        file.set_len(capacity)?;
+        Ok(Self { file, capacity })
+    }
+}
+
+impl SnapshotTransport for FileSnapshotArena {
+    fn write_blob(&self, offset: u64, bytes: &[u8]) -> Result<()> {
+        use std::os::unix::fs::FileExt;
+        if offset + bytes.len() as u64 > self.capacity {
+            anyhow::bail!(
+                "FileSnapshotArena write {offset}+{} exceeds capacity {}",
+                bytes.len(),
+                self.capacity
+            );
+        }
+        self.file.write_all_at(bytes, offset)?;
+        Ok(())
+    }
+    fn read_blob(&self, offset: u64, out: &mut [u8]) -> Result<()> {
+        use std::os::unix::fs::FileExt;
+        if offset + out.len() as u64 > self.capacity {
+            anyhow::bail!(
+                "FileSnapshotArena read {offset}+{} exceeds capacity {}",
+                out.len(),
+                self.capacity
+            );
+        }
+        self.file.read_exact_at(out, offset)?;
+        Ok(())
+    }
+}
+
+/// Build the **decode rolling-tier** cold store (a SEPARATE instance from the
+/// Marconi `build_tier_store`, its own `ATLAS_SSM_DECODE_*` env namespace so keys
+/// and budgets never collide). Non-dropping is a HARD requirement: a dropped
+/// decode blob is a lost rollback target = corrupt restore (unlike Marconi's
+/// miss→recompute). `min_slots` = `(ring_slots − hot_lanes) × max_batch_size` is
+/// the worst-case cold residency; the local NVMe arena is sized ≥ that and its
+/// undersizing is a preflight ERROR, never a warn.
+///
+/// Selection (`ATLAS_SSM_DECODE_TIER`):
+///   - `nvme` + `ATLAS_SSM_DECODE_NVME_DIR=<dir>` → [`FileSnapshotArena`] behind
+///     [`ArenaSnapshotStore`], provably sized ≥ `min_slots`.
+///   - `peer`  + `ATLAS_SSM_DECODE_RDMA_TIER=host:port` → the never-dropping
+///     [`PagingSnapshotStore`] (peer LRU-spills to its own NVMe), own
+///     `ATLAS_SSM_DECODE_NS` namespace fold.
+///   - unset / anything else → unbounded host-RAM [`MemBlobStore::new(0)`].
+pub(crate) fn build_decode_tier_store(
+    blob_bytes: usize,
+    min_slots: usize,
+) -> Result<std::sync::Arc<dyn SnapshotBlobStore>> {
+    use std::sync::Arc;
+    match std::env::var("ATLAS_SSM_DECODE_TIER").ok().as_deref() {
+        Some("nvme") => {
+            let dir = std::env::var("ATLAS_SSM_DECODE_NVME_DIR")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "ATLAS_SSM_DECODE_TIER=nvme requires ATLAS_SSM_DECODE_NVME_DIR=<dir>"
+                    )
+                })?;
+            // Provision to the worst-case cold residency + headroom slot so the
+            // non-dropping invariant holds by construction (an undersized arena
+            // would return Ok(false) on a live target = corruption).
+            let slots = min_slots + 1;
+            let capacity = slots as u64 * blob_bytes as u64;
+            let arena = FileSnapshotArena::create(&dir, capacity)?;
+            tracing::info!(
+                "SSM decode cold tier = LOCAL NVMe {dir} ({slots} slots × {blob_bytes} B = \
+                 {:.2} GiB, non-dropping ≥ min_slots {min_slots})",
+                capacity as f64 / (1024.0 * 1024.0 * 1024.0),
+            );
+            Ok(Arc::new(ArenaSnapshotStore::new(
+                Box::new(arena),
+                blob_bytes,
+                slots,
+            )))
+        }
+        Some("peer") => {
+            let peer = std::env::var("ATLAS_SSM_DECODE_RDMA_TIER")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "ATLAS_SSM_DECODE_TIER=peer requires ATLAS_SSM_DECODE_RDMA_TIER=host:port"
+                    )
+                })?;
+            // Own namespace so decode spills never contend with the primary
+            // Marconi tier keys on the shared atlas-cache-peer.
+            let namespace = std::env::var("ATLAS_SSM_DECODE_NS")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(atlas_kernels::DECODE_DOMAIN);
+            // Arena RAM cache size is a hint; the peer pages to its own NVMe so
+            // the store never drops regardless of this slot count.
+            let slots = (min_slots + 1).max(512);
+            let arena_bytes = slots as u64 * blob_bytes as u64;
+            let arena =
+                spark_storage::RdmaSnapshotArena::connect_paging(&peer, arena_bytes, blob_bytes)?;
+            tracing::info!(
+                "SSM decode cold tier = RDMA PAGING peer {peer} (non-dropping, ns={namespace:#x})"
+            );
+            Ok(Arc::new(PagingSnapshotStore::new(arena, blob_bytes, namespace)))
+        }
+        _ => {
+            tracing::info!("SSM decode cold tier = host-RAM (unbounded, non-dropping)");
+            Ok(Arc::new(MemBlobStore::new(0)))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -670,6 +828,51 @@ mod tests {
         let mut o = [0u8; BLOB];
         assert!(s.get(1, &mut o).unwrap());
         assert_eq!(o, [2; BLOB], "reads the overwritten value");
+    }
+
+    // ── Decode rolling tier: FileSnapshotArena (local NVMe) + selector ────
+    #[test]
+    fn file_arena_round_trip_bit_identical() {
+        let dir = std::env::temp_dir().join(format!("atlas-decode-test-{}", std::process::id()));
+        let dir = dir.to_str().unwrap();
+        let store = ArenaSnapshotStore::new(
+            Box::new(FileSnapshotArena::create(dir, 4 * BLOB as u64).unwrap()),
+            BLOB,
+            4,
+        );
+        assert!(store.put(0xDEAD, &[9, 8, 7, 6]).unwrap());
+        let mut out = [0u8; BLOB];
+        assert!(store.get(0xDEAD, &mut out).unwrap());
+        assert_eq!(out, [9, 8, 7, 6], "file spill->arena->fault is bit-identical");
+        // Slot recycle: distinct key reuses a fresh slot, both recover.
+        assert!(store.put(0xBEEF, &[1, 2, 3, 4]).unwrap());
+        let mut o2 = [0u8; BLOB];
+        assert!(store.get(0xBEEF, &mut o2).unwrap() && o2 == [1, 2, 3, 4]);
+        assert!(store.get(0xDEAD, &mut out).unwrap() && out == [9, 8, 7, 6]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn file_arena_write_past_capacity_errs_not_corrupts() {
+        let dir = std::env::temp_dir().join(format!("atlas-decode-cap-{}", std::process::id()));
+        let dir = dir.to_str().unwrap();
+        let arena = FileSnapshotArena::create(dir, BLOB as u64).unwrap();
+        assert!(arena.write_blob(0, &[1; BLOB]).is_ok());
+        assert!(arena.write_blob(1, &[1; BLOB]).is_err(), "over-capacity write refused");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn decode_tier_defaults_to_host_ram_non_dropping() {
+        // With ATLAS_SSM_DECODE_TIER unset the decode store is unbounded host-RAM
+        // and never drops (the correctness floor). Guard on the var being unset.
+        if std::env::var_os("ATLAS_SSM_DECODE_TIER").is_none() {
+            let s = build_decode_tier_store(4, /*min_slots*/ 8).unwrap();
+            for k in 0..2000u64 {
+                assert!(s.put(k, &[0; 4]).unwrap(), "non-dropping: nothing refused");
+            }
+            assert_eq!(s.len(), 2000);
+        }
     }
 
     #[test]

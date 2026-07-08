@@ -61,6 +61,10 @@ impl TransformerModel {
         ssm_cache_slots: usize,
         ssm_checkpoint_interval: usize,
     ) -> Result<Self> {
+        // Share the backend with the rolling decode-tier spill worker. `Arc::from`
+        // a `Box<dyn>` is a pointer move (no re-alloc); Deref is identical so every
+        // `gpu.*` call below is unchanged.
+        let gpu: std::sync::Arc<dyn GpuBackend> = std::sync::Arc::from(gpu);
         let rms_norm_kernel = gpu.kernel("norm", "rms_norm")?;
         let dense_gemv_kernel = gpu.kernel("gemv", "dense_gemv_bf16")?;
         // FP32-output dense GEMV — the FP32 logits path required an FP32
@@ -161,7 +165,7 @@ impl TransformerModel {
         } else {
             0
         };
-        let ssm_snapshots = SsmSnapshotPool::new(
+        let mut ssm_snapshots = SsmSnapshotPool::new(
             ssm_cache_slots,
             ssm_pool.h_bytes,
             ssm_pool.conv_bytes,
@@ -174,6 +178,32 @@ impl TransformerModel {
             config.hidden_size * 2,
             gpu.as_ref(),
         )?;
+        // ROLLING decode tier (ATLAS_SSM_DECODE_RING_ROLL): build a SEPARATE
+        // non-dropping cold store (local NVMe / RDMA peer / host-RAM, its own
+        // ATLAS_SSM_DECODE_* namespace) and spawn the async spill worker. Errors
+        // here are fatal (a mis-provisioned tier would corrupt restores — surface
+        // it at init, not on a rollback).
+        //
+        // Arena sizing = the true worst-case distinct-key cardinality, NOT the
+        // live-cold residency. Cold keys are per-(seq, ring_slot) and are not
+        // removed until `drop_decode_slot` is wired into the scheduler
+        // truncate/teardown path (follow-up); until then every one of the
+        // `ring_slots` logical slots per sequence can accumulate a mapped key
+        // over a full round-robin cycle. Sizing at `(ring_slots − hot_lanes) ×
+        // max_batch_size` (the live-cold estimate) under-provisions by
+        // `hot_lanes × max_batch_size`, so the fixed-slot NVMe arena's `put`
+        // would drop a freshly-spilled LIVE rollback target once the store
+        // exceeds capacity → later fault-miss → corrupt/declined restore. Size
+        // for `ring_slots × max_batch_size` so a live target is never dropped
+        // (host-RAM/peer are non-dropping regardless).
+        if ssm_snapshots.decode_rolling_enabled() {
+            let min_slots = decode_ring_slots * max_batch_size;
+            let decode_store = super::ssm_tier::build_decode_tier_store(
+                ssm_snapshots.spill_blob_bytes(),
+                min_slots,
+            )?;
+            ssm_snapshots.attach_decode_spiller(gpu.clone(), decode_store)?;
+        }
         if ssm_checkpoint_interval > 0 && ssm_cache_slots > 0 {
             tracing::info!(
                 "Marconi intermediate checkpoints: every {} blocks ({} tokens at block_size={})",

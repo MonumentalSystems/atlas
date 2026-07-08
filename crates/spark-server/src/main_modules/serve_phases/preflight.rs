@@ -115,12 +115,26 @@ pub(crate) fn preflight_reserve(
     // GPU budget by `(8 - 3) × max_batch_size × num_ssm_layers ×
     // (h_bytes + conv_bytes)` — the two constants were decoupled when the
     // ring was widened past the rollback cap.
-    let decode_ring_slots = if config.num_ssm_layers() > 0 {
-        atlas_kernels::DECODE_ROLLBACK_RING_SLOTS
+    // SSOT with `SsmSnapshotPool::new`: the decode HBM region is
+    // `decode_hbm_lanes_per_seq × max_batch_size` frames, PLUS the shared
+    // fault-scratch pool in ROLLING mode (ATLAS_SSM_DECODE_RING_ROLL) — where the
+    // per-seq HBM lanes shrink from 8 to `hot_lanes + margin` and the deep tail
+    // spills to ATLAS_SSM_DECODE_TIER. Both this reservation and the pool alloc
+    // call the same `atlas_kernels` helper so they can never drift.
+    let decode_frames = if config.num_ssm_layers() > 0 {
+        let rolling = atlas_kernels::decode_ring_rolling_enabled();
+        let hot_lanes = atlas_kernels::decode_hot_lanes_runtime();
+        let per_seq = atlas_kernels::decode_hbm_lanes_per_seq(rolling, hot_lanes);
+        let scratch = if rolling {
+            atlas_kernels::DECODE_FAULT_SCRATCH
+        } else {
+            0
+        };
+        per_seq * args.max_batch_size + scratch
     } else {
         0
     };
-    let ssm_snapshot_bytes = (args.ssm_cache_slots + decode_ring_slots * args.max_batch_size)
+    let ssm_snapshot_bytes = (args.ssm_cache_slots + decode_frames)
         * config.num_ssm_layers()
         * (h_state_bytes + conv_state_bytes);
     let cuda_headroom: usize =

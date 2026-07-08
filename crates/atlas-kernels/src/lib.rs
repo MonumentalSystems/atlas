@@ -276,6 +276,72 @@ pub const ROLLBACK_RESTEER_CAP: u32 = 2;
 /// models ignore this (their ring is 0; they roll back to any boundary).
 pub const DECODE_ROLLBACK_RING_SLOTS: usize = 8;
 
+// ── Decode-rollback ROLLING hot-HBM / cold-spill tier (ATLAS_SSM_DECODE_RING_ROLL)
+//
+// The decode-rollback ring is `DECODE_ROLLBACK_RING_SLOTS(8) × max_batch_size ×
+// layers × (h+conv)` of pure HBM — ~4 GB at C=8, ~32 GB at C=64. The rolling
+// tier keeps only the `DECODE_HOT_LANES` most-recent boundaries per sequence
+// HBM-resident (the common rollback target + the per-boundary write land here as
+// fast D2D), plus `DECODE_SPILL_MARGIN` async-drain lane(s), and spills the
+// deeper `8 − DECODE_HOT_LANES` boundaries to a cold tier (local NVMe or the RDMA
+// paging peer). Physical HBM lanes per sequence = `L_phys = DECODE_HOT_LANES +
+// DECODE_SPILL_MARGIN`; a small shared `DECODE_FAULT_SCRATCH` pool holds
+// fault-in targets for the rare deep re-steer. OFF by default → the ring is the
+// full 8-slot HBM region, byte-identical to today.
+
+/// Rolling decode tier: HBM-resident hot lanes per sequence (the per-boundary
+/// write + the common rollback target). Default 2 (current boundary + one shallow
+/// rollback target). Overridable at runtime via `ATLAS_SSM_DECODE_HOT_LANES`.
+pub const DECODE_HOT_LANES: usize = 2;
+
+/// Rolling decode tier: extra HBM lane(s) per sequence for an in-flight async
+/// spill drain, so the next boundary write never stalls waiting for a spill to
+/// complete (the fundamental +1 the honest 12 GB@C=64 headline pays for).
+pub const DECODE_SPILL_MARGIN: usize = 1;
+
+/// Rolling decode tier: shared (global, not per-seq) HBM scratch lanes for cold
+/// fault-in targets on a deep re-steer. Must be ≥ `ROLLBACK_RESTEER_CAP` so a
+/// bounded burst of concurrent rollbacks always has a landing lane.
+pub const DECODE_FAULT_SCRATCH: usize = 8;
+
+/// Domain salt folded into every decode cold-tier key so a decode-ring blob can
+/// never collide with a Marconi prefix-hash key on a shared store/peer.
+pub const DECODE_DOMAIN: u64 = 0xD3C0_DE12_A5B6_C7D8;
+
+/// Physical HBM lanes the rolling decode tier reserves per sequence when
+/// `rolling` is engaged, else the full logical ring depth. SSOT for the pool
+/// allocation ([`SsmSnapshotPool::new`]) AND the preflight HBM reservation mirror
+/// — both MUST call this so they never drift (the 3-vs-8 under-reservation class
+/// of bug). `hot_lanes` is the runtime-resolved [`DECODE_HOT_LANES`] override.
+#[inline]
+pub fn decode_hbm_lanes_per_seq(rolling: bool, hot_lanes: usize) -> usize {
+    if rolling {
+        hot_lanes + DECODE_SPILL_MARGIN
+    } else {
+        DECODE_ROLLBACK_RING_SLOTS
+    }
+}
+
+/// Runtime-resolved hot-lane count: `ATLAS_SSM_DECODE_HOT_LANES` clamped to
+/// `[1, DECODE_ROLLBACK_RING_SLOTS]`, default [`DECODE_HOT_LANES`]. A value of
+/// `DECODE_ROLLBACK_RING_SLOTS` (8) means "all lanes hot" = rolling disabled in
+/// effect (nothing ever spills), the A/B "off" arm expressed through the knob.
+pub fn decode_hot_lanes_runtime() -> usize {
+    std::env::var("ATLAS_SSM_DECODE_HOT_LANES")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(DECODE_HOT_LANES)
+        .clamp(1, DECODE_ROLLBACK_RING_SLOTS)
+}
+
+/// Whether the rolling decode tier is engaged. `ATLAS_SSM_DECODE_RING_ROLL` must
+/// be set AND the resolved hot-lane count must be strictly below the logical ring
+/// depth (else there is nothing to spill and the flat HBM ring is used).
+pub fn decode_ring_rolling_enabled() -> bool {
+    std::env::var_os("ATLAS_SSM_DECODE_RING_ROLL").is_some()
+        && decode_hot_lanes_runtime() < DECODE_ROLLBACK_RING_SLOTS
+}
+
 impl Default for ModelBehavior {
     fn default() -> Self {
         Self {

@@ -54,7 +54,11 @@ pub struct TransformerModel {
     /// no rotation env) keeps the decode-graph path byte-identical to today.
     pub(super) lora_rotatable: bool,
     pub(super) kv_cache: Mutex<PagedKvCache>,
-    pub(super) gpu: Box<dyn GpuBackend>,
+    // `Arc` (not `Box`) so the rolling decode-tier async spill worker
+    // (`SsmSnapshotPool::attach_decode_spiller`) can share the backend with the
+    // scheduler thread. Deref/`as_ref` are identical to `Box`, so every existing
+    // `self.gpu.*` call site is unchanged.
+    pub(super) gpu: std::sync::Arc<dyn GpuBackend>,
     pub(super) rms_norm_kernel: KernelHandle,
     pub(super) dense_gemv_kernel: KernelHandle,
     /// FP32-output variant of dense_gemv_bf16. Used by the LM head when

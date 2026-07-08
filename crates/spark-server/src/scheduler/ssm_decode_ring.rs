@@ -20,10 +20,10 @@
 //! Snapshotting only at boundary tokens — not every token — keeps the
 //! cost bounded: at most `capacity` D2D copies are live per sequence,
 //! and the ring evicts oldest-first so a long generation never grows
-//! the set. `capacity` is the model's
-//! `decode_rollback_ring_slots()` — sized `ROLLBACK_RESTEER_CAP + 1`
-//! so every permitted rollback has a distinct snapshot plus the current
-//! boundary.
+//! the set. `capacity` is the model's `decode_rollback_ring_slots()` =
+//! `DECODE_ROLLBACK_RING_SLOTS` (8) — DECOUPLED from `ROLLBACK_RESTEER_CAP`:
+//! the ring must retain enough boundaries that a clean PRE-loop one survives
+//! (`CAP + 1 = 3` was too small and forced spurious `NoSsmSnapshot` declines).
 //!
 //! Memory cost: each slot stores `h_state + conv_state` for **all** SSM
 //! layers. Per marconi.md that is ~77 MB/slot for a 122B/36-layer model;

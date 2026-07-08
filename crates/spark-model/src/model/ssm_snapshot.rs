@@ -5,6 +5,7 @@
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::mpsc;
 
 use anyhow::{Result, bail};
 use atlas_core::config::{LayerType, ModelConfig};
@@ -16,7 +17,11 @@ use super::block_mgmt::{
     apply_evicted_blocks, ensure_blocks_through_decode, ensure_blocks_through_prefill,
     extract_layer_refs, reuse_prefix_match_disk_ids,
 };
+use super::decode_ring_manager::{
+    DecodeRingManager, RestoreDecision, SaveDecision, SpillCommit, SpillReq,
+};
 use super::ssm_pool::SsmStatePool;
+use super::ssm_tier::SnapshotBlobStore;
 use super::types::{PinnedMetaStaging, TransformerModel};
 use crate::layer::{
     AttnMetadataDev, ForwardContext, GdnPrefillBuffers, LayerState, SsmLayerState, TransformerLayer,
@@ -88,6 +93,51 @@ pub(crate) struct SsmSnapshotPool {
     /// Marconi slots that currently hold a valid `hidden_snapshot` entry
     /// (only leaf saves populate it; intermediate checkpoints do not).
     pub(super) slot_has_hidden: Mutex<std::collections::HashSet<usize>>,
+    /// ROLLING decode tier (`ATLAS_SSM_DECODE_RING_ROLL`): residency state
+    /// machine shared with the async spill worker. `None` ⇒ the decode region is
+    /// the flat HBM (or UMA) ring, byte-identical to the pre-rolling build.
+    pub(super) decode_rolling: Option<Arc<Mutex<DecodeRingManager>>>,
+    /// Physical HBM lanes per sequence: `hot_lanes + DECODE_SPILL_MARGIN` in
+    /// rolling mode, else `decode_ring_slots`. Drives decode-region frame
+    /// addressing and MUST equal what the preflight reservation mirrors.
+    pub(super) decode_l_phys: usize,
+    /// Cold tier for spilled decode boundaries (non-dropping). `Some` in rolling
+    /// mode once `attach_decode_spiller` runs.
+    decode_store: Option<Arc<dyn SnapshotBlobStore>>,
+    /// Async spill worker handle (rolling mode). Drains aged hot lanes off the
+    /// decode critical path.
+    decode_spiller: Option<DecodeSpiller>,
+}
+
+/// A queued cold-tier spill for the async worker.
+struct SpillJob {
+    req: SpillReq,
+    /// Event recorded on the save stream; the worker's stream waits on it so the
+    /// D2H gather never races the boundary's D2D write into the same lane.
+    wait_event: u64,
+}
+
+/// Owns the async decode-spill worker thread + its channel. Dropping it hangs up
+/// the channel, ending the worker.
+struct DecodeSpiller {
+    /// `mpsc::Sender` is `!Sync`; the pool is shared `&self` across threads, so
+    /// the sender is `Mutex`-guarded (a send is a cheap enqueue).
+    tx: Mutex<mpsc::Sender<SpillJob>>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for DecodeSpiller {
+    fn drop(&mut self) {
+        // Drop the sender first (hangs up the channel) so the worker's `recv`
+        // returns `Err` and the loop exits, then join.
+        {
+            let (tx, _) = mpsc::channel();
+            *self.tx.lock() = tx; // replace with a dangling sender → original dropped
+        }
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
 }
 
 impl SsmSnapshotPool {
@@ -128,6 +178,10 @@ impl SsmSnapshotPool {
                 hidden_snapshot: DevicePtr::NULL,
                 hidden_bytes,
                 slot_has_hidden: Mutex::new(std::collections::HashSet::new()),
+                decode_rolling: None,
+                decode_l_phys: 0,
+                decode_store: None,
+                decode_spiller: None,
             });
         }
 
@@ -144,10 +198,32 @@ impl SsmSnapshotPool {
 
         let mut decode_h_snapshots = Vec::new();
         let mut decode_conv_snapshots = Vec::new();
-        let decode_region = if decode_enabled {
-            decode_max_seqs * decode_ring_slots
+        // ROLLING tier (ATLAS_SSM_DECODE_RING_ROLL): shrink the HBM decode region
+        // to `hot_lanes + margin` physical lanes per seq (+ shared fault scratch)
+        // and drive residency via the manager. Supersedes the flat UMA A/B path
+        // when both are set (rolling keeps the hot write in HBM — the point).
+        let rolling = decode_enabled && atlas_kernels::decode_ring_rolling_enabled();
+        let hot_lanes = atlas_kernels::decode_hot_lanes_runtime();
+        let rolling_mgr = if rolling {
+            Some(DecodeRingManager::new(
+                decode_ring_slots,
+                hot_lanes,
+                atlas_kernels::DECODE_SPILL_MARGIN,
+                atlas_kernels::DECODE_FAULT_SCRATCH,
+                decode_max_seqs,
+                atlas_kernels::DECODE_DOMAIN,
+            ))
         } else {
+            None
+        };
+        let decode_l_phys =
+            atlas_kernels::decode_hbm_lanes_per_seq(rolling, hot_lanes);
+        let decode_region = if !decode_enabled {
             0
+        } else if let Some(m) = &rolling_mgr {
+            m.total_frames()
+        } else {
+            decode_max_seqs * decode_ring_slots
         };
         // The decode-rollback ring scales as `decode_max_seqs × ring_slots ×
         // layers × (h+conv)` — ~4 GB at C=8, ~32 GB at C=64 — yet it is touched
@@ -169,7 +245,10 @@ impl SsmSnapshotPool {
         let ring_uma = std::env::var_os("ATLAS_SSM_DECODE_RING_UMA").is_some();
         if decode_enabled {
             for _ in 0..num_ssm_layers {
-                let (h, c) = if ring_uma {
+                // Rolling ALWAYS lands in HBM (the hot per-boundary write must be
+                // fast D2D — the whole reason UMA regressed 5.8%). UMA is the flat
+                // A/B knob, honored only when rolling is off.
+                let (h, c) = if ring_uma && !rolling {
                     (
                         gpu.alloc_managed(decode_region * h_bytes)?,
                         gpu.alloc_managed(decode_region * conv_bytes)?,
@@ -192,12 +271,28 @@ impl SsmSnapshotPool {
         };
         let marconi_mb = num_ssm_layers * num_slots * (h_bytes + conv_bytes) / (1024 * 1024);
         let decode_mb = num_ssm_layers * decode_region * (h_bytes + conv_bytes) / (1024 * 1024);
+        let decode_mode = if rolling {
+            "HBM ROLLING"
+        } else if ring_uma {
+            "UMA/managed"
+        } else {
+            "HBM"
+        };
         tracing::info!(
             "SSM snapshot pool: Marconi {num_slots} slots ({marconi_mb} MB), \
-             decode-rollback {decode_ring_slots} slots × {decode_max_seqs} seqs \
-             ({decode_mb} MB, {}), {num_ssm_layers} layers",
-            if ring_uma { "UMA/managed" } else { "HBM" },
+             decode-rollback {decode_ring_slots} logical slots × {decode_max_seqs} seqs, \
+             {decode_l_phys} HBM lanes/seq ({decode_mb} MB, {decode_mode}), \
+             {num_ssm_layers} layers",
         );
+        if rolling {
+            tracing::info!(
+                "SSM decode ROLLING tier: {hot_lanes} hot + {} margin lanes/seq, \
+                 {} shared fault-scratch — HBM capped at {decode_max_seqs}×{decode_l_phys}×blob \
+                 (cold residue spills to ATLAS_SSM_DECODE_TIER)",
+                atlas_kernels::DECODE_SPILL_MARGIN,
+                atlas_kernels::DECODE_FAULT_SCRATCH,
+            );
+        }
 
         Ok(Self {
             h_snapshots,
@@ -215,7 +310,113 @@ impl SsmSnapshotPool {
             hidden_snapshot,
             hidden_bytes,
             slot_has_hidden: Mutex::new(std::collections::HashSet::new()),
+            decode_rolling: rolling_mgr.map(|m| Arc::new(Mutex::new(m))),
+            decode_l_phys: if decode_enabled { decode_l_phys } else { 0 },
+            decode_store: None,
+            decode_spiller: None,
         })
+    }
+
+    /// Whether the rolling decode tier is active on this pool.
+    pub(super) fn decode_rolling_enabled(&self) -> bool {
+        self.decode_rolling.is_some()
+    }
+
+    /// Attach the cold tier + spawn the async spill worker for the rolling decode
+    /// tier. Called once from model init (rolling mode only). `gpu`/`store` are
+    /// owned `Arc`s the worker thread keeps. No-op if rolling is off.
+    pub(super) fn attach_decode_spiller(
+        &mut self,
+        gpu: Arc<dyn GpuBackend>,
+        store: Arc<dyn SnapshotBlobStore>,
+    ) -> Result<()> {
+        let Some(mgr) = self.decode_rolling.clone() else {
+            return Ok(());
+        };
+        self.decode_store = Some(store.clone());
+        let (tx, rx) = mpsc::channel::<SpillJob>();
+        // Cloned handles the worker owns for the lifetime of the pool.
+        let h_ptrs: Vec<DevicePtr> = self.decode_h_snapshots.clone();
+        let c_ptrs: Vec<DevicePtr> = self.decode_conv_snapshots.clone();
+        let h_bytes = self.h_bytes;
+        let conv_bytes = self.conv_bytes;
+        let num_layers = self.num_ssm_layers;
+        let l_phys = self.decode_l_phys;
+        let blob_bytes = self.spill_blob_bytes();
+        let spill_stream = gpu.create_stream().unwrap_or(0);
+        let handle = std::thread::Builder::new()
+            .name("atlas-decode-spill".into())
+            .spawn(move || {
+                if let Err(e) = gpu.bind_to_thread() {
+                    tracing::error!("decode-spill worker: bind_to_thread failed: {e:#}");
+                    return;
+                }
+                while let Ok(job) = rx.recv() {
+                    let req = job.req;
+                    // Order the gather after the boundary write into this lane.
+                    let _ = gpu.stream_wait_event(spill_stream, job.wait_event);
+                    let frame = req.seq * l_phys + req.lane;
+                    let mut blob = vec![0u8; blob_bytes];
+                    let per_layer = h_bytes + conv_bytes;
+                    let mut ok = true;
+                    for i in 0..num_layers {
+                        let off = i * per_layer;
+                        if gpu
+                            .copy_d2h_on_stream(
+                                h_ptrs[i].offset(frame * h_bytes),
+                                &mut blob[off..off + h_bytes],
+                                spill_stream,
+                            )
+                            .is_err()
+                            || gpu
+                                .copy_d2h_on_stream(
+                                    c_ptrs[i].offset(frame * conv_bytes),
+                                    &mut blob[off + h_bytes..off + per_layer],
+                                    spill_stream,
+                                )
+                                .is_err()
+                        {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    let put_ok = ok && store.put(req.cold_key, &blob).unwrap_or(false);
+                    if !put_ok {
+                        // A non-dropping store (host-RAM / peer / a correctly-sized
+                        // NVMe arena) must never reach here. If it does, the bytes
+                        // did NOT land in the cold store — so we must NOT commit the
+                        // slot Cold and free its lane (that would erase the only
+                        // copy and corrupt a later rollback). Leave it Spilling: the
+                        // hot lane stays pinned with the valid bytes, so a rollback
+                        // to this boundary restores directly from the lane. The
+                        // stranded lane is a bounded degradation, never corruption.
+                        tracing::error!(
+                            "decode-spill: store.put refused/failed for key {:#x} (seq {} slot {}) \
+                             — rolling decode tier MUST be non-dropping; keeping slot resident \
+                             (lane pinned) to preserve the rollback target",
+                            req.cold_key,
+                            req.seq,
+                            req.logical
+                        );
+                        let _ = gpu.destroy_event(job.wait_event);
+                        continue;
+                    }
+                    // Commit (or cancel on a superseding save/truncate) under the
+                    // manager lock.
+                    match mgr.lock().complete_spill(req.seq, req.logical, req.epoch) {
+                        SpillCommit::Committed => {}
+                        SpillCommit::Cancelled { remove_cold_key } => {
+                            store.remove(remove_cold_key);
+                        }
+                    }
+                    let _ = gpu.destroy_event(job.wait_event);
+                }
+            })?;
+        self.decode_spiller = Some(DecodeSpiller {
+            tx: Mutex::new(tx),
+            handle: Some(handle),
+        });
+        Ok(())
     }
 
     /// Marconi prefix-cache region availability.
@@ -242,6 +443,9 @@ impl SsmSnapshotPool {
         gpu: &dyn GpuBackend,
         stream: u64,
     ) -> Result<()> {
+        if self.decode_rolling.is_some() {
+            return self.save_decode_managed(ssm_slot, ring_slot, main_pool, gpu, stream);
+        }
         let flat = self.decode_flat_index(ssm_slot, ring_slot)?;
         for i in 0..self.num_ssm_layers {
             gpu.copy_d2d_async(
@@ -270,6 +474,9 @@ impl SsmSnapshotPool {
         gpu: &dyn GpuBackend,
         stream: u64,
     ) -> Result<()> {
+        if self.decode_rolling.is_some() {
+            return self.restore_decode_managed(ssm_slot, ring_slot, main_pool, gpu, stream);
+        }
         let flat = self.decode_flat_index(ssm_slot, ring_slot)?;
         for i in 0..self.num_ssm_layers {
             gpu.copy_d2d_async(
@@ -286,6 +493,266 @@ impl SsmSnapshotPool {
             )?;
         }
         Ok(())
+    }
+
+    // ── Rolling decode tier: managed save/restore + device gather/scatter ────
+
+    /// Physical decode-frame index for a per-seq lane (rolling mode).
+    #[inline]
+    fn decode_lane_frame(&self, ssm_slot: usize, lane: usize) -> usize {
+        ssm_slot * self.decode_l_phys + lane
+    }
+
+    /// D2D live pool slot → decode HBM lane frame (the fast per-boundary write).
+    fn decode_write_lane(
+        &self,
+        ssm_slot: usize,
+        lane: usize,
+        main_pool: &SsmStatePool,
+        gpu: &dyn GpuBackend,
+        stream: u64,
+    ) -> Result<()> {
+        let frame = self.decode_lane_frame(ssm_slot, lane);
+        for i in 0..self.num_ssm_layers {
+            gpu.copy_d2d_async(
+                main_pool.h_state(i, ssm_slot),
+                self.decode_h_snapshots[i].offset(frame * self.h_bytes),
+                self.h_bytes,
+                stream,
+            )?;
+            gpu.copy_d2d_async(
+                main_pool.conv_state(i, ssm_slot),
+                self.decode_conv_snapshots[i].offset(frame * self.conv_bytes),
+                self.conv_bytes,
+                stream,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// D2D decode HBM frame → live pool slot (restore from a resident/pinned
+    /// lane, or from a just-faulted scratch frame).
+    fn decode_restore_frame(
+        &self,
+        frame: usize,
+        ssm_slot: usize,
+        main_pool: &SsmStatePool,
+        gpu: &dyn GpuBackend,
+        stream: u64,
+    ) -> Result<()> {
+        for i in 0..self.num_ssm_layers {
+            gpu.copy_d2d_async(
+                self.decode_h_snapshots[i].offset(frame * self.h_bytes),
+                main_pool.h_state(i, ssm_slot),
+                self.h_bytes,
+                stream,
+            )?;
+            gpu.copy_d2d_async(
+                self.decode_conv_snapshots[i].offset(frame * self.conv_bytes),
+                main_pool.conv_state(i, ssm_slot),
+                self.conv_bytes,
+                stream,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// The per-boundary save in rolling mode: plan against the residency manager,
+    /// write the boundary D2D into an HBM lane (constraint 1), and async-spill the
+    /// displaced LRU-hot lane off the decode path (constraint 2). Backpressure
+    /// (all lanes busy) waits for the worker to free a lane rather than writing to
+    /// a tier synchronously.
+    fn save_decode_managed(
+        &self,
+        ssm_slot: usize,
+        ring_slot: usize,
+        main_pool: &SsmStatePool,
+        gpu: &dyn GpuBackend,
+        stream: u64,
+    ) -> Result<()> {
+        let mgr = self.decode_rolling.as_ref().expect("rolling");
+        let decision = loop {
+            let d = mgr.lock().plan_save(ssm_slot, ring_slot);
+            match d {
+                SaveDecision::Backpressure { drain } => {
+                    if self.decode_spiller.is_some() {
+                        // Async worker owns these in-flight spills — wait for it to
+                        // complete one and free a lane, then re-plan. Never re-do
+                        // them here (that would double-commit / double-remove).
+                        std::thread::sleep(std::time::Duration::from_micros(50));
+                    } else {
+                        // No worker: safe to synchronously drain (nothing else
+                        // owns these spills).
+                        for req in drain {
+                            self.decode_drain_spill_sync(req, gpu, stream)?;
+                        }
+                    }
+                }
+                other => break other,
+            }
+        };
+        match decision {
+            SaveDecision::InPlace { lane } => {
+                self.decode_write_lane(ssm_slot, lane, main_pool, gpu, stream)?;
+            }
+            SaveDecision::Fresh { lane, spill } => {
+                self.decode_write_lane(ssm_slot, lane, main_pool, gpu, stream)?;
+                if let Some(req) = spill {
+                    self.decode_enqueue_spill(req, gpu, stream)?;
+                }
+            }
+            SaveDecision::Backpressure { .. } => unreachable!("drained above"),
+        }
+        Ok(())
+    }
+
+    /// The rare rollback restore in rolling mode: restore from the pinned HBM lane
+    /// (Resident/Spilling) or fault the cold blob back into a scratch lane BEFORE
+    /// the D2D restore reads it (constraint 3+4).
+    fn restore_decode_managed(
+        &self,
+        ssm_slot: usize,
+        ring_slot: usize,
+        main_pool: &SsmStatePool,
+        gpu: &dyn GpuBackend,
+        stream: u64,
+    ) -> Result<()> {
+        let mgr = self.decode_rolling.as_ref().expect("rolling");
+        let decision = mgr.lock().plan_restore(ssm_slot, ring_slot);
+        match decision {
+            RestoreDecision::FromLane { lane } => {
+                let frame = self.decode_lane_frame(ssm_slot, lane);
+                self.decode_restore_frame(frame, ssm_slot, main_pool, gpu, stream)
+            }
+            RestoreDecision::FaultThenRestore { scratch_lane, cold_key } => {
+                let res =
+                    self.decode_fault_scratch(ssm_slot, scratch_lane, cold_key, main_pool, gpu, stream);
+                mgr.lock().release_scratch(scratch_lane);
+                res
+            }
+            RestoreDecision::Decline => {
+                bail!("SSM decode rolling: no live snapshot for ring_slot {ring_slot}")
+            }
+        }
+    }
+
+    /// Fault `cold_key` H2D into the shared scratch `scratch_lane`, synchronize so
+    /// the scatter commits, then D2D scratch → live pool. A store MISS on a live
+    /// rollback target is impossible with a non-dropping tier — treat it as a hard
+    /// corruption bug, never a silent recompute.
+    fn decode_fault_scratch(
+        &self,
+        ssm_slot: usize,
+        scratch_lane: usize,
+        cold_key: u64,
+        main_pool: &SsmStatePool,
+        gpu: &dyn GpuBackend,
+        stream: u64,
+    ) -> Result<()> {
+        let store = self
+            .decode_store
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("rolling decode tier: no cold store attached"))?;
+        let mut blob = vec![0u8; self.spill_blob_bytes()];
+        if !store.get(cold_key, &mut blob)? {
+            bail!(
+                "SSM decode rolling: cold MISS on live target key {cold_key:#x} — the decode \
+                 tier MUST be non-dropping; this is corruption, not a recompute"
+            );
+        }
+        let frame = self.decode_max_seqs * self.decode_l_phys + scratch_lane;
+        let per_layer = self.h_bytes + self.conv_bytes;
+        for i in 0..self.num_ssm_layers {
+            let off = i * per_layer;
+            gpu.copy_h2d_async(
+                &blob[off..off + self.h_bytes],
+                self.decode_h_snapshots[i].offset(frame * self.h_bytes),
+                stream,
+            )?;
+            gpu.copy_h2d_async(
+                &blob[off + self.h_bytes..off + per_layer],
+                self.decode_conv_snapshots[i].offset(frame * self.conv_bytes),
+                stream,
+            )?;
+        }
+        gpu.synchronize(stream)?; // scatter committed before the D2D restore reads it
+        self.decode_restore_frame(frame, ssm_slot, main_pool, gpu, stream)
+    }
+
+    /// Hand a displaced-lane spill to the async worker (records an ordering event
+    /// on the save `stream`). Falls back to a synchronous drain if no worker is
+    /// attached or the channel is closed.
+    fn decode_enqueue_spill(&self, req: SpillReq, gpu: &dyn GpuBackend, stream: u64) -> Result<()> {
+        if let Some(sp) = &self.decode_spiller {
+            let ev = gpu.create_event()?;
+            gpu.record_event(ev, stream)?;
+            match sp.tx.lock().send(SpillJob { req, wait_event: ev }) {
+                Ok(()) => Ok(()),
+                Err(_) => {
+                    let _ = gpu.destroy_event(ev);
+                    self.decode_drain_spill_sync(req, gpu, stream)
+                }
+            }
+        } else {
+            self.decode_drain_spill_sync(req, gpu, stream)
+        }
+    }
+
+    /// Synchronous fallback spill (backpressure with no worker, or a closed
+    /// channel): drain the save stream, gather the lane D2H, put, and commit the
+    /// residency transition. Blocks the decode thread — only the uncommon path.
+    fn decode_drain_spill_sync(
+        &self,
+        req: SpillReq,
+        gpu: &dyn GpuBackend,
+        stream: u64,
+    ) -> Result<()> {
+        let store = self
+            .decode_store
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("rolling decode tier: no cold store attached"))?;
+        gpu.synchronize(stream)?;
+        let frame = req.seq * self.decode_l_phys + req.lane;
+        let mut blob = vec![0u8; self.spill_blob_bytes()];
+        let per_layer = self.h_bytes + self.conv_bytes;
+        for i in 0..self.num_ssm_layers {
+            let off = i * per_layer;
+            gpu.copy_d2h(
+                self.decode_h_snapshots[i].offset(frame * self.h_bytes),
+                &mut blob[off..off + self.h_bytes],
+            )?;
+            gpu.copy_d2h(
+                self.decode_conv_snapshots[i].offset(frame * self.conv_bytes),
+                &mut blob[off + self.h_bytes..off + per_layer],
+            )?;
+        }
+        if !store.put(req.cold_key, &blob)? {
+            bail!("rolling decode tier refused a spill (must be non-dropping)");
+        }
+        if let SpillCommit::Cancelled { remove_cold_key } =
+            self.decode_rolling.as_ref().expect("rolling").lock().complete_spill(
+                req.seq,
+                req.logical,
+                req.epoch,
+            )
+        {
+            store.remove(remove_cold_key);
+        }
+        Ok(())
+    }
+
+    /// Drop a logical decode slot (scheduler `truncate_after` / seq teardown): free
+    /// its lane, cancel any in-flight spill (epoch bump), and remove its cold key.
+    /// No-op when rolling is off.
+    pub(super) fn drop_decode_slot(&self, ssm_slot: usize, ring_slot: usize) {
+        let Some(mgr) = self.decode_rolling.as_ref() else {
+            return;
+        };
+        if let Some(key) = mgr.lock().drop_slot(ssm_slot, ring_slot) {
+            if let Some(store) = &self.decode_store {
+                store.remove(key);
+            }
+        }
     }
 
     /// Flat index into the decode-rollback region, with bounds checks.
