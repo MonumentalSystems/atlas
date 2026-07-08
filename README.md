@@ -373,7 +373,7 @@ sudo docker run -d --name atlas \
     --tool-call-parser qwen3_coder
 ```
 
-For 122B with **both** `--speculative` *and* a 64 K window, move to EP=2 across two Sparks ([`QUICKSTART.md`](QUICKSTART.md) §5). For long contexts on a single Spark, add `--high-speed-swap --high-speed-swap-dir /path/on/nvme --high-speed-swap-cache-blocks-per-seq 64` — HSS keeps a rolling 1024-token KV window in HBM and streams older blocks to NVMe through an io_uring orchestrator. The container needs `--security-opt seccomp=unconfined --ulimit memlock=-1` for io_uring access.
+For 122B with **both** `--speculative` *and* a 64 K window, move to EP=2 across two Sparks ([`QUICKSTART.md`](QUICKSTART.md) §5). For long contexts on a single Spark, add `--high-speed-swap --high-speed-swap-dir /path/on/nvme --high-speed-swap-cache-blocks-per-seq 64` — HSS keeps a rolling 1024-token KV window in HBM and streams older blocks to NVMe through an io_uring orchestrator. In a container the io_uring syscalls are blocked by Docker's default seccomp profile — pass the surgical profile `--security-opt seccomp=docker/gb10/seccomp-io_uring.json --ulimit memlock=-1 --cap-add=SYS_NICE` (default + io_uring only; keeps the rest of the sandbox, unlike `seccomp=unconfined`). Without it HSS transparently falls back to a slower POSIX backend (set `ATLAS_KV_BACKEND=io_uring` to require io_uring instead). See [`docker/gb10/seccomp-io_uring.README.md`](docker/gb10/seccomp-io_uring.README.md).
 
 ### Hitting the Endpoint
 

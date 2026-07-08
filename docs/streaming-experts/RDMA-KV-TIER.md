@@ -119,7 +119,10 @@ trait, so nothing else changed.
   try io_uring, transparently fall back to the portable POSIX `pread`/`pwrite`
   backend if io_uring can't init** (restrictive container seccomp blocks the
   `io_uring_*` syscalls → `EPERM`; pre-5.1 kernels lack it). `posix` = skip io_uring;
-  `io_uring` = require it, fail loud (pair with `--security-opt seccomp=unconfined`).
+  `io_uring` = require it, fail loud. To actually get io_uring in a container, pass
+  the surgical seccomp profile `--security-opt seccomp=docker/gb10/seccomp-io_uring.json`
+  (Docker default + io_uring only; `docker/gb10/seccomp-io_uring.README.md`) — the
+  default profile blocks the `io_uring_*` syscalls.
   So over-core KV works everywhere out-of-the-box — RDMA (`$ATLAS_KV_PEER`) and
   io_uring are both opt-in fast paths over the POSIX floor.
 - CLI: `--high-speed-swap --high-speed-swap-dir <d> --high-speed-swap-gb <g>

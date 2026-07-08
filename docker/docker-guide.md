@@ -134,6 +134,29 @@ curl http://localhost:8888/v1/chat/completions \
 | `--max-batch-size` | `8` | Max concurrent sequences per decode step |
 | `--kv-cache-dtype` | `fp8` | KV cache precision (`fp8` or `bf16`) |
 
+## io_uring seccomp scope (`--high-speed-swap`)
+
+The `--high-speed-swap` local-NVMe KV-overflow tier uses an **io_uring**
+orchestrator. Docker's **default** seccomp profile blocks the `io_uring_*`
+syscalls (removed after the 2023 io_uring kernel-LPE disclosures), so in a normal
+container `io_uring_setup` returns `EPERM` ("Operation not permitted") and HSS
+transparently falls back to a slower POSIX `pread`/`pwrite` backend.
+
+To get the fast path, open **only** io_uring with the committed surgical profile
+(Docker default + the three io_uring syscalls — keeps the rest of the sandbox,
+unlike `seccomp=unconfined`):
+
+```bash
+docker run --security-opt seccomp=docker/gb10/seccomp-io_uring.json \
+           --ulimit memlock=-1 --cap-add=SYS_NICE ...   # SQPOLL wants SYS_NICE
+```
+
+Verified in-image (`io_uring_setup` probe): Docker default → `EPERM` (blocked);
+this profile → `EFAULT` (allowed, same as `unconfined`). Set
+`ATLAS_KV_BACKEND=io_uring` to require io_uring and fail loud if the scope isn't
+open; `=posix` to force the portable backend. See
+[`gb10/seccomp-io_uring.README.md`](gb10/seccomp-io_uring.README.md).
+
 ## Performance (NVIDIA GB10 / DGX Spark)
 
 | Model | Mode | Counting | Diverse |

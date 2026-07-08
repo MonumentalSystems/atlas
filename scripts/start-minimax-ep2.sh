@@ -40,6 +40,9 @@ ssh "$WORKER_IP" "sudo docker rm -f atlas-minimax-ep1 2>/dev/null || true"
 # IORING_SETUP_SQPOLL (kernel ≥ 5.13) used by --high-speed-swap; the
 # default Docker seccomp profile blocks io_uring_* syscalls so we run
 # unconfined for the storage path.
+# Hardened alternative (keeps the rest of the sandbox — proven to permit
+# io_uring, EP2 RDMA/NCCL path not yet re-validated under it):
+#   --security-opt seccomp=$(git rev-parse --show-toplevel)/docker/gb10/seccomp-io_uring.json
 RDMA_FLAGS="--device=/dev/infiniband --cap-add=IPC_LOCK --cap-add=SYS_NICE --ulimit memlock=-1 --security-opt seccomp=unconfined"
 
 # NCCL env — same as Qwen3.5-122B EP=2 (RoCEv2 / IPv4, GB10-safe)
