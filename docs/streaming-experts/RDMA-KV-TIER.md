@@ -173,6 +173,24 @@ secret at the start of a 17,137-token prompt (HBM cap 10,240) → correct
    speed decode — the per-step restore is latency-bound, so zero-copy/dual-rail
    (bandwidth wins) only help prefill TTFT, not decode tok/s. See
    `kv-bench/CONCURRENCY-FINDINGS.md`.
+   **Measured clean wall (2026-07-08, image B, C=8, ~8K prompt, max_tokens=128,
+   no nsys):** bounce **10.20 tok/s** (206.3 s) vs zero-copy **9.99 tok/s**
+   (207.6 s) — **tied within noise**, both 8/8 ok, zc verified live (no
+   `permanently using bounce restore` fallback). Zero-copy is correct — *not* a
+   corruption no-go — but wins nothing at this scale because (a) the path is
+   RDMA-READ-latency-bound so the saved `copy_h2d` isn't on the critical path, and
+   (b) zero-copy **still host-blocks on the UMA-landing completion** (needs
+   GPUDirect to go async), so it can't overlap ahead. It only pays off when the
+   bounce `copy_h2d` lands on the critical path (larger per-restore payloads /
+   higher restore rate / faster decode tier).
+7. **#11 async prefetch-completion refinement (`2a9d256`) — validated by nsys A/B
+   on the bounce path** (2026-07-08, C=8, ~8K prompt). Replacing the coarse
+   per-boundary `cuStreamSynchronize` (full prefetch-stream drain before a bounce
+   buffer can be reused) with a per-buffer completion event cut `cuStreamSynchronize`
+   **1,528.8 ms → 812.9 ms (−47%)**; total host-block (incl. the new fine-grained
+   `cuEventSynchronize`) **−34%** (~1,529 → ~1,006 ms). Wall is tied at this scale
+   (latency-bound) — the win is framework headroom for faster tiers / overlap
+   regimes. Reports: `nsys-out/atlas_{A,B}.nsys-rep` (A = `6628ddc` pre-refinement).
 4. **Coherence assumption:** after an RDMA completion the NIC's DMA to LPDDR is
    assumed GPU-visible (same as the expert arena). Holds on GB10; revalidate on
    other hardware.
