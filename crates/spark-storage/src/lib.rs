@@ -114,6 +114,7 @@ pub mod rdma_kv_backend;
 // transport (feature `cuda` + atlas_rdma_verbs) isn't built, so dependents can
 // reference `RdmaSnapshotArena` unconditionally and degrade to host-RAM.
 pub mod rdma_snapshot;
+pub mod snapshot_swap;
 // T1 write-back cache composite (wraps any StorageBackend). cuda but not verbs.
 #[cfg(feature = "cuda")]
 pub mod cascade_backend;
