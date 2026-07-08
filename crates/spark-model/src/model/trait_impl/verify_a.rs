@@ -417,4 +417,20 @@ impl TransformerModel {
             stream,
         )
     }
+
+    /// Reset the rolling decode-tier residency for a whole seq-slot. Called when
+    /// a new sequence recycles `seq.slot_idx` (or its ring is fully truncated) so
+    /// the fresh incarnation does not inherit the prior sequence's lanes/LRU/
+    /// residency. No-op unless the rolling tier is engaged.
+    pub(super) fn reset_decode_ring_seq_dispatch(&self, seq: &SequenceState) {
+        self.ssm_snapshots.reset_decode_seq(seq.slot_idx);
+    }
+
+    /// Drop a single logical decode-ring slot for `seq` (a rollback's
+    /// `truncate_after` discarded this boundary). Frees its rolling-tier lane and
+    /// removes any cold blob so the manager's lane accounting stays consistent.
+    /// No-op unless the rolling tier is engaged.
+    pub(super) fn drop_decode_ring_slot_dispatch(&self, seq: &SequenceState, ring_slot: usize) {
+        self.ssm_snapshots.drop_decode_slot(seq.slot_idx, ring_slot);
+    }
 }

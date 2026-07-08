@@ -354,6 +354,25 @@ impl DecodeRingManager {
         }
     }
 
+    /// Reset an ENTIRE sequence slot to a fresh state — a new sequence has
+    /// reused this seq-slot (cross-sequence recycling) or the whole ring was
+    /// truncated. Without this the new incarnation inherits the prior sequence's
+    /// lane occupancy / LRU / residency, corrupting eviction + restore. Returns
+    /// the cold keys of every Cold/Spilling slot so the pool can `store.remove`
+    /// them; every epoch is bumped so any in-flight spill of the old incarnation
+    /// cancels on commit.
+    pub(crate) fn reset_seq(&mut self, seq: usize) -> Vec<u64> {
+        let mut keys = Vec::new();
+        for logical in 0..self.ring_slots {
+            if let Some(k) = self.drop_slot(seq, logical) {
+                keys.push(k);
+            }
+        }
+        // `drop_slot` already resets slots/lanes/lru/epoch per logical; the seq
+        // is now byte-for-byte a fresh `SeqLanes` (all Absent, no lanes held).
+        keys
+    }
+
     /// Drop a logical slot (ring `truncate_after` / seq teardown): bump its epoch
     /// so any in-flight spill cancels on commit, free its lane if resident/
     /// spilling, and return its cold key so the pool can `store.remove` it.
@@ -534,6 +553,37 @@ mod tests {
         assert_eq!(removed, Some(m.cold_key(0, 0)), "spilling slot's cold key returned for removal");
         assert_eq!(m.residency(0, 0), Residency::Absent);
         // The now-late spill commit cancels (epoch bumped by drop).
+        assert!(matches!(
+            m.complete_spill(req.seq, req.logical, req.epoch),
+            SpillCommit::Cancelled { .. }
+        ));
+    }
+
+    #[test]
+    fn reset_seq_clears_stale_state_for_a_recycled_slot() {
+        // Sequence A fills the ring (some Resident, one spilled Cold), then the
+        // seq-slot is recycled by sequence B → reset_seq must hand back a fresh
+        // SeqLanes so B's first save doesn't inherit A's lanes/LRU/residency.
+        let mut m = mgr(); // ring=8, hot=2, l_phys=3
+        m.plan_save(0, 0);
+        m.plan_save(0, 1);
+        let SaveDecision::Fresh { spill: Some(req), .. } = m.plan_save(0, 2) else {
+            panic!("expected spill");
+        };
+        m.complete_spill(req.seq, req.logical, req.epoch); // slot 0 Cold
+        // seq 0 now holds lanes + a cold blob.
+        let keys = m.reset_seq(0);
+        assert_eq!(keys, vec![m.cold_key(0, 0)], "the Cold slot's key is returned for removal");
+        for lg in 0..8 {
+            assert_eq!(m.residency(0, lg), Residency::Absent, "all slots reset");
+        }
+        // A fresh save on the recycled seq behaves exactly like a brand-new seq:
+        // first two stay hot, no spill, no backpressure.
+        let d0 = m.plan_save(0, 0);
+        assert!(matches!(d0, SaveDecision::Fresh { spill: None, .. }), "got {d0:?}");
+        let d1 = m.plan_save(0, 1);
+        assert!(matches!(d1, SaveDecision::Fresh { spill: None, .. }), "got {d1:?}");
+        // And an in-flight spill of A's old incarnation now cancels (epoch bumped).
         assert!(matches!(
             m.complete_spill(req.seq, req.logical, req.epoch),
             SpillCommit::Cancelled { .. }

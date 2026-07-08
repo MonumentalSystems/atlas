@@ -250,6 +250,12 @@ impl Model for TransformerModel {
     fn restore_decode_ssm_snapshot(&self, seq: &SequenceState, ring_slot: usize) -> Result<()> {
         self.restore_decode_ssm_snapshot_dispatch(seq, ring_slot)
     }
+    fn reset_decode_ring_seq(&self, seq: &SequenceState) {
+        self.reset_decode_ring_seq_dispatch(seq)
+    }
+    fn drop_decode_ring_slot(&self, seq: &SequenceState, ring_slot: usize) {
+        self.drop_decode_ring_slot_dispatch(seq, ring_slot)
+    }
     fn generate_speculative(
         &self,
         prompt_tokens: &[u32],

@@ -371,6 +371,17 @@ pub trait Model: Send + Sync {
         Ok(())
     }
 
+    /// Reset the rolling decode-tier residency for a whole seq-slot — called when
+    /// a new sequence recycles `seq.slot_idx` or its ring is fully truncated, so
+    /// the fresh incarnation does not inherit stale lanes/residency. Default and
+    /// non-rolling (flat/UMA) builds: no-op (the flat ring is stateless).
+    fn reset_decode_ring_seq(&self, _seq: &SequenceState) {}
+
+    /// Drop one logical decode-ring slot (a rollback's `truncate_after` discarded
+    /// this boundary) so the rolling manager frees its lane and cold blob.
+    /// Default and non-rolling builds: no-op.
+    fn drop_decode_ring_slot(&self, _seq: &SequenceState, _ring_slot: usize) {}
+
     /// Speculative decoding via the model's internal MTP proposer; falls
     /// back to regular decode when no proposer is wired up.
     fn generate_speculative(

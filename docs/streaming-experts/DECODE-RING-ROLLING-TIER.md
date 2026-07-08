@@ -3,11 +3,47 @@
 Status: DESIGN (synthesized from three competing angles — reuse-blobstore,
 purpose-built, uma-hybrid). Owner: streaming-experts. Date: 2026-07-08.
 
-## IMPLEMENTATION STATUS (2026-07-08) — STAGED SCAFFOLD, NOT WIRED LIVE
+## IMPLEMENTATION STATUS (2026-07-08) — WIRED LIVE + GPU-VALIDATED
 
 Landed on `feat/streaming-experts-mvp`, gated OFF by default
-(`ATLAS_SSM_DECODE_RING_ROLL`), **compiles + 29 unit tests pass** (12
-`decode_ring_manager` + 17 `ssm_tier`), byte-identical when the flag is unset:
+(`ATLAS_SSM_DECODE_RING_ROLL`), byte-identical when the flag is unset. Compiles;
+**unit tests pass** (13 `decode_ring_manager` incl. `reset_seq`, 13 `ssm_decode_ring`,
+18 `rollback`, 17 `ssm_tier`).
+
+**GPU-validated on Holo-3.1-35B (C=8, cold=local NVMe, target-kv-tokens 100000,
+fp8+calibration, full CUTLASS/grouped-MoE fast set):**
+- Rolling tier engaged: `2 hot + 1 margin lanes/seq, 8 fault-scratch`; cold tier
+  `LOCAL NVMe … 65 slots (non-dropping ≥ min_slots 64)` — the adversarial-fix arena
+  sizing (`ring_slots × max_batch` = 8C) is live.
+- **Correctness: both waves 8/8 ok** — wave 2 recycled the seq-slots, so the
+  `reset_decode_ring_seq` path (cross-sequence reuse) produces coherent restores.
+- **HBM: 4080 → 2040 MB** at C=8 (decode region halved; L_phys=3 vs 8 logical) →
+  projects ~32 → ~12.75 GB at C=64.
+- **Decode cost: ~9–10%** vs the HBM baseline (38.97 → 35.3 tok/s w/ CUTLASS),
+  decode-bound single-thread spill overhead — real, not free. This is the high-C
+  HBM-vs-throughput trade; the cost is worth it only where the 32 GB HBM ring is the
+  binding constraint.
+
+### The live wiring (what drives the manager)
+- `save_decode`/`restore_decode` branch to `save/restore_decode_managed` when
+  `ATLAS_SSM_DECODE_RING_ROLL` is set (existing scheduler `save/restore_decode_ssm_snapshot`
+  calls route through unchanged).
+- `reset_decode_ring_seq` (trait → `SsmSnapshotPool::reset_decode_seq` →
+  `DecodeRingManager::reset_seq`) fires from `rollback.rs::snapshot_boundary_if_ssm` when
+  the scheduler ring `is_empty()` (fresh sequence recycled the seq-slot, or full truncate)
+  — prevents a new sequence inheriting the prior one's stale lanes/LRU/residency.
+- `drop_decode_ring_slot` fires for each slot returned by `SsmDecodeRing::truncate_after`
+  (partial rollback) — frees discarded lanes so `plan_save` can't backpressure with an
+  empty drain (deadlock).
+
+### Remaining (optional)
+- High-C spill throughput: the single-thread worker + margin=1 can backpressure under
+  sustained decode — multi-thread worker / bigger margin if the ~10% decode cost matters
+  at scale. Supersede the flat `ATLAS_SSM_DECODE_RING_UMA` knob (no physical cap on GB10).
+
+<details><summary>original scaffold status (superseded)</summary>
+
+Landed gated OFF, compiled + 29 unit tests:
 
 - **Built (pool side):** `decode_ring_manager.rs` (residency state machine
   Absent/Resident/Spilling/Cold + epoch guard + backpressure), `ssm_snapshot.rs`
@@ -39,6 +75,8 @@ Landed on `feat/streaming-experts-mvp`, gated OFF by default
      trusting the 12 GB@C=64 cap in practice).
   4. Supersede/remove the flat `ATLAS_SSM_DECODE_RING_UMA` knob once the rolling
      tier is live (UMA gives no physical cap on GB10 — see §on the uma-hybrid).
+
+</details>
 
 ## 0. Problem & thesis
 

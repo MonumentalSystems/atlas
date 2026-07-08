@@ -84,6 +84,16 @@ impl SsmDecodeRing {
         self.capacity > 0
     }
 
+    /// No live snapshots. A `true` here at the first boundary of a decode run
+    /// signals a *fresh* ring — a newly-admitted sequence (or one whose ring was
+    /// fully truncated), i.e. the point at which the model's rolling decode-tier
+    /// residency for this seq-slot must be reset (it may hold a prior sequence's
+    /// stale lanes). The stateless flat ring ignores this.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
     /// Reserve the snapshot slot the next boundary should be written
     /// into, registering the `(token_position, slot)` entry.
     ///
@@ -146,7 +156,17 @@ impl SsmDecodeRing {
     /// in the now-discarded degenerate tail are invalid and their slots
     /// must become reusable. The snapshot at exactly `keep_len` (the one
     /// just restored) is kept — generation resumes from it.
-    pub fn truncate_after(&mut self, keep_len: usize) {
+    ///
+    /// Returns the discarded entries' `snapshot_slot`s so the caller can drop
+    /// them in the model's rolling decode tier (freeing their HBM lanes + cold
+    /// blobs). The stateless flat ring ignores the return value.
+    pub fn truncate_after(&mut self, keep_len: usize) -> Vec<usize> {
+        let dropped: Vec<usize> = self
+            .entries
+            .iter()
+            .filter(|e| e.token_position > keep_len)
+            .map(|e| e.snapshot_slot)
+            .collect();
         self.entries.retain(|e| e.token_position <= keep_len);
         // Resume slot assignment right after the newest surviving
         // snapshot. Without this the cursor keeps pointing into the
@@ -161,6 +181,7 @@ impl SsmDecodeRing {
         } else if self.capacity > 0 {
             self.next_slot = 0;
         }
+        dropped
     }
 
     /// Number of live snapshots. Test/diagnostic helper.

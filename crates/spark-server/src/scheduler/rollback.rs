@@ -278,8 +278,14 @@ pub fn rollback_to_boundary(
         }
         // The degenerate tail's snapshots are now stale — drop them so
         // their ring slots are reusable. The boundary snapshot itself is
-        // kept (generation resumes from it).
-        a.ssm_rollback_ring.truncate_after(keep_len);
+        // kept (generation resumes from it). Each discarded slot is also
+        // dropped in the model's rolling decode tier so its HBM lane + cold
+        // blob are freed (else the manager's lanes stay occupied by discarded
+        // boundaries → a later reuse-save can backpressure with no drainable
+        // spill). No-op for the stateless flat ring.
+        for discarded in a.ssm_rollback_ring.truncate_after(keep_len) {
+            model.drop_decode_ring_slot(&a.seq, discarded);
+        }
     }
 
     apply_rollback(a, keep_len, dropped);
@@ -326,6 +332,14 @@ pub fn snapshot_boundary_if_ssm(a: &mut ActiveSeq, model: &dyn Model) {
     if id >= mask.len() || !mask[id] {
         return;
     }
+    // A fresh ring (this is its first live boundary) means a newly-admitted
+    // sequence recycled this seq-slot, or the ring was just fully truncated.
+    // Reset the model's rolling decode-tier residency for the seq-slot so the
+    // new incarnation does not inherit a prior sequence's stale lanes / LRU /
+    // cold blobs. No-op for the stateless flat ring.
+    if a.ssm_rollback_ring.is_empty() {
+        model.reset_decode_ring_seq(&a.seq);
+    }
     let token_position = a.output_tokens.len();
     let Some(slot) = a.ssm_rollback_ring.record(token_position) else {
         return;
@@ -339,8 +353,12 @@ pub fn snapshot_boundary_if_ssm(a: &mut ActiveSeq, model: &dyn Model) {
         );
         // The just-recorded entry would point at stale/garbage GPU
         // state — remove it so `slot_for_position` never selects it.
-        a.ssm_rollback_ring
-            .truncate_after(token_position.saturating_sub(1));
+        for discarded in a
+            .ssm_rollback_ring
+            .truncate_after(token_position.saturating_sub(1))
+        {
+            model.drop_decode_ring_slot(&a.seq, discarded);
+        }
     }
 }
 

@@ -755,6 +755,21 @@ impl SsmSnapshotPool {
         }
     }
 
+    /// Reset the rolling-tier residency for a whole seq-slot (a new sequence
+    /// recycled it, or its ring was fully truncated). Frees all lanes and
+    /// removes any cold blobs. No-op when rolling is off.
+    pub(super) fn reset_decode_seq(&self, ssm_slot: usize) {
+        let Some(mgr) = self.decode_rolling.as_ref() else {
+            return;
+        };
+        let keys = mgr.lock().reset_seq(ssm_slot);
+        if let Some(store) = &self.decode_store {
+            for key in keys {
+                store.remove(key);
+            }
+        }
+    }
+
     /// Flat index into the decode-rollback region, with bounds checks.
     fn decode_flat_index(&self, ssm_slot: usize, ring_slot: usize) -> Result<usize> {
         if !self.decode_rollback_enabled() {
