@@ -254,3 +254,41 @@ wrong premises (RDMA UMA relayout, expert-residency, "skip the 2nd pass") before
 they cost a wasted cross-crate change, by reading one comment / checking one
 config / dissecting the phase timeline. When a fix hinges on an unverified cause,
 profile first.
+
+## Model coverage notes (2026-07-08)
+
+### ThinkingCap-Qwen3.6-27B-NVFP4 — VALIDATED
+Dense hybrid (64 layers / 16 attn / 48 SSM / **0 experts**), NVFP4/modelopt,
+loaded via #257 native U8-NVFP4 (no BF16 dequant/requant roundtrip — confirmed
+per-layer in the load log). Real vision tower (`model.visual.blocks.*`, depth=27).
+- **Prefill** (batch=1, no-thinking, prefix-cache off): ~1,100 tok/s @1K →
+  ~1,440 @8K → ~1,375 @16K. Comparable to FP8 Holo; ~5× slower than Holo-NVFP4
+  (dense computes all params every GEMM vs Holo's routed 3B active).
+- **Decode** ~12–14 tok/s — memory-bound dense 27B (reads all params/token vs
+  Holo MoE's 3B-active ~50–75). Architecture gap, not a config issue.
+- **Agentic** (calc/sort/convert): **3/3 PASS**, 391s wall (slow only from ~12
+  tok/s decode; tool-calling/build/verify fully correct).
+- **Vision** (Mona-Lisa probe, `--vision-max-pixels 262144` = 256K px):
+  **PASS** — full recognition ("Mona Lisa by Leonardo da Vinci…"), TTFT 1,104ms,
+  13.6 tok/s. Cap + visual-tower + MRoPE-interleaved all confirmed engaged
+  (`Vision max_pixels cap enabled: 262144`, `100 merged patches encoded`).
+- Serve flags: NVFP4 dense set (ATLAS_CUTLASS_NVFP4_GEMM/SSM_OUT, GDN_FLASHINFER,
+  KV_OVERCOMMIT, FAST_LOAD_PREFETCH_SHARDS), image `atlas-gb10:qwen36`
+  (ATLAS_TARGET_MODEL=qwen3.6-27b), production KV (`--target-kv-tokens 100000`,
+  fp8 KV 6.1 GB @100K). Vision cap knob: `--vision-max-pixels N` /
+  `ATLAS_VISION_MAX_PIXELS`.
+
+### Nemotron-3-Puzzle-75B-A9B-NVFP4 — NOT loadable today (bring-up scoped, deferred)
+Heterogeneous NAS "Puzzle" hybrid (`nemotron_h_puzzle`): 88 blocks
+(`num_hidden_layers: null`, count = `len(layers_block_type)`), irregular
+mamba/moe/attention schedule, DeepSeek-style 512 routed + shared experts
+(`moe_latent_size`), **per-block-varying MoE** (top-k 4/8/22…, per-block
+`moe_intermediate_size` in `block_configs`), GQA 32/2, 256K ctx, NVFP4, no vision,
+2-block MTP head (5.5GB `mtp.safetensors`). Weights cached (68G, ~/.cache +/tank).
+Gaps to serve: (1) dispatch — `nemotron_h_puzzle` unmatched in `factory.rs:93`
+(the `:176` rewrite is test-only); (2) loader assumes uniform scalar
+`moe_intermediate_size`+top-k (`nemotron.rs:57`), never reads `layers_block_type`
+/ per-block `num_experts_per_tok`; (3) null layer-count; (4) shared-expert/latent
++ MTP head loader work. Atlas has the primitives (`nemotron_mamba2`,
+`nemotron_moe`, NVFP4) — bring-up = teach config/loader the per-block schedule +
+add dispatch, then build a target image and GPU-validate. MTP off (no --speculative).
