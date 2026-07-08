@@ -38,10 +38,22 @@ mod stub {
         pub fn connect(_addr: &str, _arena_bytes: u64, _blob_bytes: usize) -> Result<Self> {
             bail!("RDMA snapshot tier not built (needs feature `cuda` + atlas_rdma_verbs)")
         }
+        pub fn connect_paging(_addr: &str, _arena_bytes: u64, _blob_bytes: usize) -> Result<Self> {
+            bail!("RDMA snapshot tier not built (needs feature `cuda` + atlas_rdma_verbs)")
+        }
         pub fn write(&self, _offset: u64, _bytes: &[u8]) -> Result<()> {
             unreachable!("stub RdmaSnapshotArena is never constructed")
         }
         pub fn read(&self, _offset: u64, _out: &mut [u8]) -> Result<()> {
+            unreachable!("stub RdmaSnapshotArena is never constructed")
+        }
+        pub fn paging_put(&self, _key: u64, _bytes: &[u8]) -> Result<()> {
+            unreachable!("stub RdmaSnapshotArena is never constructed")
+        }
+        pub fn paging_get(&self, _key: u64, _out: &mut [u8]) -> Result<bool> {
+            unreachable!("stub RdmaSnapshotArena is never constructed")
+        }
+        pub fn paging_remove(&self, _key: u64) -> Result<()> {
             unreachable!("stub RdmaSnapshotArena is never constructed")
         }
     }
@@ -73,7 +85,10 @@ struct ArenaInner {
     rails: Vec<SnapRail>,
     rr: usize,
     next_wr: u64,
-    _stream: TcpStream, // keep the control connection alive for the QP's lifetime
+    /// In legacy (dumb) mode: kept alive for the QP's lifetime, otherwise idle.
+    /// In paging mode (WS-A): the live control channel — alloc/commit/get/remove
+    /// requests ride this stream, interleaved with the RDMA data plane below.
+    stream: TcpStream,
 }
 
 /// Offset-addressed RDMA snapshot arena. Connect to an `atlas-cache-peer` sized for
@@ -104,6 +119,18 @@ impl RdmaSnapshotArena {
     /// = rail 0, `ATLAS_KV_RAIL2_DEV`/`GID` = rail 1, dual only when
     /// `ATLAS_KV_DUAL_RAIL=1`). `arena_bytes` = `arena_slots × blob_bytes`.
     pub fn connect(addr: &str, arena_bytes: u64, blob_bytes: usize) -> Result<Self> {
+        Self::connect_inner(addr, arena_bytes, blob_bytes, false)
+    }
+
+    /// Paging-mode connect (WS-A): the peer arena becomes a page-cache over an
+    /// NVMe swap file and OWNS residency; this client uses the control channel
+    /// (`paging_put`/`paging_get`/`paging_remove`) instead of a client-side
+    /// allocator. Requires the peer be started with `--swap-dir`.
+    pub fn connect_paging(addr: &str, arena_bytes: u64, blob_bytes: usize) -> Result<Self> {
+        Self::connect_inner(addr, arena_bytes, blob_bytes, true)
+    }
+
+    fn connect_inner(addr: &str, arena_bytes: u64, blob_bytes: usize, paging: bool) -> Result<Self> {
         let dev0 = std::env::var("ATLAS_EXPERT_RDMA_DEV").unwrap_or_else(|_| "roceP2p1s0f1".into());
         let gid0 = env_u32("ATLAS_EXPERT_RDMA_GID", 3);
         let dev1 = std::env::var("ATLAS_KV_RAIL2_DEV").unwrap_or_else(|_| "rocep1s0f1".into());
@@ -119,7 +146,15 @@ impl RdmaSnapshotArena {
         let mut stream =
             TcpStream::connect(addr).map_err(|e| anyhow::anyhow!("connect snapshot peer {addr}: {e}"))?;
         stream.set_nodelay(true).ok();
-        stream.write_all(&arena_bytes.to_le_bytes())?;
+        // Paging clients select the protocol with the magic + blob size; legacy
+        // (dumb one-sided) clients send only arena_bytes. See cache_peer.rs.
+        if paging {
+            stream.write_all(&crate::snapshot_swap::PAGING_MAGIC.to_le_bytes())?;
+            stream.write_all(&arena_bytes.to_le_bytes())?;
+            stream.write_all(&(blob_bytes as u64).to_le_bytes())?;
+        } else {
+            stream.write_all(&arena_bytes.to_le_bytes())?;
+        }
         stream.write_all(&[n_rails as u8])?;
 
         let mut rails: Vec<SnapRail> = Vec::with_capacity(n_rails);
@@ -179,7 +214,7 @@ impl RdmaSnapshotArena {
                 rails,
                 rr: 0,
                 next_wr: 1, // 0 == "no completion yet" sentinel in the poll loop
-                _stream: stream,
+                stream,
             }),
             remote_base: base,
             blob_bytes,
@@ -196,22 +231,36 @@ impl RdmaSnapshotArena {
         if bytes.len() != self.blob_bytes {
             bail!("snapshot write: {} != blob_bytes {}", bytes.len(), self.blob_bytes);
         }
-        let raddr = self.remote_base + offset;
         let mut g = self.inner.lock().expect("snapshot arena mutex");
+        self.rdma_write_locked(&mut g, self.remote_base + offset, bytes)
+    }
+
+    /// RDMA-READ one `blob_bytes` blob from `base + offset` into `out`, drained.
+    pub fn read(&self, offset: u64, out: &mut [u8]) -> Result<()> {
+        if out.len() != self.blob_bytes {
+            bail!("snapshot read: {} != blob_bytes {}", out.len(), self.blob_bytes);
+        }
+        let mut g = self.inner.lock().expect("snapshot arena mutex");
+        self.rdma_read_locked(&mut g, self.remote_base + offset, out)
+    }
+
+    /// Pick a rail (round-robin) and a fresh wr id.
+    fn rail_and_wr(g: &mut ArenaInner) -> (usize, u64) {
         let n = g.rails.len();
         let ri = g.rr % n;
         g.rr = g.rr.wrapping_add(1);
         let wr = g.next_wr;
         g.next_wr = g.next_wr.wrapping_add(1).max(1);
+        (ri, wr)
+    }
+
+    fn rdma_write_locked(&self, g: &mut ArenaInner, raddr: u64, bytes: &[u8]) -> Result<()> {
+        let (ri, wr) = Self::rail_and_wr(g);
         let rail = &mut g.rails[ri];
         // SAFETY: bounce is a live registered MR of blob_bytes; copy the blob in,
         // RDMA-WRITE it to the peer arena, drain the single completion.
         unsafe {
-            std::ptr::copy_nonoverlapping(
-                bytes.as_ptr(),
-                rail.bounce.ptr as *mut u8,
-                self.blob_bytes,
-            );
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), rail.bounce.ptr as *mut u8, self.blob_bytes);
             rail.verbs.post_write(
                 rail.bounce.ptr,
                 rail.lkey,
@@ -225,18 +274,8 @@ impl RdmaSnapshotArena {
         Ok(())
     }
 
-    /// RDMA-READ one `blob_bytes` blob from `base + offset` into `out`, drained.
-    pub fn read(&self, offset: u64, out: &mut [u8]) -> Result<()> {
-        if out.len() != self.blob_bytes {
-            bail!("snapshot read: {} != blob_bytes {}", out.len(), self.blob_bytes);
-        }
-        let raddr = self.remote_base + offset;
-        let mut g = self.inner.lock().expect("snapshot arena mutex");
-        let n = g.rails.len();
-        let ri = g.rr % n;
-        g.rr = g.rr.wrapping_add(1);
-        let wr = g.next_wr;
-        g.next_wr = g.next_wr.wrapping_add(1).max(1);
+    fn rdma_read_locked(&self, g: &mut ArenaInner, raddr: u64, out: &mut [u8]) -> Result<()> {
+        let (ri, wr) = Self::rail_and_wr(g);
         let rail = &mut g.rails[ri];
         // SAFETY: read into the live bounce MR, drain, then copy host-side to out.
         unsafe {
@@ -251,13 +290,46 @@ impl RdmaSnapshotArena {
         }
         while rail.verbs.poll()? != wr {}
         unsafe {
-            std::ptr::copy_nonoverlapping(
-                rail.bounce.ptr as *const u8,
-                out.as_mut_ptr(),
-                self.blob_bytes,
-            );
+            std::ptr::copy_nonoverlapping(rail.bounce.ptr as *const u8, out.as_mut_ptr(), self.blob_bytes);
         }
         Ok(())
+    }
+
+    // ─────────────────────────── paging data path (WS-A) ───────────────────────
+    // The peer owns residency; we ALLOC a slot (control), RDMA-WRITE the blob,
+    // then COMMIT — all under one lock so the peer's single-threaded per-conn
+    // request order is respected. GET faults from the peer's NVMe swap if needed.
+
+    /// PUT `key`'s blob into the tier. Never "full" — the peer spills to NVMe.
+    pub fn paging_put(&self, key: u64, bytes: &[u8]) -> Result<()> {
+        if bytes.len() != self.blob_bytes {
+            bail!("paging_put: {} != blob_bytes {}", bytes.len(), self.blob_bytes);
+        }
+        let mut g = self.inner.lock().expect("snapshot arena mutex");
+        let off = crate::snapshot_swap::client_alloc(&mut g.stream, key)?;
+        self.rdma_write_locked(&mut g, self.remote_base + off, bytes)?;
+        crate::snapshot_swap::client_commit(&mut g.stream, key)
+    }
+
+    /// GET `key`'s blob into `out`. `Ok(false)` = the peer has no such key.
+    pub fn paging_get(&self, key: u64, out: &mut [u8]) -> Result<bool> {
+        if out.len() != self.blob_bytes {
+            bail!("paging_get: {} != blob_bytes {}", out.len(), self.blob_bytes);
+        }
+        let mut g = self.inner.lock().expect("snapshot arena mutex");
+        match crate::snapshot_swap::client_get(&mut g.stream, key)? {
+            Some(off) => {
+                self.rdma_read_locked(&mut g, self.remote_base + off, out)?;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    /// Drop `key` from the peer cache.
+    pub fn paging_remove(&self, key: u64) -> Result<()> {
+        let mut g = self.inner.lock().expect("snapshot arena mutex");
+        crate::snapshot_swap::client_remove(&mut g.stream, key)
     }
 }
 }

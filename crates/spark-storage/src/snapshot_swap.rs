@@ -572,6 +572,76 @@ pub fn run_paging_loop<T: Read + Write, A: SlotArena, S: SwapStore>(
     Ok(())
 }
 
+// ─────────────────────── client-side protocol helpers ───────────────────────
+//
+// The CLIENT half of the control channel, sharing the wire format above so peer
+// and client can never drift. Each sends `[op][u64 key]` and reads the reply.
+// The RDMA data-plane WRITE/READ (client-side) happens between `client_alloc`
+// and `client_commit` (PUT) or after `client_get` (GET) — see RdmaSnapshotArena.
+
+fn send_req<T: Write>(s: &mut T, op: u8, key: u64) -> Result<()> {
+    let mut buf = [0u8; 9];
+    buf[0] = op;
+    buf[1..].copy_from_slice(&key.to_le_bytes());
+    s.write_all(&buf)?;
+    s.flush()?;
+    Ok(())
+}
+
+fn read_status<T: Read>(s: &mut T) -> Result<u8> {
+    let mut st = [0u8; 1];
+    s.read_exact(&mut st).context("read paging status")?;
+    Ok(st[0])
+}
+
+fn read_offset<T: Read>(s: &mut T) -> Result<u64> {
+    let mut b = [0u8; 8];
+    s.read_exact(&mut b).context("read paging offset")?;
+    Ok(u64::from_le_bytes(b))
+}
+
+/// PUT step 1: reserve a slot for `key`; returns the arena offset to RDMA-WRITE.
+pub fn client_alloc<T: Read + Write>(s: &mut T, key: u64) -> Result<u64> {
+    send_req(s, OP_ALLOC, key)?;
+    match read_status(s)? {
+        ST_OK => read_offset(s),
+        st => bail!("paging ALLOC {key:#x} refused (status {st})"),
+    }
+}
+
+/// PUT step 2: the RDMA-WRITE has drained; mark `key` resident.
+pub fn client_commit<T: Read + Write>(s: &mut T, key: u64) -> Result<()> {
+    send_req(s, OP_COMMIT, key)?;
+    match read_status(s)? {
+        ST_OK => Ok(()),
+        st => bail!("paging COMMIT {key:#x} failed (status {st})"),
+    }
+}
+
+/// GET: `Some(offset)` to RDMA-READ, or `None` if the peer has no such key.
+pub fn client_get<T: Read + Write>(s: &mut T, key: u64) -> Result<Option<u64>> {
+    send_req(s, OP_GET, key)?;
+    match read_status(s)? {
+        ST_OK => Ok(Some(read_offset(s)?)),
+        ST_MISS => Ok(None),
+        st => bail!("paging GET {key:#x} error (status {st})"),
+    }
+}
+
+/// Drop `key` from the peer cache.
+pub fn client_remove<T: Read + Write>(s: &mut T, key: u64) -> Result<()> {
+    send_req(s, OP_REMOVE, key)?;
+    match read_status(s)? {
+        ST_OK => Ok(()),
+        st => bail!("paging REMOVE {key:#x} failed (status {st})"),
+    }
+}
+
+/// Politely tell the peer to close the paging loop.
+pub fn client_bye<T: Write>(s: &mut T) -> Result<()> {
+    send_req(s, OP_BYE, 0)
+}
+
 // ─────────────────────────── real peer-mmap arena ───────────────────────────
 
 /// `SlotArena` over the peer's RDMA-registered `mmap` region (a raw base ptr).
@@ -910,6 +980,70 @@ mod tests {
         exp.push(ST_MISS); // get 42
         exp.push(ST_OK); // remove
         assert_eq!(dx.out, exp);
+    }
+
+    /// Client codec: request bytes on the wire + reply decode.
+    #[test]
+    fn client_codec_alloc_get_miss() {
+        // ALLOC → [ST_OK][offset 0x40]
+        let mut reply = vec![ST_OK];
+        reply.extend_from_slice(&0x40u64.to_le_bytes());
+        let mut dx = Duplex { inp: std::io::Cursor::new(reply), out: Vec::new() };
+        let off = client_alloc(&mut dx, 0xAB).unwrap();
+        assert_eq!(off, 0x40);
+        assert_eq!(dx.out, req(OP_ALLOC, 0xAB), "request bytes on the wire");
+
+        // GET miss → [ST_MISS]
+        let mut dx = Duplex { inp: std::io::Cursor::new(vec![ST_MISS]), out: Vec::new() };
+        assert_eq!(client_get(&mut dx, 7).unwrap(), None);
+
+        // COMMIT ok → [ST_OK]
+        let mut dx = Duplex { inp: std::io::Cursor::new(vec![ST_OK]), out: Vec::new() };
+        client_commit(&mut dx, 9).unwrap();
+        assert_eq!(dx.out, req(OP_COMMIT, 9));
+    }
+
+    /// End-to-end loopback: the client codec's request bytes feed the peer
+    /// `dispatch`; the peer's reply bytes feed the client codec — the two halves
+    /// agree on the wire and a PUT→GET round-trips a blob byte-identical (the
+    /// RDMA data plane emulated via direct arena writes at the returned offset).
+    #[test]
+    fn client_peer_loopback_roundtrip() {
+        let mut r = residency(4);
+        // Run one client request through the peer and return the client-decoded
+        // reply channel (a cursor over the peer's reply bytes).
+        fn peer_roundtrip(
+            r: &mut SnapshotResidency<VecArena, MemSwap>,
+            req_bytes: &[u8],
+        ) -> std::io::Cursor<Vec<u8>> {
+            let op = req_bytes[0];
+            let key = u64::from_le_bytes(req_bytes[1..9].try_into().unwrap());
+            let mut reply = Vec::new();
+            write_reply(&mut reply, &dispatch(r, op, key)).unwrap();
+            std::io::Cursor::new(reply)
+        }
+
+        // PUT key 3: ALLOC → emulate RDMA write → COMMIT.
+        let mut wire = Vec::new();
+        send_req(&mut wire, OP_ALLOC, 3).unwrap();
+        let mut rep = peer_roundtrip(&mut r, &wire);
+        assert_eq!(read_status(&mut rep).unwrap(), ST_OK);
+        let off = read_offset(&mut rep).unwrap();
+        r.arena.write_slot((off as usize) / B, &blob(0x77)).unwrap();
+
+        wire.clear();
+        send_req(&mut wire, OP_COMMIT, 3).unwrap();
+        assert_eq!(read_status(&mut peer_roundtrip(&mut r, &wire)).unwrap(), ST_OK);
+
+        // GET key 3 → read back byte-identical.
+        wire.clear();
+        send_req(&mut wire, OP_GET, 3).unwrap();
+        let mut rep = peer_roundtrip(&mut r, &wire);
+        assert_eq!(read_status(&mut rep).unwrap(), ST_OK);
+        let goff = read_offset(&mut rep).unwrap();
+        let mut out = vec![0u8; B];
+        r.arena.read_slot((goff as usize) / B, &mut out).unwrap();
+        assert_eq!(out, blob(0x77), "PUT→GET round-trips byte-identical over the protocol");
     }
 
     /// `MmapSlotArena` over a real page-aligned heap buffer round-trips bytes.

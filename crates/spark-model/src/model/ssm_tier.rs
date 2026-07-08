@@ -197,6 +197,24 @@ pub(crate) fn build_tier_store(blob_bytes: usize) -> std::sync::Arc<dyn Snapshot
             .and_then(|s| s.parse().ok())
             .unwrap_or(512);
         let arena_bytes = slots as u64 * blob_bytes as u64;
+        // WS-A: ATLAS_SSM_SWAP=1 selects PAGING mode — the peer (started with
+        // --swap-dir) owns residency and backs the RAM arena with an NVMe swap
+        // file, giving infinite depth (never drops) shared across clients. Falls
+        // through to the bounded RDMA store / host-RAM on any connect failure.
+        if std::env::var("ATLAS_SSM_SWAP").ok().as_deref() == Some("1") {
+            match spark_storage::RdmaSnapshotArena::connect_paging(&peer, arena_bytes, blob_bytes) {
+                Ok(arena) => {
+                    tracing::info!(
+                        "SSM spill tier = RDMA PAGING peer {peer} ({slots}-slot RAM cache × \
+                         {blob_bytes} B + NVMe swap = infinite depth, peer-owned residency)"
+                    );
+                    return Arc::new(PagingSnapshotStore::new(arena, blob_bytes));
+                }
+                Err(e) => tracing::warn!(
+                    "SSM RDMA paging connect to {peer} failed ({e:#}); trying bounded RDMA"
+                ),
+            }
+        }
         // `connect` errors (and we fall back) both on a real connect failure and
         // in a build without the RDMA verbs (the stub arena always errors).
         match spark_storage::RdmaSnapshotArena::connect(&peer, arena_bytes, blob_bytes) {
@@ -288,6 +306,51 @@ impl SnapshotTransport for spark_storage::RdmaSnapshotArena {
     }
     fn read_blob(&self, offset: u64, out: &mut [u8]) -> Result<()> {
         self.read(offset, out)
+    }
+}
+
+/// WS-A paging-mode store: the PEER owns residency + an NVMe swap file, so this
+/// store just forwards PUT/GET/REMOVE over the arena's control channel. Unlike
+/// [`RdmaSnapshotStore`] (client-side fixed-slot allocator, `Ok(false)` when the
+/// arena fills), a paging PUT **never rejects** — the peer spills the coldest
+/// slot to disk. This is the "infinite depth" tier + shared across clients (one
+/// peer-owned map) that the bounded RDMA/host-RAM stores can't give.
+pub(crate) struct PagingSnapshotStore {
+    arena: spark_storage::RdmaSnapshotArena,
+    blob_bytes: usize,
+}
+
+impl PagingSnapshotStore {
+    pub(crate) fn new(arena: spark_storage::RdmaSnapshotArena, blob_bytes: usize) -> Self {
+        Self { arena, blob_bytes }
+    }
+}
+
+impl SnapshotBlobStore for PagingSnapshotStore {
+    fn put(&self, key: u64, bytes: &[u8]) -> Result<bool> {
+        if bytes.len() != self.blob_bytes {
+            anyhow::bail!("paging put: {} != blob_bytes {}", bytes.len(), self.blob_bytes);
+        }
+        self.arena.paging_put(key, bytes)?;
+        Ok(true) // never full — the peer spills to NVMe
+    }
+    fn get(&self, key: u64, out: &mut [u8]) -> Result<bool> {
+        if out.len() != self.blob_bytes {
+            anyhow::bail!("paging get: {} != blob_bytes {}", out.len(), self.blob_bytes);
+        }
+        self.arena.paging_get(key, out)
+    }
+    fn remove(&self, key: u64) {
+        if let Err(e) = self.arena.paging_remove(key) {
+            tracing::debug!("paging remove {key:#x} failed: {e:#}");
+        }
+    }
+    // Residency lives on the peer (RAM cache + NVMe); the client doesn't track it.
+    fn len(&self) -> usize {
+        0
+    }
+    fn bytes_resident(&self) -> usize {
+        0
     }
 }
 
