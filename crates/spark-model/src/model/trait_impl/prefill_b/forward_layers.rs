@@ -265,13 +265,39 @@ impl TransformerModel {
                 .map(|(i, us)| format!("L{}={:.2}ms", i, *us as f64 / 1000.0))
                 .collect();
             let path_label = if use_decode_path { "decode" } else { "prefill" };
+            // #3 warm-TTFT: split the forward pass by MIXER type. Attention and
+            // SSM layers carry the SAME MoE FFN, so the per-type time difference
+            // isolates the mixer — a large attn-layer share on a ~30-token warm
+            // suffix over ~15K KV confirms the attention-over-long-context
+            // hypothesis (each suffix token attends the full paged KV × N attn
+            // layers × 2 tail-cut passes) vs. MoE/SSM being the wall.
+            let mut attn_us = 0u128;
+            let mut attn_n = 0usize;
+            let mut ssm_us = 0u128;
+            let mut ssm_n = 0usize;
+            for (i, us) in layer_times.iter().copied().enumerate() {
+                if self.config.layer_type(i) == atlas_core::config::LayerType::FullAttention {
+                    attn_us += us;
+                    attn_n += 1;
+                } else {
+                    ssm_us += us;
+                    ssm_n += 1;
+                }
+            }
             tracing::info!(
-                "Prefill chunk {} tok (proc {}, {}): {:.1}ms total, top5: {}",
+                "Prefill chunk {} tok (proc {}, {}): {:.1}ms total, top5: {} | \
+                 mixer split: attn {:.1}ms ({} layers, {:.2}ms/layer) vs ssm {:.1}ms ({} layers, {:.2}ms/layer)",
                 chunk_len,
                 proc_count,
                 path_label,
                 total_us as f64 / 1000.0,
                 top5.join(", "),
+                attn_us as f64 / 1000.0,
+                attn_n,
+                if attn_n > 0 { attn_us as f64 / 1000.0 / attn_n as f64 } else { 0.0 },
+                ssm_us as f64 / 1000.0,
+                ssm_n,
+                if ssm_n > 0 { ssm_us as f64 / 1000.0 / ssm_n as f64 } else { 0.0 },
             );
         }
         Ok(())
