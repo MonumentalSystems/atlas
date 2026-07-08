@@ -123,6 +123,22 @@ point for a fresh session to blast out the remaining greenlit tasks. See memory:
   NOTE: the decode-rollback ring (4080 MB here) is separate (#12) and does NOT
   shrink with this.
 
+### #12 decode-rollback ring — UMA offload knob measured (2026-07-08)
+- The ring scales `DECODE_ROLLBACK_RING_SLOTS(8) × max_batch × layers × (h+conv)`
+  = 4080 MB at C=8, **~32 GB at C=64** — pure HBM, and it's ONLY used by the
+  Phase-C re-steer watchdog (writes = one D2D copy per sentence boundary; reads =
+  rare rollback). `ATLAS_SSM_DECODE_RING_UMA=1` allocates it in GB10 unified
+  (managed) memory (`alloc_managed`/`cuMemAllocManaged`) instead of the GPU pool.
+- **A/B (Holo-3.1-35B, C=8, decode-heavy 256-tok gens): HBM 37.31 vs UMA 35.14
+  tok/s = ~5.8% slower** (identical token counts, both 8/8 ok). NOT free — managed
+  D2D is slower than HBM→HBM (cuMemAllocManaged ≠ the pinned-UMA KV zero-copy
+  uses). Single-run each; decode-heavy = worst case for the per-boundary cost.
+- **Verdict:** OFF by default (env knob). It's the escape valve for high-C where
+  the 32 GB HBM ring would OOM / starve KV — there ~6% decode buys the HBM to run
+  the concurrency (or feed KV). At low C, keep it HBM. The `rollback_resteer` gate
+  was dropped (re-steer is always on). A hot-slot-HBM / cold-slot-spill "rolling"
+  design could cut the ~6% but is materially more complex — not pursued yet.
+
 ### Resident Marconi pool shrink (UNBLOCKED — eviction pin is live)
 - With the tier + the GET→RDMA-read eviction pin deployed, the resident Marconi
   pool is a hot cache in front of the infinite-depth spill tier — it no longer

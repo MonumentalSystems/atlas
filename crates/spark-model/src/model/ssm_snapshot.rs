@@ -149,10 +149,39 @@ impl SsmSnapshotPool {
         } else {
             0
         };
+        // The decode-rollback ring scales as `decode_max_seqs × ring_slots ×
+        // layers × (h+conv)` — ~4 GB at C=8, ~32 GB at C=64 — yet it is touched
+        // only at sentence boundaries (one D2D snapshot copy) and read only on a
+        // rare watchdog rollback. `ATLAS_SSM_DECODE_RING_UMA=1` allocates it in
+        // GB10 unified (managed) memory instead of the HBM/GPU pool, moving that
+        // budget off the KV-competing pool onto the same physical LPDDR. The
+        // device-side save/restore copies address a managed `DevicePtr`
+        // identically, so nothing downstream changes.
+        //
+        // MEASURED COST (Holo-3.1-35B, C=8, decode-heavy 256-tok gens, 2026-07-08):
+        // ~5.8% decode throughput (37.31 → 35.14 tok/s) — the per-boundary D2D
+        // copy into managed memory is slower than HBM→HBM (cuMemAllocManaged is
+        // not the pinned-UMA the KV zero-copy path uses). So this is OFF by
+        // default: it's the escape valve for high-C, where the ring would
+        // otherwise be tens of GB of HBM (32 GB at C=64) — trading ~6% decode for
+        // the HBM to run that concurrency at all (or to give it to KV) is the win
+        // there, NOT at low C where HBM isn't the binding constraint.
+        let ring_uma = std::env::var_os("ATLAS_SSM_DECODE_RING_UMA").is_some();
         if decode_enabled {
             for _ in 0..num_ssm_layers {
-                decode_h_snapshots.push(gpu.alloc(decode_region * h_bytes)?);
-                decode_conv_snapshots.push(gpu.alloc(decode_region * conv_bytes)?);
+                let (h, c) = if ring_uma {
+                    (
+                        gpu.alloc_managed(decode_region * h_bytes)?,
+                        gpu.alloc_managed(decode_region * conv_bytes)?,
+                    )
+                } else {
+                    (
+                        gpu.alloc(decode_region * h_bytes)?,
+                        gpu.alloc(decode_region * conv_bytes)?,
+                    )
+                };
+                decode_h_snapshots.push(h);
+                decode_conv_snapshots.push(c);
             }
         }
 
@@ -166,7 +195,8 @@ impl SsmSnapshotPool {
         tracing::info!(
             "SSM snapshot pool: Marconi {num_slots} slots ({marconi_mb} MB), \
              decode-rollback {decode_ring_slots} slots × {decode_max_seqs} seqs \
-             ({decode_mb} MB), {num_ssm_layers} layers",
+             ({decode_mb} MB, {}), {num_ssm_layers} layers",
+            if ring_uma { "UMA/managed" } else { "HBM" },
         );
 
         Ok(Self {
