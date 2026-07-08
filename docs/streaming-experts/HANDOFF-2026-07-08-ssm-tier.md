@@ -109,6 +109,20 @@ point for a fresh session to blast out the remaining greenlit tasks. See memory:
 - **#13 — graphs-on production tok/s.** Every number so far is a profiling floor.
   Gotcha: spark serve wedges on SIGTERM → `kill -9` measurement servers.
 
+### Resident Marconi pool shrink (UNBLOCKED — eviction pin is live)
+- With the tier + the GET→RDMA-read eviction pin deployed, the resident Marconi
+  pool is a hot cache in front of the infinite-depth spill tier — it no longer
+  needs to hold every live conversation's whole checkpoint chain (PR #278's
+  reason for `--ssm-cache-slots 256` / 16 GB). **Guidance: run a small resident
+  pool + tier**, e.g. `--ssm-cache-slots 8–32` (0.5–2 GB) with
+  `ATLAS_SSM_TIER=1` (+ `ATLAS_SSM_SWAP=1 ATLAS_SSM_RDMA_TIER=…:9920` for the
+  shared RDMA tier), reclaiming ~14–15 GB HBM. GPU-proven: a 4-slot pool + tier
+  reproduced the 256-slot hit behavior coherently (18/18, 12 fault-ins). The #5
+  cost gate (`ATLAS_SSM_FAULT_MIN_TOKENS`) keeps a shrunk pool from faulting
+  shallow prefixes cheaper to recompute. **Multi-model is now safe** (the
+  eviction pin closed the concurrent-ALLOC race). Size the pool to
+  ~checkpoints-restored-per-warm-turn + concurrency headroom, not chain×sessions.
+
 ### WS-A loose ends (before multi-tenant / to finish item 8)
 - **GET→RDMA-read eviction pin.** `run_paging_loop_shared` releases the residency
   Mutex before the client's one-sided RDMA-READ; a concurrent ALLOC (another
