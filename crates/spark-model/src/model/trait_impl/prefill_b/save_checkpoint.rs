@@ -39,8 +39,16 @@ impl TransformerModel {
         // additionally fire at chunk boundaries that are interval-block
         // multiples (with full-size chunks that granularity is coarse — the
         // tail checkpoints + leaf carry the warm path).
+        // TAIL ZONE (2026-07-08): a snapshot save fires at ANY block boundary
+        // within `TAIL_ZONE_BLOCKS` below the prompt tail — so the tail-clustered
+        // ladder's rungs (`last - i*bs`, `prefill_chunk_dispatch`) each save.
+        // Normal single-shot prefill has no NON-last chunk ending in this zone,
+        // so it never fires spuriously. Widened from the old two-boundary check.
+        const TAIL_ZONE_BLOCKS: usize = 128;
         let tail = (tokens.len().saturating_sub(1) / bs) * bs;
-        let is_prompt_tail = end_token == tail || (tail >= bs && end_token == tail - bs);
+        let is_prompt_tail = end_token <= tail
+            && end_token.is_multiple_of(bs)
+            && tail - end_token <= TAIL_ZONE_BLOCKS * bs;
         let on_interval = self.ssm_checkpoint_interval > 0
             && end_block.is_multiple_of(self.ssm_checkpoint_interval);
         if end_block == 0 || !(is_prompt_tail || on_interval) {
