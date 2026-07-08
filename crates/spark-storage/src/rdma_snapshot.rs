@@ -78,11 +78,18 @@ struct SnapRail {
     bounce: PinnedBuffer,
     lkey: u32,
     remote_rkey: u32,
+    /// lkey for the SHARED striped-staging buffer registered on THIS rail (0 if
+    /// staging disabled). Every rail registers the SAME contiguous staging
+    /// buffer, so whichever rail fetches a chunk it lands at its true offset.
+    staging_lkey: u32,
 }
 
 /// Mutable rail state, serialized under one lock (the trait exposes `&self`).
 struct ArenaInner {
     rails: Vec<SnapRail>,
+    /// ONE contiguous `blob_bytes` staging buffer for the striped/pipelined
+    /// dual-rail path (ATLAS_SSM_STAGING); None = single-WR bounce fallback.
+    staging: Option<PinnedBuffer>,
     rr: usize,
     next_wr: u64,
     /// In legacy (dumb) mode: kept alive for the QP's lifetime, otherwise idle.
@@ -157,6 +164,12 @@ impl RdmaSnapshotArena {
         }
         stream.write_all(&[n_rails as u8])?;
 
+        // ONE contiguous staging buffer (ATLAS_SSM_STAGING) registered on EVERY
+        // rail → each rail gets its own lkey over the SAME memory, so a chunk
+        // striped to any rail lands at its true offset (the inc-6 reassembly fix).
+        let staging_on = std::env::var("ATLAS_SSM_STAGING").ok().as_deref() == Some("1");
+        let staging = if staging_on { Some(PinnedBuffer::new(blob_bytes)?) } else { None };
+
         let mut rails: Vec<SnapRail> = Vec::with_capacity(n_rails);
         for (dev, gid) in &rail_devs {
             let psn = rand::random::<u32>() & 0xff_ffff;
@@ -165,11 +178,19 @@ impl RdmaSnapshotArena {
             // SAFETY: bounce lives as long as the rail (and thus the MR); local
             // read (remote_read=false — we WRITE from it and READ into it).
             let keys = unsafe { verbs.reg_mr(bounce.ptr, blob_bytes, false)? };
+            // Register the SHARED staging buffer on this rail (local-write, same
+            // access as the bounce). SAFETY: staging outlives the rail (both live
+            // in ArenaInner, dropped together).
+            let staging_lkey = match &staging {
+                Some(s) => unsafe { verbs.reg_mr(s.ptr, blob_bytes, false)?.lkey },
+                None => 0,
+            };
             rails.push(SnapRail {
                 verbs,
                 bounce,
                 lkey: keys.lkey,
                 remote_rkey: 0,
+                staging_lkey,
             });
         }
 
@@ -212,6 +233,7 @@ impl RdmaSnapshotArena {
         Ok(Self {
             inner: Mutex::new(ArenaInner {
                 rails,
+                staging,
                 rr: 0,
                 next_wr: 1, // 0 == "no completion yet" sentinel in the poll loop
                 stream,
@@ -255,6 +277,9 @@ impl RdmaSnapshotArena {
     }
 
     fn rdma_write_locked(&self, g: &mut ArenaInner, raddr: u64, bytes: &[u8]) -> Result<()> {
+        if g.staging.is_some() {
+            return self.rdma_staged(g, raddr, Some(bytes), None);
+        }
         let (ri, wr) = Self::rail_and_wr(g);
         let rail = &mut g.rails[ri];
         // SAFETY: bounce is a live registered MR of blob_bytes; copy the blob in,
@@ -275,6 +300,9 @@ impl RdmaSnapshotArena {
     }
 
     fn rdma_read_locked(&self, g: &mut ArenaInner, raddr: u64, out: &mut [u8]) -> Result<()> {
+        if g.staging.is_some() {
+            return self.rdma_staged(g, raddr, None, Some(out));
+        }
         let (ri, wr) = Self::rail_and_wr(g);
         let rail = &mut g.rails[ri];
         // SAFETY: read into the live bounce MR, drain, then copy host-side to out.
@@ -291,6 +319,69 @@ impl RdmaSnapshotArena {
         while rail.verbs.poll()? != wr {}
         unsafe {
             std::ptr::copy_nonoverlapping(rail.bounce.ptr as *const u8, out.as_mut_ptr(), self.blob_bytes);
+        }
+        Ok(())
+    }
+
+    /// Striped, pipelined, dual-rail transfer of ONE blob through the shared
+    /// contiguous staging buffer (ATLAS_SSM_STAGING). `write_src` set = WRITE
+    /// (memcpy in, stripe out); `read_dst` set = READ (stripe in, memcpy out).
+    /// Chunks round-robin across rails, ≤ depth in-flight per rail (bounds the
+    /// send queue). Because every rail registers the SAME staging buffer, chunk
+    /// j lands at its true offset regardless of rail → one memcpy reassembles.
+    fn rdma_staged(
+        &self,
+        g: &mut ArenaInner,
+        raddr: u64,
+        write_src: Option<&[u8]>,
+        read_dst: Option<&mut [u8]>,
+    ) -> Result<()> {
+        let staging = g.staging.as_ref().expect("staging present").ptr as *mut u8;
+        let is_read = read_dst.is_some();
+        if let Some(src) = write_src {
+            // WRITE: assemble the whole blob into staging first.
+            unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), staging, self.blob_bytes) };
+        }
+        let n = g.rails.len();
+        let chunk = crate::snapshot_swap::staging_chunk_bytes();
+        let depth = crate::snapshot_swap::staging_depth();
+        let plan = crate::snapshot_swap::stripe_plan(self.blob_bytes, chunk, n);
+        let total: usize = plan.iter().map(|w| w.len()).sum();
+        let mut posted = vec![0usize; n];
+        let mut reaped = vec![0usize; n];
+        let mut done = 0usize;
+        while done < total {
+            // Post up to `depth` in-flight per rail (bounds each SQ).
+            for ri in 0..n {
+                while posted[ri] < plan[ri].len() && (posted[ri] - reaped[ri]) < depth {
+                    let (off, len) = plan[ri][posted[ri]];
+                    let wr = g.next_wr;
+                    g.next_wr = g.next_wr.wrapping_add(1).max(1);
+                    let rail = &mut g.rails[ri];
+                    let local = unsafe { staging.add(off) } as *mut _;
+                    let raddr_chunk = raddr + off as u64;
+                    unsafe {
+                        if is_read {
+                            rail.verbs.post_read(local, rail.staging_lkey, raddr_chunk, rail.remote_rkey, len as u32, wr)?;
+                        } else {
+                            rail.verbs.post_write(local, rail.staging_lkey, raddr_chunk, rail.remote_rkey, len as u32, wr)?;
+                        }
+                    }
+                    posted[ri] += 1;
+                }
+            }
+            // Reap one completion from each rail with work outstanding.
+            for ri in 0..n {
+                if posted[ri] > reaped[ri] {
+                    g.rails[ri].verbs.poll()?;
+                    reaped[ri] += 1;
+                    done += 1;
+                }
+            }
+        }
+        if let Some(dst) = read_dst {
+            // READ: one memcpy reassembles (every chunk is at its true offset).
+            unsafe { std::ptr::copy_nonoverlapping(staging as *const u8, dst.as_mut_ptr(), self.blob_bytes) };
         }
         Ok(())
     }
