@@ -39,11 +39,11 @@ pub fn build_model(
     kv_dtype: KvCacheDtype,
     inference_reserve: usize,
     gpu_memory_utilization: f64,
-    // `--kv-cache-gb`: size the KV cache to this many bytes DIRECTLY instead of
-    // deriving it from `gpu_memory_utilization`. `None` = util-derived (default,
-    // byte-identical). Still clamped to actually-free memory so a too-large
-    // target degrades to a warning instead of OOMing.
-    kv_cache_target_bytes: Option<usize>,
+    // `--target-kv-tokens`: when > 0, size the KV pool to hold exactly this many
+    // tokens (rounded up to whole blocks) and validate it fits, instead of
+    // deriving the budget from `gpu_memory_utilization`. 0 = util-derived
+    // (default, byte-identical).
+    target_kv_tokens: usize,
     ssm_cache_slots: usize,
     layer_dtypes: Vec<KvCacheDtype>,
     ssm_checkpoint_interval: usize,
@@ -373,36 +373,10 @@ pub fn build_model(
         }
     }
     let total_budget = (total_mem as f64 * gpu_memory_utilization) as usize;
-    let free_for_kv = actual_free.saturating_sub(inference_reserve);
-    let kv_budget = match kv_cache_target_bytes {
-        // `--kv-cache-gb`: honor the explicit KV-cache size target, clamped to
-        // free memory (minus the inference reserve) so an oversized target
-        // degrades to a warning + best-effort fit rather than OOMing at load.
-        Some(target) => {
-            let clamped = target.min(free_for_kv);
-            if clamped < target {
-                tracing::warn!(
-                    "--kv-cache-gb target {:.1} GB exceeds free memory ({:.1} GB after reserve); \
-                     clamping KV cache to {:.1} GB",
-                    gib(target),
-                    gib(free_for_kv),
-                    gib(clamped),
-                );
-            } else {
-                tracing::info!(
-                    "--kv-cache-gb: sizing KV cache to explicit target {:.1} GB \
-                     (ignoring gpu-memory-utilization {:.0}% for KV)",
-                    gib(clamped),
-                    gpu_memory_utilization * 100.0,
-                );
-            }
-            clamped
-        }
-        None => total_budget
-            .saturating_sub(used_so_far)
-            .saturating_sub(inference_reserve)
-            .min(free_for_kv),
-    };
+    let kv_budget = total_budget
+        .saturating_sub(used_so_far)
+        .saturating_sub(inference_reserve)
+        .min(actual_free.saturating_sub(inference_reserve));
     // Phase 6.1.f: when HBM-shrink is active, size the production cache to
     // `max_batch_size × cache_blocks_per_seq` rather than the unbounded
     // budget-driven sum. This is the *whole point* of the HBM-shrink
@@ -442,6 +416,31 @@ pub fn build_model(
                 max_batch_size
             );
             n
+        }
+        None if target_kv_tokens > 0 => {
+            // Auto-provision: size the pool to the requested token target (rounded
+            // up to whole blocks) and validate it fits in free memory after
+            // weights/buffers/reserve — no --gpu-memory-utilization guesswork.
+            let want_blocks = target_kv_tokens.div_ceil(kv_block_size);
+            let want_bytes = want_blocks * kv_config.block_bytes_kv_all_layers();
+            let avail = actual_free.saturating_sub(inference_reserve);
+            if want_bytes > avail {
+                anyhow::bail!(
+                    "--target-kv-tokens {} needs {:.1} GB for KV ({} blocks × {} tok/block) but only \
+                     {:.1} GB is free after weights+buffers+reserve ({:.1} GB reserve). Lower \
+                     --target-kv-tokens or free GPU memory.",
+                    target_kv_tokens, gib(want_bytes), want_blocks, kv_block_size,
+                    gib(avail), gib(inference_reserve),
+                );
+            }
+            tracing::info!(
+                "KV cache: --target-kv-tokens {} → {} blocks × {} tok/block = {} max KV tokens \
+                 ({:.1} GB), auto-provisioned ({:.1} GB free after reserve; --gpu-memory-utilization \
+                 ignored for KV sizing)",
+                target_kv_tokens, want_blocks, kv_block_size, want_blocks * kv_block_size,
+                gib(want_bytes), gib(avail),
+            );
+            want_blocks
         }
         None => {
             if kv_budget == 0 {

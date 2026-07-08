@@ -153,7 +153,7 @@ mod tests {
             KvCacheDtype::Fp8,
             1024 * 1024 * 1024,
             0.90,
-            None, // kv_cache_target_bytes
+            0, // target_kv_tokens
             0,
             vec![],
             0,

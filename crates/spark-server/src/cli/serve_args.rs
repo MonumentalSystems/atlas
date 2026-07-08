@@ -86,14 +86,14 @@ pub struct ServeArgs {
     #[arg(long, default_value_t = 0.90)]
     pub gpu_memory_utilization: f64,
 
-    /// Size the KV cache to this many GiB DIRECTLY, overriding the
-    /// `--gpu-memory-utilization`-derived budget for KV (weights/buffers/SSM
-    /// pool still respect the util cap). Use for reproducible over-core testing:
-    /// pin a fixed KV budget, then measure how much HBM a small SSM-snapshot
-    /// pool + spill tier frees. Clamped to actually-free memory (a too-large
-    /// target warns + best-effort fits). Unset / 0 = util-derived (default).
-    #[arg(long)]
-    pub kv_cache_gb: Option<f64>,
+    /// Target KV-cache capacity in TOKENS. When > 0, the KV pool is sized to
+    /// hold exactly this many tokens (rounded up to whole blocks) and validated
+    /// against free memory after weights+buffers+reserve, ignoring
+    /// `--gpu-memory-utilization` for KV sizing. Lets you say "give me N KV
+    /// tokens" and auto-provision, skipping the gpu-mem guesswork. 0 =
+    /// util-derived (default).
+    #[arg(long, default_value_t = 0)]
+    pub target_kv_tokens: usize,
 
     /// Maximum concurrent sequences.
     #[arg(long, default_value_t = 128)]
