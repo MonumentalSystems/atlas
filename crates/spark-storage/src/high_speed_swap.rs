@@ -89,6 +89,17 @@ pub struct HighSpeedSwap {
     /// `prefetch_stream` after the read, wait on the main stream before the
     /// next attend) becomes mandatory.
     kv_war_event: CudaEvent,
+    /// #11-refinement: MIRROR-RAW twin of `kv_war_event`, exactly the follow-up
+    /// pre-specified in the kv_war_event doc above. Recorded on `prefetch_stream`
+    /// AFTER the prefetch H2D (in prefetch_layer_on_stream), waited on the MAIN
+    /// stream at attend(L+1)'s tile-phase entry. Closes attend-reads-before-H2D-
+    /// lands device-side so read_async can drop its terminal host stream_sync.
+    /// One event suffices: at most one prefetch outstanding (issued at boundary L,
+    /// consumed+unpinned by attend L+1 before boundary L+1); the C-seq fan-out is
+    /// sequential on the single in-order prefetch_stream so the last record
+    /// dominates every seq's H2D; cuStreamWaitEvent snapshots at enqueue so a
+    /// later re-record can't perturb an enqueued wait — same argument as kv_war_event.
+    kv_prefetch_done: CudaEvent,
     /// #11: mirrors the scheduler's `ATLAS_KV_PREFETCH` switch (read once at
     /// construction; decode_a2.rs gates the actual prefetch on the same var).
     /// Now used ONLY to gate the empty-read skip in the batched-attend union
@@ -400,6 +411,10 @@ impl HighSpeedSwap {
         // perturb bytes; unconditional creation avoids a second Option branch.
         // HSS is only built when a swap pool exists, so a CUDA context is live.
         let kv_war_event = CudaEvent::new()?;
+        // #11-refinement: MIRROR-RAW completion event (see field doc), created
+        // unconditionally like `kv_war_event`; inert (never recorded/waited) when
+        // prefetch is off.
+        let kv_prefetch_done = CudaEvent::new()?;
         // Same var decode_a2.rs gates prefetch on; read once here so the batched
         // attend can skip io_uring's unconditional empty-read drain only when the
         // event fence replaces it (see field docs).
@@ -418,6 +433,7 @@ impl HighSpeedSwap {
             batch,
             prefetch_stream,
             kv_war_event,
+            kv_prefetch_done,
             kv_prefetch_enabled,
             disk_state,
         })

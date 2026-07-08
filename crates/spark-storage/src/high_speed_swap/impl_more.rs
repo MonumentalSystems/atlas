@@ -335,6 +335,15 @@ impl HighSpeedSwap {
         lbvs: i32,
     ) -> Result<()> {
         let c = seqs.len();
+        // #11-refinement: consume the async prefetch's mirror-RAW event. The
+        // producer (prefetch_layer_on_stream) recorded `kv_prefetch_done` on
+        // `prefetch_stream` after the prefetched H2D; wait it DEVICE-side here so
+        // this attend's slot reads see the landed bytes. The host does NOT block
+        // (unlike the old terminal stream_sync inside backend.read). Gated on
+        // prefetch so prefetch-OFF emits zero ops (byte-identity).
+        if self.kv_prefetch_enabled {
+            self.kv_prefetch_done.wait(stream)?;
+        }
         let tile_cap = self.cfg.resident_blocks as usize;
         let q_row_elems = self.model.num_q_heads as usize * self.model.head_dim as usize;
         let q_row_bytes = q_row_elems * 2; // BF16
@@ -569,6 +578,13 @@ impl HighSpeedSwap {
         last_block_valid_slots: i32,
     ) -> Result<()> {
         // 3. Tile loop.
+        // #11-refinement: consume the async prefetch's mirror-RAW event before
+        // any pool read on the main stream (see attend_tile_phase_batched).
+        // Device-side wait; host does not block. `begin_step` doesn't touch the
+        // pool, so gating here covers every subsequent `step_tile` slot read.
+        if self.kv_prefetch_enabled {
+            self.kv_prefetch_done.wait(stream)?;
+        }
         self.attn
             .begin_step_on_stream(&self.scratch[seq_slot].planes, stream, 1)?;
         let tile_cap = self.cfg.resident_blocks as usize;
@@ -737,8 +753,16 @@ impl HighSpeedSwap {
             // CPU does not block. `reqs` non-empty ⟺ ≥1 `assign` ⟺ ≥1 slot
             // about to be overwritten — exactly when the fence is needed. A
             // pins-only prefetch (empty `reqs`) never waits.
-            self.kv_war_event.wait(stream)?;
-            self.backend.read(&reqs, stream)?;
+            self.kv_war_event.wait(stream)?; // #11 WAR — UNCHANGED
+            // #11-refinement: fully-async prefetch — enqueue the tier read + H2D
+            // on `prefetch_stream` WITHOUT a terminal host stream_sync (the
+            // decode host thread must not block on main compute here). Mirror-RAW
+            // is then closed device-side: record `kv_prefetch_done` on this
+            // in-order stream AFTER the H2D, and the NEXT attend waits it
+            // cross-stream on the main stream. Staging/bounce reuse is made safe
+            // internally by each async backend (per-bounce copy events + FIFO).
+            self.backend.read_async(&reqs, stream)?;
+            self.kv_prefetch_done.record(stream)?;
         }
         Ok(())
     }

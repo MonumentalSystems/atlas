@@ -33,6 +33,21 @@ pub trait StorageBackend: Send + Sync {
     /// can issue subsequent kernels that depend on the data.
     fn read(&mut self, requests: &[ReadRequest], stream: u64) -> Result<()>;
 
+    /// Async variant of `read` (#11-refinement): enqueue the tier read + H2D on
+    /// `stream` and return WITHOUT a terminal host `stream_sync`. Mirror-RAW is
+    /// the CALLER's job — HighSpeedSwap records `kv_prefetch_done` on this
+    /// in-order stream right after this returns and the consumer waits it
+    /// cross-stream, so the decode host thread never blocks on main compute at
+    /// the prefetch boundary. Staging/bounce reuse MUST be made safe INTERNALLY
+    /// (per-buffer completion events + FIFO reuse), NOT by a host sync.
+    ///
+    /// Default = the synchronous `read` (correct, just not async), so posix and
+    /// any future backend need no change and the on-demand `read` path stays
+    /// byte-identical.
+    fn read_async(&mut self, requests: &[ReadRequest], stream: u64) -> Result<()> {
+        self.read(requests, stream)
+    }
+
     /// One-shot sequential write — used at offload time to populate disk
     /// from a host-side K/V buffer.
     fn write_from_host(&mut self, key: GroupKey, src: &[u8]) -> Result<()>;

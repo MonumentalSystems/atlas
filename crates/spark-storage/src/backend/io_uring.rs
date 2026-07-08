@@ -109,8 +109,19 @@ impl IoUringBackend {
     }
 }
 
-impl StorageBackend for IoUringBackend {
-    fn read(&mut self, requests: &[ReadRequest], stream: u64) -> Result<()> {
+impl IoUringBackend {
+    /// Body shared by `read` (sync) and `read_async`. When `sync_at_end` is
+    /// true it is textually the pre-#11-refinement `read`: terminal `stream_sync`
+    /// + event wipe. When false (async prefetch), it drops BOTH — the persistent
+    /// per-buffer `self.events` are kept so `wait_buffer_free` gates cross-call
+    /// bounce reuse device-side without a host sync, and mirror-RAW is closed by
+    /// the caller's `kv_prefetch_done`.
+    fn read_inner(
+        &mut self,
+        requests: &[ReadRequest],
+        stream: u64,
+        sync_at_end: bool,
+    ) -> Result<()> {
         let bytes = self.layout.group_bytes() as u32;
         // user_data layout: high 16 bits = req index, low 16 bits = buf index.
         // (We never submit > 65k requests in one batch.)
@@ -171,14 +182,33 @@ impl StorageBackend for IoUringBackend {
                 completed += 1;
             }
         }
-        // After all reads have produced device data, finalise the stream
-        // (matches PosixBackend semantics: at return, the stream is synced).
-        stream_sync(stream)?;
-        // Drop now-completed events; they are useful only across calls.
-        for slot in self.events.iter_mut() {
-            *slot = None;
+        if sync_at_end {
+            // After all reads have produced device data, finalise the stream
+            // (matches PosixBackend semantics: at return, the stream is synced).
+            stream_sync(stream)?;
+            // Drop now-completed events; they are useful only across calls.
+            // (Async path KEEPS them so wait_buffer_free gates the next call's
+            // bounce reuse without a host sync.)
+            for slot in self.events.iter_mut() {
+                *slot = None;
+            }
         }
         Ok(())
+    }
+}
+
+impl StorageBackend for IoUringBackend {
+    fn read(&mut self, requests: &[ReadRequest], stream: u64) -> Result<()> {
+        // Byte-identical to the pre-refinement path: records per-buffer events,
+        // terminal stream_sync, then wipes the events.
+        self.read_inner(requests, stream, true)
+    }
+
+    fn read_async(&mut self, requests: &[ReadRequest], stream: u64) -> Result<()> {
+        // No terminal host sync: the H2Ds stay in flight on `stream`, mirror-RAW
+        // is closed by the caller's `kv_prefetch_done`, and cross-call bounce
+        // reuse is gated by the persisted per-buffer events via wait_buffer_free.
+        self.read_inner(requests, stream, false)
     }
 
     fn write_from_host(&mut self, key: GroupKey, src: &[u8]) -> Result<()> {
@@ -263,6 +293,72 @@ mod tests {
             stream_sync(_ctx.stream).unwrap();
             assert_eq!(&got, expected);
         }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// #11-refinement: `read_async` (no terminal host `stream_sync`) must land
+    /// byte-identical data to `read`, AND its persisted per-buffer events must
+    /// gate cross-call bounce reuse without a host sync. We force reuse by using
+    /// qd (2) < requests (4), then issue TWO back-to-back `read_async` calls (the
+    /// second reuses buffers the first left in flight — `wait_buffer_free` on the
+    /// persisted events is the only thing preventing an H2D-vs-refill race). A
+    /// caller-side `stream_sync` (standing in for the HSS `kv_prefetch_done`
+    /// consumer) precedes each readback. Any missing reuse gate → corruption.
+    #[test]
+    #[ignore = "requires GPU"]
+    fn read_async_matches_read_and_reuses_bounces_safely() {
+        let _ctx = CudaCtx::new(0).expect("cuda init");
+        let dir = tempdir("async-rt");
+        // 4 blocks, qd=2 so every batch laps the 2-buffer ring at least twice.
+        let spec = GroupLayout::new(1, 4, 1, 16, 128, 2, 4096);
+        let layout = Layout::create(&dir, spec).unwrap();
+        let mut backend = IoUringBackend::new(layout, 2).unwrap();
+        let bytes = backend.layout().group_bytes() as usize;
+        let patterns: Vec<(GroupKey, Vec<u8>)> = (0..4u32)
+            .map(|b| {
+                let k = GroupKey::new(0, b, 0, KvKind::K);
+                let pat: Vec<u8> = (0..bytes).map(|i| ((i * 3 + b as usize) & 0xFF) as u8).collect();
+                (k, pat)
+            })
+            .collect();
+        for (k, p) in &patterns {
+            backend.write_from_host(*k, p).unwrap();
+        }
+        backend.drop_pagecache();
+
+        let readback = |backend: &mut IoUringBackend, dev: &[DeviceBuffer], async_mode: bool| {
+            let reqs: Vec<ReadRequest> = patterns
+                .iter()
+                .zip(dev)
+                .map(|((k, _), d)| ReadRequest {
+                    group: *k,
+                    dst_dev_ptr: d.ptr,
+                })
+                .collect();
+            if async_mode {
+                backend.read_async(&reqs, _ctx.stream).unwrap();
+                // Stand in for the HSS kv_prefetch_done consumer: the async path
+                // does NOT sync, so the caller must before reading device memory.
+                stream_sync(_ctx.stream).unwrap();
+            } else {
+                backend.read(&reqs, _ctx.stream).unwrap();
+            }
+            for ((_, expected), d) in patterns.iter().zip(dev) {
+                let mut got = vec![0_u8; bytes];
+                copy_d_to_h_async(got.as_mut_ptr() as *mut c_void, d.ptr, bytes, _ctx.stream)
+                    .unwrap();
+                stream_sync(_ctx.stream).unwrap();
+                assert_eq!(&got, expected, "read_async landed wrong bytes");
+            }
+        };
+
+        let dev_sync: Vec<DeviceBuffer> = patterns.iter().map(|_| DeviceBuffer::new(bytes).unwrap()).collect();
+        let dev_a: Vec<DeviceBuffer> = patterns.iter().map(|_| DeviceBuffer::new(bytes).unwrap()).collect();
+        let dev_b: Vec<DeviceBuffer> = patterns.iter().map(|_| DeviceBuffer::new(bytes).unwrap()).collect();
+
+        readback(&mut backend, &dev_sync, false); // sync oracle
+        readback(&mut backend, &dev_a, true); // async, first call (persists events)
+        readback(&mut backend, &dev_b, true); // async, reuses buffers across calls
         std::fs::remove_dir_all(&dir).ok();
     }
 }

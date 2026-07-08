@@ -36,7 +36,7 @@ use std::net::TcpStream;
 use anyhow::{Context, Result, bail};
 
 use crate::backend::{ReadRequest, StorageBackend};
-use crate::cuda_min::{PinnedBuffer, copy_h_to_d_async, stream_sync};
+use crate::cuda_min::{CudaEvent, PinnedBuffer, copy_h_to_d_async, stream_sync};
 use crate::expert_peer::{STATUS_OK, VerbsClientParams};
 use crate::group::{GroupKey, GroupLayout};
 use crate::cache_peer::CacheServerParams;
@@ -46,6 +46,14 @@ use crate::rdma_verbs::Verbs;
 struct Bounce {
     buf: PinnedBuffer,
     lkey: u32,
+    /// #11-refinement: async prefetch reuse guard. `read_async` records a CUDA
+    /// event on the copy stream AFTER `copy_h_to_d_async` drains this bounce;
+    /// the next reuse of this bounce `sync`s it first (via `wait_bounce_free`),
+    /// so the host cannot re-fill the bounce before the device copy has read it —
+    /// the reuse hazard the deleted terminal host stream_sync used to prevent.
+    /// `None` on the synchronous path (that path keeps its terminal stream_sync),
+    /// so the guard is a pure no-op there → byte-identical for prefetch-OFF.
+    copy_done: Option<CudaEvent>,
 }
 
 /// An in-flight RDMA op, keyed by its `wr_id`, so a completion can be dispatched.
@@ -61,7 +69,7 @@ struct Rail {
     verbs: Verbs,
     remote_rkey: u32,
     bounces: Vec<Bounce>,
-    free: Vec<usize>,
+    free: std::collections::VecDeque<usize>,
     inflight: HashMap<u64, InFlight>,
     next_wr: u64,
     /// Zero-copy restore: lkeys of destination MRs registered on demand (a UMA
@@ -120,8 +128,13 @@ impl Rail {
     }
 
     /// Reap exactly one completion on this rail, freeing its bounce. For a READ,
-    /// first `copy_h2d` the landed bytes to its HBM dest on `stream`.
-    fn reap_one(&mut self, group_bytes: usize, stream: u64) -> Result<()> {
+    /// first `copy_h2d` the landed bytes to its HBM dest on `stream`. When
+    /// `track` is set (async prefetch), record a CUDA event on `stream` after
+    /// that copy so a later reuse of this bounce can `sync` on the copy draining
+    /// the bounce (replacing the deleted terminal host stream_sync). `track` is
+    /// only ever true on `read_async`'s READ reaps; the sync path and all write
+    /// drains pass false, leaving `copy_done = None` → byte-identical.
+    fn reap_one(&mut self, group_bytes: usize, stream: u64, track: bool) -> Result<()> {
         let wr = self.verbs.poll()?;
         let op = self
             .inflight
@@ -135,17 +148,36 @@ impl Rail {
                     group_bytes,
                     stream,
                 )?;
+                if track {
+                    let ev = CudaEvent::new()?;
+                    ev.record(stream)?;
+                    self.bounces[bounce].copy_done = Some(ev);
+                }
                 bounce
             }
             InFlight::Write { bounce } => bounce,
         };
-        self.free.push(bounce);
+        self.free.push_back(bounce);
+        Ok(())
+    }
+
+    /// #11-refinement: before reusing bounce `b`, wait for any still-in-flight
+    /// async copy_h2d that is draining it (recorded by a prior `read_async`
+    /// reap). No-op on the sync path (`copy_done` is always `None`), so it never
+    /// perturbs prefetch-OFF. Off the decode run-ahead loop it only ever fires
+    /// under genuine copy-engine backpressure (correct async pushback).
+    fn wait_bounce_free(&mut self, b: usize) -> Result<()> {
+        if let Some(ev) = self.bounces[b].copy_done.take() {
+            ev.sync()?;
+        }
         Ok(())
     }
 
     fn drain(&mut self, group_bytes: usize, stream: u64) -> Result<()> {
         while !self.inflight.is_empty() {
-            self.reap_one(group_bytes, stream)?;
+            // Drained ops here are writes (before a read) or teardown reaps — no
+            // new mirror-RAW consumer needs the copy event, so track=false.
+            self.reap_one(group_bytes, stream, false)?;
         }
         Ok(())
     }
@@ -255,6 +287,7 @@ impl RdmaKvBackend {
                 bounces.push(Bounce {
                     buf,
                     lkey: keys.lkey,
+                    copy_done: None,
                 });
             }
             rails.push(Rail {
@@ -399,8 +432,27 @@ fn env_u32(k: &str, default: u32) -> u32 {
         .unwrap_or(default)
 }
 
-impl StorageBackend for RdmaKvBackend {
-    fn read(&mut self, requests: &[ReadRequest], stream: u64) -> Result<()> {
+impl RdmaKvBackend {
+    /// Body shared by `read` (sync) and `read_async` (#11-refinement). Bounce
+    /// path only differs by `is_async`:
+    ///   * sync  (`false`): LIFO bounce reuse (`pop_back` = original `pop`),
+    ///     `track=false` (no per-bounce copy event), terminal host `stream_sync`.
+    ///     Byte-identical to the pre-refinement `read`; `wait_bounce_free` is a
+    ///     pure no-op (all `copy_done == None`).
+    ///   * async (`true`): FIFO bounce reuse (`pop_front` — reuse the OLDEST
+    ///     freed bounce so its `copy_done` has had `depth`-many copy-times to
+    ///     drain, making `wait_bounce_free` a steady-state no-op; LIFO would
+    ///     stall on every reuse and defeat run-ahead), `track=true` (record a
+    ///     copy event per reaped READ), and NO terminal `stream_sync` — mirror-
+    ///     RAW is closed by the caller's `kv_prefetch_done`.
+    /// The zero-copy branch is shared verbatim (see `read_zero_copy` / §G: it
+    /// keeps its own leading WAR host sync, the one honestly-unremovable block).
+    fn read_common(
+        &mut self,
+        requests: &[ReadRequest],
+        stream: u64,
+        is_async: bool,
+    ) -> Result<()> {
         let bytes = self.layout.group_bytes() as usize;
         // Ensure any pending offloads land first, so a restore sees them.
         for rail in &mut self.rails {
@@ -449,14 +501,26 @@ impl StorageBackend for RdmaKvBackend {
             for (ri, rail) in self.rails.iter_mut().enumerate() {
                 while !rail.free.is_empty() {
                     let Some(j) = pend[ri].pop_front() else { break };
-                    let b = rail.free.pop().unwrap();
+                    // FIFO on async (oldest freed bounce, copy_done drained),
+                    // LIFO on sync (== original `pop()`, byte-identical order).
+                    let b = if is_async {
+                        rail.free.pop_front()
+                    } else {
+                        rail.free.pop_back()
+                    }
+                    .unwrap();
+                    // Reuse gate: wait any async copy_h2d still draining this
+                    // bounce before the NIC refills it. No-op unless a prior
+                    // read_async left a copy_done on `b` (always None on the pure
+                    // sync/prefetch-OFF path → byte-identical).
+                    rail.wait_bounce_free(b)?;
                     let raddr = self.remote_base
                         + self.layout.group_id(requests[j].group).0 * self.layout.group_stride;
                     // SAFETY: bounce b is a live MR; raddr/rkey are the blade.
                     unsafe { rail.post_read(b, raddr, bytes, requests[j].dst_dev_ptr)? };
                 }
                 if !rail.inflight.is_empty() {
-                    rail.reap_one(bytes, stream)?;
+                    rail.reap_one(bytes, stream, is_async)?;
                     active = true;
                 }
             }
@@ -464,8 +528,22 @@ impl StorageBackend for RdmaKvBackend {
                 break;
             }
         }
-        stream_sync(stream)?;
+        if !is_async {
+            // Sync path: finalise the stream (PosixBackend semantics). The async
+            // path deliberately omits this — that deleted host block IS the win.
+            stream_sync(stream)?;
+        }
         Ok(())
+    }
+}
+
+impl StorageBackend for RdmaKvBackend {
+    fn read(&mut self, requests: &[ReadRequest], stream: u64) -> Result<()> {
+        self.read_common(requests, stream, false)
+    }
+
+    fn read_async(&mut self, requests: &[ReadRequest], stream: u64) -> Result<()> {
+        self.read_common(requests, stream, true)
     }
 
     fn register_landing_region(&mut self, base: u64, len: usize) -> Result<()> {
@@ -497,9 +575,14 @@ impl StorageBackend for RdmaKvBackend {
         let rail = &mut self.rails[ri];
         // Acquire a free bounce on this rail, reaping a completion if full.
         if rail.free.is_empty() {
-            rail.reap_one(bytes, 0)?; // only writes are in flight here (no copy)
+            rail.reap_one(bytes, 0, false)?; // only writes are in flight here (no copy)
         }
-        let b = rail.free.pop().expect("free bounce after reap");
+        let b = rail.free.pop_back().expect("free bounce after reap");
+        // #11-refinement: an offload staging-write must not race a still-draining
+        // async prefetch copy_h2d out of this bounce. No-op unless a prior
+        // read_async left a copy_done on `b` (always None on the pure sync path);
+        // when it fires it is on the offload/eviction path, off the decode loop.
+        rail.wait_bounce_free(b)?;
         // SAFETY: bounce b holds `bytes`; copy the group in, then RDMA-WRITE it.
         unsafe {
             std::ptr::copy_nonoverlapping(src.as_ptr(), rail.bounces[b].buf.ptr as *mut u8, bytes);
