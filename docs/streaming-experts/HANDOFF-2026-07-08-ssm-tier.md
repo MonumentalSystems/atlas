@@ -3,7 +3,57 @@
 Branch `feat/streaming-experts-mvp` (PR #9). All work committed + pushed. Pick-up
 point for a fresh session to blast out the remaining greenlit tasks. See memory:
 `ssm-snapshot-nvme-tier-followup.md`, `streaming-experts.md`,
-`ssm-decode-rollback-rightsizing.md`, `atlas-kv-peer-service.md`.
+`ssm-decode-rollback-rightsizing.md`, `atlas-kv-peer-service.md`,
+`feedback-atlas-serve-flags.md` (canonical serve flags — SSOT).
+
+---
+
+## ▶ CURRENT STATE — end of 2026-07-08 (SUPERSEDES the task lists below)
+
+### Shipped this session (continuation)
+- **#5/#6** SSM fault-vs-recompute gate (`ATLAS_SSM_FAULT_MIN_TOKENS`) + `prefill_a`/`prefill_c` wired to the tier. GPU-validated.
+- **#9/#10** RDMA C=8 over-core KV measured (RDMA≈NVMe, latency-bound); zero-copy measured = **tied** with bounce (10.20 vs 9.99 tok/s), NOT a corruption no-go — it just can't win until GPUDirect (see HOLD below).
+- **#11** cross-stream WAR fence + async prefetch-completion refinement; nsys A/B: `cuStreamSynchronize` −47% (bounce path). `2a9d256`.
+- **Peer memory cap** — CONFIRMED already done: `--max-blade-gb` + `blade_cap::CommitLedger` `try_reserve` at handshake on all 3 peers (7 tests).
+- **Portable local-NVMe KV tier** (`3cd15c4`) — io_uring→POSIX auto-fallback so `--high-speed-swap` works without io_uring privileges; `ATLAS_KV_BACKEND` override.
+- **Surgical seccomp profile** (`85d9eac`) — `docker/gb10/seccomp-io_uring.json` (moby default + only io_uring_* syscalls); proven via `io_uring_setup` probe. Use instead of blanket `seccomp=unconfined`.
+- **Marconi pool shrink** (`74a4ba7`) — VALIDATED: `--ssm-cache-slots 16` + `ATLAS_SSM_TIER=1` = 16320→1020 MB (~15 GB HBM back) on Holo-35B; preflight right-sizing hint.
+- **#12 decode-ring UMA knob** (`ce1f359`) — `ATLAS_SSM_DECODE_RING_UMA` measured −5.8% (managed D2D on every boundary write); superseded by the rolling tier below.
+- **Rolling decode-ring tier** (`7786f69` scaffold → `3b416a9` wired+validated) — hot-HBM/cold-spill (`ATLAS_SSM_DECODE_RING_ROLL`, cold = local NVMe / RDMA peer / host-RAM). GPU-validated: HBM 4080→2040 MB at C=8 (→~12.75 GB at C=64), both waves 8/8-ok (seq-reset path coherent), ~10–13% decode cost. Design: `DECODE-RING-ROLLING-TIER.md`.
+- **Legacy one-sided path retirement** — SCOPED (`KV-PAGING-MIGRATION.md`); parked, see triage.
+
+### Task triage (operator decisions 2026-07-08)
+| Task | State | Note |
+|---|---|---|
+| **#3 warm-TTFT** (NVFP4-KV + mid-chunk-snapshot/suffix-attn kernel) | **OPEN — TOP PRIORITY, HARD** | "super important but we've had trouble cracking it." The real user-visible latency lever. |
+| **Rolling-ring spill worker → multi-thread** | **OPEN — top follow-up** | Claw back the ~10–13% decode cost / high-C spill backpressure. Single-thread worker + margin=1 is the bottleneck. |
+| **#11 make parity tests real gates** | **OPEN — greenlit** | Force-overlap + fix the C=1 panic so the tests actually gate. |
+| **Dual-rail the expert tier** | **OPEN — wanted** | Operator: "all things RDMA should be able to do this" — make dual-rail a general capability across ALL RDMA tiers (experts/KV/SSM/LoRA/weights), not per-tier one-offs. |
+| **3-tier cascade (local RAM → peer RAM → SSD)** | **OPEN — wanted** | |
+| **LoRA adapter rotation on the peer** | **OPEN — wanted** | Read-only weights → the one-sided READ tier applies; peer holds an adapter pool. |
+| **Unify full model weights on the peer** | **OPEN — wanted** | Content-addressed RDMA blob service; fleet pulls over CX7 not NFS. Part of the "all things RDMA" push. |
+| **Zero-copy → GPUDirect** | **ON HOLD** | GPUDirect is NOT possible on GB10 DGX Blackwell. Operator researching workaround patterns; do NOT pursue until they report back. |
+| **#13 graphs-on production tok/s** | **≈DONE** | We've mostly been running graphs-on; no dedicated task. |
+| **Retire legacy one-sided path** | **PARKED — "enough for now"** | Heavy (real `RdmaKvBackend`→paging client rewrite). The unified single-daemon consolidation (`atlas-cache-peer`, one daemon serving all RDMA tiers) covers the practical concern. Revisit only if it blocks something. |
+| **Avarok rebase** | **OPEN — cleanup** | Pull the one missing shape kernel to converge the branch. |
+
+### Canonical fast serve flags (SSOT = `feedback-atlas-serve-flags.md`)
+Full set for Holo-3.1-35B on GB10 (build in `atlas-gb10:build` w/ CUTLASS+CUDA 13.2):
+- **KV budget:** `--target-kv-tokens 100000` (human token budget — NOT `--gpu-memory-utilization`). NOTE: 100K ÷ 32K max-seq-len = only C=3; lower `--max-seq-len` (e.g. 8192) or raise the budget for higher C.
+- **fp8 KV:** `--kv-cache-dtype fp8 --fp8-kv-calibration-tokens 256` (always together — else BF16→E4M3 clipping).
+- **CUTLASS/MoE (prefill speed):** `-e ATLAS_CUTLASS_NVFP4_GEMM=1 -e ATLAS_HOLO_MOE_GROUPED_CUTLASS=1 -e ATLAS_HOLO_MOE_GROUPED_DOWN=1 -e ATLAS_CUTLASS_NVFP4_SSM_OUT=1 -e ATLAS_PREFILL_CODISPATCH=1` (image builds CUTLASS in but does NOT activate it at runtime — must pass). Confirm via startup log `CUTLASS grouped SFB: built N experts…`. These are PREFILL levers — a decode-heavy workload won't show them.
+- **fast-MoE gate:** `-e ATLAS_HOLO_LOW_MEMORY_MOE=1 -e ATLAS_HOLO_FAST_MOE_MODE=full -e ATLAS_HOLO_MOE_GATEUP_FP4=1 -e ATLAS_HOLO_MOE_DOWN_FP4=1 -e ATLAS_HOLO_FAST_MOE_LAYERS=0-39` + `-e ATLAS_GDN_FLASHINFER=1`.
+- **scheduling:** `--scheduling-policy slai --tbt-deadline-ms 100 --enable-prefix-caching`.
+- **env:** `ATLAS_SSM_TAIL_PROTECT=1 RUST_LOG=info`. Do NOT set `ATLAS_MS_PROFILE` for prod tok/s (~4× slower floor).
+- **container:** `--security-opt seccomp=docker/gb10/seccomp-io_uring.json --ulimit memlock=-1 --cap-add=SYS_NICE --gpus all --ipc=host`.
+- **`--lm-head-dtype`:** leave DEFAULT (nvfp4 on Holo). bf16 is an optional QUALITY knob, NOT needed by CUTLASS — reach for it only if long-gen quality degrades.
+
+### Key measured findings (this session)
+- **The SSM HBM-tiers trade decode throughput.** Both the Marconi pool tier (`ATLAS_SSM_TIER=1`) and the decode-rollback rolling tier cost decode tok/s and **stack**: full set HBM baseline 34.58 vs 38.97 without `ATLAS_SSM_TIER` (~−11%); rolling-vs-HBM ~10–13%. They are **HBM-when-you-need-it** knobs (high C / long context), NOT decode-tok/s maximizers — turn on only when HBM is the binding constraint.
+- Rolling-ring wave-2 (seq-slot reuse) holds flat with the full set → reset path solid.
+- RDMA snapshot fault ≈ 2.5 GB/s / 26 ms = ~1.6% of a warm turn → NOT the bottleneck (the tail-prefill is; see #3).
+
+---
 
 ## What shipped this session (context)
 
