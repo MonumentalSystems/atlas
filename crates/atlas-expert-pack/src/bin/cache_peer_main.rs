@@ -68,6 +68,23 @@ fn main() -> Result<()> {
                 }
                 rdma.swap_cap_bytes = (g * 1024.0 * 1024.0 * 1024.0) as u64;
             }
+            // Per-kind disk-cap override: this kind's arena gets its OWN fixed
+            // disk budget instead of carving from the shared --swap-cap-gb, so
+            // one kind can't starve another in the multi-arena registry. Maps to
+            // PagingKind (ssm=0, kv=1). 0 = unbounded for that kind.
+            "--swap-cap-gb-ssm" | "--swap-cap-gb-kv" => {
+                let kind: u8 = if a == "--swap-cap-gb-ssm" { 0 } else { 1 };
+                let g: f64 = it
+                    .next()
+                    .with_context(|| format!("{a} needs a number"))?
+                    .parse()
+                    .with_context(|| format!("{a} must be a number"))?;
+                if !g.is_finite() || g < 0.0 {
+                    bail!("{a} must be non-negative (got {g})");
+                }
+                rdma.per_kind_swap_cap_bytes
+                    .insert(kind, (g * 1024.0 * 1024.0 * 1024.0) as u64);
+            }
             "-h" | "--help" => {
                 eprintln!(
                     "atlas-cache-peer — RW RDMA overflow blade for the KV cache\n\n\
@@ -77,7 +94,8 @@ fn main() -> Result<()> {
                      --max-blade-gb <g>: cap total blade RAM (0/absent = unlimited)\n\
                      --swap-dir <dir>: NVMe dir backing PAGING clients (WS-A) →\n\
                      \x20                 RAM arena becomes a page-cache over disk\n\
-                     --swap-cap-gb <g>: disk cap for the paging swap (default 50; 0=unbounded)\n\
+                     --swap-cap-gb <g>: shared disk cap for the paging swap (default 50; 0=unbounded)\n\
+                     --swap-cap-gb-ssm/-kv <g>: per-kind disk cap override (own budget, no cross-kind starve; 0=unbounded)\n\
                      client selects via $ATLAS_KV_PEER=host:port ($ATLAS_KV_DUAL_RAIL=1 for both)"
                 );
                 return Ok(());

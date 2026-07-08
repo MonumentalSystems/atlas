@@ -93,7 +93,15 @@ mod server_impl {
         /// Disk cap for the paging swap file, in bytes: bounds the on-disk
         /// snapshot count (coldest dropped when full → later GET misses →
         /// recompute). 0 = unbounded. Default 50 GiB (operator sanity limit).
+        /// In the multi-arena registry this is the SHARED ceiling carved across
+        /// kinds unless a kind has a `per_kind_swap_cap_bytes` override.
         pub swap_cap_bytes: u64,
+        /// Per-`PagingKind` disk-cap overrides (`kind.0 → bytes`). When a kind
+        /// is present here, its arena gets this FIXED disk budget instead of
+        /// carving from the shared `swap_cap_bytes` remainder — so one kind
+        /// (e.g. KV) can't starve another (e.g. SSM snapshots). 0 = unbounded
+        /// for that kind. Set via `--swap-cap-gb-<kind>`.
+        pub per_kind_swap_cap_bytes: std::collections::HashMap<u8, u64>,
     }
 
     impl Default for RdmaConfig {
@@ -103,6 +111,7 @@ mod server_impl {
                 max_blade_bytes: 0,
                 swap_dir: None,
                 swap_cap_bytes: 50 * 1024 * 1024 * 1024,
+                per_kind_swap_cap_bytes: std::collections::HashMap::new(),
             }
         }
     }
@@ -128,6 +137,18 @@ mod server_impl {
                 )
             },
         );
+        // Explicit memlock ceiling: paging arenas are anon-mmap'd AND
+        // RDMA-registered (pinned = memlocked). With no `--max-blade-gb` the
+        // registry can pin unbounded RAM across (kind, shape) arenas as clients
+        // of new shapes connect — on a shared box that can exhaust host RAM /
+        // hit the memlock rlimit. Warn so the operator sets an explicit cap.
+        if rdma.max_blade_bytes == 0 && rdma.swap_dir.is_some() {
+            tracing::warn!(
+                "cache-peer paging registry active with NO blade ceiling (--max-blade-gb 0 = \
+                 unlimited): each new (kind, shape) arena pins RDMA-registered RAM without bound. \
+                 Set --max-blade-gb <G> to cap total memlocked blade RAM."
+            );
+        }
         for conn in listener.incoming() {
             let stream = match conn {
                 Ok(s) => s,
@@ -388,6 +409,31 @@ mod server_impl {
     static SHARED_PAGING: std::sync::LazyLock<std::sync::Mutex<PagingRegistry>> =
         std::sync::LazyLock::new(|| std::sync::Mutex::new(PagingRegistry::default()));
 
+    /// Decide a paging arena's disk-cap slot count and the updated shared-cap
+    /// remainder. Precedence: (1) per-kind override → this kind's OWN fixed
+    /// budget (0 = unbounded for it), leaving the shared remainder untouched so
+    /// it can't starve other kinds; (2) shared `swap_cap` ceiling → claim the
+    /// current remainder (≥1-record floor); (3) both unset (0) → unbounded.
+    /// Pure so the precedence is unit-tested without RDMA/mmap.
+    #[cfg(atlas_rdma_verbs)]
+    pub(super) fn carve_disk_slots(
+        per_kind_cap: Option<u64>,
+        shared_cap: u64,
+        shared_remaining: u64,
+        blob_bytes: u64,
+    ) -> (usize, u64) {
+        let bb = blob_bytes.max(1);
+        match per_kind_cap {
+            Some(0) => (0, shared_remaining), // this kind explicitly unbounded
+            Some(cap) => (((cap / bb) as usize).max(1), shared_remaining),
+            None if shared_cap == 0 => (0, shared_remaining), // unbounded
+            None => {
+                let recs = (shared_remaining / bb) as usize;
+                (recs.max(1), shared_remaining.saturating_sub(recs as u64 * bb))
+            }
+        }
+    }
+
     /// Get (first client of a (kind, blob) creates) that shape's shared arena.
     /// Charges the blade ledger per arena; carves the disk cap from a shared
     /// ceiling. The registry lock guards only the map + budget — residency ops
@@ -425,18 +471,14 @@ mod server_impl {
             .context("paging blade cap")?;
         let arena = Mmap::anon(arena_bytes)?;
         let num_slots = arena_bytes / blob_bytes;
-        // Carve the disk cap from the shared budget (hard ceiling): a bounded
-        // entry claims its share of remaining records; 0 = unbounded config only.
-        let bounded = rdma.swap_cap_bytes > 0;
-        let max_disk_slots = if !bounded {
-            0 // unbounded (0 == unbounded in SnapshotResidency)
-        } else {
-            let recs = (reg.remaining_cap / blob_bytes as u64) as usize;
-            reg.remaining_cap = reg
-                .remaining_cap
-                .saturating_sub(recs as u64 * blob_bytes as u64);
-            recs.max(1) // never 0 here (which would mean unbounded); starved kind → 1-record floor
-        };
+        // Disk-cap sizing (per-kind override → shared-ceiling carve → unbounded).
+        let (max_disk_slots, new_remaining) = carve_disk_slots(
+            rdma.per_kind_swap_cap_bytes.get(&kind).copied(),
+            rdma.swap_cap_bytes,
+            reg.remaining_cap,
+            blob_bytes as u64,
+        );
+        reg.remaining_cap = new_remaining;
         let swap_path = swap_dir.join(format!("atlas-snap-{kind}-{blob_bytes}.swap"));
         let swap = crate::snapshot_swap::DirectSwapFile::create(&swap_path, blob_bytes)?;
         // SAFETY: the Mmap is owned by SharedPaging (held by the registry Arc), so
@@ -467,6 +509,26 @@ mod server_impl {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(atlas_rdma_verbs)]
+    #[test]
+    fn carve_disk_slots_precedence() {
+        let bb = 4u64; // tiny blob
+        // Per-kind override: fixed budget, shared remainder UNTOUCHED (no starve).
+        let (slots, rem) = server_impl::carve_disk_slots(Some(40), 100, 100, bb);
+        assert_eq!(slots, 10);
+        assert_eq!(rem, 100, "per-kind override must not consume the shared remainder");
+        // Per-kind 0 = unbounded for that kind, remainder untouched.
+        assert_eq!(server_impl::carve_disk_slots(Some(0), 100, 100, bb), (0, 100));
+        // No override, shared cap set: claim the remainder (and it drops).
+        let (slots, rem) = server_impl::carve_disk_slots(None, 100, 100, bb);
+        assert_eq!(slots, 25);
+        assert_eq!(rem, 0, "shared carve consumes the remainder");
+        // No override, shared cap 0 = unbounded.
+        assert_eq!(server_impl::carve_disk_slots(None, 0, 0, bb), (0, 0));
+        // Starved shared remainder still floors at 1 record (never 0=unbounded).
+        assert_eq!(server_impl::carve_disk_slots(None, 100, 0, bb), (1, 0));
+    }
 
     #[test]
     fn kv_server_params_round_trip() {
