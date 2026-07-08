@@ -202,13 +202,28 @@ pub(crate) fn build_tier_store(blob_bytes: usize) -> std::sync::Arc<dyn Snapshot
         // file, giving infinite depth (never drops) shared across clients. Falls
         // through to the bounded RDMA store / host-RAM on any connect failure.
         if std::env::var("ATLAS_SSM_SWAP").ok().as_deref() == Some("1") {
+            // Namespace = ATLAS_SSM_SWAP_NS (explicit u64) or a hash of
+            // ATLAS_TARGET_MODEL, so different models sharing one peer can't
+            // collide; 0 = single-model fleet (passthrough).
+            let namespace = std::env::var("ATLAS_SSM_SWAP_NS")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or_else(|| match std::env::var("ATLAS_TARGET_MODEL") {
+                    Ok(m) if !m.is_empty() && m != "*" => {
+                        use std::hash::{Hash, Hasher};
+                        let mut h = std::collections::hash_map::DefaultHasher::new();
+                        m.hash(&mut h);
+                        h.finish()
+                    }
+                    _ => 0,
+                });
             match spark_storage::RdmaSnapshotArena::connect_paging(&peer, arena_bytes, blob_bytes) {
                 Ok(arena) => {
                     tracing::info!(
-                        "SSM spill tier = RDMA PAGING peer {peer} ({slots}-slot RAM cache × \
-                         {blob_bytes} B + NVMe swap = infinite depth, peer-owned residency)"
+                        "SSM spill tier = RDMA PAGING peer {peer} ({slots}-slot shared RAM cache × \
+                         {blob_bytes} B + NVMe swap = infinite depth; ns={namespace:#x})"
                     );
-                    return Arc::new(PagingSnapshotStore::new(arena, blob_bytes));
+                    return Arc::new(PagingSnapshotStore::new(arena, blob_bytes, namespace));
                 }
                 Err(e) => tracing::warn!(
                     "SSM RDMA paging connect to {peer} failed ({e:#}); trying bounded RDMA"
@@ -318,11 +333,35 @@ impl SnapshotTransport for spark_storage::RdmaSnapshotArena {
 pub(crate) struct PagingSnapshotStore {
     arena: spark_storage::RdmaSnapshotArena,
     blob_bytes: usize,
+    /// Per-model namespace folded into every key so a SHARED peer never serves
+    /// one model's SSM state to another (the prefix_hash is model-independent —
+    /// same tokens collide across models, but their recurrent state differs).
+    /// 0 = no namespacing (single-model fleet / passthrough).
+    namespace: u64,
 }
 
 impl PagingSnapshotStore {
-    pub(crate) fn new(arena: spark_storage::RdmaSnapshotArena, blob_bytes: usize) -> Self {
-        Self { arena, blob_bytes }
+    pub(crate) fn new(
+        arena: spark_storage::RdmaSnapshotArena,
+        blob_bytes: usize,
+        namespace: u64,
+    ) -> Self {
+        Self { arena, blob_bytes, namespace }
+    }
+
+    /// Fold the namespace into a key (splitmix64 on `key ^ ns`). Deterministic
+    /// (same model+key → same wire key → cache hit) with negligible cross-model
+    /// collision, same 64-bit contract as `prefix_hash` itself.
+    fn wire(&self, key: u64) -> u64 {
+        if self.namespace == 0 {
+            return key;
+        }
+        let mut h = key ^ self.namespace.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        h ^= h >> 30;
+        h = h.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        h ^= h >> 27;
+        h = h.wrapping_mul(0x94D0_49BB_1331_11EB);
+        h ^ (h >> 31)
     }
 }
 
@@ -331,17 +370,17 @@ impl SnapshotBlobStore for PagingSnapshotStore {
         if bytes.len() != self.blob_bytes {
             anyhow::bail!("paging put: {} != blob_bytes {}", bytes.len(), self.blob_bytes);
         }
-        self.arena.paging_put(key, bytes)?;
+        self.arena.paging_put(self.wire(key), bytes)?;
         Ok(true) // never full — the peer spills to NVMe
     }
     fn get(&self, key: u64, out: &mut [u8]) -> Result<bool> {
         if out.len() != self.blob_bytes {
             anyhow::bail!("paging get: {} != blob_bytes {}", out.len(), self.blob_bytes);
         }
-        self.arena.paging_get(key, out)
+        self.arena.paging_get(self.wire(key), out)
     }
     fn remove(&self, key: u64) {
-        if let Err(e) = self.arena.paging_remove(key) {
+        if let Err(e) = self.arena.paging_remove(self.wire(key)) {
             tracing::debug!("paging remove {key:#x} failed: {e:#}");
         }
     }

@@ -37,9 +37,14 @@ fn main() -> anyhow::Result<()> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(32); // >> slots → guarantees disk spill
 
+    // put | get | putget (default). `get` proves CROSS-CONNECTION sharing: a
+    // separate client process GETs keys an earlier `put` run left in the SHARED
+    // peer arena/swap.
+    let mode = std::env::var("SMOKE_MODE").unwrap_or_else(|_| "putget".into());
+
     let arena_bytes = (slots * blob) as u64;
     println!(
-        "connecting paging tier @ {addr}: {slots}-slot RAM arena × {blob} B, putting {n} keys \
+        "connecting paging tier @ {addr} [{mode}]: {slots}-slot RAM arena × {blob} B, {n} keys \
          (forces {} disk spills)",
         n.saturating_sub(slots as u64)
     );
@@ -54,20 +59,39 @@ fn main() -> anyhow::Result<()> {
         v
     };
 
-    let t0 = std::time::Instant::now();
-    for k in 0..n {
-        arena.paging_put(k, &pat(k))?;
+    let mut put_ms: Option<f64> = None;
+    if mode != "get" {
+        let t0 = std::time::Instant::now();
+        for k in 0..n {
+            arena.paging_put(k, &pat(k))?;
+        }
+        put_ms = Some(t0.elapsed().as_secs_f64() * 1e3);
     }
-    let put_ms = t0.elapsed().as_secs_f64() * 1e3;
+    if mode == "put" {
+        println!("PUT-only done: {n} keys left resident+spilled in the shared peer arena");
+        return Ok(());
+    }
 
-    let t1 = std::time::Instant::now();
     let mut out = vec![0u8; blob];
+    let t1 = std::time::Instant::now();
     for k in 0..n {
         let hit = arena.paging_get(k, &mut out)?;
-        anyhow::ensure!(hit, "key {k} MISSING — peer dropped it (infinite-depth violated)");
+        anyhow::ensure!(
+            hit,
+            "key {k} MISSING — peer dropped it, or (mode=get) not shared across connections"
+        );
         anyhow::ensure!(out == pat(k), "key {k} CORRUPTED — spill/fault not byte-identical");
     }
     let get_ms = t1.elapsed().as_secs_f64() * 1e3;
+    if mode == "get" {
+        println!(
+            "CROSS-CONNECTION SHARING OK ✅  a SEPARATE client GET all {n} keys a prior `put` \
+             run left in the shared peer — {:.1}ms/blob",
+            get_ms / n as f64
+        );
+        return Ok(());
+    }
+    let put_ms = put_ms.unwrap_or(0.0);
 
     // Re-GET a definitely-evicted early key to time a cold fault-from-disk.
     let t2 = std::time::Instant::now();

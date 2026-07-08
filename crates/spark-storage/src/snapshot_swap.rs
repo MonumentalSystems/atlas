@@ -642,6 +642,35 @@ pub fn client_bye<T: Write>(s: &mut T) -> Result<()> {
     send_req(s, OP_BYE, 0)
 }
 
+/// Shared variant of [`run_paging_loop`]: many connection threads drive ONE
+/// process-global residency, locking it per request. This is what makes the
+/// peer a SHARED warm cache — a snapshot PUT by one client is GET-able by
+/// another (same namespace). The lock is held only for the (fast) map op + any
+/// spill/fault byte move, never across a TCP read.
+pub fn run_paging_loop_shared<T: Read + Write, A: SlotArena, S: SwapStore>(
+    stream: &mut T,
+    res: &std::sync::Mutex<SnapshotResidency<A, S>>,
+) -> Result<()> {
+    loop {
+        let mut op = [0u8; 1];
+        if stream.read_exact(&mut op).is_err() {
+            break;
+        }
+        if op[0] == OP_BYE {
+            break;
+        }
+        let mut kb = [0u8; 8];
+        stream.read_exact(&mut kb).context("read paging key")?;
+        let key = u64::from_le_bytes(kb);
+        let reply = {
+            let mut g = res.lock().expect("shared residency mutex poisoned");
+            dispatch(&mut g, op[0], key)
+        };
+        write_reply(stream, &reply)?;
+    }
+    Ok(())
+}
+
 // ─────────────────────────── real peer-mmap arena ───────────────────────────
 
 /// `SlotArena` over the peer's RDMA-registered `mmap` region (a raw base ptr).

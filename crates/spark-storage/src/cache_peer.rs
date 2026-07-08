@@ -204,24 +204,38 @@ mod server_impl {
             );
         }
 
-        // Admission gate: charge the arena size ONCE (the N per-rail MRs pin the
-        // SAME refcounted pages, so the committed footprint is `total`, not
-        // total*n_rails). Reserve BEFORE any mmap/reg_mr pins RAM; the RAII guard
-        // releases on every exit below (early bail, reg_mr error, normal hangup).
-        let _reservation = ledger.try_reserve(total as u64).context("kv blade cap")?;
-
-        // Anonymous, page-aligned, lazily-zeroed arena — registered ONCE per rail
-        // (each device its own PD/rkey). The physical pages are shared (pinned
-        // refcounted), so N rails do NOT cost N× RAM — only N MR handles + rkeys.
-        let arena = Mmap::anon(total).context("mmap kv blade arena")?;
+        // Acquire the arena to register. Legacy: a per-connection anonymous
+        // mapping, charged per-conn. Paging (WS-A): the process-global SHARED
+        // arena (charged ONCE at init) so every client's QPs point at the SAME
+        // physical slots → a snapshot PUT by one client is GET-able by another.
         let pid = std::process::id();
+        let shared: Option<std::sync::Arc<SharedPaging>> = match paging_blob {
+            Some(blob) => Some(get_or_init_shared_paging(rdma, total, blob, ledger)?),
+            None => None,
+        };
+        // Per-connection arena + blade reservation (legacy only), kept alive
+        // until teardown; the shared arena's reservation lives in the static.
+        let local: Option<(crate::blade_cap::Reservation, Mmap)> = if shared.is_none() {
+            let reservation = ledger.try_reserve(total as u64).context("kv blade cap")?;
+            let arena = Mmap::anon(total).context("mmap kv blade arena")?;
+            Some((reservation, arena))
+        } else {
+            None
+        };
+        let (arena_base, arena_len): (*mut libc::c_void, usize) = match (&shared, &local) {
+            (Some(sh), _) => (sh.arena.addr, sh.arena.len),
+            (None, Some((_, arena))) => (arena.addr, arena.len),
+            _ => unreachable!("exactly one of shared/local is set"),
+        };
+        // Register the arena ONCE per rail (each device its own PD/rkey; shared
+        // refcounted pages, so N rails cost N MR handles + rkeys, not N× RAM).
         let mut rails: Vec<Verbs> = Vec::with_capacity(n_rails);
         let mut rkeys: Vec<u32> = Vec::with_capacity(n_rails);
         for (i, (dev, gid)) in rdma.rails.iter().take(n_rails).enumerate() {
             let psn = (0x5a5a5a ^ pid ^ ((i as u32) << 20)) & 0xff_ffff;
             let mut v = Verbs::create(dev, *gid, psn)?;
-            // SAFETY: the arena outlives every rail (dropped after them below).
-            let keys = unsafe { v.reg_mr_rw(arena.addr as *mut _, arena.len)? };
+            // SAFETY: the arena (shared or local) outlives every rail below.
+            let keys = unsafe { v.reg_mr_rw(arena_base as *mut _, arena_len)? };
             rkeys.push(keys.rkey);
             rails.push(v);
         }
@@ -233,7 +247,7 @@ mod server_impl {
                 qpn: v.qpn(),
                 psn: v.psn(),
                 gid: v.gid(),
-                base_addr: arena.addr as u64,
+                base_addr: arena_base as u64,
                 rkey: *rkey,
             }
             .write_to(&mut stream)
@@ -258,45 +272,16 @@ mod server_impl {
         );
 
         // 5. Data plane.
-        if let Some(blob_bytes) = paging_blob {
-            // Paging mode (WS-A): the arena is a page-cache over an O_DIRECT NVMe
-            // swap file; the peer owns residency and faults from disk on GET.
-            // Bytes still move one-sided over RDMA into/out of the arena slots;
+        if let Some(sh) = shared {
+            // Paging mode (WS-A): drive the SHARED residency — a snapshot PUT by
+            // one client is GET-able by another (cross-connection warm cache).
+            // Bytes move one-sided over RDMA into/out of the shared arena slots;
             // only tiny [op][key] control messages cross this TCP stream. The MR
             // is never re-registered — swap happens under the stable rkey.
-            use std::os::fd::AsRawFd;
-            let num_slots = total / blob_bytes;
-            let run = |stream: &mut TcpStream| -> Result<()> {
-                let swap_dir = rdma
-                    .swap_dir
-                    .as_ref()
-                    .context("paging client but peer has no --swap-dir configured")?;
-                let swap_path =
-                    swap_dir.join(format!("snap-{pid}-{:x}.swap", stream.as_raw_fd() as u64));
-                let swap = crate::snapshot_swap::DirectSwapFile::create(&swap_path, blob_bytes)?;
-                // SAFETY: `arena` outlives this loop (dropped just below).
-                let slot_arena = unsafe {
-                    crate::snapshot_swap::MmapSlotArena::new(
-                        arena.addr as *mut u8,
-                        blob_bytes,
-                        num_slots,
-                    )
-                };
-                let mut residency =
-                    crate::snapshot_swap::SnapshotResidency::new(slot_arena, swap)?;
-                tracing::info!(
-                    "cache-peer PAGING client: {num_slots} slots × {blob_bytes} B RAM arena \
-                     + NVMe swap {} (infinite depth)",
-                    swap_path.display(),
-                );
-                let r = crate::snapshot_swap::run_paging_loop(stream, &mut residency);
-                let _ = std::fs::remove_file(&swap_path); // per-conn swap is ephemeral
-                r
-            };
-            let res = run(&mut stream);
-            drop(rails);
-            drop(arena);
-            return res;
+            tracing::info!("cache-peer PAGING client joined shared arena ({n_rails} rail(s))");
+            let r = crate::snapshot_swap::run_paging_loop_shared(&mut stream, &sh.residency);
+            drop(rails); // dereg this conn's MRs; the shared arena stays mapped
+            return r;
         }
 
         // Legacy one-sided KV blade: idle until the client hangs up.
@@ -310,7 +295,7 @@ mod server_impl {
         }
         // Dereg (rails) before unmap (arena): drop rails first.
         drop(rails);
-        drop(arena);
+        drop(local);
         Ok(())
     }
 
@@ -351,6 +336,90 @@ mod server_impl {
             // SAFETY: addr/len from a successful mmap, unmapped once.
             unsafe { libc::munmap(self.addr, self.len) };
         }
+    }
+
+    // ── WS-A: process-global SHARED paging arena (cross-connection cache) ──
+    //
+    // All paging connections reg_mr the SAME arena and drive ONE residency, so a
+    // snapshot PUT by one client is GET-able by another (same namespace — the
+    // client folds a per-model id into the key). Arena + blob geometry are fixed
+    // by the FIRST paging client; later clients must match blob_bytes. The arena,
+    // swap file and blade reservation live for the daemon's lifetime.
+    #[cfg(atlas_rdma_verbs)]
+    struct SharedPaging {
+        arena: Mmap,
+        blob_bytes: usize,
+        residency: std::sync::Mutex<
+            crate::snapshot_swap::SnapshotResidency<
+                crate::snapshot_swap::MmapSlotArena,
+                crate::snapshot_swap::DirectSwapFile,
+            >,
+        >,
+        _reservation: crate::blade_cap::Reservation,
+    }
+    // SAFETY: `arena.addr` is a stable mapping; every mutable access to the
+    // residency (and thus the arena bytes) is serialized through its Mutex.
+    #[cfg(atlas_rdma_verbs)]
+    unsafe impl Send for SharedPaging {}
+    #[cfg(atlas_rdma_verbs)]
+    unsafe impl Sync for SharedPaging {}
+
+    #[cfg(atlas_rdma_verbs)]
+    static SHARED_PAGING: std::sync::Mutex<Option<std::sync::Arc<SharedPaging>>> =
+        std::sync::Mutex::new(None);
+
+    /// Get (first paging client creates) the process-global shared paging arena.
+    /// Charges the blade ledger ONCE. Later clients must match `blob_bytes`.
+    #[cfg(atlas_rdma_verbs)]
+    fn get_or_init_shared_paging(
+        rdma: &RdmaConfig,
+        arena_bytes: usize,
+        blob_bytes: usize,
+        ledger: &std::sync::Arc<crate::blade_cap::CommitLedger>,
+    ) -> Result<std::sync::Arc<SharedPaging>> {
+        let mut g = SHARED_PAGING.lock().expect("shared paging registry poisoned");
+        if let Some(sh) = g.as_ref() {
+            if sh.blob_bytes != blob_bytes {
+                bail!(
+                    "paging blob_bytes {blob_bytes} != established {} (all clients of a shared \
+                     peer arena must use the same snapshot size)",
+                    sh.blob_bytes
+                );
+            }
+            return Ok(sh.clone());
+        }
+        let swap_dir = rdma
+            .swap_dir
+            .as_ref()
+            .context("paging client but peer has no --swap-dir configured")?;
+        let reservation = ledger
+            .try_reserve(arena_bytes as u64)
+            .context("paging blade cap")?;
+        let arena = Mmap::anon(arena_bytes)?;
+        let num_slots = arena_bytes / blob_bytes;
+        std::fs::create_dir_all(swap_dir).ok();
+        let swap_path = swap_dir.join("atlas-snap-shared.swap");
+        let swap = crate::snapshot_swap::DirectSwapFile::create(&swap_path, blob_bytes)?;
+        // SAFETY: the Mmap is owned by SharedPaging (held by the static Arc), so
+        // its base VA outlives every MmapSlotArena view of it.
+        let slot_arena = unsafe {
+            crate::snapshot_swap::MmapSlotArena::new(arena.addr as *mut u8, blob_bytes, num_slots)
+        };
+        let residency = crate::snapshot_swap::SnapshotResidency::new(slot_arena, swap)?;
+        tracing::info!(
+            "cache-peer SHARED paging arena: {num_slots} slots × {blob_bytes} B RAM ({:.1} GiB) \
+             + NVMe swap {} (infinite depth, shared across clients)",
+            arena_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+            swap_path.display(),
+        );
+        let sh = std::sync::Arc::new(SharedPaging {
+            arena,
+            blob_bytes,
+            residency: std::sync::Mutex::new(residency),
+            _reservation: reservation,
+        });
+        *g = Some(sh.clone());
+        Ok(sh)
     }
 }
 
