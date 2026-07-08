@@ -87,9 +87,13 @@ mod server_impl {
         pub max_blade_bytes: u64,
         /// Directory for NVMe swap files backing paging-mode connections
         /// (WS-A). `None` = paging clients are refused (RAM-only). When set, a
-        /// paging connection's RDMA arena becomes a page-cache over a per-conn
-        /// O_DIRECT swap file here → "infinite depth".
+        /// paging connection's RDMA arena becomes a page-cache over an O_DIRECT
+        /// swap file here, bounded by `swap_cap_bytes`.
         pub swap_dir: Option<std::path::PathBuf>,
+        /// Disk cap for the paging swap file, in bytes: bounds the on-disk
+        /// snapshot count (coldest dropped when full → later GET misses →
+        /// recompute). 0 = unbounded. Default 50 GiB (operator sanity limit).
+        pub swap_cap_bytes: u64,
     }
 
     impl Default for RdmaConfig {
@@ -98,6 +102,7 @@ mod server_impl {
                 rails: vec![("roceP2p1s0f1".into(), 3), ("rocep1s0f1".into(), 3)],
                 max_blade_bytes: 0,
                 swap_dir: None,
+                swap_cap_bytes: 50 * 1024 * 1024 * 1024,
             }
         }
     }
@@ -400,17 +405,31 @@ mod server_impl {
         std::fs::create_dir_all(swap_dir).ok();
         let swap_path = swap_dir.join("atlas-snap-shared.swap");
         let swap = crate::snapshot_swap::DirectSwapFile::create(&swap_path, blob_bytes)?;
+        // Bound the disk tier to the configured cap (coldest on-disk snapshot
+        // dropped when full). 0 = unbounded.
+        let max_disk_slots = if rdma.swap_cap_bytes == 0 {
+            0
+        } else {
+            (rdma.swap_cap_bytes / blob_bytes as u64) as usize
+        };
         // SAFETY: the Mmap is owned by SharedPaging (held by the static Arc), so
         // its base VA outlives every MmapSlotArena view of it.
         let slot_arena = unsafe {
             crate::snapshot_swap::MmapSlotArena::new(arena.addr as *mut u8, blob_bytes, num_slots)
         };
-        let residency = crate::snapshot_swap::SnapshotResidency::new(slot_arena, swap)?;
+        let residency =
+            crate::snapshot_swap::SnapshotResidency::new_capped(slot_arena, swap, max_disk_slots)?;
         tracing::info!(
             "cache-peer SHARED paging arena: {num_slots} slots × {blob_bytes} B RAM ({:.1} GiB) \
-             + NVMe swap {} (infinite depth, shared across clients)",
+             + NVMe swap {} (disk cap {} = {} records; shared across clients)",
             arena_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
             swap_path.display(),
+            if max_disk_slots == 0 {
+                "unbounded".to_string()
+            } else {
+                format!("{:.0} GiB", rdma.swap_cap_bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+            },
+            max_disk_slots,
         );
         let sh = std::sync::Arc::new(SharedPaging {
             arena,

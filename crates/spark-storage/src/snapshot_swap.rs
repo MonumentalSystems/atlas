@@ -74,6 +74,9 @@ pub struct SwapStats {
     pub spills_to_disk: u64,
     pub faults_from_disk: u64,
     pub resident_hits: u64,
+    /// Cold on-disk snapshots dropped because the disk cap was hit (a later GET
+    /// for one cleanly misses → recompute).
+    pub disk_evictions: u64,
 }
 
 /// The page table: `key → Loc` over a bounded `SlotArena` (hot) backed by an
@@ -88,6 +91,15 @@ pub struct SnapshotResidency<A: SlotArena, S: SwapStore> {
     /// Resident keys, front = coldest (LRU eviction victim). Reserved keys are
     /// NOT in here (pinned).
     lru: VecDeque<u64>,
+    /// On-disk keys, front = coldest — the disk-cap eviction victim. Every
+    /// `OnDisk` entry is exactly once in here (a bounded two-level LRU:
+    /// RAM `lru` above disk `disk_lru`).
+    disk_lru: VecDeque<u64>,
+    /// Max simultaneous on-disk records (the disk cap / blob_bytes). 0 =
+    /// unbounded. When full, the coldest on-disk snapshot is dropped to make
+    /// room — a later GET for it misses and the model recomputes (correct
+    /// degradation, keeps the swap file bounded).
+    max_disk_slots: usize,
     /// Free disk record indices (reused before growing the high-water mark).
     free_disk: Vec<usize>,
     next_disk: usize,
@@ -97,7 +109,15 @@ pub struct SnapshotResidency<A: SlotArena, S: SwapStore> {
 }
 
 impl<A: SlotArena, S: SwapStore> SnapshotResidency<A, S> {
+    /// Unbounded disk tier (no cap). Prefer [`new_capped`] in production.
     pub fn new(arena: A, swap: S) -> Result<Self> {
+        Self::new_capped(arena, swap, 0)
+    }
+
+    /// `max_disk_slots` bounds the on-disk record count (0 = unbounded). When
+    /// full, spilling evicts the coldest on-disk snapshot (dropped → later GET
+    /// misses → recompute), keeping the swap file at ≤ `max_disk_slots` records.
+    pub fn new_capped(arena: A, swap: S, max_disk_slots: usize) -> Result<Self> {
         let blob_bytes = arena.slot_bytes();
         if blob_bytes == 0 {
             bail!("SnapshotResidency: slot_bytes must be > 0");
@@ -120,6 +140,8 @@ impl<A: SlotArena, S: SwapStore> SnapshotResidency<A, S> {
             map: HashMap::new(),
             free_slots: (0..n).rev().collect(),
             lru: VecDeque::new(),
+            disk_lru: VecDeque::new(),
+            max_disk_slots,
             free_disk: Vec::new(),
             next_disk: 0,
             scratch: vec![0u8; blob_bytes],
@@ -163,6 +185,7 @@ impl<A: SlotArena, S: SwapStore> SnapshotResidency<A, S> {
             Some(Loc::Reserved(slot)) => return Ok(slot),
             Some(Loc::OnDisk(disk_slot)) => {
                 // Rewriting a spilled key: reclaim its disk record, give a slot.
+                self.disk_lru_remove(key);
                 self.free_disk.push(disk_slot);
                 self.swap.discard_record(disk_slot);
             }
@@ -204,7 +227,16 @@ impl<A: SlotArena, S: SwapStore> SnapshotResidency<A, S> {
                 Ok(Some(slot))
             }
             Some(Loc::OnDisk(disk_slot)) => {
-                let slot = self.acquire_slot()?;
+                // Pin against `acquire_slot`'s spill+make_disk_room evicting THIS
+                // key (it is still OnDisk until the fault below completes).
+                self.disk_lru_remove(key);
+                let slot = match self.acquire_slot() {
+                    Ok(s) => s,
+                    Err(e) => {
+                        self.disk_lru.push_front(key); // un-pin (still on disk)
+                        return Err(e);
+                    }
+                };
                 // scratch is exclusive to one move at a time (control loop is
                 // single-threaded per connection); read disk → arena slot.
                 let mut buf = std::mem::take(&mut self.scratch);
@@ -214,6 +246,7 @@ impl<A: SlotArena, S: SwapStore> SnapshotResidency<A, S> {
                 } else {
                     self.scratch = buf;
                     self.free_slots.push(slot);
+                    self.disk_lru.push_front(key); // still on disk; re-pin (cold)
                     return r.map(|_| None);
                 }
                 self.scratch = buf;
@@ -239,6 +272,7 @@ impl<A: SlotArena, S: SwapStore> SnapshotResidency<A, S> {
                 self.free_slots.push(slot);
             }
             Some(Loc::OnDisk(disk_slot)) => {
+                self.disk_lru_remove(key);
                 self.free_disk.push(disk_slot);
                 self.swap.discard_record(disk_slot);
             }
@@ -269,6 +303,9 @@ impl<A: SlotArena, S: SwapStore> SnapshotResidency<A, S> {
             Some(Loc::Resident(slot)) => slot,
             other => bail!("LRU/map desync: victim {victim:#x} is {other:?}, expected Resident"),
         };
+        // Bound the disk tier: drop the coldest on-disk snapshot(s) if at cap
+        // BEFORE claiming a disk slot for this spill.
+        self.make_disk_room();
         let disk_slot = self.alloc_disk_slot();
         let mut buf = std::mem::take(&mut self.scratch);
         let res = self
@@ -283,8 +320,28 @@ impl<A: SlotArena, S: SwapStore> SnapshotResidency<A, S> {
             return Err(e);
         }
         self.map.insert(victim, Loc::OnDisk(disk_slot));
+        self.disk_lru.push_back(victim); // warmest on-disk entry
         self.stats.spills_to_disk += 1;
         Ok(slot)
+    }
+
+    /// Evict the coldest on-disk snapshot(s) until there is room for one more
+    /// under `max_disk_slots` (no-op when unbounded). A dropped snapshot's key
+    /// leaves the map entirely → a later GET misses → the model recomputes.
+    fn make_disk_room(&mut self) {
+        if self.max_disk_slots == 0 {
+            return;
+        }
+        while self.disk_lru.len() >= self.max_disk_slots {
+            let Some(cold) = self.disk_lru.pop_front() else {
+                break;
+            };
+            if let Some(Loc::OnDisk(ds)) = self.map.remove(&cold) {
+                self.free_disk.push(ds);
+                self.swap.discard_record(ds);
+                self.stats.disk_evictions += 1;
+            }
+        }
     }
 
     fn alloc_disk_slot(&mut self) -> usize {
@@ -294,6 +351,12 @@ impl<A: SlotArena, S: SwapStore> SnapshotResidency<A, S> {
             let d = self.next_disk;
             self.next_disk += 1;
             d
+        }
+    }
+
+    fn disk_lru_remove(&mut self, key: u64) {
+        if let Some(pos) = self.disk_lru.iter().position(|&k| k == key) {
+            self.disk_lru.remove(pos);
         }
     }
 
@@ -812,6 +875,31 @@ mod tests {
 
     fn residency(slots: usize) -> SnapshotResidency<VecArena, MemSwap> {
         SnapshotResidency::new(VecArena::new(B, slots), MemSwap::new(B)).unwrap()
+    }
+
+    fn residency_capped(slots: usize, max_disk: usize) -> SnapshotResidency<VecArena, MemSwap> {
+        SnapshotResidency::new_capped(VecArena::new(B, slots), MemSwap::new(B), max_disk).unwrap()
+    }
+
+    /// Disk cap: the swap tier is BOUNDED — beyond RAM slots + `max_disk`, the
+    /// COLDEST on-disk snapshot is dropped (a later GET misses → recompute), so
+    /// the swap file never grows past the cap. This is the operator's 50 GB
+    /// sanity limit at the paging layer.
+    #[test]
+    fn disk_cap_bounds_swap_and_drops_coldest() {
+        let mut r = residency_capped(2, 3); // 2 RAM + 3 disk = 5 total capacity
+        for k in 0..10u64 {
+            put(&mut r, k, k as u8);
+        }
+        assert!(r.stats().disk_evictions >= 5, "coldest disk snaps must be dropped at cap");
+        assert!(r.total_keys() <= 2 + 3, "total tracked keys bounded by RAM + disk cap");
+        // Coldest keys were dropped → clean miss (checked first: a miss doesn't
+        // perturb residency).
+        assert_eq!(get(&mut r, 0), None, "oldest key evicted from the capped disk");
+        assert_eq!(get(&mut r, 1), None);
+        // The hottest keys survive (resident) and are byte-identical.
+        assert_eq!(get(&mut r, 9).as_deref(), Some(&blob(9)[..]));
+        assert_eq!(get(&mut r, 8).as_deref(), Some(&blob(8)[..]));
     }
 
     /// THE headline invariant: put far more keys than the arena holds; the

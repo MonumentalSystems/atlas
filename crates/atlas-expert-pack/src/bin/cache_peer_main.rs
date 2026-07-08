@@ -55,6 +55,19 @@ fn main() -> Result<()> {
                 let d = it.next().context("--swap-dir needs a path")?;
                 rdma.swap_dir = Some(std::path::PathBuf::from(d));
             }
+            // Disk cap for the paging swap file (GiB); coldest on-disk snapshot
+            // dropped when full. 0 = unbounded. Default 50 GiB.
+            "--swap-cap-gb" => {
+                let g: f64 = it
+                    .next()
+                    .context("--swap-cap-gb needs a number")?
+                    .parse()
+                    .context("--swap-cap-gb must be a number")?;
+                if !g.is_finite() || g < 0.0 {
+                    bail!("--swap-cap-gb must be non-negative (got {g})");
+                }
+                rdma.swap_cap_bytes = (g * 1024.0 * 1024.0 * 1024.0) as u64;
+            }
             "-h" | "--help" => {
                 eprintln!(
                     "atlas-cache-peer — RW RDMA overflow blade for the KV cache\n\n\
@@ -63,7 +76,8 @@ fn main() -> Result<()> {
                      defaults: listen 0.0.0.0:9910, rails roceP2p1s0f1:3 rocep1s0f1:3\n\
                      --max-blade-gb <g>: cap total blade RAM (0/absent = unlimited)\n\
                      --swap-dir <dir>: NVMe dir backing PAGING clients (WS-A) →\n\
-                     \x20                 RAM arena becomes a page-cache w/ infinite depth\n\
+                     \x20                 RAM arena becomes a page-cache over disk\n\
+                     --swap-cap-gb <g>: disk cap for the paging swap (default 50; 0=unbounded)\n\
                      client selects via $ATLAS_KV_PEER=host:port ($ATLAS_KV_DUAL_RAIL=1 for both)"
                 );
                 return Ok(());
