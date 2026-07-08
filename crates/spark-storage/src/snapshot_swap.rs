@@ -105,6 +105,14 @@ pub struct SnapshotResidency<A: SlotArena, S: SwapStore> {
     next_disk: usize,
     /// Reusable scratch for a single blob move (spill/fault), sized once.
     scratch: Vec<u8>,
+    /// Read-pins: `key → active reader count`. A GET hands the client an arena
+    /// offset it then one-sided-RDMA-READs; the peer drops the residency lock
+    /// before that read, so a concurrent ALLOC on another connection could pick
+    /// the slot as an eviction victim and reuse it mid-read (torn restore). A
+    /// pinned key is held OUT of `lru` (like a `Reserved` slot) so
+    /// `evict_coldest_to_disk` can never choose it. Ref-counted for concurrent
+    /// readers of the same key. Invariant: `key ∈ lru ⟺ Resident AND unpinned`.
+    read_pins: HashMap<u64, u32>,
     stats: SwapStats,
 }
 
@@ -145,6 +153,7 @@ impl<A: SlotArena, S: SwapStore> SnapshotResidency<A, S> {
             free_disk: Vec::new(),
             next_disk: 0,
             scratch: vec![0u8; blob_bytes],
+            read_pins: HashMap::new(),
             stats: SwapStats::default(),
         })
     }
@@ -202,7 +211,13 @@ impl<A: SlotArena, S: SwapStore> SnapshotResidency<A, S> {
         match self.map.get(&key).copied() {
             Some(Loc::Reserved(slot)) => {
                 self.map.insert(key, Loc::Resident(slot));
-                self.lru.push_back(key); // hottest
+                // Maintain the `in-lru ⟺ Resident AND unpinned` invariant: if a
+                // reader pinned this key while the re-PUT was in flight, leave it
+                // out of the LRU — `unpin_read` re-adds it when the last reader
+                // releases.
+                if !self.read_pins.contains_key(&key) {
+                    self.lru.push_back(key); // hottest
+                }
                 Ok(())
             }
             Some(Loc::Resident(_)) => Ok(()), // already committed — idempotent
@@ -218,7 +233,14 @@ impl<A: SlotArena, S: SwapStore> SnapshotResidency<A, S> {
         match self.map.get(&key).copied() {
             Some(Loc::Resident(slot)) => {
                 self.stats.resident_hits += 1;
-                self.lru_touch(key);
+                // A concurrently-pinned key is held out of `lru`; touching it
+                // would re-insert it (breaking the invariant + making it an
+                // eviction victim while still being read). The caller pins right
+                // after this returns, so unpinned hits get refreshed here and
+                // pinned ones stay out.
+                if !self.read_pins.contains_key(&key) {
+                    self.lru_touch(key);
+                }
                 Ok(Some(slot))
             }
             Some(Loc::Reserved(slot)) => {
@@ -280,6 +302,46 @@ impl<A: SlotArena, S: SwapStore> SnapshotResidency<A, S> {
         }
     }
 
+    /// Read-pin `key` so its resident slot cannot be chosen as an eviction
+    /// victim while a client's one-sided RDMA READ of it is in flight (the
+    /// GET→RDMA-read race: the peer replies with the offset and drops the lock
+    /// before the client reads, so a concurrent ALLOC could otherwise
+    /// spill+reuse the slot). Ref-counted for concurrent readers; the first pin
+    /// removes the key from `lru` (like a `Reserved` slot). No-op unless the key
+    /// is currently `Resident`.
+    pub fn pin_read(&mut self, key: u64) {
+        if !matches!(self.map.get(&key), Some(Loc::Resident(_))) {
+            return;
+        }
+        let n = self.read_pins.get(&key).copied().unwrap_or(0);
+        if n == 0 {
+            self.lru_remove(key); // exclude from eviction victims while read
+        }
+        self.read_pins.insert(key, n + 1);
+    }
+
+    /// Release one read-pin taken by [`pin_read`]. When the last reader
+    /// releases, the key rejoins `lru` as hottest (it was just read). No-op if
+    /// the key holds no pin. Robust to the key having been removed while pinned:
+    /// only re-adds to `lru` if still `Resident` and not already present.
+    pub fn unpin_read(&mut self, key: u64) {
+        let Some(n) = self.read_pins.get_mut(&key) else {
+            return;
+        };
+        *n -= 1;
+        if *n == 0 {
+            self.read_pins.remove(&key);
+            if matches!(self.map.get(&key), Some(Loc::Resident(_))) && !self.lru.contains(&key) {
+                self.lru.push_back(key); // hottest — just accessed
+            }
+        }
+    }
+
+    /// Active read-pin count (test/introspection).
+    pub fn read_pin_count(&self, key: u64) -> u32 {
+        self.read_pins.get(&key).copied().unwrap_or(0)
+    }
+
     // ─────────────────────────── internals ───────────────────────────
 
     /// A free arena slot, spilling the coldest resident slot to disk if none.
@@ -295,7 +357,8 @@ impl<A: SlotArena, S: SwapStore> SnapshotResidency<A, S> {
     fn evict_coldest_to_disk(&mut self) -> Result<usize> {
         let Some(victim) = self.lru.pop_front() else {
             bail!(
-                "SnapshotResidency: arena exhausted — all {} slots reserved (uncommitted PUTs)",
+                "SnapshotResidency: arena exhausted — all {} slots reserved (uncommitted \
+                 PUTs) or read-pinned (in-flight RDMA READs)",
                 self.arena.num_slots()
             );
         };
@@ -703,10 +766,36 @@ fn write_reply<W: Write>(w: &mut W, reply: &PagingReply) -> Result<()> {
 /// The peer-side control loop: read `[op][u64 key]` requests, dispatch against
 /// `res`, write replies, until BYE or hangup. Generic over the stream so it runs
 /// against a real `TcpStream` in the peer and a fake duplex in tests.
+/// One control op with connection-scoped read-pin lifecycle. Releases this
+/// connection's previous GET read-pin — its RDMA READ has necessarily drained,
+/// because the client is synchronous and only sends its NEXT op after the read
+/// completes — then dispatches, and pins a fresh GET hit so a concurrent ALLOC
+/// on another connection cannot evict the slot mid-read. `pinned` threads the
+/// connection's currently-pinned key across calls. Needs NO new opcode and no
+/// client change (auto-release on next op / disconnect) → wire-compatible with
+/// the deployed peer.
+fn handle_paging_op<A: SlotArena, S: SwapStore>(
+    res: &mut SnapshotResidency<A, S>,
+    op: u8,
+    key: u64,
+    pinned: &mut Option<u64>,
+) -> PagingReply {
+    if let Some(prev) = pinned.take() {
+        res.unpin_read(prev);
+    }
+    let reply = dispatch(res, op, key);
+    if op == OP_GET && matches!(reply, PagingReply::Located(_)) {
+        res.pin_read(key);
+        *pinned = Some(key);
+    }
+    reply
+}
+
 pub fn run_paging_loop<T: Read + Write, A: SlotArena, S: SwapStore>(
     stream: &mut T,
     res: &mut SnapshotResidency<A, S>,
 ) -> Result<()> {
+    let mut pinned: Option<u64> = None;
     loop {
         let mut op = [0u8; 1];
         if stream.read_exact(&mut op).is_err() {
@@ -718,8 +807,12 @@ pub fn run_paging_loop<T: Read + Write, A: SlotArena, S: SwapStore>(
         let mut kb = [0u8; 8];
         stream.read_exact(&mut kb).context("read paging key")?;
         let key = u64::from_le_bytes(kb);
-        let reply = dispatch(res, op[0], key);
+        let reply = handle_paging_op(res, op[0], key, &mut pinned);
         write_reply(stream, &reply)?;
+    }
+    // Release this connection's outstanding read-pin on hangup / BYE.
+    if let Some(pk) = pinned {
+        res.unpin_read(pk);
     }
     Ok(())
 }
@@ -803,6 +896,11 @@ pub fn run_paging_loop_shared<T: Read + Write, A: SlotArena, S: SwapStore>(
     stream: &mut T,
     res: &std::sync::Mutex<SnapshotResidency<A, S>>,
 ) -> Result<()> {
+    // Per-connection read-pin (see `handle_paging_op`): a GET hit is pinned OUT
+    // of the LRU under the same lock as the dispatch, so a concurrent ALLOC on
+    // another connection can't evict the slot while THIS client RDMA-reads it.
+    // Released on the connection's next op (its read has drained) or disconnect.
+    let mut pinned: Option<u64> = None;
     loop {
         let mut op = [0u8; 1];
         if stream.read_exact(&mut op).is_err() {
@@ -816,9 +914,12 @@ pub fn run_paging_loop_shared<T: Read + Write, A: SlotArena, S: SwapStore>(
         let key = u64::from_le_bytes(kb);
         let reply = {
             let mut g = res.lock().expect("shared residency mutex poisoned");
-            dispatch(&mut g, op[0], key)
+            handle_paging_op(&mut g, op[0], key, &mut pinned)
         };
         write_reply(stream, &reply)?;
+    }
+    if let Some(pk) = pinned {
+        res.lock().expect("shared residency mutex poisoned").unpin_read(pk);
     }
     Ok(())
 }
@@ -1008,6 +1109,86 @@ mod tests {
             assert_eq!(get(&mut r, k).as_deref(), Some(&blob(k as u8)[..]), "key {k}");
         }
         assert!(r.stats().faults_from_disk > 0);
+    }
+
+    /// THE eviction-pin guarantee (WS-A GET→RDMA-read race): a read-pinned key
+    /// is never chosen as an eviction victim, even when it is the LRU-coldest —
+    /// a concurrent ALLOC spills the next-coldest UNPINNED key instead, so the
+    /// client's in-flight one-sided RDMA READ is never torn by slot reuse.
+    #[test]
+    fn read_pin_survives_concurrent_eviction() {
+        let mut r = residency(2);
+        put(&mut r, 0, 0); // resident: [0] (coldest)
+        put(&mut r, 1, 1); // resident: [0,1]
+        // Client A GETs key 0 (the coldest) and begins its RDMA read → pin it.
+        assert!(r.locate(0).unwrap().is_some());
+        r.pin_read(0);
+        assert_eq!(r.read_pin_count(0), 1);
+        let faults_before = r.stats().faults_from_disk;
+
+        // Client B ALLOCs a new key → arena full → must evict. Key 0 is coldest
+        // but pinned, so key 1 is spilled instead.
+        put(&mut r, 2, 2);
+        assert_eq!(r.stats().spills_to_disk, 1, "exactly one eviction");
+        assert_eq!(get(&mut r, 1), Some(blob(1)), "the UNPINNED key 1 was the victim");
+        // Key 0 is still resident (byte-intact) and never touched disk.
+        assert_eq!(get(&mut r, 0), Some(blob(0)), "pinned key 0 survived intact");
+        assert_eq!(
+            r.stats().faults_from_disk,
+            faults_before + 1,
+            "only key 1 faulted back; key 0 never spilled"
+        );
+    }
+
+    /// Ref-counted: concurrent readers each add a pin; the key stays protected
+    /// until the LAST reader releases, then rejoins the LRU (no double-insert).
+    #[test]
+    fn refcounted_read_pins_release_to_evictable() {
+        let mut r = residency(2);
+        put(&mut r, 0, 0);
+        put(&mut r, 1, 1);
+        r.pin_read(0);
+        r.pin_read(0); // second concurrent reader of key 0
+        assert_eq!(r.read_pin_count(0), 2);
+        r.unpin_read(0);
+        assert_eq!(r.read_pin_count(0), 1, "still one reader → still pinned");
+        // Force an eviction: key 0 is still protected → key 1 spills.
+        put(&mut r, 2, 2);
+        assert_eq!(get(&mut r, 1), Some(blob(1)), "key 1 evicted while key 0 still pinned");
+        // Last reader releases → key 0 rejoins the LRU exactly once and is now
+        // an eligible victim again.
+        r.unpin_read(0);
+        assert_eq!(r.read_pin_count(0), 0);
+        assert_eq!(r.resident_count(), 2, "keys 0 and 2 resident; no LRU double-insert");
+        put(&mut r, 3, 3); // evicts the now-unpinned coldest (key 0)
+        put(&mut r, 4, 4);
+        assert_eq!(get(&mut r, 0), Some(blob(0)), "unpinned key 0 spilled+faulted byte-identical");
+    }
+
+    /// The connection-scoped auto-release: `handle_paging_op` pins a GET hit and
+    /// releases it on the SAME connection's next op — no new opcode, no client
+    /// change. During the window the slot survives a concurrent ALLOC.
+    #[test]
+    fn handle_paging_op_pins_get_and_auto_releases() {
+        let mut r = residency(2);
+        put(&mut r, 0, 0);
+        put(&mut r, 1, 1);
+        let mut pinned: Option<u64> = None;
+
+        // Connection A: GET 0 → pinned.
+        let reply = handle_paging_op(&mut r, OP_GET, 0, &mut pinned);
+        assert!(matches!(reply, PagingReply::Located(_)));
+        assert_eq!(pinned, Some(0));
+        assert_eq!(r.read_pin_count(0), 1);
+
+        // Concurrent ALLOC (another connection) evicts the unpinned key 1, not 0.
+        put(&mut r, 2, 2);
+        assert_eq!(get(&mut r, 0), Some(blob(0)), "pinned GET slot survived the ALLOC");
+
+        // Connection A's NEXT op releases the pin (its RDMA read has drained).
+        handle_paging_op(&mut r, OP_REMOVE, 99, &mut pinned);
+        assert_eq!(pinned, None);
+        assert_eq!(r.read_pin_count(0), 0, "pin auto-released on next op");
     }
 
     #[test]
