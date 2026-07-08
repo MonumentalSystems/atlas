@@ -301,7 +301,18 @@ impl TransformerModel {
             // already-cached values).
             //
             // For pure attention (MLA/GQA): use matched tokens directly.
-            let snap_tok = prefix_match.ssm_snapshot_tokens;
+            //
+            // CRITICAL (tier fault-in skip fix, 2026-07-07): use the EFFECTIVE
+            // snapshot depth, not the resident-only `ssm_snapshot_tokens`. When
+            // the anchor was SPILLED and faulted back in above, the resident
+            // field is 0 and the real depth lives in `ssm_snapshot_tier_tokens`
+            // (both folded into `eff_snapshot_tokens`). Using the raw field here
+            // made `snap_tok = 0 → skip_tokens = 0` for every tier restore, so
+            // the suffix prefill re-ran the SSM over the ENTIRE prefix (measured
+            // k≈15k) — the restore completed but skipped nothing, making a warm
+            // fault-in 2× SLOWER than a plain recompute. `eff_snapshot_tokens`
+            // makes the skip point equal the restored state depth.
+            let snap_tok = eff_snapshot_tokens;
             let skip_tokens = if skip && !has_ssm {
                 matched
             } else if skip && matched == total && snap_tok == matched {
