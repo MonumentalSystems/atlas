@@ -176,25 +176,26 @@ mod server_impl {
         let mut b8 = [0u8; 8];
         stream.read_exact(&mut b8).context("read total_bytes/magic")?;
         let first = u64::from_le_bytes(b8);
-        let (total, paging_blob): (usize, Option<usize>) =
-            if first == crate::snapshot_swap::PAGING_MAGIC {
-                stream.read_exact(&mut b8).context("read paging arena_bytes")?;
-                let arena_bytes = u64::from_le_bytes(b8) as usize;
-                stream.read_exact(&mut b8).context("read paging blob_bytes")?;
-                let blob = u64::from_le_bytes(b8) as usize;
-                if blob == 0 || arena_bytes == 0 || !arena_bytes.is_multiple_of(blob) {
-                    bail!("paging: bad arena_bytes {arena_bytes} / blob_bytes {blob}");
+        // v1/v2 paging magic → (kind, arena_bytes, blob_bytes); legacy KV bare
+        // total_bytes → None. `parse_paging_header` reads the kind byte (v2) +
+        // the two sizes off the stream and rejects unsupported kinds.
+        let (total, paging): (usize, Option<(u8, usize)>) =
+            match crate::snapshot_swap::parse_paging_header(first, &mut stream)? {
+                Some((kind, arena_bytes, blob)) => {
+                    let arena_bytes = arena_bytes as usize;
+                    let blob = blob as usize;
+                    if blob == 0 || arena_bytes == 0 || !arena_bytes.is_multiple_of(blob) {
+                        bail!("paging: bad arena_bytes {arena_bytes} / blob_bytes {blob}");
+                    }
+                    // Reject BEFORE the rail handshake when this peer has no swap
+                    // dir — the client's connect_paging then errors cleanly and
+                    // falls back to the bounded/host-RAM tier.
+                    if rdma.swap_dir.is_none() {
+                        bail!("paging client but peer started without --swap-dir; refusing");
+                    }
+                    (arena_bytes, Some((kind.0, blob)))
                 }
-                // Reject paging BEFORE the rail handshake when this peer has no
-                // swap dir — the client's `connect_paging` then errors cleanly on
-                // the missing peer reply and falls back to the bounded/host-RAM
-                // tier (vs a confusing mid-session failure after STATUS_OK).
-                if rdma.swap_dir.is_none() {
-                    bail!("paging client but peer started without --swap-dir; refusing");
-                }
-                (arena_bytes, Some(blob))
-            } else {
-                (first as usize, None)
+                None => (first as usize, None),
             };
         if total == 0 || total > (1usize << 42) {
             bail!("implausible kv blade size: {total}");
@@ -214,8 +215,8 @@ mod server_impl {
         // arena (charged ONCE at init) so every client's QPs point at the SAME
         // physical slots → a snapshot PUT by one client is GET-able by another.
         let pid = std::process::id();
-        let shared: Option<std::sync::Arc<SharedPaging>> = match paging_blob {
-            Some(blob) => Some(get_or_init_shared_paging(rdma, total, blob, ledger)?),
+        let shared: Option<std::sync::Arc<SharedPaging>> = match paging {
+            Some((kind, blob)) => Some(get_or_init_shared_paging(rdma, kind, total, blob, ledger)?),
             None => None,
         };
         // Per-connection arena + blade reservation (legacy only), kept alive
@@ -353,7 +354,6 @@ mod server_impl {
     #[cfg(atlas_rdma_verbs)]
     struct SharedPaging {
         arena: Mmap,
-        blob_bytes: usize,
         residency: std::sync::Mutex<
             crate::snapshot_swap::SnapshotResidency<
                 crate::snapshot_swap::MmapSlotArena,
@@ -369,50 +369,77 @@ mod server_impl {
     #[cfg(atlas_rdma_verbs)]
     unsafe impl Sync for SharedPaging {}
 
+    /// Item 8: a REGISTRY of paging arenas keyed by (kind, blob_bytes) so ONE
+    /// peer serves per-(kind, shape) arenas. Distinct shapes coexist (different
+    /// fixed-slot geometries); same-shape clients share one arena (namespaced
+    /// keys). The disk cap is a single hard-ceiling budget carved across entries.
     #[cfg(atlas_rdma_verbs)]
-    static SHARED_PAGING: std::sync::Mutex<Option<std::sync::Arc<SharedPaging>>> =
-        std::sync::Mutex::new(None);
+    #[derive(Default)]
+    struct PagingRegistry {
+        arenas: std::collections::HashMap<(u8, usize), std::sync::Arc<SharedPaging>>,
+        /// Remaining disk-cap budget (bytes); the first (SSM) entry claims the
+        /// remainder, honoring the hard `swap_cap_bytes` ceiling across arenas.
+        remaining_cap: u64,
+        cap_init: bool,
+        legacy_cleaned: bool,
+    }
 
-    /// Get (first paging client creates) the process-global shared paging arena.
-    /// Charges the blade ledger ONCE. Later clients must match `blob_bytes`.
+    #[cfg(atlas_rdma_verbs)]
+    static SHARED_PAGING: std::sync::LazyLock<std::sync::Mutex<PagingRegistry>> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new(PagingRegistry::default()));
+
+    /// Get (first client of a (kind, blob) creates) that shape's shared arena.
+    /// Charges the blade ledger per arena; carves the disk cap from a shared
+    /// ceiling. The registry lock guards only the map + budget — residency ops
+    /// run under each entry's own Mutex, never this lock.
     #[cfg(atlas_rdma_verbs)]
     fn get_or_init_shared_paging(
         rdma: &RdmaConfig,
+        kind: u8,
         arena_bytes: usize,
         blob_bytes: usize,
         ledger: &std::sync::Arc<crate::blade_cap::CommitLedger>,
     ) -> Result<std::sync::Arc<SharedPaging>> {
-        let mut g = SHARED_PAGING.lock().expect("shared paging registry poisoned");
-        if let Some(sh) = g.as_ref() {
-            if sh.blob_bytes != blob_bytes {
-                bail!(
-                    "paging blob_bytes {blob_bytes} != established {} (all clients of a shared \
-                     peer arena must use the same snapshot size)",
-                    sh.blob_bytes
-                );
-            }
-            return Ok(sh.clone());
+        let mut reg = SHARED_PAGING.lock().expect("paging registry poisoned");
+        let key = (kind, blob_bytes);
+        if let Some(sh) = reg.arenas.get(&key) {
+            return Ok(sh.clone()); // same (kind, shape) → share
         }
         let swap_dir = rdma
             .swap_dir
             .as_ref()
             .context("paging client but peer has no --swap-dir configured")?;
+        std::fs::create_dir_all(swap_dir).ok();
+        // One-time: init the shared disk budget + remove the pre-registry fixed
+        // swap file (verify gap: orphaned atlas-snap-shared.swap on upgrade).
+        if !reg.cap_init {
+            reg.remaining_cap = rdma.swap_cap_bytes;
+            reg.cap_init = true;
+        }
+        if !reg.legacy_cleaned {
+            let _ = std::fs::remove_file(swap_dir.join("atlas-snap-shared.swap"));
+            reg.legacy_cleaned = true;
+        }
         let reservation = ledger
             .try_reserve(arena_bytes as u64)
             .context("paging blade cap")?;
         let arena = Mmap::anon(arena_bytes)?;
         let num_slots = arena_bytes / blob_bytes;
-        std::fs::create_dir_all(swap_dir).ok();
-        let swap_path = swap_dir.join("atlas-snap-shared.swap");
-        let swap = crate::snapshot_swap::DirectSwapFile::create(&swap_path, blob_bytes)?;
-        // Bound the disk tier to the configured cap (coldest on-disk snapshot
-        // dropped when full). 0 = unbounded.
-        let max_disk_slots = if rdma.swap_cap_bytes == 0 {
-            0
+        // Carve the disk cap from the shared budget (hard ceiling): a bounded
+        // entry claims its share of remaining records; 0 = unbounded config only.
+        let bounded = rdma.swap_cap_bytes > 0;
+        let max_disk_slots = if !bounded {
+            0 // unbounded (0 == unbounded in SnapshotResidency)
         } else {
-            (rdma.swap_cap_bytes / blob_bytes as u64) as usize
+            let recs = (reg.remaining_cap / blob_bytes as u64) as usize;
+            reg.remaining_cap = reg
+                .remaining_cap
+                .saturating_sub(recs as u64 * blob_bytes as u64);
+            recs.max(1) // never 0 here (which would mean unbounded); starved kind → 1-record floor
         };
-        // SAFETY: the Mmap is owned by SharedPaging (held by the static Arc), so
+        let swap_path = swap_dir.join(format!("atlas-snap-{kind}-{blob_bytes}.swap"));
+        let swap = crate::snapshot_swap::DirectSwapFile::create(&swap_path, blob_bytes)?;
+        // SAFETY: the Mmap is owned by SharedPaging (held by the registry Arc), so
         // its base VA outlives every MmapSlotArena view of it.
         let slot_arena = unsafe {
             crate::snapshot_swap::MmapSlotArena::new(arena.addr as *mut u8, blob_bytes, num_slots)
@@ -420,24 +447,19 @@ mod server_impl {
         let residency =
             crate::snapshot_swap::SnapshotResidency::new_capped(slot_arena, swap, max_disk_slots)?;
         tracing::info!(
-            "cache-peer SHARED paging arena: {num_slots} slots × {blob_bytes} B RAM ({:.1} GiB) \
-             + NVMe swap {} (disk cap {} = {} records; shared across clients)",
+            "cache-peer paging arena kind={kind} shape={blob_bytes}B: {num_slots} slots RAM \
+             ({:.1} GiB) + NVMe swap {} (disk cap {} records; budget {:.0} GiB left)",
             arena_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
             swap_path.display(),
-            if max_disk_slots == 0 {
-                "unbounded".to_string()
-            } else {
-                format!("{:.0} GiB", rdma.swap_cap_bytes as f64 / (1024.0 * 1024.0 * 1024.0))
-            },
-            max_disk_slots,
+            if max_disk_slots == 0 { "unbounded".to_string() } else { max_disk_slots.to_string() },
+            reg.remaining_cap as f64 / (1024.0 * 1024.0 * 1024.0),
         );
         let sh = std::sync::Arc::new(SharedPaging {
             arena,
-            blob_bytes,
             residency: std::sync::Mutex::new(residency),
             _reservation: reservation,
         });
-        *g = Some(sh.clone());
+        reg.arenas.insert(key, sh.clone());
         Ok(sh)
     }
 }
