@@ -175,8 +175,25 @@ impl TransformerModel {
         );
 
         // Marconi: restore SSM snapshot if available (session-gated).
-        let (kv_write_start, marconi_skip) = if let Some(snap_id) = prefix_match.ssm_snapshot {
-            let snap_tok = prefix_match.ssm_snapshot_tokens;
+        //
+        // Phase 1b spill-tier fault-in (#6): fault a SPILLED anchor back to a
+        // resident slot so this two-phase path restores it instead of
+        // recomputing the whole prefix. `eff_snapshot`/`eff_snapshot_tokens`
+        // fold resident + faulted — the resident `ssm_snapshot_tokens` field is
+        // 0 for a faulted anchor, so its real depth lives in the tier field. A
+        // faulted slot is byte-identical to the snapshot it spilled from, so the
+        // restore/skip logic below is unchanged. Gated by the #5 cost-aware
+        // depth guard; see `ssm_fault_in.rs`.
+        let faulted_snap =
+            self.try_fault_in_ssm_snapshot(&prefix_match, seq.session_hash, stream);
+        let eff_snapshot = prefix_match.ssm_snapshot.or(faulted_snap);
+        let eff_snapshot_tokens = if faulted_snap.is_some() {
+            prefix_match.ssm_snapshot_tier_tokens
+        } else {
+            prefix_match.ssm_snapshot_tokens
+        };
+        let (kv_write_start, marconi_skip) = if let Some(snap_id) = eff_snapshot {
+            let snap_tok = eff_snapshot_tokens;
             if snap_tok > 0
                 && matched <= total_len
                 && self

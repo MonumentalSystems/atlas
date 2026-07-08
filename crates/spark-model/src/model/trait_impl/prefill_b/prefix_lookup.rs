@@ -117,50 +117,10 @@ impl TransformerModel {
             // prefix was SPILLED (ssm_snapshot is None but a tier key is
             // present), fault its bytes into a slot and treat it as resident for
             // the restore below — converting a recompute into a tier-restore.
-            // `acquire_or_spill_slot` spills a resident victim to make room when
-            // the pool is full, so a warm hit isn't lost to a busy pool; only if
-            // the tier no longer holds the blob do we fall through to recompute.
-            let mut faulted_snap: Option<usize> = None;
-            if prefix_match.ssm_snapshot.is_none() {
-                if let (Some(store), Some(key)) = (
-                    self.ssm_tier_store.as_deref(),
-                    prefix_match.ssm_snapshot_tier_key,
-                ) {
-                    if let Some(slot) = self.ssm_snapshots.acquire_or_spill_slot(
-                        self.prefix_cache.as_ref(),
-                        store,
-                        self.gpu.as_ref(),
-                    ) {
-                        match self.ssm_snapshots.fault_in_slot(
-                            slot,
-                            key,
-                            store,
-                            self.gpu.as_ref(),
-                            stream,
-                        ) {
-                            Ok(true) => {
-                                self.prefix_cache.promote_snapshot(key, slot);
-                                // Re-home the session owner onto the fresh slot.
-                                // Without this the slot is untagged (or carries a
-                                // spill victim's stale tag) and the
-                                // `session_matches` gate below rejects the
-                                // just-faulted state → full recompute. lookup_tiered
-                                // already filtered by session, so seq.session_hash
-                                // is the rightful owner.
-                                self.ssm_snapshots.tag_session(slot, seq.session_hash);
-                                faulted_snap = Some(slot);
-                                tracing::info!(
-                                    "SSM tier fault-in: restored spilled snapshot at token {} \
-                                     into slot {slot}",
-                                    prefix_match.ssm_snapshot_tier_tokens,
-                                );
-                            }
-                            // Miss (blob gone) or error: return the slot, recompute.
-                            _ => self.ssm_snapshots.free(slot),
-                        }
-                    }
-                }
-            }
+            // Shared with prefill_a/prefill_c and gated by the #5 cost-aware
+            // depth guard; see `ssm_fault_in.rs`.
+            let faulted_snap =
+                self.try_fault_in_ssm_snapshot(&prefix_match, seq.session_hash, stream);
             let eff_snapshot = prefix_match.ssm_snapshot.or(faulted_snap);
             let eff_snapshot_tokens = if faulted_snap.is_some() {
                 prefix_match.ssm_snapshot_tier_tokens

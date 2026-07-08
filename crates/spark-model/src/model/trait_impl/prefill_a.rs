@@ -133,8 +133,25 @@ impl TransformerModel {
         // With intermediate checkpoints, ssm_snapshot_tokens may be less than
         // matched_tokens. Use ssm_snapshot_tokens as the skip point.
         // Session isolation: only restore snapshots belonging to this session.
-        let marconi_skip = if let Some(snap_id) = prefix_match.ssm_snapshot {
-            let snap_tok = prefix_match.ssm_snapshot_tokens;
+        //
+        // Phase 1b spill-tier fault-in (#6): if the anchor was SPILLED, fault it
+        // back to a resident slot so this path restores it instead of
+        // recomputing the whole prefix. `eff_snapshot`/`eff_snapshot_tokens`
+        // fold resident + faulted — the resident `ssm_snapshot_tokens` field is
+        // 0 for a faulted anchor, so its real depth lives in the tier field.
+        // A faulted slot is byte-identical to the resident snapshot it spilled
+        // from, so the restore/skip logic below is unchanged. Gated by the #5
+        // cost-aware depth guard; see `ssm_fault_in.rs`.
+        let faulted_snap =
+            self.try_fault_in_ssm_snapshot(&prefix_match, seq.session_hash, stream);
+        let eff_snapshot = prefix_match.ssm_snapshot.or(faulted_snap);
+        let eff_snapshot_tokens = if faulted_snap.is_some() {
+            prefix_match.ssm_snapshot_tier_tokens
+        } else {
+            prefix_match.ssm_snapshot_tokens
+        };
+        let marconi_skip = if let Some(snap_id) = eff_snapshot {
+            let snap_tok = eff_snapshot_tokens;
             if snap_tok > 0
                 && kv_write_start <= n
                 && self
@@ -165,9 +182,21 @@ impl TransformerModel {
                         snap_id,
                     );
                 }
-                // When all tokens matched (exact prompt), the snapshot covers
-                // everything — skip the entire prompt, process only the last token.
-                kv_write_start = if kv_write_start >= n { n } else { snap_tok };
+                // When all tokens matched (exact prompt) AND the snapshot
+                // covers that full match, skip the entire prompt — process only
+                // the last token. But an *intermediate* checkpoint at full match
+                // length (snap_tok < matched == n — e.g. a faulted-in or
+                // ladder anchor whose leaf was evicted) leaves the restored
+                // recurrent state at `snap_tok`, NOT `n`. Skipping to `n` here
+                // would desync the SSM h_state/conv_state from KV/positions →
+                // first decoded token reads a misaligned state → garbage. Skip
+                // only to `snap_tok` so the suffix prefill recomputes SSM over
+                // [snap_tok, n). (Mirrors the prefill_b/prefill_c warm-hit fix.)
+                kv_write_start = if kv_write_start >= n && snap_tok >= kv_write_start {
+                    n
+                } else {
+                    snap_tok
+                };
                 true
             } else {
                 if kv_write_start > 0 {
