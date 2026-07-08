@@ -59,9 +59,11 @@ fn main() -> Result<()> {
                 eprintln!(
                     "atlas-cache-peer — RW RDMA overflow blade for the KV cache\n\n\
                      USAGE: atlas-cache-peer [--listen host:port] [--rail <dev>:<gid> ...]\n\
-                     \x20                  [--max-blade-gb <g>]\n\
+                     \x20                  [--max-blade-gb <g>] [--swap-dir <dir>]\n\
                      defaults: listen 0.0.0.0:9910, rails roceP2p1s0f1:3 rocep1s0f1:3\n\
                      --max-blade-gb <g>: cap total blade RAM (0/absent = unlimited)\n\
+                     --swap-dir <dir>: NVMe dir backing PAGING clients (WS-A) →\n\
+                     \x20                 RAM arena becomes a page-cache w/ infinite depth\n\
                      client selects via $ATLAS_KV_PEER=host:port ($ATLAS_KV_DUAL_RAIL=1 for both)"
                 );
                 return Ok(());

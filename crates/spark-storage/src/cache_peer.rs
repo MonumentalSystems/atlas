@@ -180,6 +180,13 @@ mod server_impl {
                 if blob == 0 || arena_bytes == 0 || !arena_bytes.is_multiple_of(blob) {
                     bail!("paging: bad arena_bytes {arena_bytes} / blob_bytes {blob}");
                 }
+                // Reject paging BEFORE the rail handshake when this peer has no
+                // swap dir — the client's `connect_paging` then errors cleanly on
+                // the missing peer reply and falls back to the bounded/host-RAM
+                // tier (vs a confusing mid-session failure after STATUS_OK).
+                if rdma.swap_dir.is_none() {
+                    bail!("paging client but peer started without --swap-dir; refusing");
+                }
                 (arena_bytes, Some(blob))
             } else {
                 (first as usize, None)
