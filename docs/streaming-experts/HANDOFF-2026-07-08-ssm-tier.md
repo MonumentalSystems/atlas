@@ -50,6 +50,24 @@ point for a fresh session to blast out the remaining greenlit tasks. See memory:
 
 ## OPEN GREENLIT TASKS (blast these out)
 
+### DONE (2026-07-08, commit 635cbcf + GPU-validated on holo-p11)
+- **#5 — cost-aware fault-vs-recompute gate.** `ATLAS_SSM_FAULT_MIN_TOKENS`
+  (default 256, 0=disabled): below it a matched prefix is shallow enough that
+  recompute beats the fixed ~28 ms blob fault+replay. Lives in the shared
+  `trait_impl/ssm_fault_in.rs` helper so it applies to all three prefill paths.
+- **#6 — wire `prefill_a`/`prefill_c` to the tier.** Both previously ignored
+  `ssm_snapshot_tier_key` → recompute; now fault a spilled anchor back to a
+  resident slot and fold via `eff_snapshot`/`eff_snapshot_tokens`, exactly like
+  `prefill_b` (extracted into `try_fault_in_ssm_snapshot`). Also hardened
+  `prefill_a`'s exact-match skip (only skip whole prompt when `snap_tok >=
+  matched`) to match the prefill_b/c intermediate-checkpoint fix.
+  - **GPU evidence (Holo-3.1-35B-A3B-NVFP4, host-RAM tier, ladder N=2, ssm_deep
+    6×3):** `--ssm-cache-slots 4` → 103 spills, 12 tier fault-ins RESTORED via
+    the helper, 12 intermediate hits, 18/18 coherent, 0 errors (proves 4
+    slots/0.25 GB + tier ≈ 256 slots/16 GB). Gate flip
+    `ATLAS_SSM_FAULT_MIN_TOKENS=20000` → 12 SKIPs, 0 fault-ins, 12 recompute
+    fallbacks, 18/18 coherent. Workload harness: `scripts/streaming-experts/ssm_deep.py`.
+
 ### SSM-snapshot / prefill path
 - **#3 — warm-TTFT (the real latency lever, ~1600 ms turn).** MEASURED: a warm
   turn = `484ms` (embed+lookup over 15K) + `532ms` (tail-cut pass 1 + checkpoint)
