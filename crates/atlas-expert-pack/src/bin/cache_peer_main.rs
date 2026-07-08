@@ -47,6 +47,14 @@ fn main() -> Result<()> {
                 }
                 rdma.max_blade_bytes = (gb * 1024.0 * 1024.0 * 1024.0) as u64;
             }
+            // Directory for NVMe swap files backing paging-mode clients (WS-A):
+            // a paging connection's RDMA arena becomes a page-cache over an
+            // O_DIRECT swap file here, giving the SSM-snapshot tier infinite
+            // depth. Absent = paging clients are refused (RAM-only, legacy).
+            "--swap-dir" => {
+                let d = it.next().context("--swap-dir needs a path")?;
+                rdma.swap_dir = Some(std::path::PathBuf::from(d));
+            }
             "-h" | "--help" => {
                 eprintln!(
                     "atlas-cache-peer — RW RDMA overflow blade for the KV cache\n\n\

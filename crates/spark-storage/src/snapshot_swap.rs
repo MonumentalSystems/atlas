@@ -26,7 +26,7 @@
 
 use std::collections::{HashMap, VecDeque};
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 
 /// The hot tier: the RDMA-registered RAM arena as a set of `num_slots`
 /// fixed-size slots. The peer implements this over its `mmap`'d MR (page-aligned
@@ -446,6 +446,184 @@ impl Drop for AlignedBuf {
     }
 }
 
+// ───────────────────────────── control protocol ─────────────────────────────
+//
+// Inc 2: the TCP control channel between a paging client and the peer. It rides
+// the SAME stream the peer used for the RDMA handshake (which today just idles).
+// Backward-compatible: a paging client sends `PAGING_MAGIC` as its first u64
+// where a legacy KV client sends `total_bytes` (validated <= 1<<42); the magic
+// is far above that range, so legacy clients are never mis-parsed.
+//
+// After the shared rail handshake, the loop is: client sends [op][key], peer
+// replies [status] (+ [offset] for ALLOC/GET-hit). Data still moves one-sided
+// over RDMA into/out of `slot_offset(slot)`; only tiny control messages cross
+// TCP.
+
+use std::io::{Read, Write};
+
+/// First-u64 sentinel selecting the paging protocol (> 1<<42, so a legacy
+/// `total_bytes` can never collide). "PAGE" + version.
+pub const PAGING_MAGIC: u64 = 0x5041_4745_0000_0001;
+
+pub const OP_BYE: u8 = 0;
+pub const OP_ALLOC: u8 = 1;
+pub const OP_COMMIT: u8 = 2;
+pub const OP_GET: u8 = 3;
+pub const OP_REMOVE: u8 = 4;
+
+pub const ST_OK: u8 = 0;
+pub const ST_MISS: u8 = 1;
+pub const ST_ERR: u8 = 2;
+
+/// Result of one control request, ready to serialize.
+#[derive(Debug, PartialEq, Eq)]
+pub enum PagingReply {
+    /// ST_OK with a following u64 arena offset (ALLOC and GET-hit).
+    Located(u64),
+    /// ST_OK with no payload (COMMIT, REMOVE).
+    Ok,
+    /// ST_MISS — unknown key (GET).
+    Miss,
+    /// ST_ERR — operation failed (e.g. arena exhausted by reservations).
+    Err,
+    /// Client asked to close.
+    Bye,
+}
+
+/// Execute one control op against the residency and return the reply. Pure over
+/// the (already unit-tested) `SnapshotResidency`, so the protocol is testable
+/// without a socket or RDMA.
+pub fn dispatch<A: SlotArena, S: SwapStore>(
+    res: &mut SnapshotResidency<A, S>,
+    op: u8,
+    key: u64,
+) -> PagingReply {
+    match op {
+        OP_BYE => PagingReply::Bye,
+        OP_ALLOC => match res.alloc(key) {
+            Ok(slot) => PagingReply::Located(res.slot_offset(slot)),
+            Err(e) => {
+                tracing::warn!("paging ALLOC {key:#x} failed: {e:#}");
+                PagingReply::Err
+            }
+        },
+        OP_COMMIT => match res.commit(key) {
+            Ok(()) => PagingReply::Ok,
+            Err(e) => {
+                tracing::warn!("paging COMMIT {key:#x} failed: {e:#}");
+                PagingReply::Err
+            }
+        },
+        OP_GET => match res.locate(key) {
+            Ok(Some(slot)) => PagingReply::Located(res.slot_offset(slot)),
+            Ok(None) => PagingReply::Miss,
+            Err(e) => {
+                tracing::warn!("paging GET {key:#x} failed: {e:#}");
+                PagingReply::Err
+            }
+        },
+        OP_REMOVE => {
+            res.remove(key);
+            PagingReply::Ok
+        }
+        other => {
+            tracing::warn!("paging: unknown op {other}");
+            PagingReply::Err
+        }
+    }
+}
+
+fn write_reply<W: Write>(w: &mut W, reply: &PagingReply) -> Result<()> {
+    match reply {
+        PagingReply::Located(off) => {
+            w.write_all(&[ST_OK])?;
+            w.write_all(&off.to_le_bytes())?;
+        }
+        PagingReply::Ok => w.write_all(&[ST_OK])?,
+        PagingReply::Miss => w.write_all(&[ST_MISS])?,
+        PagingReply::Err => w.write_all(&[ST_ERR])?,
+        PagingReply::Bye => {}
+    }
+    w.flush()?;
+    Ok(())
+}
+
+/// The peer-side control loop: read `[op][u64 key]` requests, dispatch against
+/// `res`, write replies, until BYE or hangup. Generic over the stream so it runs
+/// against a real `TcpStream` in the peer and a fake duplex in tests.
+pub fn run_paging_loop<T: Read + Write, A: SlotArena, S: SwapStore>(
+    stream: &mut T,
+    res: &mut SnapshotResidency<A, S>,
+) -> Result<()> {
+    loop {
+        let mut op = [0u8; 1];
+        if stream.read_exact(&mut op).is_err() {
+            break; // client hung up
+        }
+        if op[0] == OP_BYE {
+            break;
+        }
+        let mut kb = [0u8; 8];
+        stream.read_exact(&mut kb).context("read paging key")?;
+        let key = u64::from_le_bytes(kb);
+        let reply = dispatch(res, op[0], key);
+        write_reply(stream, &reply)?;
+    }
+    Ok(())
+}
+
+// ─────────────────────────── real peer-mmap arena ───────────────────────────
+
+/// `SlotArena` over the peer's RDMA-registered `mmap` region (a raw base ptr).
+/// The peer memcpys between an arena slot and the disk swap on spill/fault; the
+/// client one-sided-RDMAs into/out of the same slots. The base VA is stable and
+/// registered ONCE per rail — this NEVER re-registers (no MR churn).
+///
+/// SAFETY: `base` must point at a live mapping of at least `num_slots *
+/// slot_bytes` bytes, page-aligned (mmap guarantees this), outliving the arena.
+pub struct MmapSlotArena {
+    base: *mut u8,
+    slot_bytes: usize,
+    num_slots: usize,
+}
+unsafe impl Send for MmapSlotArena {}
+
+impl MmapSlotArena {
+    /// # Safety
+    /// `base` must be a valid, writable mapping of `>= num_slots*slot_bytes`
+    /// bytes that outlives this arena.
+    pub unsafe fn new(base: *mut u8, slot_bytes: usize, num_slots: usize) -> Self {
+        Self { base, slot_bytes, num_slots }
+    }
+    fn slot_ptr(&self, slot: usize) -> *mut u8 {
+        // slot < num_slots enforced by callers (residency free-list).
+        unsafe { self.base.add(slot * self.slot_bytes) }
+    }
+}
+
+impl SlotArena for MmapSlotArena {
+    fn slot_bytes(&self) -> usize {
+        self.slot_bytes
+    }
+    fn num_slots(&self) -> usize {
+        self.num_slots
+    }
+    fn read_slot(&self, slot: usize, out: &mut [u8]) -> Result<()> {
+        if slot >= self.num_slots || out.len() != self.slot_bytes {
+            bail!("read_slot({slot}) out of range / size mismatch");
+        }
+        unsafe { std::ptr::copy_nonoverlapping(self.slot_ptr(slot), out.as_mut_ptr(), self.slot_bytes) };
+        Ok(())
+    }
+    fn write_slot(&mut self, slot: usize, bytes: &[u8]) -> Result<()> {
+        if slot >= self.num_slots || bytes.len() != self.slot_bytes {
+            bail!("write_slot({slot}) out of range / size mismatch");
+        }
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.slot_ptr(slot), self.slot_bytes) };
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -640,5 +818,114 @@ mod tests {
     fn size_mismatch_rejected() {
         let bad = SnapshotResidency::new(VecArena::new(8, 2), MemSwap::new(16));
         assert!(bad.is_err(), "arena/swap size mismatch must be rejected at construction");
+    }
+
+    // ─────────────────────────── protocol tests ───────────────────────────
+
+    #[test]
+    fn magic_above_legacy_range() {
+        // A legacy client's total_bytes is validated <= 1<<42; the paging magic
+        // must be strictly above so it can never be mistaken for a size.
+        assert!(PAGING_MAGIC > (1u64 << 42));
+    }
+
+    /// One PUT (alloc→arena write→commit) then GET, driven through `dispatch`,
+    /// with the caller's RDMA-write emulated by writing the returned slot.
+    #[test]
+    fn dispatch_put_then_get_roundtrips() {
+        let mut r = residency(4);
+        // ALLOC key 7
+        let PagingReply::Located(off) = dispatch(&mut r, OP_ALLOC, 7) else {
+            panic!("alloc reply")
+        };
+        let slot = (off as usize) / B;
+        // client RDMA-WRITE emulation
+        r.arena.write_slot(slot, &blob(0xAB)).unwrap();
+        assert_eq!(dispatch(&mut r, OP_COMMIT, 7), PagingReply::Ok);
+        // GET key 7
+        let PagingReply::Located(goff) = dispatch(&mut r, OP_GET, 7) else {
+            panic!("get reply")
+        };
+        let mut out = vec![0u8; B];
+        r.arena.read_slot((goff as usize) / B, &mut out).unwrap();
+        assert_eq!(out, blob(0xAB));
+        // unknown key → miss
+        assert_eq!(dispatch(&mut r, OP_GET, 999), PagingReply::Miss);
+    }
+
+    /// Fake bidirectional stream: scripted input, captured output.
+    struct Duplex {
+        inp: std::io::Cursor<Vec<u8>>,
+        out: Vec<u8>,
+    }
+    impl Read for Duplex {
+        fn read(&mut self, b: &mut [u8]) -> std::io::Result<usize> {
+            self.inp.read(b)
+        }
+    }
+    impl Write for Duplex {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.out.extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn req(op: u8, key: u64) -> Vec<u8> {
+        let mut v = vec![op];
+        v.extend_from_slice(&key.to_le_bytes());
+        v
+    }
+
+    /// Drive the full `run_paging_loop` over a scripted request stream and
+    /// assert the reply bytes — the protocol end-to-end (sans RDMA data plane).
+    #[test]
+    fn run_paging_loop_scripts_ok() {
+        let mut r = residency(4);
+        // ALLOC 1 → we need its offset before we can COMMIT meaningfully, but
+        // run_paging_loop reads all input at once; emulate the client by first
+        // allocating via dispatch to learn the slot, writing bytes, THEN scripting
+        // commit+get through the loop. (Mirrors real client ordering.)
+        let PagingReply::Located(off) = dispatch(&mut r, OP_ALLOC, 1) else {
+            panic!()
+        };
+        r.arena.write_slot((off as usize) / B, &blob(0x5A)).unwrap();
+
+        let mut script = Vec::new();
+        script.extend(req(OP_COMMIT, 1));
+        script.extend(req(OP_GET, 1));
+        script.extend(req(OP_GET, 42)); // miss
+        script.extend(req(OP_REMOVE, 1));
+        script.extend(req(OP_BYE, 0));
+        let mut dx = Duplex { inp: std::io::Cursor::new(script), out: Vec::new() };
+        run_paging_loop(&mut dx, &mut r).unwrap();
+
+        // Expected replies: COMMIT→[OK]; GET1→[OK][off]; GET42→[MISS]; REMOVE→[OK].
+        let mut exp = Vec::new();
+        exp.push(ST_OK); // commit
+        exp.push(ST_OK);
+        exp.extend_from_slice(&off.to_le_bytes()); // get 1 (same slot/offset)
+        exp.push(ST_MISS); // get 42
+        exp.push(ST_OK); // remove
+        assert_eq!(dx.out, exp);
+    }
+
+    /// `MmapSlotArena` over a real page-aligned heap buffer round-trips bytes.
+    #[test]
+    fn mmap_slot_arena_roundtrips() {
+        let slot_bytes = 4096usize;
+        let n = 3usize;
+        let buf = AlignedBuf::new(slot_bytes * n);
+        let mut arena = unsafe { MmapSlotArena::new(buf.ptr, slot_bytes, n) };
+        let pat = vec![0x3C_u8; slot_bytes];
+        arena.write_slot(1, &pat).unwrap();
+        let mut out = vec![0u8; slot_bytes];
+        arena.read_slot(1, &mut out).unwrap();
+        assert_eq!(out, pat);
+        assert!(arena.write_slot(3, &pat).is_err(), "slot out of range rejected");
+        drop(arena);
+        drop(buf); // buf outlives arena (asserted by drop order)
     }
 }

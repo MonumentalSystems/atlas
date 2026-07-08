@@ -85,6 +85,11 @@ mod server_impl {
         /// Ceiling on total committed (registered) blade RAM across all
         /// concurrent connections, in bytes. `0` = unlimited (the default).
         pub max_blade_bytes: u64,
+        /// Directory for NVMe swap files backing paging-mode connections
+        /// (WS-A). `None` = paging clients are refused (RAM-only). When set, a
+        /// paging connection's RDMA arena becomes a page-cache over a per-conn
+        /// O_DIRECT swap file here → "infinite depth".
+        pub swap_dir: Option<std::path::PathBuf>,
     }
 
     impl Default for RdmaConfig {
@@ -92,6 +97,7 @@ mod server_impl {
             Self {
                 rails: vec![("roceP2p1s0f1".into(), 3), ("rocep1s0f1".into(), 3)],
                 max_blade_bytes: 0,
+                swap_dir: None,
             }
         }
     }
@@ -156,10 +162,28 @@ mod server_impl {
         use std::io::{Read, Write};
         stream.set_nodelay(true).ok();
 
-        // 1. Client tells us how much RAM to register and how many rails it wants.
+        // 1. Client tells us how much RAM to register and how many rails it
+        //    wants. Backward-compatible paging select (WS-A): a paging client
+        //    sends `PAGING_MAGIC` as its first u64 (far above the legacy
+        //    `total_bytes` range, which is validated <= 1<<42), then
+        //    `[u64 arena_bytes][u64 blob_bytes]`. A legacy KV client's first u64
+        //    IS `total_bytes`, so it is never mis-parsed.
         let mut b8 = [0u8; 8];
-        stream.read_exact(&mut b8).context("read total_bytes")?;
-        let total = u64::from_le_bytes(b8) as usize;
+        stream.read_exact(&mut b8).context("read total_bytes/magic")?;
+        let first = u64::from_le_bytes(b8);
+        let (total, paging_blob): (usize, Option<usize>) =
+            if first == crate::snapshot_swap::PAGING_MAGIC {
+                stream.read_exact(&mut b8).context("read paging arena_bytes")?;
+                let arena_bytes = u64::from_le_bytes(b8) as usize;
+                stream.read_exact(&mut b8).context("read paging blob_bytes")?;
+                let blob = u64::from_le_bytes(b8) as usize;
+                if blob == 0 || arena_bytes == 0 || !arena_bytes.is_multiple_of(blob) {
+                    bail!("paging: bad arena_bytes {arena_bytes} / blob_bytes {blob}");
+                }
+                (arena_bytes, Some(blob))
+            } else {
+                (first as usize, None)
+            };
         if total == 0 || total > (1usize << 42) {
             bail!("implausible kv blade size: {total}");
         }
@@ -226,7 +250,49 @@ mod server_impl {
             total as f64 / (1024.0 * 1024.0 * 1024.0),
         );
 
-        // 5. Idle until the client hangs up. All movement is one-sided.
+        // 5. Data plane.
+        if let Some(blob_bytes) = paging_blob {
+            // Paging mode (WS-A): the arena is a page-cache over an O_DIRECT NVMe
+            // swap file; the peer owns residency and faults from disk on GET.
+            // Bytes still move one-sided over RDMA into/out of the arena slots;
+            // only tiny [op][key] control messages cross this TCP stream. The MR
+            // is never re-registered — swap happens under the stable rkey.
+            use std::os::fd::AsRawFd;
+            let num_slots = total / blob_bytes;
+            let run = |stream: &mut TcpStream| -> Result<()> {
+                let swap_dir = rdma
+                    .swap_dir
+                    .as_ref()
+                    .context("paging client but peer has no --swap-dir configured")?;
+                let swap_path =
+                    swap_dir.join(format!("snap-{pid}-{:x}.swap", stream.as_raw_fd() as u64));
+                let swap = crate::snapshot_swap::DirectSwapFile::create(&swap_path, blob_bytes)?;
+                // SAFETY: `arena` outlives this loop (dropped just below).
+                let slot_arena = unsafe {
+                    crate::snapshot_swap::MmapSlotArena::new(
+                        arena.addr as *mut u8,
+                        blob_bytes,
+                        num_slots,
+                    )
+                };
+                let mut residency =
+                    crate::snapshot_swap::SnapshotResidency::new(slot_arena, swap)?;
+                tracing::info!(
+                    "cache-peer PAGING client: {num_slots} slots × {blob_bytes} B RAM arena \
+                     + NVMe swap {} (infinite depth)",
+                    swap_path.display(),
+                );
+                let r = crate::snapshot_swap::run_paging_loop(stream, &mut residency);
+                let _ = std::fs::remove_file(&swap_path); // per-conn swap is ephemeral
+                r
+            };
+            let res = run(&mut stream);
+            drop(rails);
+            drop(arena);
+            return res;
+        }
+
+        // Legacy one-sided KV blade: idle until the client hangs up.
         let mut sink = [0u8; 8];
         loop {
             match stream.read(&mut sink) {
