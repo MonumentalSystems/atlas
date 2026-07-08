@@ -159,10 +159,18 @@ secret at the start of a 17,137-token prompt (HBM cap 10,240) → correct
    window evicts a block before all attention layers offload it). Minimum viable
    is `~8` (128 tok HBM). Literal "0 tokens HBM" is not reachable via this path —
    it's an hss eviction-race bug, **not** the RDMA tier.
-2. **The peer has NO memory cap** — `kv_peer` only rejects `total > 4 TiB` (sanity).
-   No per-client cap, no aggregate budget, no eviction under pressure. A client can
-   OOM the peer. **TODO: `--max-blade-gb` (reject oversized at handshake) + a
-   running aggregate across connections.** Applies to the expert peer too.
+2. **Peer memory cap — LANDED (this note was stale).** `--max-blade-gb <g>` on
+   all three peer bins (`cache_peer_main`, `expert_peer_main`, `weight_peer_main`)
+   sets `max_blade_bytes`; a process-global `blade_cap::CommitLedger` (Arc, shared
+   by every connection thread) does an atomic test-and-add `try_reserve(total)` at
+   the RDMA handshake — AFTER the requested size is known, BEFORE any `mmap`/`reg_mr`
+   pins RAM — so an oversized or aggregate-over-budget client is rejected with
+   nothing registered (`cache_peer.rs:246` local KV blade, `:469` shared paging
+   arena; RAII `Reservation` released on drop = uniform cleanup on bail/reg_mr
+   fail/hangup). `0`/absent = unlimited (unchanged default). Startup logs the
+   ceiling or "unlimited". Ledger arithmetic is unit-tested (`blade_cap.rs`, 7
+   tests: exact-fit, aggregate reject-then-accept-after-drop, overflow-not-wrapped).
+   Still no *eviction under pressure* — the cap rejects, it doesn't reclaim.
 3. **Zero-copy in the serving path — LANDED (this note was stale).**
    `ATLAS_KV_ZERO_COPY=1` requires the read destination to be pinned UMA (host==dev
    VA) so `ibv_reg_mr` succeeds and the GPU reads it. The swap ScratchPool now
@@ -203,7 +211,8 @@ secret at the start of a 17,137-token prompt (HBM cap 10,240) → correct
 
 ## 7. Recommended next steps
 
-1. **Peer memory cap + aggregate budget** (§6.2) — small, do before unattended use.
+1. ~~Peer memory cap + aggregate budget~~ — **DONE** (§6.2): `--max-blade-gb` +
+   `blade_cap::CommitLedger` handshake reservation on all three peers.
 2. **UMA KV scratch pool** → zero-copy restore end-to-end in the live serving path
    (currently the standalone bandwidth path is zero-copy, serving is bounce). This
    is the last piece to get the 21 GB/s restore into real inference.

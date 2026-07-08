@@ -132,6 +132,13 @@ point for a fresh session to blast out the remaining greenlit tasks. See memory:
   gate concurrent multi-model until this lands.**
 - **Retire the legacy dumb one-sided path** once KV migrates to paging (finishes
   #8). Stays only because `RdmaKvBackend` (KV overflow) shares `cache_peer`.
+  **Scoped:** `KV-PAGING-MIGRATION.md` (2026-07-08) — confirmed the legacy path is
+  LIVE (KV's only transport, the path just benchmarked), so this is a real
+  client rewrite of `RdmaKvBackend` onto the paging `OP_*` protocol + reconciling
+  KV group-stride ↔ paging-slot addressing, NOT a dead-code delete. Full file:line
+  checklist + risk in that doc. Peer is now unattended-safe on the legacy path via
+  `--max-blade-gb` regardless, so migration is capability (disk spill/shared arena),
+  not safety.
 - **Per-kind `--swap-cap-gb-<kind>` overrides + explicit memlock ceiling** for the
   multi-arena registry (`RdmaConfig.max_blade_bytes` default is unlimited).
 - **Deploy the registry binary to gx10:9920** — systemd peer is still the
