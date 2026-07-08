@@ -524,9 +524,98 @@ impl Drop for AlignedBuf {
 
 use std::io::{Read, Write};
 
-/// First-u64 sentinel selecting the paging protocol (> 1<<42, so a legacy
-/// `total_bytes` can never collide). "PAGE" + version.
+/// First-u64 sentinel selecting the paging protocol v1 (> 1<<42, so a legacy KV
+/// `total_bytes` can never collide). "PAGE" + version. v1 == SSM snapshots, no
+/// kind byte (the deployed gx10:9920 peer + clients speak this — keep byte-exact).
 pub const PAGING_MAGIC: u64 = 0x5041_4745_0000_0001;
+
+/// Paging protocol v2 (item 8): after the magic comes a `[u8 kind]` byte so ONE
+/// peer serves a registry of per-(kind, shape) arenas. Also > 1<<42.
+pub const PAGING_MAGIC_V2: u64 = 0x5041_4745_0000_0002;
+
+/// The tier a paging arena serves. Only the RW paging kinds (SSM, KV-as-paging)
+/// ride the `CacheServerParams` single-base+rkey reply; the read-only tiers
+/// (experts/weights/lora) speak a different manifest+VerbsServerParams dialect
+/// and are NOT accepted on this handshake (rejected in `parse_paging_header`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct PagingKind(pub u8);
+impl PagingKind {
+    pub const SSM: PagingKind = PagingKind(0);
+    pub const KV: PagingKind = PagingKind(1);
+    /// Whether this kind is servable on the RW paging (CacheServerParams) path.
+    pub fn is_paging_rw(self) -> bool {
+        self.0 <= 1
+    }
+}
+
+/// Parse the paging handshake header after the caller has read the first u64.
+/// v1 magic → (SSM, arena_bytes, blob_bytes) with NO kind byte on the wire
+/// (byte-exact with the deployed peer). v2 magic → read `[u8 kind]` then the two
+/// sizes. Any other first u64 is a legacy KV `total_bytes` → `Ok(None)` so the
+/// caller takes the dumb one-sided path. Rejects unsupported kinds (≥2).
+pub fn parse_paging_header<R: Read>(
+    first: u64,
+    r: &mut R,
+) -> Result<Option<(PagingKind, u64, u64)>> {
+    let kind = if first == PAGING_MAGIC {
+        PagingKind::SSM
+    } else if first == PAGING_MAGIC_V2 {
+        let mut kb = [0u8; 1];
+        r.read_exact(&mut kb).context("read paging kind")?;
+        let k = PagingKind(kb[0]);
+        if !k.is_paging_rw() {
+            bail!("paging: unsupported kind {} (only SSM/KV ride this handshake)", kb[0]);
+        }
+        k
+    } else {
+        return Ok(None); // legacy KV total_bytes — not a paging client
+    };
+    let mut b8 = [0u8; 8];
+    r.read_exact(&mut b8).context("read paging arena_bytes")?;
+    let arena_bytes = u64::from_le_bytes(b8);
+    r.read_exact(&mut b8).context("read paging blob_bytes")?;
+    let blob_bytes = u64::from_le_bytes(b8);
+    Ok(Some((kind, arena_bytes, blob_bytes)))
+}
+
+/// Round-robin stripe a `blob_bytes` transfer into `chunk_bytes` chunks across
+/// `n_rails`, returning per-rail lists of `(offset, len)`. The offset is the
+/// chunk's position in BOTH the (single, contiguous) staging buffer and the peer
+/// arena slot — so whichever rail fetches chunk j, it lands at its true offset
+/// and one memcpy reassembles the blob (the verified inc-6 reassembly fix). The
+/// tail chunk carries the short remainder, never `chunk_bytes`.
+pub fn stripe_plan(blob_bytes: usize, chunk_bytes: usize, n_rails: usize) -> Vec<Vec<(usize, usize)>> {
+    let n = n_rails.max(1);
+    let cb = chunk_bytes.max(1);
+    let mut rails: Vec<Vec<(usize, usize)>> = vec![Vec::new(); n];
+    let mut off = 0usize;
+    let mut j = 0usize;
+    while off < blob_bytes {
+        let len = cb.min(blob_bytes - off);
+        rails[j % n].push((off, len));
+        off += len;
+        j += 1;
+    }
+    rails
+}
+
+/// Chunk size for the striped snapshot pipeline (ATLAS_SSM_CHUNK_BYTES, default
+/// 1 MiB) and pipeline depth (ATLAS_SSM_PIPELINE_DEPTH, default 16, clamped
+/// 1..=128, mirroring the KV backend).
+pub fn staging_chunk_bytes() -> usize {
+    std::env::var("ATLAS_SSM_CHUNK_BYTES")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&v| v >= 4096)
+        .unwrap_or(1024 * 1024)
+}
+pub fn staging_depth() -> usize {
+    std::env::var("ATLAS_SSM_PIPELINE_DEPTH")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(16)
+        .clamp(1, 128)
+}
 
 pub const OP_BYE: u8 = 0;
 pub const OP_ALLOC: u8 = 1;
@@ -1011,9 +1100,93 @@ mod tests {
 
     #[test]
     fn magic_above_legacy_range() {
-        // A legacy client's total_bytes is validated <= 1<<42; the paging magic
-        // must be strictly above so it can never be mistaken for a size.
+        // A legacy client's total_bytes is validated <= 1<<42; both paging magics
+        // must be strictly above so neither is mistaken for a size, and distinct.
         assert!(PAGING_MAGIC > (1u64 << 42));
+        assert!(PAGING_MAGIC_V2 > (1u64 << 42));
+        assert_ne!(PAGING_MAGIC, PAGING_MAGIC_V2);
+    }
+
+    #[test]
+    fn stripe_plan_covers_every_byte_once() {
+        for (blob, chunk, rails) in [
+            (64usize, 16usize, 2usize), // even split
+            (70, 16, 2),                // tail remainder
+            (64, 16, 1),                // single rail
+            (10, 64, 2),                // chunk > blob → one chunk
+            (64, 64, 2),                // chunk == blob
+            (66846720, 1048576, 2),     // real 66MB SSM blob, 1MiB chunks, dual-rail
+        ] {
+            let plan = stripe_plan(blob, chunk, rails);
+            assert_eq!(plan.len(), rails.max(1));
+            // Flatten and assert every byte [0,blob) is covered exactly once.
+            let mut covered = vec![0u8; blob];
+            for rail in &plan {
+                for &(off, len) in rail {
+                    assert!(len <= chunk && off + len <= blob, "chunk oob {off}+{len}>{blob}");
+                    for b in &mut covered[off..off + len] {
+                        assert_eq!(*b, 0, "byte {off} double-covered");
+                        *b = 1;
+                    }
+                }
+            }
+            assert!(covered.iter().all(|&b| b == 1), "gap in coverage blob={blob}");
+        }
+        // Zero blob → empty plan (no chunks).
+        assert!(stripe_plan(0, 16, 2).iter().all(|r| r.is_empty()));
+    }
+
+    #[test]
+    fn paging_header_v1_v2_legacy_and_reject() {
+        // v1: no kind byte on the wire → SSM.
+        let mut body = Vec::new();
+        body.extend_from_slice(&0x1000u64.to_le_bytes()); // arena
+        body.extend_from_slice(&0x40u64.to_le_bytes()); // blob
+        let mut c = std::io::Cursor::new(body);
+        assert_eq!(
+            parse_paging_header(PAGING_MAGIC, &mut c).unwrap(),
+            Some((PagingKind::SSM, 0x1000, 0x40))
+        );
+        // v2: [kind][arena][blob].
+        let mut body = vec![PagingKind::KV.0];
+        body.extend_from_slice(&0x2000u64.to_le_bytes());
+        body.extend_from_slice(&0x80u64.to_le_bytes());
+        let mut c = std::io::Cursor::new(body);
+        assert_eq!(
+            parse_paging_header(PAGING_MAGIC_V2, &mut c).unwrap(),
+            Some((PagingKind::KV, 0x2000, 0x80))
+        );
+        // legacy KV bare total_bytes → None (dumb path).
+        let mut c = std::io::Cursor::new(Vec::new());
+        assert_eq!(parse_paging_header(12345, &mut c).unwrap(), None);
+        // unsupported kind (RO tier) → hard error, never a bogus arena.
+        let mut body = vec![3u8];
+        body.extend_from_slice(&[0u8; 16]);
+        let mut c = std::io::Cursor::new(body);
+        assert!(parse_paging_header(PAGING_MAGIC_V2, &mut c).is_err());
+    }
+
+    /// WIRE-GOLDEN (verify's ask): freeze the exact v1 handshake byte layout so a
+    /// future codec edit can't silently shift it and strand the deployed peer.
+    #[test]
+    fn v1_handshake_wire_golden() {
+        // What connect_paging emits for arena=0x1000, blob=0x40, 1 rail:
+        //   [PAGING_MAGIC u64 le][arena u64 le][blob u64 le][n_rails u8]
+        let mut w = Vec::new();
+        w.extend_from_slice(&PAGING_MAGIC.to_le_bytes());
+        w.extend_from_slice(&0x1000u64.to_le_bytes());
+        w.extend_from_slice(&0x40u64.to_le_bytes());
+        w.push(1u8);
+        assert_eq!(
+            w,
+            vec![
+                0x01, 0x00, 0x00, 0x00, 0x45, 0x47, 0x41, 0x50, // PAGING_MAGIC LE
+                0x00, 0x10, 0, 0, 0, 0, 0, 0, // arena 0x1000
+                0x40, 0, 0, 0, 0, 0, 0, 0, // blob 0x40
+                0x01, // n_rails
+            ],
+            "v1 handshake bytes must never shift — the deployed peer depends on this"
+        );
     }
 
     /// One PUT (alloc→arena write→commit) then GET, driven through `dispatch`,
