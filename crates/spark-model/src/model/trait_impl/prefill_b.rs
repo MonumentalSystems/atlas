@@ -198,12 +198,42 @@ impl TransformerModel {
 
         let mut kv_cache = self.kv_cache.lock();
 
+        // #3 warm-TTFT phase breakdown (ATLAS_PREFILL_PROFILE): per-PHASE timing
+        // to locate the warm non-forward wall (embed / lookup+restore / forward /
+        // finalize+snapshot-save). Only ~8 phase-boundary syncs per chunk (vs
+        // --profile's ~40 per-layer syncs), so it perturbs the regime far less.
+        // The `phase!` macro syncs+times its body only when the flag is set.
+        let phase_prof = std::env::var_os("ATLAS_PREFILL_PROFILE").is_some();
+        let mut phase_t: Vec<(&'static str, u128)> = Vec::new();
+        macro_rules! phase {
+            ($label:expr, $body:expr) => {{
+                let __t = if phase_prof {
+                    let _ = self.gpu.synchronize(stream);
+                    Some(std::time::Instant::now())
+                } else {
+                    None
+                };
+                let __r = $body;
+                if let Some(__t) = __t {
+                    let _ = self.gpu.synchronize(stream);
+                    phase_t.push(($label, __t.elapsed().as_micros()));
+                }
+                __r
+            }};
+        }
+
         // ── Phase 1+1b: embed chunk + vision pad overlay ──
-        self.prefill_b_embed_chunk(tokens, chunk_start, chunk_len, stream)?;
+        phase!(
+            "embed",
+            self.prefill_b_embed_chunk(tokens, chunk_start, chunk_len, stream)
+        )?;
 
         // ── Phase 2: prefix-cache lookup + EP sync + Marconi snapshot restore ──
-        let (kv_write_start, marconi_skip) =
-            self.prefill_b_prefix_lookup(tokens, seq, chunk_start, total, &mut kv_cache, stream)?;
+        // (includes the SSM tier fault-in / acquire_or_spill on the warm path)
+        let (kv_write_start, marconi_skip) = phase!(
+            "lookup+restore",
+            self.prefill_b_prefix_lookup(tokens, seq, chunk_start, total, &mut kv_cache, stream)
+        )?;
 
         if std::env::var("ATLAS_SSM_SAVE_DUMP").is_ok() {
             self.ssm_pool.debug_state_checksum(
@@ -218,28 +248,35 @@ impl TransformerModel {
         let bs = kv_cache.block_size();
         let end_pos = chunk_start + chunk_len;
         let blocks_needed = (end_pos - 1) / bs + 1;
-        super::super::block_mgmt::ensure_blocks_through_prefill(
-            seq,
-            blocks_needed - 1,
-            &mut kv_cache,
-            self.prefix_cache.as_ref(),
-            self.gpu.as_ref(),
-            stream,
+        phase!(
+            "block_alloc",
+            super::super::block_mgmt::ensure_blocks_through_prefill(
+                seq,
+                blocks_needed - 1,
+                &mut kv_cache,
+                self.prefix_cache.as_ref(),
+                self.gpu.as_ref(),
+                stream,
+            )
         )?;
 
         // ── Phase 2b: compute effective processing range (may early-return) ──
-        let (proc_start, proc_count, effective_seq_len_start) = match self.prefill_b_proc_range(
-            tokens,
-            seq,
-            chunk_start,
-            chunk_len,
-            is_last_chunk,
-            kv_write_start,
-            marconi_skip,
-            // Single-stream: hidden lives at offset 0 ⇒ pass base (byte-identical).
-            self.buffers.hidden_states(),
-            stream,
-        )? {
+        let proc_range_res = phase!(
+            "proc_range",
+            self.prefill_b_proc_range(
+                tokens,
+                seq,
+                chunk_start,
+                chunk_len,
+                is_last_chunk,
+                kv_write_start,
+                marconi_skip,
+                // Single-stream: hidden lives at offset 0 ⇒ pass base (byte-identical).
+                self.buffers.hidden_states(),
+                stream,
+            )
+        )?;
+        let (proc_start, proc_count, effective_seq_len_start) = match proc_range_res {
             proc_range::ProcRange::Compute {
                 proc_start,
                 proc_count,
@@ -272,29 +309,35 @@ impl TransformerModel {
             pos_stream_bytes,
             use_mrope,
             needs_paged,
-        } = self.prefill_b_upload_meta(
-            tokens,
-            seq,
-            chunk_start,
-            chunk_len,
-            proc_start,
-            proc_count,
-            effective_seq_len_start,
-            &kv_cache,
-            stream,
+        } = phase!(
+            "upload_meta",
+            self.prefill_b_upload_meta(
+                tokens,
+                seq,
+                chunk_start,
+                chunk_len,
+                proc_start,
+                proc_count,
+                effective_seq_len_start,
+                &kv_cache,
+                stream,
+            )
         )?;
 
         // ── Phase 3b: paged metadata (block_table + seq_len) ──
         if needs_paged {
-            self.prefill_b_upload_paged(
-                seq,
-                total,
-                proc_start,
-                proc_count,
-                meta_base,
-                slot_offset,
-                &kv_cache,
-                stream,
+            phase!(
+                "upload_paged",
+                self.prefill_b_upload_paged(
+                    seq,
+                    total,
+                    proc_start,
+                    proc_count,
+                    meta_base,
+                    slot_offset,
+                    &kv_cache,
+                    stream,
+                )
             )?;
         }
 
@@ -306,22 +349,25 @@ impl TransformerModel {
         self.gpu.synchronize(stream)?;
 
         // ── Phase 4: forward through all layers ──
-        self.prefill_b_forward_layers(
-            seq,
-            &mut kv_cache,
-            chunk_start,
-            chunk_len,
-            is_last_chunk,
-            proc_count,
-            effective_seq_len_start,
-            kv_write_start,
-            marconi_skip,
-            meta_base,
-            slot_offset,
-            pos_stream_bytes,
-            use_mrope,
-            needs_paged,
-            stream,
+        phase!(
+            "forward",
+            self.prefill_b_forward_layers(
+                seq,
+                &mut kv_cache,
+                chunk_start,
+                chunk_len,
+                is_last_chunk,
+                proc_count,
+                effective_seq_len_start,
+                kv_write_start,
+                marconi_skip,
+                meta_base,
+                slot_offset,
+                pos_stream_bytes,
+                use_mrope,
+                needs_paged,
+                stream,
+            )
         )?;
 
         // ── Phase 5: update sequence state incrementally ──
@@ -335,29 +381,57 @@ impl TransformerModel {
         // leaves it at the prompt's complete-block count (see prefill_a).
         seq.last_decode_ckpt_block = seq.tokens.len() / bs;
 
-        if is_last_chunk {
-            // ── Phase 6+7+8: final norm, lm_head, prefix-cache + snapshot save ──
-            self.prefill_b_finalize_last(
-                tokens,
-                seq,
-                &mut kv_cache,
-                chunk_start,
-                chunk_len,
-                proc_count,
-                stream,
+        let result = if is_last_chunk {
+            // ── Phase 6+7+8: final norm, lm_head, prefix-cache + snapshot save
+            // (snapshot save may spill a 66 MB victim on the warm path) ──
+            phase!(
+                "finalize+save",
+                self.prefill_b_finalize_last(
+                    tokens,
+                    seq,
+                    &mut kv_cache,
+                    chunk_start,
+                    chunk_len,
+                    proc_count,
+                    stream,
+                )
             )
         } else {
             // ── Phase 9: intermediate Marconi checkpoint ──
-            self.prefill_b_save_checkpoint(
-                tokens,
-                seq,
-                &mut kv_cache,
-                chunk_start,
-                chunk_len,
-                stream,
+            phase!(
+                "save_ckpt",
+                self.prefill_b_save_checkpoint(
+                    tokens,
+                    seq,
+                    &mut kv_cache,
+                    chunk_start,
+                    chunk_len,
+                    stream,
+                )
             )?;
             Ok(DevicePtr::NULL)
+        };
+
+        if phase_prof {
+            let total_us: u128 = phase_t.iter().map(|(_, us)| *us).sum();
+            let breakdown: Vec<String> = phase_t
+                .iter()
+                .map(|(label, us)| {
+                    format!(
+                        "{label}={:.1}ms ({:.0}%)",
+                        *us as f64 / 1000.0,
+                        if total_us > 0 { *us as f64 * 100.0 / total_us as f64 } else { 0.0 }
+                    )
+                })
+                .collect();
+            tracing::info!(
+                "PREFILL_PROFILE chunk[start={chunk_start} len={chunk_len} proc={proc_count} \
+                 last={is_last_chunk}]: {:.1}ms phases | {}",
+                total_us as f64 / 1000.0,
+                breakdown.join(" "),
+            );
         }
+        result
     }
 }
 
