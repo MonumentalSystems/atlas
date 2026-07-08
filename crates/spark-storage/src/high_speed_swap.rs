@@ -21,6 +21,72 @@ use crate::tiled_attention::{TiledAttention, TiledAttentionDims, TiledAttnPlanes
 // non-cuda builds where the swap orchestrator below isn't compiled.
 pub use crate::model_dims::ModelDims;
 
+/// Which local-NVMe KV-overflow backend to build. io_uring is the fast default,
+/// but it is not universally available: the default container seccomp profile
+/// blocks the `io_uring_*` syscalls (post-2023 hardening) and pre-5.1 kernels
+/// lack it entirely. `$ATLAS_KV_BACKEND` overrides the choice.
+#[derive(Debug, PartialEq, Eq)]
+enum KvBackendChoice {
+    /// Default: try io_uring, transparently fall back to POSIX on failure.
+    UringThenPosix,
+    /// `ATLAS_KV_BACKEND=posix`: skip io_uring, use portable pread/pwrite.
+    ForcePosix,
+    /// `ATLAS_KV_BACKEND=io_uring`: require io_uring; fail loud if unavailable.
+    RequireUring,
+}
+
+/// Pure `$ATLAS_KV_BACKEND` policy (unit-tested without CUDA/NVMe). Unknown
+/// values fall through to the default (try-then-fall-back), so a typo never
+/// silently forces the slow path.
+fn kv_backend_choice(forced: Option<&str>) -> KvBackendChoice {
+    match forced {
+        Some("posix") => KvBackendChoice::ForcePosix,
+        Some("io_uring") | Some("iouring") => KvBackendChoice::RequireUring,
+        _ => KvBackendChoice::UringThenPosix,
+    }
+}
+
+/// Build the local-NVMe KV-overflow backend (the default when no `$ATLAS_KV_PEER`
+/// is set). io_uring is the fast path; on a host where it can't init — a
+/// restrictive container seccomp profile (io_uring_* blocked → `EPERM`) or a
+/// pre-5.1 kernel — degrade to the portable POSIX `pread`/`pwrite` backend with a
+/// warning, so `--high-speed-swap` still works everywhere instead of failing
+/// outright. RDMA and io_uring are both opt-in fast paths over this floor.
+fn local_nvme_backend(
+    dir: &std::path::Path,
+    group_layout: GroupLayout,
+    qd: usize,
+) -> Result<Box<dyn crate::backend::StorageBackend>> {
+    let choice = kv_backend_choice(std::env::var("ATLAS_KV_BACKEND").ok().as_deref());
+    if choice != KvBackendChoice::ForcePosix {
+        // `IoUringBackend::new` consumes `layout`; on failure it is dropped
+        // (fds closed) and the POSIX path below recreates it cleanly.
+        let layout = Layout::create(dir, group_layout).context("create layout")?;
+        match IoUringBackend::new(layout, qd) {
+            Ok(b) => {
+                tracing::info!("high-speed-swap: KV overflow tier = local NVMe (io_uring, qd {qd})");
+                return Ok(Box::new(b));
+            }
+            Err(e) if choice == KvBackendChoice::RequireUring => {
+                return Err(e).context("ATLAS_KV_BACKEND=io_uring set but io_uring init failed");
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "high-speed-swap: io_uring backend unavailable ({e:#}); falling back to \
+                     the POSIX pread/pwrite backend. Expected under a restrictive container \
+                     seccomp profile (io_uring_* syscalls blocked) or a pre-5.1 kernel. Run \
+                     with --security-opt seccomp=unconfined (or set ATLAS_KV_BACKEND=io_uring \
+                     to require io_uring and fail loud instead)."
+                );
+            }
+        }
+    }
+    // ForcePosix, or io_uring init failed and fallback is allowed.
+    let layout = Layout::create(dir, group_layout).context("create layout (posix)")?;
+    tracing::info!("high-speed-swap: KV overflow tier = local NVMe (POSIX pread/pwrite)");
+    Ok(Box::new(crate::backend::PosixBackend::new(layout)?))
+}
+
 pub struct HighSpeedSwap {
     cfg: HighSpeedSwapConfig,
     model: ModelDims,
@@ -266,15 +332,13 @@ impl HighSpeedSwap {
                         group_layout,
                     )?)
                 } else {
-                    let layout = Layout::create(&cfg.dir, group_layout).context("create layout")?;
-                    Box::new(IoUringBackend::new(layout, cfg.qd as usize)?)
+                    local_nvme_backend(&cfg.dir, group_layout, cfg.qd as usize)?
                 }
             }
             #[cfg(not(atlas_rdma_verbs))]
             {
                 let _ = &kv_peer;
-                let layout = Layout::create(&cfg.dir, group_layout).context("create layout")?;
-                Box::new(IoUringBackend::new(layout, cfg.qd as usize)?)
+                local_nvme_backend(&cfg.dir, group_layout, cfg.qd as usize)?
             }
         };
         // Restore-destination pool. When zero-copy restore is requested
@@ -558,4 +622,29 @@ pub fn local_installed() -> bool {
 /// Run `f` with a `&mut HighSpeedSwap` if installed; returns `None` if not.
 pub fn with_local<R>(f: impl FnOnce(&mut HighSpeedSwap) -> Result<R>) -> Option<Result<R>> {
     LOCAL.with(|cell| cell.borrow_mut().as_mut().map(f))
+}
+
+#[cfg(test)]
+mod kv_backend_choice_tests {
+    use super::{KvBackendChoice, kv_backend_choice};
+
+    #[test]
+    fn default_when_unset_or_unknown() {
+        // Unset, empty, and typos all keep the safe default: try io_uring, fall
+        // back to POSIX. A misspelled value must never silently force the slow path.
+        assert_eq!(kv_backend_choice(None), KvBackendChoice::UringThenPosix);
+        assert_eq!(kv_backend_choice(Some("")), KvBackendChoice::UringThenPosix);
+        assert_eq!(kv_backend_choice(Some("psoix")), KvBackendChoice::UringThenPosix);
+    }
+
+    #[test]
+    fn posix_is_forced() {
+        assert_eq!(kv_backend_choice(Some("posix")), KvBackendChoice::ForcePosix);
+    }
+
+    #[test]
+    fn io_uring_is_required_both_spellings() {
+        assert_eq!(kv_backend_choice(Some("io_uring")), KvBackendChoice::RequireUring);
+        assert_eq!(kv_backend_choice(Some("iouring")), KvBackendChoice::RequireUring);
+    }
 }

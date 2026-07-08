@@ -115,6 +115,13 @@ trait, so nothing else changed.
 - `$ATLAS_KV_ZERO_COPY=1` — RDMA directly into UMA dst (needs UMA KV scratch — see
   §6; without UMA scratch, `reg_dst` errors, so leave off until that lands).
 - `$ATLAS_KV_PIPELINE_DEPTH=16` — bounces per rail.
+- `$ATLAS_KV_BACKEND=io_uring|posix` — local-NVMe backend override. **Default (unset):
+  try io_uring, transparently fall back to the portable POSIX `pread`/`pwrite`
+  backend if io_uring can't init** (restrictive container seccomp blocks the
+  `io_uring_*` syscalls → `EPERM`; pre-5.1 kernels lack it). `posix` = skip io_uring;
+  `io_uring` = require it, fail loud (pair with `--security-opt seccomp=unconfined`).
+  So over-core KV works everywhere out-of-the-box — RDMA (`$ATLAS_KV_PEER`) and
+  io_uring are both opt-in fast paths over the POSIX floor.
 - CLI: `--high-speed-swap --high-speed-swap-dir <d> --high-speed-swap-gb <g>
   --high-speed-swap-cache-blocks-per-seq <N>` (N blocks × block_size = HBM-resident
   tokens; the rest overflow to the tier).
