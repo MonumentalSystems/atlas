@@ -47,6 +47,12 @@ pub(crate) fn build_model(
         .mtp_quantization
         .parse()
         .context("Invalid --mtp-quantization value")?;
+    // `--kv-cache-gb`: explicit KV-cache size target (GiB → bytes), overriding
+    // the gpu-memory-utilization-derived budget. `None` when unset/0.
+    let kv_cache_target_bytes = args
+        .kv_cache_gb
+        .filter(|&gb| gb > 0.0)
+        .map(|gb| (gb * 1024.0 * 1024.0 * 1024.0) as usize);
     spark_model::factory::build_model(
         config.clone(),
         store,
@@ -69,6 +75,7 @@ pub(crate) fn build_model(
         kv_dtype,
         inference_reserve,
         args.gpu_memory_utilization,
+        kv_cache_target_bytes,
         args.ssm_cache_slots,
         layer_dtypes,
         args.ssm_checkpoint_interval,

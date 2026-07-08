@@ -39,6 +39,11 @@ pub fn build_model(
     kv_dtype: KvCacheDtype,
     inference_reserve: usize,
     gpu_memory_utilization: f64,
+    // `--kv-cache-gb`: size the KV cache to this many bytes DIRECTLY instead of
+    // deriving it from `gpu_memory_utilization`. `None` = util-derived (default,
+    // byte-identical). Still clamped to actually-free memory so a too-large
+    // target degrades to a warning instead of OOMing.
+    kv_cache_target_bytes: Option<usize>,
     ssm_cache_slots: usize,
     layer_dtypes: Vec<KvCacheDtype>,
     ssm_checkpoint_interval: usize,
@@ -368,10 +373,36 @@ pub fn build_model(
         }
     }
     let total_budget = (total_mem as f64 * gpu_memory_utilization) as usize;
-    let kv_budget = total_budget
-        .saturating_sub(used_so_far)
-        .saturating_sub(inference_reserve)
-        .min(actual_free.saturating_sub(inference_reserve));
+    let free_for_kv = actual_free.saturating_sub(inference_reserve);
+    let kv_budget = match kv_cache_target_bytes {
+        // `--kv-cache-gb`: honor the explicit KV-cache size target, clamped to
+        // free memory (minus the inference reserve) so an oversized target
+        // degrades to a warning + best-effort fit rather than OOMing at load.
+        Some(target) => {
+            let clamped = target.min(free_for_kv);
+            if clamped < target {
+                tracing::warn!(
+                    "--kv-cache-gb target {:.1} GB exceeds free memory ({:.1} GB after reserve); \
+                     clamping KV cache to {:.1} GB",
+                    gib(target),
+                    gib(free_for_kv),
+                    gib(clamped),
+                );
+            } else {
+                tracing::info!(
+                    "--kv-cache-gb: sizing KV cache to explicit target {:.1} GB \
+                     (ignoring gpu-memory-utilization {:.0}% for KV)",
+                    gib(clamped),
+                    gpu_memory_utilization * 100.0,
+                );
+            }
+            clamped
+        }
+        None => total_budget
+            .saturating_sub(used_so_far)
+            .saturating_sub(inference_reserve)
+            .min(free_for_kv),
+    };
     // Phase 6.1.f: when HBM-shrink is active, size the production cache to
     // `max_batch_size × cache_blocks_per_seq` rather than the unbounded
     // budget-driven sum. This is the *whole point* of the HBM-shrink
