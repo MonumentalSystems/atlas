@@ -159,6 +159,24 @@ audited across the other `copy_d2h_on_stream` callers:
   (`ATLAS_MLA_PERSEQ_FALLBACK`) — dead code in prod. **`forward_prefill_routed.rs`**
   = 516B single copy, intrinsic sync — none.
 
+## HSS coalescing
+
+### HSS Tier-1 block I/O coalescing — BIG WIN, now default ON (2026-07-09)
+The audit's *disk* caveat was the real HSS bottleneck: the offload/rehydrate did
+`2*nkv` separate ~4KiB ops per KV block (small-random-I/O bound → cold prefill
+capped ~1000 tok/s, 4-7× slower than no-offload). A block's `2*nkv` groups are one
+contiguous span byte-identical on disk (`GroupLayout::file_offset`) AND in the
+device slot (`ScratchPool`), so one `block_bytes=2*nkv*group_stride` op reproduces
+them byte-for-byte. `ATLAS_HSS_COALESCE_BLOCKS` (commit `1ba777ea`, workflow-built,
+3 verify lenses SOUND, 108 storage tests) collapses `2*nkv → 1` op/block on both
+io_uring + posix, all 4 offload/attend/prefetch loops, no layout change. GPU
+A/B (Holo-35B, --high-speed-swap, prefix-cache off): **needle recall PASS both**
+(bit-identical); **decode ~2.5× tok/s** (4K 5.7→14.2, 8K 3.1→8.4; TPOT −60%) and
+**prefill −10-14%** — decode wins big because every step rehydrates offloaded
+blocks. **Default ON** (opt out `=0`). Follow-up: Tier-2 ~1MB run-merging (merge
+consecutive-id block runs; needs bounce+scatter, fragmentation-gated) + coalesce
+the cascade/RDMA backends (currently inherit per-head fan-out).
+
 ## Status
 
 Landed on `feat/streaming-experts-mvp` (reviewed, unit-tested): seq-sharded pool +

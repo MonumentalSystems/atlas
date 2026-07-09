@@ -330,10 +330,18 @@ impl HighSpeedSwap {
             2, // BF16
             4096,
         );
-        // ATLAS_HSS_COALESCE_BLOCKS (Tier-1 I/O coalescing) — read ONCE, presence-
-        // gated like ATLAS_KV_PREFETCH. Threaded into the local-NVMe backend ctor
-        // (buffer sizing) AND stored for the caller-side dispatch so the two agree.
-        let coalesce_blocks = std::env::var_os("ATLAS_HSS_COALESCE_BLOCKS").is_some();
+        // ATLAS_HSS_COALESCE_BLOCKS (Tier-1 I/O coalescing) — read ONCE. DEFAULT ON:
+        // GPU-validated bit-identical (needle recall) with ~2.5× HSS decode tok/s +
+        // ~10-14% prefill on Holo-35B (one block-sized op replaces 2·nkv per-head
+        // 4KiB ops). Opt out with ATLAS_HSS_COALESCE_BLOCKS=0. Threaded into the
+        // local-NVMe backend ctor (buffer sizing) AND stored for caller dispatch.
+        let coalesce_blocks = !matches!(
+            std::env::var("ATLAS_HSS_COALESCE_BLOCKS")
+                .ok()
+                .as_deref()
+                .map(str::trim),
+            Some("0") | Some("false") | Some("off") | Some("no")
+        );
         if coalesce_blocks {
             let block_bytes = group_layout.block_bytes();
             let ops_per_block = 2 * group_layout.num_kv_heads as u64;
