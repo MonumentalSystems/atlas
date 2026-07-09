@@ -299,12 +299,42 @@ fn run_spill_worker(
             0
         }
     };
+    // Fused gather uses a per-worker PINNED host buffer (cuMemAllocHost). D2H into
+    // pageable memory stages through a small internal bounce buffer — slow AND
+    // implicitly synchronous (measured ~0.17 GB/s), which is why fusing the syncs
+    // alone barely helped. A pinned dst makes cuMemcpyDtoHAsync truly async +
+    // full-bandwidth. Allocated once, reused across this worker's spills (serial —
+    // one spill in flight per worker), freed at worker exit. Falls back to a
+    // per-spill pageable Vec if the flag is off or the alloc fails.
+    let pinned = if *DECODE_FUSED_GATHER {
+        match gpu.alloc_host_pinned(blob_bytes) {
+            Ok(p) => Some(p),
+            Err(e) => {
+                tracing::error!(
+                    "decode-spill: alloc_host_pinned({blob_bytes}) failed ({e:#}); \
+                     falling back to pageable gather"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
     while let Ok(job) = rx.recv() {
         let req = job.req;
         // Order the gather after the boundary write into this lane.
         let _ = gpu.stream_wait_event(spill_stream, job.wait_event);
         let frame = req.seq * l_phys + req.lane;
-        let mut blob = vec![0u8; blob_bytes];
+        let mut vec_fallback;
+        // SAFETY: pinned points to `blob_bytes` of cuMemAllocHost memory owned by
+        // this worker; only this thread touches it, serially per spill.
+        let blob: &mut [u8] = match pinned {
+            Some(p) => unsafe { std::slice::from_raw_parts_mut(p, blob_bytes) },
+            None => {
+                vec_fallback = vec![0u8; blob_bytes];
+                &mut vec_fallback
+            }
+        };
         let per_layer = h_bytes + conv_bytes;
         let stats = DECODE_SPILL_STATS.enabled;
         let fused = *DECODE_FUSED_GATHER;
@@ -353,7 +383,7 @@ fn run_spill_worker(
         }
         let gather_us = g0.map(|t| t.elapsed().as_micros() as u64).unwrap_or(0);
         let p0 = if stats { Some(std::time::Instant::now()) } else { None };
-        let put_ok = ok && store.put(req.cold_key, &blob).unwrap_or(false);
+        let put_ok = ok && store.put(req.cold_key, &*blob).unwrap_or(false);
         if stats {
             let put_us = p0.map(|t| t.elapsed().as_micros() as u64).unwrap_or(0);
             DECODE_SPILL_STATS.note_timing(gather_us, put_us);
@@ -385,6 +415,9 @@ fn run_spill_worker(
             }
         }
         let _ = gpu.destroy_event(job.wait_event);
+    }
+    if let Some(p) = pinned {
+        let _ = gpu.free_host_pinned(p, blob_bytes);
     }
 }
 
