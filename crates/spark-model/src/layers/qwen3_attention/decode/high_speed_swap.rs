@@ -237,12 +237,21 @@ impl Qwen3AttentionLayer {
         let pinned: Option<HssPinnedPair> = if *HSS_PINNED_OFFLOAD {
             match ctx.gpu.alloc_host_pinned(d2h_dst_bytes) {
                 Ok(k) => match ctx.gpu.alloc_host_pinned(d2h_dst_bytes) {
-                    Ok(v) => Some(HssPinnedPair {
-                        gpu: ctx.gpu,
-                        k,
-                        v,
-                        bytes: d2h_dst_bytes,
-                    }),
+                    Ok(v) => {
+                        static ACTIVE_LOG: std::sync::Once = std::sync::Once::new();
+                        ACTIVE_LOG.call_once(|| {
+                            tracing::info!(
+                                "HSS pinned offload ACTIVE (ATLAS_HSS_PINNED_OFFLOAD): reused \
+                                 pinned K/V pair, {d2h_dst_bytes} B each, fused D2H"
+                            );
+                        });
+                        Some(HssPinnedPair {
+                            gpu: ctx.gpu,
+                            k,
+                            v,
+                            bytes: d2h_dst_bytes,
+                        })
+                    }
                     Err(e) => {
                         let _ = ctx.gpu.free_host_pinned(k, d2h_dst_bytes);
                         tracing::warn!(
