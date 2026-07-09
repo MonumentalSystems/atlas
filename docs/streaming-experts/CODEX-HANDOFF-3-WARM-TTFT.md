@@ -8,14 +8,23 @@ Read top to bottom before touching code.
 ## 0. The task in one sentence
 
 A **warm** conversational turn on Holo-3.1-35B (a prompt that hits an existing
-deep prefix cache, so almost nothing should recompute) still costs **~1600 ms**
-before the first output token. **Find out why and cut it.** Measurement says
-**~69% of that is two "tail-cut" prefill passes** (~530 ms each) that run over a
-tiny (~30-token) suffix. That is the anomaly to kill.
+deep prefix cache, so almost nothing should recompute) still spends most TTFT in
+two "tail-cut" prefill passes over a tiny suffix. Older notes measured this at
+**~1600 ms**; the current verified resident-cache baseline is lower but the same
+shape remains: **~350-380 ms warm TTFT**, with **~240 ms in attention** across
+the two tiny suffix passes. **Keep cutting that.**
 
 **This is a measure-first task.** The profiling scaffolding is already landed.
 Your **first deliverable is a confirmed breakdown**, not a code change. Do not
 start optimizing until the profile tells you which op dominates.
+
+**Codex status, 2026-07-09:** baseline tagged as
+`warm-ttft-baseline-2026-07-08` at `4f9f4e`. The original 6-session repro below
+can self-evict with `--target-kv-tokens 100000`; use the one-session command in
+§4 for resident-cache profiling. A low-risk BR64 dispatch experiment is now
+available via `ATLAS_PREFILL_PAGED_BR64_MIN_Q=1`; on the one-session Holo/NVFP4
+run it cut warm TTFT from **376/354 ms** to **328/301 ms** by reducing attention
+from **~120 ms/pass** to **~94 ms/pass**. This is not yet the final fix.
 
 ---
 
@@ -33,7 +42,7 @@ start optimizing until the profile tells you which op dominates.
 
 ## 2. Current understanding (measured, not guessed)
 
-A warm turn decomposes (measured on a ~15K-token deep prefix) as:
+A warm turn originally decomposed (measured on a ~15K-token deep prefix) as:
 
 | Phase | Time | Notes |
 |---|---|---|
@@ -41,8 +50,15 @@ A warm turn decomposes (measured on a ~15K-token deep prefix) as:
 | tail-cut **pass 1** + checkpoint | ~532 ms | ~30 suffix tokens |
 | tail-cut **pass 2** + finalize | ~538 ms | ~30 suffix tokens |
 
-**The two tail-cut passes = 69% of the turn, each ~530 ms for ~30 tokens.**
-That is absurd for 30 tokens unless something scales with the *prefix* length.
+The current one-session, reps-1600 profile is:
+
+| Config | Warm TTFT | Tail pass attention | Tail pass SSM | Notes |
+|---|---:|---:|---:|---|
+| default BR32 for `q_len < 256` | 376 ms / 354 ms | ~120 ms/pass | ~48-51 ms/pass | resident cache, 30K prompt |
+| `ATLAS_PREFILL_PAGED_BR64_MIN_Q=1` | 328 ms / 301 ms | ~94 ms/pass | ~48-51 ms/pass | same workload |
+
+The two tail-cut passes remain the turn's main cost. The cost scales with the
+*prefix* length because each suffix token attends over the full paged KV.
 
 **Prime suspect: attention.** Each suffix token attends over the **full ~15K KV**,
 × the attention layers, × 2 passes. If the per-layer profile shows the attention
@@ -120,21 +136,30 @@ docker run -d --name warmttft --gpus all --network host --ipc=host \
    --fp8-kv-calibration-tokens 256 --target-kv-tokens 100000"
 ```
 Wait for `curl -sf http://127.0.0.1:8888/v1/models` to return the model id.
+For the BR64 suffix-attention experiment, add
+`-e ATLAS_PREFILL_PAGED_BR64_MIN_Q=1` to the `docker run` env list.
 
 ### Drive a deep-prefix WARM turn (>16K tokens so the mixer split fires)
 ```
-python3 scripts/streaming-experts/ssm_deep.py http://127.0.0.1:8888/v1/chat/completions 1600
+python3 scripts/streaming-experts/ssm_deep.py \
+  http://127.0.0.1:8888/v1/chat/completions 1600 \
+  --sessions 1 --turns 3 --max-tokens 24 --target-kv-tokens 100000
 ```
-`ssm_deep.py <url> <reps>` builds 6 sessions × 3 turns of deep-prefix context.
-`reps 800` ≈ 15K tokens, `reps 1600` ≈ 32K. Turn 2/3 are the **warm** turns (the
-prefix is already cached) — those are the ones whose profile you read. Run it
-**serialized** (one request in flight) so the timings are clean.
+`ssm_deep.py <url> <reps>` defaults to 6 sessions × 3 turns of deep-prefix
+context. For warm-TTFT profiling with `--target-kv-tokens 100000`, force
+`--sessions 1`: six reps-1600 sessions are roughly 180K live prompt tokens and
+can evict each other before warm turns, producing a cold trace with zero prefix
+hits. `reps 800` ≈ 15K tokens, `reps 1600` ≈ 30K. Turn 2/3 are the **warm** turns
+when `cached_tokens` is nonzero. Run it **serialized** (one request in flight) so
+the timings are clean.
 
 ### Read the breakdown
 ```
 docker logs warmttft 2>&1 | grep -E "PREFILL_PROFILE|mixer split|top5"
 ```
 Confirm: which phase dominates (a), and whether attn ≫ ssm per-layer (b).
+Also confirm the driver printed nonzero `cached=` on post-t0 turns and
+`atlas_prefix_cache_hits_total` increased. If not, you profiled a cold run.
 
 ---
 
@@ -142,10 +167,13 @@ Confirm: which phase dominates (a), and whether attn ≫ ssm per-layer (b).
 
 Two candidate fixes; the profile decides which:
 
-1. **If attention-over-long-context dominates** (expected): the ~30-token suffix
+1. **If attention-over-long-context dominates** (confirmed): the ~30-token suffix
    attends the full paged KV every layer, twice. Target the suffix-attention
    kernel — it should attend the long prefix KV far more cheaply (the suffix is
    tiny; the cost is all in the K/V length). This is the highest-leverage fix.
+   First cheap lever: test/lower `ATLAS_PREFILL_PAGED_BR64_MIN_Q` for NVFP4
+   suffixes. It improves Holo/NVFP4 but needs a broader sweep before becoming a
+   production default.
 
 2. **One-pass + mid-chunk checkpoint restructure.** The turn runs **two** tail-cut
    passes. Collapsing to one would ~halve the tail cost. **Blocked today** because
@@ -197,7 +225,8 @@ Code entry points for all of the above:
    `mixer split` logs (this alone is valuable — it validates or refutes the
    attention hypothesis).
 2. A change that measurably cuts warm-turn TTFT, with **before/after** numbers
-   from the same `ssm_deep.py reps 1600` serialized workload, and unit tests.
+   from the same resident-cache `ssm_deep.py reps 1600 --sessions 1` serialized
+   workload, and unit tests.
 3. No regression in correctness — a warm turn must produce the same tokens as a
    cold turn for the same prompt (coherence check).
 

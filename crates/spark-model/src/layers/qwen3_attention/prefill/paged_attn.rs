@@ -158,7 +158,11 @@ impl Qwen3AttentionLayer {
                 stream,
             )?;
         } else {
-            let use_br64 = n >= 256;
+            let br64_min_q = std::env::var("ATLAS_PREFILL_PAGED_BR64_MIN_Q")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+                .unwrap_or(256);
+            let use_br64 = n >= br64_min_q;
             let (fp8_k_scale, fp8_v_scale) = self.effective_fp8_scales();
             match (self.kv_dtype, use_br64) {
                 (KvCacheDtype::Nvfp4, true) => ops::prefill_attention_paged_nvfp4_64(
