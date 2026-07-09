@@ -394,6 +394,33 @@ impl DecodeRingManager {
     }
 }
 
+/// Deterministic sequence → spill-worker mapping for the multi-worker decode-spill
+/// pool. Coherence rests on this being a pure function of `seq` ONLY: because
+/// [`DecodeRingManager::cold_key`] is a pure function of `(seq, logical)`, routing
+/// every job for a given sequence to ONE worker keeps all same-`cold_key` spill
+/// incarnations (epoch e, e+1, …) FIFO on a single channel — byte-reproducing the
+/// single-consumer `put → complete_spill → remove` order the epoch guard was
+/// designed around. NEVER route by arrival/round-robin/logical: that would let a
+/// stale-epoch completion `store.remove` a freshly committed blob under the shared
+/// key. A splitmix step de-clusters the low bits of `seq` so `n` workers get an
+/// even share (raw `seq % n` is equally correct — the only invariant is that the
+/// index depends on `seq` and `n` alone). `n == 1` always returns 0 (byte-identical
+/// to the single-worker build).
+pub(crate) fn spill_worker_index(seq: usize, n: usize) -> usize {
+    debug_assert!(n >= 1, "worker pool must have at least one worker");
+    if n <= 1 {
+        return 0;
+    }
+    // splitmix64 finalizer over `seq` (same mixer family as `cold_key`).
+    let mut h = seq as u64;
+    h ^= h >> 30;
+    h = h.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    h ^= h >> 27;
+    h = h.wrapping_mul(0x94D0_49BB_1331_11EB);
+    h ^= h >> 31;
+    (h % n as u64) as usize
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -623,5 +650,104 @@ mod tests {
         assert_eq!(m.residency(1, 0), Residency::Absent);
         let d = m.plan_save(1, 0);
         assert!(matches!(d, SaveDecision::Fresh { spill: None, .. }));
+    }
+
+    // ── Multi-worker spill-pool dispatch (GPU-free). The coherence proof is that
+    // the worker index depends ONLY on `seq`, so every job sharing a `cold_key`
+    // (which is a pure fn of `(seq, logical)`) lands on one worker's FIFO channel.
+
+    #[test]
+    fn spill_worker_index_n1_is_always_zero() {
+        // N == 1 is byte-identical to the single-worker build.
+        for seq in 0..64 {
+            assert_eq!(spill_worker_index(seq, 1), 0);
+        }
+    }
+
+    #[test]
+    fn spill_worker_index_depends_only_on_seq() {
+        // For any pool size, the index is a stable pure function of `seq`; it does
+        // NOT depend on logical/epoch (those aren't even inputs) and repeated calls
+        // agree. Different seqs may (and generally do) map elsewhere.
+        for &n in &[1usize, 2, 4, 8] {
+            for seq in 0..128 {
+                let w = spill_worker_index(seq, n);
+                assert!(w < n, "index {w} out of range for n={n}");
+                assert_eq!(w, spill_worker_index(seq, n), "must be deterministic");
+            }
+            if n > 1 {
+                // Sanity: the mapping is not degenerate (not all seqs to worker 0).
+                let distinct: std::collections::HashSet<usize> =
+                    (0..128).map(|s| spill_worker_index(s, n)).collect();
+                assert!(distinct.len() > 1, "n={n} collapsed every seq onto one worker");
+            }
+        }
+    }
+
+    #[test]
+    fn same_seq_multi_incarnation_jobs_route_to_one_worker() {
+        // Reproduce the headline same-cold_key hazard shape: (seq,logical) spills
+        // at epoch e1, is re-saved (fresh incarnation, epoch e2) then evicted again
+        // → two SpillReqs sharing ONE cold_key but different epochs. Both MUST route
+        // to the same worker so the pool preserves the single-consumer FIFO
+        // put→commit→remove order (else a stale-epoch remove erases the fresh blob).
+        let mut m = DecodeRingManager::new(8, /*hot*/ 2, /*margin*/ 2, 4, 2, 0xABCD);
+        m.plan_save(0, 0);
+        m.plan_save(0, 1);
+        // First incarnation of slot 0 is evicted → a real SpillReq at epoch e1.
+        let SaveDecision::Fresh { spill: Some(e1), .. } = m.plan_save(0, 2) else {
+            panic!("expected first spill of slot 0");
+        };
+        assert_eq!(e1.logical, 0);
+        // The SECOND incarnation's spill: same (seq, logical) ⇒ SAME cold_key, a
+        // bumped epoch (this is exactly the shape `plan_save`'s epoch bump + a later
+        // eviction produce; constructed directly to avoid depending on LRU victim
+        // order). This is the headline hazard: two SpillReqs on ONE cold_key.
+        let e2 = SpillReq {
+            seq: e1.seq,
+            logical: e1.logical,
+            lane: e1.lane,
+            epoch: e1.epoch + 1,
+            cold_key: m.cold_key(0, 0),
+        };
+        assert_eq!(e1.cold_key, e2.cold_key, "same (seq,logical) ⇒ shared cold_key");
+        assert_ne!(e1.epoch, e2.epoch, "distinct incarnations ⇒ distinct epochs");
+        // Coherence: both same-key jobs route to ONE worker for every pool size, so
+        // the pool reproduces the single-consumer FIFO put→commit→remove order.
+        for &n in &[1usize, 2, 4, 8] {
+            assert_eq!(
+                spill_worker_index(e1.seq, n),
+                spill_worker_index(e2.seq, n),
+                "same-key incarnations must share a worker (n={n})",
+            );
+        }
+    }
+
+    #[test]
+    fn higher_margin_absorbs_more_inflight_before_backpressure() {
+        // Pure-logic proof that the runtime margin is the backpressure lever the
+        // worker pool pairs with: margin=1 (l_phys=3) backpressures on the 4th
+        // distinct uncompleted save; margin=2 (l_phys=4) defers it by exactly one.
+        let mut m1 = DecodeRingManager::new(8, 2, /*margin*/ 1, 4, 2, 0xABCD);
+        m1.plan_save(0, 0);
+        m1.plan_save(0, 1);
+        assert!(matches!(m1.plan_save(0, 2), SaveDecision::Fresh { spill: Some(_), .. }));
+        assert!(
+            matches!(m1.plan_save(0, 3), SaveDecision::Backpressure { .. }),
+            "margin=1 backpressures on the 4th distinct uncompleted save",
+        );
+
+        let mut m2 = DecodeRingManager::new(8, 2, /*margin*/ 2, 4, 2, 0xABCD);
+        m2.plan_save(0, 0);
+        m2.plan_save(0, 1);
+        assert!(matches!(m2.plan_save(0, 2), SaveDecision::Fresh { spill: Some(_), .. }));
+        assert!(
+            matches!(m2.plan_save(0, 3), SaveDecision::Fresh { .. }),
+            "margin=2 has a free drain lane → no backpressure on the 4th",
+        );
+        assert!(
+            matches!(m2.plan_save(0, 4), SaveDecision::Backpressure { .. }),
+            "margin=2 backpressures one save later than margin=1",
+        );
     }
 }

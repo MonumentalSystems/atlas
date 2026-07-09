@@ -18,7 +18,7 @@ use super::block_mgmt::{
     extract_layer_refs, reuse_prefix_match_disk_ids,
 };
 use super::decode_ring_manager::{
-    DecodeRingManager, RestoreDecision, SaveDecision, SpillCommit, SpillReq,
+    DecodeRingManager, RestoreDecision, SaveDecision, SpillCommit, SpillReq, spill_worker_index,
 };
 use super::ssm_pool::SsmStatePool;
 use super::ssm_tier::SnapshotBlobStore;
@@ -97,9 +97,10 @@ pub(crate) struct SsmSnapshotPool {
     /// machine shared with the async spill worker. `None` ⇒ the decode region is
     /// the flat HBM (or UMA) ring, byte-identical to the pre-rolling build.
     pub(super) decode_rolling: Option<Arc<Mutex<DecodeRingManager>>>,
-    /// Physical HBM lanes per sequence: `hot_lanes + DECODE_SPILL_MARGIN` in
-    /// rolling mode, else `decode_ring_slots`. Drives decode-region frame
-    /// addressing and MUST equal what the preflight reservation mirrors.
+    /// Physical HBM lanes per sequence: `hot_lanes + spill_margin` (runtime
+    /// `decode_spill_margin_runtime`) in rolling mode, else `decode_ring_slots`.
+    /// Drives decode-region frame addressing and MUST equal what the preflight
+    /// reservation mirrors (both derive it from `decode_hbm_lanes_per_seq`).
     pub(super) decode_l_phys: usize,
     /// Cold tier for spilled decode boundaries (non-dropping). `Some` in rolling
     /// mode once `attach_decode_spiller` runs.
@@ -117,26 +118,133 @@ struct SpillJob {
     wait_event: u64,
 }
 
-/// Owns the async decode-spill worker thread + its channel. Dropping it hangs up
-/// the channel, ending the worker.
+/// Owns the async decode-spill worker POOL + their channels. Sharded by sequence:
+/// there is one independent `mpsc` channel per worker (NOT a shared receiver), and
+/// `senders[spill_worker_index(seq, N)]` is the FIFO route for all of `seq`'s
+/// spills. Because `cold_key` is a pure fn of `(seq, logical)`, this keeps every
+/// same-key incarnation on one worker's channel — byte-reproducing the original
+/// single-consumer `put → complete_spill → remove` order (see `spill_worker_index`).
+/// Dropping hangs up every channel, ending all workers. `N == 1` is byte-identical
+/// to the pre-pool single-worker build.
 struct DecodeSpiller {
-    /// `mpsc::Sender` is `!Sync`; the pool is shared `&self` across threads, so
-    /// the sender is `Mutex`-guarded (a send is a cheap enqueue).
-    tx: Mutex<mpsc::Sender<SpillJob>>,
-    handle: Option<std::thread::JoinHandle<()>>,
+    /// One `mpsc::Sender` per worker. `mpsc::Sender` is `!Sync`; the pool is shared
+    /// `&self` across threads, so each sender is `Mutex`-guarded (a send is a cheap
+    /// enqueue). `senders.len()` is the pool size `N`.
+    senders: Vec<Mutex<mpsc::Sender<SpillJob>>>,
+    handles: Vec<std::thread::JoinHandle<()>>,
 }
 
 impl Drop for DecodeSpiller {
     fn drop(&mut self) {
-        // Drop the sender first (hangs up the channel) so the worker's `recv`
-        // returns `Err` and the loop exits, then join.
-        {
+        // Hang up EVERY per-worker channel first (replace each sender with a
+        // dangling one → the original is dropped) so each worker's `recv` returns
+        // `Err` and its loop exits, then join them all. No missed-wakeup hang: a
+        // worker blocked in `recv` wakes the moment its own sender count hits zero.
+        for s in &self.senders {
             let (tx, _) = mpsc::channel();
-            *self.tx.lock() = tx; // replace with a dangling sender → original dropped
+            *s.lock() = tx;
         }
-        if let Some(h) = self.handle.take() {
+        for h in self.handles.drain(..) {
             let _ = h.join();
         }
+    }
+}
+
+/// The per-worker spill loop, factored out so all `N` pool threads share one copy.
+/// Each worker binds its OWN thread and owns its OWN CUDA stream (never shared —
+/// concurrent `stream_wait_event` + D2H gathers on one stream would race and defeat
+/// the per-job ordering event). The body is identical to the original
+/// single-worker loop, including the non-dropping `store.put`-failure branch.
+#[allow(clippy::too_many_arguments)]
+fn run_spill_worker(
+    gpu: Arc<dyn GpuBackend>,
+    store: Arc<dyn SnapshotBlobStore>,
+    mgr: Arc<Mutex<DecodeRingManager>>,
+    h_ptrs: Vec<DevicePtr>,
+    c_ptrs: Vec<DevicePtr>,
+    h_bytes: usize,
+    conv_bytes: usize,
+    num_layers: usize,
+    l_phys: usize,
+    blob_bytes: usize,
+    rx: mpsc::Receiver<SpillJob>,
+) {
+    if let Err(e) = gpu.bind_to_thread() {
+        tracing::error!("decode-spill worker: bind_to_thread failed: {e:#}");
+        return;
+    }
+    // Per-worker stream: NEVER share one across the pool. Fall back to the
+    // default stream (0) on failure — coherence-safe (each worker gathers
+    // disjoint per-job blobs and each D2H is stream-synchronized), but with N>1
+    // it silently serializes every worker's gathers onto one stream and defeats
+    // the pool, so surface the failure loudly rather than swallowing it.
+    let spill_stream = match gpu.create_stream() {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!(
+                "decode-spill worker: create_stream failed ({e:#}); falling back to \
+                 the default stream — the spill pool will serialize (no parallelism)"
+            );
+            0
+        }
+    };
+    while let Ok(job) = rx.recv() {
+        let req = job.req;
+        // Order the gather after the boundary write into this lane.
+        let _ = gpu.stream_wait_event(spill_stream, job.wait_event);
+        let frame = req.seq * l_phys + req.lane;
+        let mut blob = vec![0u8; blob_bytes];
+        let per_layer = h_bytes + conv_bytes;
+        let mut ok = true;
+        for i in 0..num_layers {
+            let off = i * per_layer;
+            if gpu
+                .copy_d2h_on_stream(
+                    h_ptrs[i].offset(frame * h_bytes),
+                    &mut blob[off..off + h_bytes],
+                    spill_stream,
+                )
+                .is_err()
+                || gpu
+                    .copy_d2h_on_stream(
+                        c_ptrs[i].offset(frame * conv_bytes),
+                        &mut blob[off + h_bytes..off + per_layer],
+                        spill_stream,
+                    )
+                    .is_err()
+            {
+                ok = false;
+                break;
+            }
+        }
+        let put_ok = ok && store.put(req.cold_key, &blob).unwrap_or(false);
+        if !put_ok {
+            // A non-dropping store (host-RAM / peer / a correctly-sized NVMe
+            // arena) must never reach here. If it does, the bytes did NOT land in
+            // the cold store — so we must NOT commit the slot Cold and free its
+            // lane (that would erase the only copy and corrupt a later rollback).
+            // Leave it Spilling: the hot lane stays pinned with the valid bytes, so
+            // a rollback to this boundary restores directly from the lane. The
+            // stranded lane is a bounded degradation, never corruption.
+            tracing::error!(
+                "decode-spill: store.put refused/failed for key {:#x} (seq {} slot {}) \
+                 — rolling decode tier MUST be non-dropping; keeping slot resident \
+                 (lane pinned) to preserve the rollback target",
+                req.cold_key,
+                req.seq,
+                req.logical
+            );
+            let _ = gpu.destroy_event(job.wait_event);
+            continue;
+        }
+        // Commit (or cancel on a superseding save/truncate) under the manager lock.
+        match mgr.lock().complete_spill(req.seq, req.logical, req.epoch) {
+            SpillCommit::Committed => {}
+            SpillCommit::Cancelled { remove_cold_key } => {
+                store.remove(remove_cold_key);
+            }
+        }
+        let _ = gpu.destroy_event(job.wait_event);
     }
 }
 
@@ -204,11 +312,16 @@ impl SsmSnapshotPool {
         // when both are set (rolling keeps the hot write in HBM — the point).
         let rolling = decode_enabled && atlas_kernels::decode_ring_rolling_enabled();
         let hot_lanes = atlas_kernels::decode_hot_lanes_runtime();
+        // Runtime-resolved async-drain margin. MUST match what
+        // `decode_hbm_lanes_per_seq` consumes below (and what the preflight
+        // reservation mirrors) — the manager's `l_phys` and the pool's HBM
+        // allocation are then one value, never drifting.
+        let spill_margin = atlas_kernels::decode_spill_margin_runtime(hot_lanes);
         let rolling_mgr = if rolling {
             Some(DecodeRingManager::new(
                 decode_ring_slots,
                 hot_lanes,
-                atlas_kernels::DECODE_SPILL_MARGIN,
+                spill_margin,
                 atlas_kernels::DECODE_FAULT_SCRATCH,
                 decode_max_seqs,
                 atlas_kernels::DECODE_DOMAIN,
@@ -286,10 +399,9 @@ impl SsmSnapshotPool {
         );
         if rolling {
             tracing::info!(
-                "SSM decode ROLLING tier: {hot_lanes} hot + {} margin lanes/seq, \
+                "SSM decode ROLLING tier: {hot_lanes} hot + {spill_margin} margin lanes/seq, \
                  {} shared fault-scratch — HBM capped at {decode_max_seqs}×{decode_l_phys}×blob \
                  (cold residue spills to ATLAS_SSM_DECODE_TIER)",
-                atlas_kernels::DECODE_SPILL_MARGIN,
                 atlas_kernels::DECODE_FAULT_SCRATCH,
             );
         }
@@ -334,8 +446,7 @@ impl SsmSnapshotPool {
             return Ok(());
         };
         self.decode_store = Some(store.clone());
-        let (tx, rx) = mpsc::channel::<SpillJob>();
-        // Cloned handles the worker owns for the lifetime of the pool.
+        // Cloned handles every worker owns for the lifetime of the pool.
         let h_ptrs: Vec<DevicePtr> = self.decode_h_snapshots.clone();
         let c_ptrs: Vec<DevicePtr> = self.decode_conv_snapshots.clone();
         let h_bytes = self.h_bytes;
@@ -343,79 +454,39 @@ impl SsmSnapshotPool {
         let num_layers = self.num_ssm_layers;
         let l_phys = self.decode_l_phys;
         let blob_bytes = self.spill_blob_bytes();
-        let spill_stream = gpu.create_stream().unwrap_or(0);
-        let handle = std::thread::Builder::new()
-            .name("atlas-decode-spill".into())
-            .spawn(move || {
-                if let Err(e) = gpu.bind_to_thread() {
-                    tracing::error!("decode-spill worker: bind_to_thread failed: {e:#}");
-                    return;
-                }
-                while let Ok(job) = rx.recv() {
-                    let req = job.req;
-                    // Order the gather after the boundary write into this lane.
-                    let _ = gpu.stream_wait_event(spill_stream, job.wait_event);
-                    let frame = req.seq * l_phys + req.lane;
-                    let mut blob = vec![0u8; blob_bytes];
-                    let per_layer = h_bytes + conv_bytes;
-                    let mut ok = true;
-                    for i in 0..num_layers {
-                        let off = i * per_layer;
-                        if gpu
-                            .copy_d2h_on_stream(
-                                h_ptrs[i].offset(frame * h_bytes),
-                                &mut blob[off..off + h_bytes],
-                                spill_stream,
-                            )
-                            .is_err()
-                            || gpu
-                                .copy_d2h_on_stream(
-                                    c_ptrs[i].offset(frame * conv_bytes),
-                                    &mut blob[off + h_bytes..off + per_layer],
-                                    spill_stream,
-                                )
-                                .is_err()
-                        {
-                            ok = false;
-                            break;
-                        }
-                    }
-                    let put_ok = ok && store.put(req.cold_key, &blob).unwrap_or(false);
-                    if !put_ok {
-                        // A non-dropping store (host-RAM / peer / a correctly-sized
-                        // NVMe arena) must never reach here. If it does, the bytes
-                        // did NOT land in the cold store — so we must NOT commit the
-                        // slot Cold and free its lane (that would erase the only
-                        // copy and corrupt a later rollback). Leave it Spilling: the
-                        // hot lane stays pinned with the valid bytes, so a rollback
-                        // to this boundary restores directly from the lane. The
-                        // stranded lane is a bounded degradation, never corruption.
-                        tracing::error!(
-                            "decode-spill: store.put refused/failed for key {:#x} (seq {} slot {}) \
-                             — rolling decode tier MUST be non-dropping; keeping slot resident \
-                             (lane pinned) to preserve the rollback target",
-                            req.cold_key,
-                            req.seq,
-                            req.logical
-                        );
-                        let _ = gpu.destroy_event(job.wait_event);
-                        continue;
-                    }
-                    // Commit (or cancel on a superseding save/truncate) under the
-                    // manager lock.
-                    match mgr.lock().complete_spill(req.seq, req.logical, req.epoch) {
-                        SpillCommit::Committed => {}
-                        SpillCommit::Cancelled { remove_cold_key } => {
-                            store.remove(remove_cold_key);
-                        }
-                    }
-                    let _ = gpu.destroy_event(job.wait_event);
-                }
-            })?;
-        self.decode_spiller = Some(DecodeSpiller {
-            tx: Mutex::new(tx),
-            handle: Some(handle),
-        });
+
+        // Tier-aware, env-overridable pool size. `N == 1` reproduces the original
+        // single-worker build byte-for-byte (one channel, `seq % 1 == 0`). Each
+        // worker gets its OWN sequence-sharded channel + its own CUDA stream, so
+        // spills for distinct sequences drain concurrently while all spills of a
+        // given sequence (hence a given `cold_key`) stay FIFO on one worker.
+        let n_workers = atlas_kernels::decode_spill_workers_runtime();
+        let mut senders = Vec::with_capacity(n_workers);
+        let mut handles = Vec::with_capacity(n_workers);
+        for w in 0..n_workers {
+            let (tx, rx) = mpsc::channel::<SpillJob>();
+            let gpu_w = gpu.clone();
+            let store_w = store.clone();
+            let mgr_w = mgr.clone();
+            let h_w = h_ptrs.clone();
+            let c_w = c_ptrs.clone();
+            let handle = std::thread::Builder::new()
+                .name(format!("atlas-decode-spill-{w}"))
+                .spawn(move || {
+                    run_spill_worker(
+                        gpu_w, store_w, mgr_w, h_w, c_w, h_bytes, conv_bytes, num_layers, l_phys,
+                        blob_bytes, rx,
+                    );
+                })?;
+            senders.push(Mutex::new(tx));
+            handles.push(handle);
+        }
+        tracing::info!(
+            "SSM decode ROLLING spill pool: {n_workers} worker(s) ACTIVE \
+             (seq-sharded, per-worker CUDA stream; tier={})",
+            std::env::var("ATLAS_SSM_DECODE_TIER").unwrap_or_else(|_| "host-RAM".into()),
+        );
+        self.decode_spiller = Some(DecodeSpiller { senders, handles });
         Ok(())
     }
 
@@ -686,7 +757,11 @@ impl SsmSnapshotPool {
         if let Some(sp) = &self.decode_spiller {
             let ev = gpu.create_event()?;
             gpu.record_event(ev, stream)?;
-            match sp.tx.lock().send(SpillJob { req, wait_event: ev }) {
+            // Seq-sharded route: all of this seq's spills (hence all incarnations
+            // sharing `req.cold_key`) go to ONE worker's FIFO channel, preserving
+            // the single-consumer put→commit→remove order.
+            let w = spill_worker_index(req.seq, sp.senders.len());
+            match sp.senders[w].lock().send(SpillJob { req, wait_event: ev }) {
                 Ok(()) => Ok(()),
                 Err(_) => {
                     let _ = gpu.destroy_event(ev);

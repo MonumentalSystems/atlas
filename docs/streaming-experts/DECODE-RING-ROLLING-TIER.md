@@ -36,10 +36,38 @@ fp8+calibration, full CUTLASS/grouped-MoE fast set):**
   (partial rollback) — frees discarded lanes so `plan_save` can't backpressure with an
   empty drain (deadlock).
 
-### Remaining (optional)
-- High-C spill throughput: the single-thread worker + margin=1 can backpressure under
-  sustained decode — multi-thread worker / bigger margin if the ~10% decode cost matters
-  at scale. Supersede the flat `ATLAS_SSM_DECODE_RING_UMA` knob (no physical cap on GB10).
+### Multi-worker spill pool (landed, gated conservative)
+The single-thread spill worker is now a **sequence-sharded pool of N workers**
+(`ssm_snapshot.rs`). Each worker owns an independent `mpsc` channel **and its own
+CUDA stream**; `decode_enqueue_spill` routes a job to
+`spill_worker_index(seq, N)` (a pure `splitmix(seq) % N`, in `decode_ring_manager.rs`).
+Because `cold_key` is a pure function of `(seq, logical)`, all spills of a
+sequence — hence every incarnation sharing a `cold_key` — stay FIFO on ONE worker,
+byte-reproducing the single-consumer `put → complete_spill → remove` order the
+epoch guard was designed around. **No `DecodeRingManager` state changed**;
+coherence comes from routing, not new locking. `N == 1` is byte-identical to the
+pre-pool build.
+
+Knobs (`atlas-kernels`, runtime env, pure-fn + unit-tested):
+- `ATLAS_SSM_DECODE_SPILL_WORKERS=<1..8>` — explicit pool size. Unset ⇒ tier-aware
+  default via `ATLAS_SSM_DECODE_TIER`: **`nvme`=4** (disjoint-offset `pwrite`
+  genuinely parallelizes), **host-RAM (unset)=1**, **`peer`=1**.
+- `ATLAS_SSM_DECODE_SPILL_MARGIN=<n>` — async-drain lanes/seq, default
+  `DECODE_SPILL_MARGIN(1)`, floored 1, ceilinged so `hot+margin ≤ ring depth`.
+  Consumed INSIDE `decode_hbm_lanes_per_seq` (the SSOT) so the pool alloc and the
+  preflight HBM reservation widen in lockstep; costs `margin × max_batch × layers ×
+  (h+conv)` HBM per raised lane. Worker-count and margin are the coupled levers that
+  shrink the backpressure/sync-fallback window at high C.
+
+**Scope / honesty:** the pool recovers throughput on **local NVMe** (and trivially
+host-RAM); the **RDMA `peer` tier stays serial** — a shared `RdmaSnapshotArena`
+holds one `Mutex` across two TCP RTTs + the RDMA write, so extra workers do not
+scale it. Per-worker peer connections are **out of scope** (a `put` on connection A
+is absent from connection B's slot map, breaking restore). No measured perf win is
+claimed here: only ~9–10% at C=8 was ever GPU-measured; the ~10–13% high-C figure
+is a projection, and the pool's recovery is a **docker A/B follow-up** (§9). The
+flat `ATLAS_SSM_DECODE_RING_UMA` knob (no physical cap on GB10) remains the separate
+high-C escape valve.
 
 <details><summary>original scaffold status (superseded)</summary>
 

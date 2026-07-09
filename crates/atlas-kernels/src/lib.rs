@@ -308,15 +308,73 @@ pub const DECODE_FAULT_SCRATCH: usize = 8;
 /// never collide with a Marconi prefix-hash key on a shared store/peer.
 pub const DECODE_DOMAIN: u64 = 0xD3C0_DE12_A5B6_C7D8;
 
+/// Runtime-resolved spill-drain margin (extra in-flight HBM lanes per sequence
+/// beyond the `hot_lanes`): `ATLAS_SSM_DECODE_SPILL_MARGIN`, default
+/// [`DECODE_SPILL_MARGIN`], floored at 1 and ceilinged so `hot_lanes + margin ≤
+/// DECODE_ROLLBACK_RING_SLOTS` (a margin can never exceed the logical ring depth).
+/// Raising it lets more than one spill be in flight per sequence before
+/// `plan_save` returns `Backpressure` — the lever the multi-worker spill pool is
+/// paired with. It is consumed INSIDE [`decode_hbm_lanes_per_seq`] (the SSOT), so
+/// the pool allocation and the preflight reservation widen in lockstep; it costs
+/// `margin × max_batch_size × layers × (h+conv)` extra HBM per raised lane.
+/// Default (margin = 1) is byte-identical to the pre-pool build.
+pub fn decode_spill_margin_runtime(hot_lanes: usize) -> usize {
+    let raw = std::env::var("ATLAS_SSM_DECODE_SPILL_MARGIN")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok());
+    decode_spill_margin_clamp(hot_lanes, raw)
+}
+
+/// Pure clamp for [`decode_spill_margin_runtime`] (env split out for testing):
+/// `raw` (parsed `ATLAS_SSM_DECODE_SPILL_MARGIN`, `None` if unset/garbage) falls
+/// back to [`DECODE_SPILL_MARGIN`], floored at 1 and ceilinged so `hot_lanes +
+/// margin ≤ DECODE_ROLLBACK_RING_SLOTS`.
+fn decode_spill_margin_clamp(hot_lanes: usize, raw: Option<usize>) -> usize {
+    let ceil = DECODE_ROLLBACK_RING_SLOTS.saturating_sub(hot_lanes).max(1);
+    raw.unwrap_or(DECODE_SPILL_MARGIN).clamp(1, ceil)
+}
+
+/// Runtime-resolved decode-spill worker-pool size. Explicit override via
+/// `ATLAS_SSM_DECODE_SPILL_WORKERS`; otherwise a conservative tier-aware default
+/// keyed on `ATLAS_SSM_DECODE_TIER`: local `nvme` = 4 (disjoint-offset pwrite
+/// genuinely parallelizes), host-RAM (unset) and `peer` = 1 (host-RAM puts are
+/// ~µs; the RDMA peer arena serializes on one connection so extra workers do not
+/// scale it). Clamped to `[1, 8]`. A value of `1` is byte-identical to the
+/// single-worker build (one channel, `seq % 1 == 0`).
+pub fn decode_spill_workers_runtime() -> usize {
+    let explicit = std::env::var("ATLAS_SSM_DECODE_SPILL_WORKERS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok());
+    let tier = std::env::var("ATLAS_SSM_DECODE_TIER").ok();
+    decode_spill_workers_resolve(explicit, tier.as_deref())
+}
+
+/// Pure resolver for [`decode_spill_workers_runtime`] (env split out for
+/// testing). Explicit override wins (clamped `[1, 8]`); otherwise a tier-aware
+/// default: `nvme` = 4, everything else (host-RAM/peer) = 1.
+fn decode_spill_workers_resolve(explicit: Option<usize>, tier: Option<&str>) -> usize {
+    if let Some(n) = explicit {
+        return n.clamp(1, 8);
+    }
+    let default_n = match tier {
+        Some("nvme") => 4,
+        // host-RAM (unset) and the RDMA `peer` tier stay serial by default.
+        _ => 1,
+    };
+    default_n.clamp(1, 8)
+}
+
 /// Physical HBM lanes the rolling decode tier reserves per sequence when
 /// `rolling` is engaged, else the full logical ring depth. SSOT for the pool
 /// allocation ([`SsmSnapshotPool::new`]) AND the preflight HBM reservation mirror
 /// — both MUST call this so they never drift (the 3-vs-8 under-reservation class
-/// of bug). `hot_lanes` is the runtime-resolved [`DECODE_HOT_LANES`] override.
+/// of bug). `hot_lanes` is the runtime-resolved [`DECODE_HOT_LANES`] override; the
+/// margin is the runtime-resolved [`decode_spill_margin_runtime`] so raising the
+/// margin widens the pool alloc and the preflight reservation together.
 #[inline]
 pub fn decode_hbm_lanes_per_seq(rolling: bool, hot_lanes: usize) -> usize {
     if rolling {
-        hot_lanes + DECODE_SPILL_MARGIN
+        hot_lanes + decode_spill_margin_runtime(hot_lanes)
     } else {
         DECODE_ROLLBACK_RING_SLOTS
     }
@@ -532,5 +590,47 @@ mod tests {
             found.is_some(),
             "ptx_for_model('qwen3-next-80b') should find the default target"
         );
+    }
+
+    // ── Decode-spill worker-pool sizing + runtime spill margin (GPU-free).
+    // These exercise the pure `_clamp` / `_resolve` inner fns (env split out) so
+    // they need no `set_var` and can't race other tests.
+
+    #[test]
+    fn clamp_spill_workers_explicit_and_tier_defaults() {
+        // Explicit override wins and is clamped to [1, 8].
+        assert_eq!(decode_spill_workers_resolve(Some(4), None), 4);
+        assert_eq!(decode_spill_workers_resolve(Some(0), Some("nvme")), 1, "floor 1");
+        assert_eq!(decode_spill_workers_resolve(Some(100), Some("peer")), 8, "ceil 8");
+        // Tier-aware default when unset: nvme parallelizes (4); host-RAM/peer serial (1).
+        assert_eq!(decode_spill_workers_resolve(None, Some("nvme")), 4);
+        assert_eq!(decode_spill_workers_resolve(None, Some("peer")), 1);
+        assert_eq!(decode_spill_workers_resolve(None, None), 1, "host-RAM default = 1");
+        assert_eq!(decode_spill_workers_resolve(None, Some("garbage")), 1);
+    }
+
+    #[test]
+    fn clamp_spill_margin_default_floor_and_ceil() {
+        // Unset → the DECODE_SPILL_MARGIN default.
+        assert_eq!(decode_spill_margin_clamp(2, None), DECODE_SPILL_MARGIN);
+        // Floor at 1 (a 0 margin would defeat the async-drain lane).
+        assert_eq!(decode_spill_margin_clamp(2, Some(0)), 1);
+        // Ceil so hot + margin ≤ DECODE_ROLLBACK_RING_SLOTS.
+        assert_eq!(decode_spill_margin_clamp(2, Some(100)), DECODE_ROLLBACK_RING_SLOTS - 2);
+        assert!(2 + decode_spill_margin_clamp(2, Some(100)) <= DECODE_ROLLBACK_RING_SLOTS);
+        // A larger-but-legal raise passes through.
+        assert_eq!(decode_spill_margin_clamp(2, Some(3)), 3);
+        // Degenerate hot == ring depth still yields a floor of 1 (rolling is off
+        // in that case, so the margin is inert, but the fn must not panic).
+        assert_eq!(decode_spill_margin_clamp(DECODE_ROLLBACK_RING_SLOTS, Some(5)), 1);
+    }
+
+    #[test]
+    fn decode_hbm_lanes_reflect_runtime_margin() {
+        // The SSOT ties pool alloc + preflight reservation to hot + margin, so a
+        // raised margin widens both together. Default (margin=1) is unchanged.
+        assert_eq!(decode_hbm_lanes_per_seq(true, 2), 2 + decode_spill_margin_runtime(2));
+        // Rolling off → always the full logical ring depth, margin-independent.
+        assert_eq!(decode_hbm_lanes_per_seq(false, 2), DECODE_ROLLBACK_RING_SLOTS);
     }
 }
