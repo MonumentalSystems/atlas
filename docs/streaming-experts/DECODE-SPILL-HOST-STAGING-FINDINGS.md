@@ -104,9 +104,58 @@ first:** the win may be "one *fused* gather into pinned-UMA" (collapse 60 launch
 to 1) as much as "avoid the bounce." Instrumentation is in place
 (`ATLAS_DECODE_RING_STATS`); a gather-vs-put phase split is the next measurement.
 
+## RESOLVED: pinned fused gather — ~2.76× rolling-tier decode Tput (2026-07-09)
+
+Profiling (`gather_ms`/`put_ms` split) showed the gather is ~95% of the per-spill
+cost (~407ms vs ~22ms put), but fusing the 60 per-copy `cuStreamSynchronize` into
+one only bought ~13% — because the real cost was `cuMemcpyDtoHAsync` into a
+**pageable `Vec`**: 63.75MB in ~358ms = **~0.17 GB/s** (CUDA stages pageable D2H
+through a small internal bounce buffer — slow AND implicitly synchronous).
+
+Fix (`ATLAS_SSM_DECODE_FUSED_GATHER`, now **default ON**, opt out `=0`): gather
+into a per-worker **pinned** host buffer (`alloc_host_pinned`, allocated once +
+reused) + async copies + ONE trailing sync. A/B at C=8 / workers=1 / NVMe:
+
+| | pageable (OFF) | pinned (ON) | Δ |
+|---|---:|---:|---:|
+| gather_ms/spill | ~358 | **~2.0** | ~180× |
+| bp_spins/spill | ~3241 | **~70** | ~46× |
+| Tput | 48.2 t/s | **133.1** | **~2.76×** |
+| TPOT p50 | 77 ms | **6.65 ms** | ~11.6× |
+
+`put_ms` unchanged (~21ms) — clean isolation, only the gather changed. **The
+pageable gather had been silently throttling the entire rolling path ~2.7×**;
+every earlier "no throughput win" A/B was pageable-vs-pageable (worker count),
+missing the real bottleneck.
+
+**Coherence — validated (2026-07-09):** live agentic (rolling+pinned, Holo-35B):
+6528 spills + 5 watchdog rollbacks (which restore spilled SSM state),
+`sync_fallbacks=0`, zero `store.put` failures / errors / degeneration; agentic
+24/26 over 9 iterations (both fails = model turn-limit on the sort task, not
+corruption). Mechanism is byte-identical by construction (same copies, one sync
+before `put`).
+
+### Scope + generalization audit
+This fix is **spill-only** (rolling tier + actual spills); normal decode-boundary
+save is D2D (HBM→HBM), untouched. The pageable-D2H-into-`Vec` *pattern* was
+audited across the other `copy_d2h_on_stream` callers:
+- **`high_speed_swap.rs` KV-block offload — the one real non-SSM candidate.** K/V
+  copies (32KB bf16/block) into a fresh pageable `Vec` per loop iter, hot in
+  prefill offload. Pinning (reused buffer) + K+V-fuse would help; measure against
+  the disk-I/O it shares. Only when `--high-speed-swap`.
+- **`moe_grouped_a2.rs` (grouped-MoE metadata) — cheap fusing-only cleanup.** Tiny
+  (~0.5–1KB offsets/scales/ptrs) so pinning is pointless, BUT it does 6–7 syncs
+  (per-copy internal + a redundant trailing `synchronize`) where 1 suffices;
+  switching to `copy_d2h_on_stream_async` (now exists) removes the redundant
+  per-copy syncs. Low-single-digit ms/forward.
+- **`decode_a2.rs`** (304KB logits) would benefit but is a non-default fallback
+  (`ATLAS_MLA_PERSEQ_FALLBACK`) — dead code in prod. **`forward_prefill_routed.rs`**
+  = 516B single copy, intrinsic sync — none.
+
 ## Status
 
-Landed on `feat/streaming-experts-mvp` (reviewed, unit-tested, default-safe):
-seq-sharded pool + `ATLAS_DECODE_RING_STATS`. Keep as the correct mechanism;
-the throughput win awaits (a) the C≥64 crash fix and (b) the pinned-UMA fused
-gather. Related: `DECODE-RING-ROLLING-TIER.md`.
+Landed on `feat/streaming-experts-mvp` (reviewed, unit-tested): seq-sharded pool +
+`ATLAS_DECODE_RING_STATS` + **pinned fused gather (default ON)**. The spill worker
+is no longer a throughput drag on the rolling tier. Open: the C≥64 decode crash
+(pre-existing, blocks high-C validation); optional `high_speed_swap` pinning.
+Related: `DECODE-RING-ROLLING-TIER.md`.
