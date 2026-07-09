@@ -133,35 +133,41 @@ pub fn moe_grouped_gate_up_cutlass(
     hidden: u32,
     stream: u64,
 ) -> Result<()> {
-    let read_u64 = |p: DevicePtr| -> Result<Vec<u64>> {
-        let mut raw = vec![0u8; num_experts * 8];
-        gpu.copy_d2h_on_stream(p, &mut raw, stream)?;
-        Ok(raw
-            .chunks_exact(8)
-            .map(|c| u64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]))
-            .collect())
-    };
-    let read_f32 = |p: DevicePtr| -> Result<Vec<f32>> {
-        let mut raw = vec![0u8; num_experts * 4];
-        gpu.copy_d2h_on_stream(p, &mut raw, stream)?;
-        Ok(raw
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect())
-    };
-
-    let gate_packed_h = read_u64(gate_packed)?;
-    let gate_sfb_h = read_u64(gate_sfb)?;
-    let up_packed_h = read_u64(up_packed)?;
-    let up_sfb_h = read_u64(up_sfb)?;
-    let gate_scale2_h = read_f32(gate_scale2)?;
-    let up_scale2_h = read_f32(up_scale2)?;
-
+    // Enqueue every metadata D2H async on `stream`, then a SINGLE trailing
+    // synchronize, then parse (host reads only after the barrier). The default
+    // `copy_d2h_on_stream` syncs per copy — 7 CPU↔GPU round-trips where 1
+    // suffices. Raw buffers must outlive the sync; none are read before it.
+    let mut gate_packed_raw = vec![0u8; num_experts * 8];
+    let mut gate_sfb_raw = vec![0u8; num_experts * 8];
+    let mut up_packed_raw = vec![0u8; num_experts * 8];
+    let mut up_sfb_raw = vec![0u8; num_experts * 8];
+    let mut gate_scale2_raw = vec![0u8; num_experts * 4];
+    let mut up_scale2_raw = vec![0u8; num_experts * 4];
     let mut off_raw = vec![0u8; (num_experts + 1) * 4];
-    gpu.copy_d2h_on_stream(expert_offsets, &mut off_raw, stream)?;
-    // The pointer/scale/offset host snapshots above are needed by the C entry
-    // before it can launch — make sure the async D2H copies have landed.
+    gpu.copy_d2h_on_stream_async(gate_packed, &mut gate_packed_raw, stream)?;
+    gpu.copy_d2h_on_stream_async(gate_sfb, &mut gate_sfb_raw, stream)?;
+    gpu.copy_d2h_on_stream_async(up_packed, &mut up_packed_raw, stream)?;
+    gpu.copy_d2h_on_stream_async(up_sfb, &mut up_sfb_raw, stream)?;
+    gpu.copy_d2h_on_stream_async(gate_scale2, &mut gate_scale2_raw, stream)?;
+    gpu.copy_d2h_on_stream_async(up_scale2, &mut up_scale2_raw, stream)?;
+    gpu.copy_d2h_on_stream_async(expert_offsets, &mut off_raw, stream)?;
     gpu.synchronize(stream)?;
+    let parse_u64 = |raw: &[u8]| -> Vec<u64> {
+        raw.chunks_exact(8)
+            .map(|c| u64::from_le_bytes(c.try_into().expect("8")))
+            .collect()
+    };
+    let parse_f32 = |raw: &[u8]| -> Vec<f32> {
+        raw.chunks_exact(4)
+            .map(|c| f32::from_le_bytes(c.try_into().expect("4")))
+            .collect()
+    };
+    let gate_packed_h = parse_u64(&gate_packed_raw);
+    let gate_sfb_h = parse_u64(&gate_sfb_raw);
+    let up_packed_h = parse_u64(&up_packed_raw);
+    let up_sfb_h = parse_u64(&up_sfb_raw);
+    let gate_scale2_h = parse_f32(&gate_scale2_raw);
+    let up_scale2_h = parse_f32(&up_scale2_raw);
     let eoff: Vec<i32> = off_raw
         .chunks_exact(4)
         .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
@@ -205,14 +211,18 @@ pub fn moe_grouped_down_cutlass(
     inter: u32,
     stream: u64,
 ) -> Result<()> {
+    // Enqueue all four metadata D2H copies async on `stream`, then ONE trailing
+    // synchronize — the host parses below only after that barrier. The default
+    // `copy_d2h_on_stream` would `cuStreamSynchronize` per copy (4 round-trips
+    // where 1 suffices). Buffers outlive the sync; nothing is read before it.
     let mut praw = vec![0u8; num_experts * 8];
-    gpu.copy_d2h_on_stream(packed, &mut praw, stream)?;
+    gpu.copy_d2h_on_stream_async(packed, &mut praw, stream)?;
     let mut sraw = vec![0u8; num_experts * 8];
-    gpu.copy_d2h_on_stream(sfb, &mut sraw, stream)?;
+    gpu.copy_d2h_on_stream_async(sfb, &mut sraw, stream)?;
     let mut s2raw = vec![0u8; num_experts * 4];
-    gpu.copy_d2h_on_stream(scale2, &mut s2raw, stream)?;
+    gpu.copy_d2h_on_stream_async(scale2, &mut s2raw, stream)?;
     let mut off_raw = vec![0u8; (num_experts + 1) * 4];
-    gpu.copy_d2h_on_stream(expert_offsets, &mut off_raw, stream)?;
+    gpu.copy_d2h_on_stream_async(expert_offsets, &mut off_raw, stream)?;
     gpu.synchronize(stream)?;
     let packed_h: Vec<u64> = praw
         .chunks_exact(8)
