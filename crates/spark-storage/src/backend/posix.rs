@@ -20,6 +20,11 @@ pub struct PosixBackend {
     /// (ATLAS_HSS_COALESCE_BLOCKS) stage through `bounce`, so when `coalesce`
     /// was requested the bounce is sized to THIS instead of group_bytes.
     block_bytes: usize,
+    /// ATLAS_HSS_COALESCE_RUNS (Tier-2): max consecutive-id blocks one merged
+    /// pread may cover (== bounce bytes / block_bytes). `1` = the Tier-1 per-block
+    /// path (run merging OFF); `read_blocks` dispatches on `r_max > 1`. When `> 1`
+    /// the bounce is sized to `r_max · block_bytes`.
+    r_max: usize,
 }
 
 impl PosixBackend {
@@ -33,18 +38,83 @@ impl PosixBackend {
     /// read/write methods can pread/pwrite one contiguous span. Set it iff the
     /// caller drives the block methods (flag threaded from `HighSpeedSwap::new`).
     pub fn new_with(layout: Layout, coalesce: bool) -> Result<Self> {
+        Self::new_with_run_cap(layout, coalesce, 0)
+    }
+
+    /// Tier-2 (ATLAS_HSS_COALESCE_RUNS) constructor. `run_cap_bytes` bounds one
+    /// merged pread (~1 MiB): `r_max = if coalesce && run_cap_bytes > block_bytes
+    /// { max(1, run_cap_bytes / block_bytes) } else { 1 }`, so the pinned bounce
+    /// is sized to `r_max · block_bytes`. `run_cap_bytes == 0` (the delegating
+    /// `new`/`new_with`) ⇒ `r_max == 1`, byte- AND op-identical to Tier-1.
+    pub fn new_with_run_cap(layout: Layout, coalesce: bool, run_cap_bytes: usize) -> Result<Self> {
         let group_bytes = layout.group_bytes() as usize;
         let block_bytes = layout.block_bytes() as usize;
-        let buf_bytes = if coalesce { block_bytes } else { group_bytes };
+        let r_max = if coalesce && run_cap_bytes > block_bytes {
+            (run_cap_bytes / block_bytes).max(1)
+        } else {
+            1
+        };
+        let buf_bytes = if coalesce {
+            block_bytes * r_max
+        } else {
+            group_bytes
+        };
         let bounce = PinnedBuffer::new(buf_bytes).context("alloc pinned bounce buffer")?;
         Ok(Self {
             layout,
             bounce,
             block_bytes,
+            r_max,
         })
     }
     pub fn layout(&self) -> &Layout {
         &self.layout
+    }
+
+    /// Tier-2 (ATLAS_HSS_COALESCE_RUNS) run-merged read: `plan_runs` splits the
+    /// requests into maximal strictly-consecutive same-layer runs (capped at
+    /// `r_max`); each run is ONE pread of `len·block_bytes` at
+    /// `block_offset(run_start)`, then its `len` blocks are SCATTERED per-block
+    /// from `bounce + i·block_bytes` to `sorted[start+i].dst_dev_ptr`, then ONE
+    /// `stream_sync` per run (the shared bounce must not be overwritten by the
+    /// next pread until all `len` H2Ds land). Byte-identical to Tier-1's `len`
+    /// per-block reads — same bytes, same slots, one disk op instead of `len`.
+    fn read_runs(&mut self, requests: &[BlockReadRequest], stream: u64) -> Result<()> {
+        let block_bytes = self.block_bytes;
+        let (sorted, runs) = super::plan_runs(requests, self.r_max);
+        let bounce_ptr = self.bounce.ptr;
+        for (start, len) in runs {
+            let read_len = len * block_bytes;
+            if self.bounce.bytes < read_len {
+                bail!(
+                    "posix backend not built for run coalescing (bounce {} < run bytes {} = {} \
+                     blocks × {}); construct with new_with_run_cap(.., run_cap_bytes)",
+                    self.bounce.bytes,
+                    read_len,
+                    len,
+                    block_bytes
+                );
+            }
+            let rs = &sorted[start];
+            let fd = self.layout.fd(rs.base_key.layer);
+            let off = self
+                .layout
+                .block_offset(rs.base_key.layer, rs.base_key.block) as i64;
+            let n = unsafe { libc::pread(fd, bounce_ptr, read_len, off) };
+            if n != read_len as isize {
+                bail!(
+                    "run pread {read_len}@{off} returned {n}, errno {}",
+                    std::io::Error::last_os_error()
+                );
+            }
+            for i in 0..len {
+                let dst = sorted[start + i].dst_dev_ptr;
+                let src = unsafe { (bounce_ptr as *const u8).add(i * block_bytes) };
+                copy_h_to_d_async(dst, src as *const c_void, block_bytes, stream)?;
+            }
+            stream_sync(stream)?;
+        }
+        Ok(())
     }
 }
 
@@ -106,6 +176,12 @@ impl StorageBackend for PosixBackend {
     }
 
     fn read_blocks(&mut self, requests: &[BlockReadRequest], stream: u64) -> Result<()> {
+        // Tier-2 (ATLAS_HSS_COALESCE_RUNS): merge consecutive-id runs into one
+        // pread each. r_max == 1 (flag off) falls through to the Tier-1 per-block
+        // body below, byte- AND op-identical.
+        if self.r_max > 1 {
+            return self.read_runs(requests, stream);
+        }
         // ONE pread + ONE copy_h_to_d + ONE stream_sync PER BLOCK (2·nkv fewer
         // syncs than the per-head path — the QD=1 serialisation win).
         let bytes = self.block_bytes;

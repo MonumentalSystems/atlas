@@ -27,6 +27,12 @@ pub struct IoUringBackend {
     /// block ReadFixed / pwrite fits — a block op into a group-sized registered
     /// iovec would be silent corruption, so the block methods hard-check it.
     block_bytes: usize,
+    /// ATLAS_HSS_COALESCE_RUNS (Tier-2): max consecutive-id blocks one merged
+    /// ReadFixed may cover (== registered buffer bytes / block_bytes). `1` = the
+    /// Tier-1 per-block path (run merging OFF); the block read methods dispatch on
+    /// `r_max > 1`. When `> 1` the registered buffers below are sized to
+    /// `r_max · block_bytes` so a run ReadFixed of that length fits.
+    r_max: usize,
 }
 
 impl IoUringBackend {
@@ -42,6 +48,22 @@ impl IoUringBackend {
     /// (ATLAS_HSS_COALESCE_BLOCKS on); the flag is threaded from
     /// `HighSpeedSwap::new` so buffer sizing and the caller's dispatch agree.
     pub fn new_with(layout: Layout, qd: usize, coalesce: bool) -> Result<Self> {
+        Self::new_with_run_cap(layout, qd, coalesce, 0)
+    }
+
+    /// Tier-2 (ATLAS_HSS_COALESCE_RUNS) constructor. `run_cap_bytes` bounds one
+    /// merged read (~1 MiB): `r_max = if coalesce && run_cap_bytes > block_bytes
+    /// { max(1, run_cap_bytes / block_bytes) } else { 1 }`, so the registered
+    /// pinned buffers are sized to `r_max · block_bytes`. `run_cap_bytes == 0`
+    /// (the delegating `new`/`new_with`) ⇒ `r_max == 1`, byte- AND op-identical to
+    /// the Tier-1 per-block path (the run body is dead code). Threaded from
+    /// `HighSpeedSwap::new` so buffer sizing and the flag agree.
+    pub fn new_with_run_cap(
+        layout: Layout,
+        qd: usize,
+        coalesce: bool,
+        run_cap_bytes: usize,
+    ) -> Result<Self> {
         if qd == 0 {
             bail!("queue depth must be ≥ 1");
         }
@@ -53,7 +75,18 @@ impl IoUringBackend {
 
         let group_bytes = layout.group_bytes() as usize;
         let block_bytes = layout.block_bytes() as usize;
-        let buf_bytes = if coalesce { block_bytes } else { group_bytes };
+        // Tier-2 run merging presupposes Tier-1 block coalescing (block-sized or
+        // wider buffers). r_max blocks per merged ReadFixed; 1 = Tier-1 per-block.
+        let r_max = if coalesce && run_cap_bytes > block_bytes {
+            (run_cap_bytes / block_bytes).max(1)
+        } else {
+            1
+        };
+        let buf_bytes = if coalesce {
+            block_bytes * r_max
+        } else {
+            group_bytes
+        };
         let mut buffers = Vec::with_capacity(qd);
         for _ in 0..qd {
             buffers.push(PinnedBuffer::new(buf_bytes)?);
@@ -80,6 +113,7 @@ impl IoUringBackend {
             events,
             qd,
             block_bytes,
+            r_max,
         })
     }
 
@@ -300,6 +334,110 @@ impl IoUringBackend {
         }
         Ok(())
     }
+
+    /// ATLAS_HSS_COALESCE_RUNS (Tier-2) run-merged block-read body — a SEPARATE
+    /// sibling of `read_block_inner` so the flag-OFF (`r_max == 1`) path stays
+    /// textually + op-identical to Tier-1. `plan_runs` sorts a copy of the
+    /// requests by (layer, block) and splits it into maximal strictly-consecutive
+    /// same-layer runs capped at `r_max`. Each run is ONE `ReadFixed` of
+    /// `len·block_bytes` at `block_offset(run_start)`; on completion its
+    /// `len` blocks are SCATTERED per-block from `buf + i·block_bytes` to
+    /// `sorted[start+i].dst_dev_ptr` (the dst rides inside the sorted request, so
+    /// it can never desync from its block id). The single per-buffer `CudaEvent`
+    /// is recorded AFTER the whole scatter loop — the buffer must survive all
+    /// `len` H2Ds before `wait_buffer_free` lets a later ReadFixed clobber it.
+    fn read_run_inner(
+        &mut self,
+        requests: &[BlockReadRequest],
+        stream: u64,
+        sync_at_end: bool,
+    ) -> Result<()> {
+        let block_bytes = self.block_bytes;
+        let (sorted, runs) = super::plan_runs(requests, self.r_max);
+        // user_data high 16 bits = run index; we never plan > 65k runs per batch.
+        if runs.len() > u16::MAX as usize {
+            bail!("io_uring run batch too large: {}", runs.len());
+        }
+        let mut next_submit = 0;
+        let mut completed = 0;
+        let mut free_bufs: Vec<u16> = (0..self.qd as u16).rev().collect();
+
+        while completed < runs.len() {
+            while next_submit < runs.len() {
+                let Some(&buf_idx) = free_bufs.last() else {
+                    break;
+                };
+                let (start, len) = runs[next_submit];
+                let read_len = len * block_bytes;
+                // Sizing coupling guard: a run ReadFixed into a too-small
+                // registered iovec is silent corruption (it does NOT spill into
+                // the next buffer — the kernel bounds-checks the iovec). Fail loud.
+                if self.buffers[buf_idx as usize].bytes < read_len {
+                    bail!(
+                        "io_uring backend not built for run coalescing (buffer {} < run bytes {} \
+                         = {} blocks × {}); construct with new_with_run_cap(.., run_cap_bytes) — \
+                         ATLAS_HSS_COALESCE_RUNS must be set before backend construction",
+                        self.buffers[buf_idx as usize].bytes,
+                        read_len,
+                        len,
+                        block_bytes
+                    );
+                }
+                self.wait_buffer_free(buf_idx as usize)?;
+                free_bufs.pop();
+                let rs = &sorted[start];
+                let fd = self.layout.fd(rs.base_key.layer);
+                let off = self
+                    .layout
+                    .block_offset(rs.base_key.layer, rs.base_key.block);
+                let user = ((next_submit as u64) << 16) | (buf_idx as u64);
+                self.submit_read(fd, off, read_len as u32, buf_idx, user)?;
+                next_submit += 1;
+            }
+            self.ring
+                .submit_and_wait(1)
+                .context("io_uring submit_and_wait")?;
+            let cq = self.ring.completion();
+            for cqe in cq {
+                let user = cqe.user_data();
+                let buf_idx = (user & 0xFFFF) as u16;
+                let run_idx = (user >> 16) as usize;
+                let result = cqe.result();
+                let (start, len) = runs[run_idx];
+                let read_len = len * block_bytes;
+                if result < 0 {
+                    bail!("io_uring run read failed for run {run_idx}: errno {}", -result);
+                }
+                if result as usize != read_len {
+                    bail!(
+                        "io_uring short run read: run {run_idx} got {result}, expected {read_len}"
+                    );
+                }
+                let buf = &self.buffers[buf_idx as usize];
+                // Scatter: one contiguous disk read → `len` per-block H2Ds, each
+                // to its own slot. Byte-identical to Tier-1's `len` per-block
+                // reads (same bytes, same per-block offset, same dst slot).
+                for i in 0..len {
+                    let dst = sorted[start + i].dst_dev_ptr;
+                    let src = unsafe { (buf.ptr as *const u8).add(i * block_bytes) };
+                    copy_h_to_d_async(dst, src as *const c_void, block_bytes, stream)?;
+                }
+                // ONE event AFTER the full scatter loop (buffer reuse safety).
+                let ev = CudaEvent::new()?;
+                ev.record(stream)?;
+                self.events[buf_idx as usize] = Some(ev);
+                free_bufs.push(buf_idx);
+                completed += 1;
+            }
+        }
+        if sync_at_end {
+            stream_sync(stream)?;
+            for slot in self.events.iter_mut() {
+                *slot = None;
+            }
+        }
+        Ok(())
+    }
 }
 
 impl StorageBackend for IoUringBackend {
@@ -346,13 +484,22 @@ impl StorageBackend for IoUringBackend {
     }
 
     fn read_blocks(&mut self, requests: &[BlockReadRequest], stream: u64) -> Result<()> {
-        // Byte-identical to the per-head `read` semantics: terminal stream_sync.
-        self.read_block_inner(requests, stream, true)
+        // Tier-2 (ATLAS_HSS_COALESCE_RUNS) when r_max > 1; otherwise the Tier-1
+        // per-block path, textually unchanged. Both terminal stream_sync.
+        if self.r_max > 1 {
+            self.read_run_inner(requests, stream, true)
+        } else {
+            self.read_block_inner(requests, stream, true)
+        }
     }
 
     fn read_blocks_async(&mut self, requests: &[BlockReadRequest], stream: u64) -> Result<()> {
         // No terminal host sync (prefetch path) — mirrors `read_async`.
-        self.read_block_inner(requests, stream, false)
+        if self.r_max > 1 {
+            self.read_run_inner(requests, stream, false)
+        } else {
+            self.read_block_inner(requests, stream, false)
+        }
     }
 
     fn write_block_from_host(&mut self, base_key: GroupKey, src: &[u8]) -> Result<()> {

@@ -57,6 +57,7 @@ fn local_nvme_backend(
     group_layout: GroupLayout,
     qd: usize,
     coalesce: bool,
+    run_cap_bytes: usize,
 ) -> Result<Box<dyn crate::backend::StorageBackend>> {
     let choice = kv_backend_choice(std::env::var("ATLAS_KV_BACKEND").ok().as_deref());
     if choice != KvBackendChoice::ForcePosix {
@@ -66,7 +67,7 @@ fn local_nvme_backend(
         // `coalesce` sizes the pinned/registered buffers to block_bytes so the
         // block read/write methods can issue one contiguous op (ATLAS_HSS_
         // COALESCE_BLOCKS). false = group-sized buffers, byte-identical to before.
-        match IoUringBackend::new_with(layout, qd, coalesce) {
+        match IoUringBackend::new_with_run_cap(layout, qd, coalesce, run_cap_bytes) {
             Ok(b) => {
                 tracing::info!("high-speed-swap: KV overflow tier = local NVMe (io_uring, qd {qd})");
                 return Ok(Box::new(b));
@@ -88,8 +89,10 @@ fn local_nvme_backend(
     // ForcePosix, or io_uring init failed and fallback is allowed.
     let layout = Layout::create(dir, group_layout).context("create layout (posix)")?;
     tracing::info!("high-speed-swap: KV overflow tier = local NVMe (POSIX pread/pwrite)");
-    Ok(Box::new(crate::backend::PosixBackend::new_with(
-        layout, coalesce,
+    Ok(Box::new(crate::backend::PosixBackend::new_with_run_cap(
+        layout,
+        coalesce,
+        run_cap_bytes,
     )?))
 }
 
@@ -353,6 +356,57 @@ impl HighSpeedSwap {
                 group_layout.group_stride,
             );
         }
+        // ATLAS_HSS_COALESCE_RUNS (Tier-2 run merging) — DEFAULT OFF (inverse of
+        // the Tier-1 parse: only 1/true/on/yes enable). For a sequence whose
+        // disk_block_ids are CONSECUTIVE, the local-NVMe READ backends merge a run
+        // of R such blocks into ONE pread/ReadFixed of R·block_bytes and SCATTER
+        // each block to its (non-adjacent) slot per-block — the disk read collapses
+        // R→1, the H2D stays per-block. Fragmented seqs degrade to R=1 (Tier-1).
+        // Tier-2 PRESUPPOSES Tier-1 (needs block-sized-or-wider buffers + the block
+        // read path): if requested while ATLAS_HSS_COALESCE_BLOCKS is off, warn and
+        // disable. WRITE stays Tier-1; cascade/RDMA keep the per-head fan-out.
+        // Ships inert (default off) until GPU-validated — NO perf claim here.
+        let runs_requested = matches!(
+            std::env::var("ATLAS_HSS_COALESCE_RUNS")
+                .ok()
+                .as_deref()
+                .map(str::trim),
+            Some("1") | Some("true") | Some("on") | Some("yes")
+        );
+        let coalesce_runs = if runs_requested && !coalesce_blocks {
+            tracing::warn!(
+                "high-speed-swap: ATLAS_HSS_COALESCE_RUNS set but ATLAS_HSS_COALESCE_BLOCKS is off \
+                 — run merging needs block coalescing (block-sized-or-wider buffers + the block \
+                 read path); DISABLING run merging (staying on the Tier-1 per-block path)"
+            );
+            false
+        } else {
+            runs_requested
+        };
+        // Run-cap bytes bound one merged read (~1 MiB default ⇒ r_max≈16-32);
+        // clamped to ≥ block_bytes so a run buffer is never smaller than one block.
+        // 0 when off ⇒ the backend computes r_max = 1 (Tier-1, run body dead code).
+        let block_bytes = group_layout.block_bytes() as usize;
+        let run_cap_bytes = if coalesce_runs {
+            let cap = std::env::var("ATLAS_HSS_RUN_CAP_BYTES")
+                .ok()
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .unwrap_or(1 << 20);
+            cap.max(block_bytes)
+        } else {
+            0
+        };
+        if coalesce_runs {
+            let r_max = (run_cap_bytes / block_bytes).max(1);
+            tracing::info!(
+                "high-speed-swap: run merging ON (ATLAS_HSS_COALESCE_RUNS) — up to r_max={r_max} \
+                 consecutive-id blocks per merged read (cap {run_cap_bytes} B, block {block_bytes} \
+                 B); io_uring pinned bounces grow to qd×{}={} B (keep under the GB10 memlock \
+                 ceiling / register_buffers limit); fragmented seqs degrade to per-block",
+                r_max * block_bytes,
+                cfg.qd as usize * r_max * block_bytes,
+            );
+        }
         // KV overflow tier selection: RDMA RAM blade when $ATLAS_KV_PEER is set,
         // else the local NVMe io_uring backend (default, unchanged).
         let kv_peer = std::env::var("ATLAS_KV_PEER").ok();
@@ -371,13 +425,25 @@ impl HighSpeedSwap {
                         group_layout,
                     )?)
                 } else {
-                    local_nvme_backend(&cfg.dir, group_layout, cfg.qd as usize, coalesce_blocks)?
+                    local_nvme_backend(
+                        &cfg.dir,
+                        group_layout,
+                        cfg.qd as usize,
+                        coalesce_blocks,
+                        run_cap_bytes,
+                    )?
                 }
             }
             #[cfg(not(atlas_rdma_verbs))]
             {
                 let _ = &kv_peer;
-                local_nvme_backend(&cfg.dir, group_layout, cfg.qd as usize, coalesce_blocks)?
+                local_nvme_backend(
+                    &cfg.dir,
+                    group_layout,
+                    cfg.qd as usize,
+                    coalesce_blocks,
+                    run_cap_bytes,
+                )?
             }
         };
         // Restore-destination pool. When zero-copy restore is requested

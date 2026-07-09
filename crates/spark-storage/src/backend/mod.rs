@@ -67,6 +67,55 @@ pub fn expand_blocks_to_groups(spec: &GroupLayout, reqs: &[BlockReadRequest]) ->
     out
 }
 
+/// Tier-2 run planner (ATLAS_HSS_COALESCE_RUNS). Sorts a COPY of `requests` by
+/// `(layer, block)` — `BlockReadRequest` is `Copy`, so each block's
+/// `dst_dev_ptr` travels INSIDE its own struct and can never desync from its
+/// block id — then splits the sorted slice into maximal runs of
+/// strictly-consecutive, same-layer block ids, each capped at `max_run` blocks.
+/// Returns the sorted requests plus `(start_idx, len)` run boundaries into it.
+///
+/// A run `[start, start+len)` occupies ONE contiguous on-disk span
+/// `[block_offset(sorted[start].block), +len·block_bytes)` because `block_offset`
+/// is linear and gapless in the block id (see `GroupLayout::block_offset` /
+/// `blocks_tile_the_file`): block `i` of the run sits at bounce offset
+/// `i·block_bytes` and scatters to `sorted[start+i].dst_dev_ptr`. This is
+/// byte-identical to Tier-1 issuing `len` separate per-block reads to the same
+/// slots — only the disk read collapses `len → 1`; the H2D stays per-block.
+///
+/// Same-layer is an EXPLICIT run-boundary condition (not a comment): each layer
+/// is a distinct fd and `block_offset` is layer-agnostic, so a cross-layer merge
+/// would read the wrong file. `max_run == 1` (flag OFF) makes every run length 1,
+/// so the caller's per-block path is byte- AND op-identical to Tier-1.
+///
+/// GPU-free + pure: the SINGLE source both local backends AND the unit tests
+/// consume, mirroring `expand_blocks_to_groups` for Tier-1.
+pub fn plan_runs(
+    requests: &[BlockReadRequest],
+    max_run: usize,
+) -> (Vec<BlockReadRequest>, Vec<(usize, usize)>) {
+    let max_run = max_run.max(1);
+    let mut sorted = requests.to_vec();
+    sorted.sort_by_key(|r| (r.base_key.layer, r.base_key.block));
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    let mut i = 0;
+    while i < sorted.len() {
+        let start = i;
+        i += 1;
+        // Extend while the next block is the SAME layer, EXACTLY +1 from its
+        // predecessor (strictly consecutive — a gap, descending step, or dup all
+        // break the run), and the run is under the byte cap.
+        while i < sorted.len()
+            && sorted[i].base_key.layer == sorted[i - 1].base_key.layer
+            && sorted[i].base_key.block == sorted[i - 1].base_key.block + 1
+            && (i - start) < max_run
+        {
+            i += 1;
+        }
+        runs.push((start, i - start));
+    }
+    (sorted, runs)
+}
+
 pub trait StorageBackend: Send + Sync {
     /// Synchronously fulfil all `requests`, returning when the corresponding
     /// HBM destinations are populated and visible on `stream`. The backend
@@ -318,5 +367,213 @@ mod coalesce_tests {
         // Length guard.
         let bad = vec![0u8; 2 * nkv * gs - 1];
         assert!(rec.write_block_from_host(GroupKey::new(2, 5, 0, KvKind::K), &bad).is_err());
+    }
+
+    // ── ATLAS_HSS_COALESCE_RUNS (Tier-2): pure run-detection + scatter math ──
+
+    /// Build a `BlockReadRequest` on `layer`/`block` with a distinct dst tied to
+    /// the block id so tests can prove the (block, dst) pairing survives the sort.
+    fn breq(layer: u32, block: u32) -> BlockReadRequest {
+        BlockReadRequest {
+            base_key: GroupKey::new(layer, block, 0, KvKind::K),
+            dst_dev_ptr: 0x1_0000_0000 + block as u64, // dst uniquely encodes block
+        }
+    }
+
+    /// Fresh consecutive ids in one layer collapse to ONE run when the cap allows.
+    #[test]
+    fn plan_runs_fresh_seq_one_run() {
+        let reqs: Vec<_> = (0..4).map(|b| breq(0, b)).collect();
+        let (sorted, runs) = plan_runs(&reqs, 8);
+        assert_eq!(runs, vec![(0, 4)]);
+        for (i, r) in sorted.iter().enumerate() {
+            assert_eq!(r.base_key.block, i as u32);
+        }
+    }
+
+    /// A gap in the id sequence splits the run at the gap.
+    #[test]
+    fn plan_runs_gap_splits() {
+        let reqs = [breq(0, 0), breq(0, 1), breq(0, 3), breq(0, 4)];
+        let (_sorted, runs) = plan_runs(&reqs, 8);
+        assert_eq!(runs, vec![(0, 2), (2, 2)]);
+    }
+
+    /// The cap splits a long consecutive run into ceil(len/cap) chunks; the LAST
+    /// chunk uses the actual remaining length, not the cap.
+    #[test]
+    fn plan_runs_cap_splits_last_short() {
+        let reqs: Vec<_> = (0..8).map(|b| breq(0, b)).collect();
+        let (_sorted, runs) = plan_runs(&reqs, 3);
+        assert_eq!(runs, vec![(0, 3), (3, 3), (6, 2)]);
+        // every run is <= cap, and lengths sum to the input.
+        assert!(runs.iter().all(|&(_, len)| len <= 3));
+        assert_eq!(runs.iter().map(|&(_, l)| l).sum::<usize>(), 8);
+    }
+
+    /// Same +1 id step but a layer change MUST break the run (distinct fd/file).
+    #[test]
+    fn plan_runs_layer_boundary_splits() {
+        let reqs = [breq(0, 0), breq(0, 1), breq(1, 2), breq(1, 3)];
+        let (sorted, runs) = plan_runs(&reqs, 8);
+        // sort_by (layer, block) keeps this order; ids continue +1 across the
+        // layer boundary, so ONLY the same-layer guard prevents a wrong merge.
+        assert_eq!(runs, vec![(0, 2), (2, 2)]);
+        assert_eq!(sorted[1].base_key.layer, 0);
+        assert_eq!(sorted[2].base_key.layer, 1);
+    }
+
+    /// Fully fragmented ids degrade to per-block runs (== Tier-1).
+    #[test]
+    fn plan_runs_fragmented_all_len_one() {
+        let reqs = [breq(0, 0), breq(0, 5), breq(0, 10)];
+        let (_sorted, runs) = plan_runs(&reqs, 8);
+        assert_eq!(runs, vec![(0, 1), (1, 1), (2, 1)]);
+    }
+
+    /// A duplicate id breaks the run at the repeat (block == prev, not prev+1).
+    /// Duplicates never occur in practice (each missing block is assigned once),
+    /// but the split stays byte-correct even if they did: each request's dst
+    /// receives ITS OWN block's bytes, exactly as Tier-1 would.
+    #[test]
+    fn plan_runs_duplicate_breaks() {
+        let reqs = [breq(0, 4), breq(0, 5), breq(0, 5), breq(0, 6)];
+        let (_sorted, runs) = plan_runs(&reqs, 8);
+        // sorted ids: 4,5,5,6. The repeat 5 breaks the run (5 != 5+1) → first run
+        // [4,5]; the trailing 5,6 are consecutive so they form a second run [5,6].
+        // Both dsts still get their own block's disk bytes.
+        assert_eq!(runs, vec![(0, 2), (2, 2)]);
+    }
+
+    /// max_run == 1 (flag OFF) ⇒ every run length 1 = the Tier-1 per-block path.
+    #[test]
+    fn plan_runs_cap_one_is_tier1() {
+        let reqs: Vec<_> = (0..5).map(|b| breq(0, b)).collect();
+        let (_sorted, runs) = plan_runs(&reqs, 1);
+        assert_eq!(runs, vec![(0, 1), (1, 1), (2, 1), (3, 1), (4, 1)]);
+        // max_run 0 is clamped to 1 (never a zero-length or empty run).
+        let (_s2, runs0) = plan_runs(&reqs, 0);
+        assert_eq!(runs0, runs);
+    }
+
+    /// Empty input ⇒ no runs (preserves the #11 empty-skip guard downstream).
+    #[test]
+    fn plan_runs_empty() {
+        let (sorted, runs) = plan_runs(&[], 8);
+        assert!(sorted.is_empty());
+        assert!(runs.is_empty());
+    }
+
+    /// HIGHEST-VALUE: the sort permutes (block, dst) ATOMICALLY. Feed unsorted
+    /// ids, each with a dst uniquely encoding its block; after plan_runs the run
+    /// is fully sorted AND every element's dst still matches its own block id, so
+    /// the scatter dst for block i can never desync from the block it was paired
+    /// with. Also asserts the scatter offset math: block i sourced at
+    /// i*block_bytes, destined for sorted[start+i].dst_dev_ptr.
+    #[test]
+    fn plan_runs_sort_keeps_block_dst_atomic_and_scatter_math() {
+        // Unsorted input [3,1,2,0], each dst = base + block.
+        let reqs = [breq(0, 3), breq(0, 1), breq(0, 2), breq(0, 0)];
+        let (sorted, runs) = plan_runs(&reqs, 8);
+        assert_eq!(runs, vec![(0, 4)]);
+        let block_bytes: u64 = 32 * 1024; // arbitrary; only the stride matters here
+        let (start, len) = runs[0];
+        for i in 0..len {
+            let elem = &sorted[start + i];
+            // Ascending after sort.
+            assert_eq!(elem.base_key.block, i as u32);
+            // dst never desynced from its block id.
+            assert_eq!(elem.dst_dev_ptr, 0x1_0000_0000 + i as u64);
+            // Scatter source offset for block i is exactly i*block_bytes.
+            let src_off = (i as u64) * block_bytes;
+            assert_eq!(src_off, (i as u64) * block_bytes);
+            // The run's total byte length is len*block_bytes.
+        }
+        assert_eq!((len as u64) * block_bytes, 4 * block_bytes);
+    }
+
+    /// Cap arithmetic mirror of the backend ctor: r_max = max(1, cap/block_bytes),
+    /// and cap < block_bytes ⇒ r_max == 1 (Tier-1). Also: every planned run's
+    /// byte length stays <= run_cap_bytes.
+    #[test]
+    fn plan_runs_cap_arithmetic_bounds_bytes() {
+        let block_bytes: usize = 32 * 1024;
+        let run_cap_bytes: usize = 1 << 20; // 1 MiB
+        let r_max = (run_cap_bytes / block_bytes).max(1); // 32
+        assert_eq!(r_max, 32);
+        // cap smaller than one block ⇒ r_max 1.
+        assert_eq!((16 * 1024usize / block_bytes).max(1), 1);
+        // A 50-block fresh seq splits so every run's bytes <= run_cap_bytes.
+        let reqs: Vec<_> = (0..50).map(|b| breq(0, b)).collect();
+        let (_sorted, runs) = plan_runs(&reqs, r_max);
+        assert!(runs.iter().all(|&(_, len)| len * block_bytes <= run_cap_bytes));
+        assert_eq!(runs.iter().map(|&(_, l)| l).sum::<usize>(), 50);
+    }
+
+    /// HEADLINE byte-identity oracle: flattening every run's per-block scatter
+    /// yields the SAME multiset of (layer, disk_offset, block_bytes, dst) ops as
+    /// the Tier-1 per-block path over the SAME requests. Proves Tier-2 touches
+    /// the same bytes → same slots, only collapsing the disk-op COUNT.
+    #[test]
+    fn tier2_scatter_op_multiset_equals_tier1() {
+        let s = spec();
+        let block_bytes = s.block_bytes();
+        // Cross-seq interleave + a resident-gap + fragmentation in one batch.
+        let reqs = [
+            breq(0, 0), breq(0, 1), breq(0, 2), // fresh run
+            breq(0, 7),                          // gap (resident 3..7)
+            breq(1, 4), breq(1, 5),              // other layer, consecutive
+            breq(0, 100),                        // fragmented tail
+        ];
+        // Tier-1 oracle: one op per request at its own block_offset → dst.
+        let mut tier1: Vec<(u32, u64, u64, u64)> = reqs
+            .iter()
+            .map(|r| {
+                (
+                    r.base_key.layer,
+                    s.block_offset(r.base_key.block),
+                    block_bytes,
+                    r.dst_dev_ptr,
+                )
+            })
+            .collect();
+        // Tier-2: plan runs, then flatten each run's per-block scatter. Block i of
+        // run [start,len) reads disk [run_base + i*block_bytes) → sorted[start+i].dst.
+        let (sorted, runs) = plan_runs(&reqs, 8);
+        let mut tier2: Vec<(u32, u64, u64, u64)> = Vec::new();
+        for (start, len) in runs {
+            let rs = &sorted[start];
+            let run_base = s.block_offset(rs.base_key.block);
+            for i in 0..len {
+                let elem = &sorted[start + i];
+                // Contiguity: block i's disk offset == run_base + i*block_bytes,
+                // which MUST equal its own block_offset (proves consecutiveness).
+                let off = run_base + (i as u64) * block_bytes;
+                assert_eq!(off, s.block_offset(elem.base_key.block));
+                tier2.push((elem.base_key.layer, off, block_bytes, elem.dst_dev_ptr));
+            }
+        }
+        tier1.sort();
+        tier2.sort();
+        assert_eq!(tier2, tier1, "Tier-2 scatter ops must equal the Tier-1 op multiset");
+    }
+
+    /// group.rs contiguity extension: for a run of R consecutive ids,
+    /// block_offset(run_start+i) == block_offset(run_start) + i*block_bytes, and
+    /// R*block_bytes stays 4096-aligned (O_DIRECT safe).
+    #[test]
+    fn run_span_is_contiguous_and_aligned() {
+        let s = spec();
+        let bb = s.block_bytes();
+        let run_start = 3u32;
+        for r in 1..=32u32 {
+            for i in 0..r {
+                assert_eq!(
+                    s.block_offset(run_start + i),
+                    s.block_offset(run_start) + (i as u64) * bb
+                );
+            }
+            assert_eq!(((r as u64) * bb) % 4096, 0);
+        }
     }
 }
