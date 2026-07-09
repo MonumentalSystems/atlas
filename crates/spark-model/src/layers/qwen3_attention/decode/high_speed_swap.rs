@@ -287,6 +287,38 @@ impl Qwen3AttentionLayer {
             }
         };
 
+        // ATLAS_HSS_COALESCE_WRITE_RUNS: batch a run of consecutive-disk-id block
+        // WRITES into ONE wide pwrite. `write_run_cap()` is `Some((r_max,
+        // block_bytes))` only when the flag is on AND the tier is a local backend
+        // sized for runs; `None` ⇒ the per-block `offload_block[_no_predict]_on_stream`
+        // path below (byte- AND op-identical to today). This offload call runs on
+        // ONE attention layer (`layer_u32` fixed), so the run accumulator is
+        // per-call/per-layer LOCALS — a run can never straddle two calls/layers.
+        let write_run_cap: Option<(usize, usize)> =
+            spark_storage::with_local(|hss| Ok(hss.write_run_cap()))
+                .expect("local_installed checked in high_speed_swap_engaged")?;
+        // do_predict is constant across this call (layer_dtype is fixed): only the
+        // BF16-laid-out arms project (the quantized layouts would OOB the BF16
+        // kernel), matching the per-block `offload_block[_no_predict]` split below.
+        let wr_do_predict = matches!(
+            layer_dtype,
+            KvCacheDtype::Bf16
+                | KvCacheDtype::Bf16KTurbo4V
+                | KvCacheDtype::Bf16KTurbo3V
+                | KvCacheDtype::Bf16KTurbo2V
+        );
+        let (wr_r_max, wr_block_bytes) = write_run_cap.unwrap_or((0, 0));
+        let mut wr_staging: Vec<u8> = if write_run_cap.is_some() {
+            vec![0u8; wr_r_max * wr_block_bytes]
+        } else {
+            Vec::new()
+        };
+        // The run accumulator IS the unit-tested `WriteRunPlanner` (backend/mod.rs)
+        // — the shipped ship path and the GPU-free no-loss/no-dup oracle exercise
+        // the SAME push/finish state machine, so they cannot drift. `push` returns
+        // the staging slot + any prior run to flush; `finish` drains the tail.
+        let mut wr_planner = spark_storage::backend::WriteRunPlanner::new(wr_r_max);
+
         for logical_pos in start..total {
             if logical_pos < window_start {
                 // Issue #31: the slide-before-alloc loop in
@@ -549,26 +581,70 @@ impl Qwen3AttentionLayer {
                     dequant_turbo8_block_to_bf16(v_raw, bs_us, nkv_us, hd_us, &mut v_host);
                 }
             }
-            spark_storage::with_local(|hss| {
-                match layer_dtype {
-                    KvCacheDtype::Bf16
-                    | KvCacheDtype::Bf16KTurbo4V
-                    | KvCacheDtype::Bf16KTurbo3V
-                    | KvCacheDtype::Bf16KTurbo2V => hss.offload_block_on_stream(
+            if write_run_cap.is_some() {
+                // ATLAS_HSS_COALESCE_WRITE_RUNS accumulate: `push` decides the
+                // staging slot and hands back any prior run broken by a
+                // non-consecutive id or the cap — flush THAT before staging this
+                // block's image into the run buffer at the returned slot.
+                let step = wr_planner.push(disk_id);
+                if let Some((start_id, run_len)) = step.flush {
+                    spark_storage::with_local(|hss| {
+                        hss.flush_write_run(layer_u32, start_id, run_len, &wr_staging)
+                    })
+                    .expect("local_installed checked in high_speed_swap_engaged")?;
+                }
+                let slot_off = step.slot * wr_block_bytes;
+                let out = &mut wr_staging[slot_off..slot_off + wr_block_bytes];
+                spark_storage::with_local(|hss| {
+                    hss.stage_block_into(
                         stream,
                         layer_u32,
                         disk_id,
                         k_block_dev,
+                        wr_do_predict,
                         &k_host,
                         &v_host,
-                    ),
-                    // Quantized: skip predictor projection — the BF16 kernel
-                    // would OOB-read on a non-BF16 layout. Eviction degrades
-                    // to LRU for these blocks; correctness preserved.
-                    _ => hss.offload_block_no_predict_on_stream(
-                        stream, layer_u32, disk_id, &k_host, &v_host,
-                    ),
-                }
+                        out,
+                    )
+                })
+                .expect("local_installed checked in high_speed_swap_engaged")?;
+            } else {
+                spark_storage::with_local(|hss| {
+                    match layer_dtype {
+                        KvCacheDtype::Bf16
+                        | KvCacheDtype::Bf16KTurbo4V
+                        | KvCacheDtype::Bf16KTurbo3V
+                        | KvCacheDtype::Bf16KTurbo2V => hss.offload_block_on_stream(
+                            stream,
+                            layer_u32,
+                            disk_id,
+                            k_block_dev,
+                            &k_host,
+                            &v_host,
+                        ),
+                        // Quantized: skip predictor projection — the BF16 kernel
+                        // would OOB-read on a non-BF16 layout. Eviction degrades
+                        // to LRU for these blocks; correctness preserved.
+                        _ => hss.offload_block_no_predict_on_stream(
+                            stream, layer_u32, disk_id, &k_host, &v_host,
+                        ),
+                    }
+                })
+                .expect("local_installed checked in high_speed_swap_engaged")?;
+            }
+        }
+        // ATLAS_HSS_COALESCE_WRITE_RUNS end-of-loop DRAIN (correctness anchor):
+        // the final run has no trailing block to trigger a break, so flush it
+        // here — BEFORE the per-layer cursor advances. A normal return cannot
+        // skip this. On ANY `?`/bail! above (the issue #31 window bail, a D2H
+        // error, or a stage/flush error) these locals drop WITHOUT flushing: safe
+        // because the pending run was only host-staged (never pwritten), the
+        // deferred invalidate never fired (resident HBM copies intact), and the
+        // cursor below is not advanced — so nothing on disk or resident is left
+        // inconsistent and the block is re-offloaded on the next pass.
+        if let Some((start_id, run_len)) = wr_planner.finish() {
+            spark_storage::with_local(|hss| {
+                hss.flush_write_run(layer_u32, start_id, run_len, &wr_staging)
             })
             .expect("local_installed checked in high_speed_swap_engaged")?;
         }

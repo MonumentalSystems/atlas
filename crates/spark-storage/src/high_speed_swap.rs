@@ -193,6 +193,18 @@ pub struct HighSpeedSwap {
     /// disagree. Default OFF ⇒ the per-head request loops and per-head backend
     /// paths are byte- AND op-identical to before. GPU-validation is a follow-up.
     coalesce_blocks: bool,
+    /// ATLAS_HSS_COALESCE_WRITE_RUNS (Tier-2-WRITE): when set (and Tier-1 on, on
+    /// a local backend), the offload loop batches a run of consecutive-disk-id
+    /// same-layer block WRITES into ONE wide pwrite via `write_blocks_run`. The
+    /// run accumulator lives as LOCALS in the spark-model offload loop (one call
+    /// = one layer ⇒ no cross-layer/cross-call carryover); this flag + the r_max
+    /// below are surfaced to it through `write_run_cap()`. Default OFF ⇒ per-block
+    /// writes, byte- AND op-identical. GPU validation is a follow-up.
+    coalesce_write_runs: bool,
+    /// Max consecutive-id blocks one wide offload pwrite may cover (== run-wide
+    /// bounce / block_bytes); 1 when `coalesce_write_runs` is off (⇒ `write_run_cap`
+    /// returns None ⇒ per-block path).
+    write_run_r_max: usize,
     // Disk-block-ID allocator (Phase 6.1.a, refactored). One global
     // allocator: a `disk_block_id` indexes the SAME logical position
     // across every layer's file, so allocation, refcount, and free list
@@ -384,11 +396,42 @@ impl HighSpeedSwap {
         } else {
             runs_requested
         };
+        // ATLAS_HSS_COALESCE_WRITE_RUNS (Tier-2-WRITE, the WRITE analog of run
+        // merging) — DEFAULT OFF (opt-in truthy). For a FRESH prefill whose
+        // disk_block_ids are consecutive, the offload loop emits one layer's
+        // whole-chunk blocks with strictly-consecutive ids; this batches a run of
+        // R such block WRITES into ONE pwrite of R·block_bytes at
+        // block_offset(run_start) instead of R per-block pwrites (same bytes, op
+        // count R→1). PRESUPPOSES Tier-1 (needs the assembled block image + a
+        // run-wide bounce): if requested while ATLAS_HSS_COALESCE_BLOCKS is off,
+        // warn and disable. Local backends only (io_uring + posix); cascade/RDMA
+        // keep the per-block fan-out. Default OFF ⇒ byte- AND op-identical to the
+        // current per-block Tier-1 write. GPU validation (needle bit-identity +
+        // cold-prefill A/B) is a FOLLOW-UP — no perf claim here.
+        let write_runs_requested = matches!(
+            std::env::var("ATLAS_HSS_COALESCE_WRITE_RUNS")
+                .ok()
+                .as_deref()
+                .map(str::trim),
+            Some("1") | Some("true") | Some("on") | Some("yes")
+        );
+        let coalesce_write_runs = if write_runs_requested && !coalesce_blocks {
+            tracing::warn!(
+                "high-speed-swap: ATLAS_HSS_COALESCE_WRITE_RUNS set but ATLAS_HSS_COALESCE_BLOCKS \
+                 is off — write-run coalescing needs block coalescing (the assembled block image + \
+                 a run-wide bounce); DISABLING write-run coalescing (staying on the per-block write)"
+            );
+            false
+        } else {
+            write_runs_requested
+        };
         // Run-cap bytes bound one merged read (~1 MiB default ⇒ r_max≈16-32);
         // clamped to ≥ block_bytes so a run buffer is never smaller than one block.
         // 0 when off ⇒ the backend computes r_max = 1 (Tier-1, run body dead code).
+        // ATLAS_HSS_COALESCE_WRITE_RUNS also needs a run-wide bounce, so it forces
+        // run_cap_bytes > block_bytes here even when the READ flag is off.
         let block_bytes = group_layout.block_bytes() as usize;
-        let run_cap_bytes = if coalesce_runs {
+        let run_cap_bytes = if coalesce_runs || coalesce_write_runs {
             let cap = std::env::var("ATLAS_HSS_RUN_CAP_BYTES")
                 .ok()
                 .and_then(|v| v.trim().parse::<usize>().ok())
@@ -407,6 +450,38 @@ impl HighSpeedSwap {
                 r_max * block_bytes,
                 cfg.qd as usize * r_max * block_bytes,
             );
+        }
+        // Write-run r_max: how many consecutive-id blocks one wide offload pwrite
+        // may cover (== run-wide bounce / block_bytes). 1 when the flag is off ⇒
+        // `write_run_cap()` returns None ⇒ the offload loop keeps the per-block
+        // write path (byte- AND op-identical).
+        let write_run_r_max = if coalesce_write_runs {
+            (run_cap_bytes / block_bytes).max(1)
+        } else {
+            1
+        };
+        if coalesce_write_runs {
+            tracing::info!(
+                "high-speed-swap: write-run coalescing ON (ATLAS_HSS_COALESCE_WRITE_RUNS) — up to \
+                 r_max={write_run_r_max} consecutive-id block WRITES batched into ONE pwrite of \
+                 r_max×block ({} B) at block_offset(run_start) (cap {run_cap_bytes} B, block \
+                 {block_bytes} B); fragmented/prefix-reused ids degrade to per-block; local \
+                 (io_uring/posix) tier only — cascade/RDMA keep per-block. Default-OFF path is \
+                 byte-identical; GPU validation is a follow-up (no perf claim)",
+                write_run_r_max * block_bytes,
+            );
+            // Interaction note: the write flag forces run_cap_bytes>block_bytes,
+            // which makes the local backend size for runs (r_max>1) — so the READ
+            // dispatch also takes the run-merge path even if ATLAS_HSS_COALESCE_RUNS
+            // was explicitly set to 0. Read run-merge is default-ON and GPU-validated,
+            // so this is safe; it only matters if you meant to A/B the WRITE flag in
+            // isolation — set ATLAS_HSS_RUN_CAP_BYTES small to bound the read runs.
+            if !coalesce_runs {
+                tracing::info!(
+                    "high-speed-swap: note — write-run coalescing also enables read run-merge \
+                     (r_max>1) despite ATLAS_HSS_COALESCE_RUNS=0; both arms share the run buffer"
+                );
+            }
         }
         // KV overflow tier selection: RDMA RAM blade when $ATLAS_KV_PEER is set,
         // else the local NVMe io_uring backend (default, unchanged).
@@ -606,8 +681,27 @@ impl HighSpeedSwap {
             kv_prefetch_done,
             kv_prefetch_enabled,
             coalesce_blocks,
+            coalesce_write_runs,
+            write_run_r_max,
             disk_state,
         })
+    }
+
+    /// ATLAS_HSS_COALESCE_WRITE_RUNS accessor for the offload loop. `Some((r_max,
+    /// block_bytes))` iff the flag is on, `r_max > 1`, AND the tier is a local
+    /// backend built with a run-wide bounce (io_uring/posix). `None` ⇒ the caller
+    /// keeps the per-block `offload_block[_no_predict]_on_stream` path (default
+    /// OFF, or RDMA/Cascade — out of scope), byte- AND op-identical to today.
+    pub fn write_run_cap(&self) -> Option<(usize, usize)> {
+        if self.coalesce_write_runs
+            && self.write_run_r_max > 1
+            && self.backend.supports_write_run_coalescing()
+        {
+            let block_bytes = self.backend.group_layout().block_bytes() as usize;
+            Some((self.write_run_r_max, block_bytes))
+        } else {
+            None
+        }
     }
 
     /// Phase 5: C — the max concurrent overflow-decode sequences the batched

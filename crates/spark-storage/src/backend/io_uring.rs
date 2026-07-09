@@ -534,6 +534,51 @@ impl StorageBackend for IoUringBackend {
         }
         Ok(())
     }
+
+    fn supports_write_run_coalescing(&self) -> bool {
+        // buffers[0] is r_max·block_bytes when built with a run cap (Tier-2);
+        // r_max > 1 means a multi-block wide pwrite fits.
+        self.r_max > 1
+    }
+
+    fn write_blocks_run(&mut self, base_key: GroupKey, run_len: usize, src: &[u8]) -> Result<()> {
+        // Tier-2-WRITE (ATLAS_HSS_COALESCE_WRITE_RUNS): ONE wide sync pwrite of
+        // run_len·block_bytes at block_offset(run_start), staged through the
+        // registered pinned buffers[0]. Byte-identical to run_len per-block
+        // pwrites (block_offset is linear/gapless) — only the op count collapses.
+        let block_bytes = self.block_bytes;
+        let run_bytes = run_len * block_bytes;
+        if src.len() != run_bytes {
+            bail!(
+                "write_blocks_run: src len {} != run bytes {run_bytes} ({run_len} × {block_bytes})",
+                src.len()
+            );
+        }
+        // buffers[0] must hold the whole run (sized r_max·block_bytes when the
+        // run cap was threaded in). Bail loud rather than truncate/overrun.
+        if self.buffers[0].bytes < run_bytes {
+            bail!(
+                "io_uring backend not built for write-run coalescing (buffer {} < run bytes {} = \
+                 {run_len} × {block_bytes}); construct with new_with_run_cap(.., run_cap_bytes)",
+                self.buffers[0].bytes,
+                run_bytes
+            );
+        }
+        self.wait_buffer_free(0)?;
+        unsafe {
+            std::ptr::copy_nonoverlapping(src.as_ptr(), self.buffers[0].ptr as *mut u8, run_bytes);
+        }
+        let fd = self.layout.fd(base_key.layer);
+        let off = self.layout.block_offset(base_key.layer, base_key.block) as i64;
+        let n = unsafe { libc::pwrite(fd, self.buffers[0].ptr, run_bytes, off) };
+        if n != run_bytes as isize {
+            bail!(
+                "run pwrite {run_bytes}@{off} returned {n}, errno {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]

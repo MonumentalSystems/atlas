@@ -120,25 +120,7 @@ impl HighSpeedSwap {
             // ATLAS_HSS_COALESCE_BLOCKS: pack all nkv K/V stripes into ONE
             // block_bytes host image (each raw stripe padded to group_stride) and
             // issue ONE contiguous block write instead of 2·nkv per-head pwrites.
-            let group_stride = self.backend.group_layout().group_stride as usize;
-            let mut k_stripes: Vec<Vec<u8>> = Vec::with_capacity(nkv);
-            let mut v_stripes: Vec<Vec<u8>> = Vec::with_capacity(nkv);
-            for kh in 0..nkv {
-                let mut k_stripe = Vec::with_capacity(bs * hd * 2);
-                let mut v_stripe = Vec::with_capacity(bs * hd * 2);
-                for tok in 0..bs {
-                    let base = (tok * nkv + kh) * hd;
-                    for x in &k_block_host[base..base + hd] {
-                        k_stripe.extend_from_slice(&x.to_le_bytes());
-                    }
-                    for x in &v_block_host[base..base + hd] {
-                        v_stripe.extend_from_slice(&x.to_le_bytes());
-                    }
-                }
-                k_stripes.push(k_stripe);
-                v_stripes.push(v_stripe);
-            }
-            let buf = assemble_block_write_buffer(nkv, group_stride, &k_stripes, &v_stripes);
+            let buf = self.assemble_block_image_from_host(k_block_host, v_block_host);
             self.backend
                 .write_block_from_host(GroupKey::new(layer, block, 0, KvKind::K), &buf)?;
         } else {
@@ -165,6 +147,137 @@ impl HighSpeedSwap {
         // keep serving the stale slot. Critical for decode where the active
         // block is re-offloaded every step with new slots filled.
         self.pool.invalidate(ResidentKey { layer, block });
+        Ok(())
+    }
+
+    /// Build the single `block_bytes` on-disk image for one block from its host
+    /// K/V (`[block_size, num_kv_heads, head_dim]` BF16): pack each kv_head's K/V
+    /// stripe (raw `block_size·head_dim·2` bytes) then pad to `group_stride` via
+    /// `assemble_block_write_buffer`. The ONE source of the coalesced block image,
+    /// shared by the immediate `offload_block_inner_on_stream` write and the
+    /// deferred `stage_block_into` accumulator — so the two can never drift.
+    fn assemble_block_image_from_host(
+        &self,
+        k_block_host: &[half::bf16],
+        v_block_host: &[half::bf16],
+    ) -> Vec<u8> {
+        let bs = self.model.block_size as usize;
+        let nkv = self.model.num_kv_heads as usize;
+        let hd = self.model.head_dim as usize;
+        let group_stride = self.backend.group_layout().group_stride as usize;
+        let mut k_stripes: Vec<Vec<u8>> = Vec::with_capacity(nkv);
+        let mut v_stripes: Vec<Vec<u8>> = Vec::with_capacity(nkv);
+        for kh in 0..nkv {
+            let mut k_stripe = Vec::with_capacity(bs * hd * 2);
+            let mut v_stripe = Vec::with_capacity(bs * hd * 2);
+            for tok in 0..bs {
+                let base = (tok * nkv + kh) * hd;
+                for x in &k_block_host[base..base + hd] {
+                    k_stripe.extend_from_slice(&x.to_le_bytes());
+                }
+                for x in &v_block_host[base..base + hd] {
+                    v_stripe.extend_from_slice(&x.to_le_bytes());
+                }
+            }
+            k_stripes.push(k_stripe);
+            v_stripes.push(v_stripe);
+        }
+        assemble_block_write_buffer(nkv, group_stride, &k_stripes, &v_stripes)
+    }
+
+    /// ATLAS_HSS_COALESCE_WRITE_RUNS stage step: run the per-block work of the
+    /// coalesced offload EXCEPT the disk write — predictor projection (only when
+    /// `do_predict`, i.e. the BF16 arms), then assemble the block's `block_bytes`
+    /// image into `out`. Does NOT write and does NOT invalidate: those are
+    /// deferred to `flush_write_run` so the run's wide pwrite lands the bytes
+    /// before the resident copies are dropped (preserving the disk-overwritten ⇒
+    /// resident-dropped atomicity of `offload_block_inner_on_stream`).
+    ///
+    /// `out` MUST be exactly `block_bytes` — the caller slices its staging buffer
+    /// at `run_len · block_bytes` so block `i` lands at `staging[i·block_bytes]`,
+    /// making the concatenation byte-identical to the block's on-disk span.
+    #[allow(clippy::too_many_arguments)]
+    pub fn stage_block_into(
+        &mut self,
+        stream: u64,
+        layer: u32,
+        block: u32,
+        k_block_dev: u64,
+        do_predict: bool,
+        k_block_host: &[half::bf16],
+        v_block_host: &[half::bf16],
+        out: &mut [u8],
+    ) -> Result<()> {
+        if do_predict {
+            self.predictor.project_kv_block_on_stream(
+                stream,
+                layer as usize,
+                block as usize,
+                k_block_dev,
+            )?;
+        }
+        let bs = self.model.block_size as usize;
+        let nkv = self.model.num_kv_heads as usize;
+        let hd = self.model.head_dim as usize;
+        if k_block_host.len() != bs * nkv * hd || v_block_host.len() != bs * nkv * hd {
+            anyhow::bail!(
+                "stage_block_into: host buffers must be {} BF16 elements",
+                bs * nkv * hd
+            );
+        }
+        let group_stride = self.backend.group_layout().group_stride as usize;
+        let block_bytes = 2 * nkv * group_stride;
+        if out.len() != block_bytes {
+            anyhow::bail!(
+                "stage_block_into: out slice {} != block_bytes {block_bytes}",
+                out.len()
+            );
+        }
+        let buf = self.assemble_block_image_from_host(k_block_host, v_block_host);
+        out.copy_from_slice(&buf);
+        Ok(())
+    }
+
+    /// ATLAS_HSS_COALESCE_WRITE_RUNS flush: write a run of `run_len`
+    /// strictly-consecutive same-layer blocks starting at `run_start` in ONE wide
+    /// pwrite (`write_blocks_run`), then drop the resident-cache copy for EVERY
+    /// block in the run. Invalidate is deferred to HERE (after the bytes land) so
+    /// a concurrent attend can never read a slot whose disk image is mid-write.
+    /// No-op on an empty run (`run_len == 0`).
+    pub fn flush_write_run(
+        &mut self,
+        layer: u32,
+        run_start: u32,
+        run_len: usize,
+        staging: &[u8],
+    ) -> Result<()> {
+        if run_len == 0 {
+            return Ok(());
+        }
+        let nkv = self.model.num_kv_heads as usize;
+        let group_stride = self.backend.group_layout().group_stride as usize;
+        let block_bytes = 2 * nkv * group_stride;
+        let run_bytes = run_len * block_bytes;
+        if staging.len() < run_bytes {
+            anyhow::bail!(
+                "flush_write_run: staging {} < run bytes {run_bytes} ({run_len} × {block_bytes})",
+                staging.len()
+            );
+        }
+        // O_DIRECT keeps offset+length 4096-aligned; block_bytes is a multiple of
+        // group_stride (4096), so run_bytes is too.
+        debug_assert_eq!(run_bytes % 4096, 0, "run bytes must stay O_DIRECT-aligned");
+        self.backend.write_blocks_run(
+            GroupKey::new(layer, run_start, 0, KvKind::K),
+            run_len,
+            &staging[..run_bytes],
+        )?;
+        for i in 0..run_len {
+            self.pool.invalidate(ResidentKey {
+                layer,
+                block: run_start + i as u32,
+            });
+        }
         Ok(())
     }
 

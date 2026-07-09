@@ -116,6 +116,94 @@ pub fn plan_runs(
     (sorted, runs)
 }
 
+/// One decision emitted by [`WriteRunPlanner::push`]: where the just-pushed
+/// block's image lands in the staging buffer, and (optionally) the completed
+/// prior run that must be flushed to disk BEFORE staging this block.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WriteRunStep {
+    /// If `Some((run_start, run_len))`, the accumulator's previous run is
+    /// complete (a non-consecutive id broke it, or the cap was reached): flush
+    /// it (ONE `write_blocks_run` of `run_len` blocks at `block_offset(run_start)`)
+    /// then reset before staging the current block into slot 0.
+    pub flush: Option<(u32, usize)>,
+    /// Staging slot (in BLOCKS) the current block's assembled image occupies —
+    /// its byte offset is `slot · block_bytes`. Resets to 0 whenever `flush` fires.
+    pub slot: usize,
+}
+
+/// Tier-2-WRITE ONLINE run accumulator (ATLAS_HSS_COALESCE_WRITE_RUNS). The
+/// WRITE analog of [`plan_runs`]: writes arrive ONE BLOCK AT A TIME through the
+/// offload loop (not a batch to sort), so this is a streaming state machine, not
+/// a sort. It is single-LAYER by construction — the offload loop runs on ONE
+/// attention layer per call, so a fresh planner per call can never straddle two
+/// layers (the structural no-lost-block guarantee).
+///
+/// `push(disk_id)` extends the current run while ids stay strictly consecutive
+/// (`disk_id == run_start + run_len`) and the run is under `r_max`; otherwise it
+/// emits a flush of the completed run and starts a fresh one. `finish()` drains
+/// the final run — the correctness anchor: the last run has no trailing block to
+/// break it, so a caller that skips `finish()` silently loses those KV writes.
+///
+/// Pure + GPU-free: the SINGLE source of the append/flush decision, mirroring
+/// how `plan_runs` is the single source for the read side. The multiset of
+/// blocks it covers (per-push `slot`s + flushes) equals the input exactly —
+/// nothing dropped or duplicated (see `write_run_planner_covers_input`).
+#[derive(Debug)]
+pub struct WriteRunPlanner {
+    r_max: usize,
+    run_start: Option<u32>,
+    run_len: usize,
+}
+
+impl WriteRunPlanner {
+    /// `r_max` = max blocks one merged write may cover (== staging bytes /
+    /// block_bytes). Clamped to ≥ 1; `r_max == 1` degrades to per-block flushes
+    /// (byte- AND op-identical to the Tier-1 per-block write).
+    pub fn new(r_max: usize) -> Self {
+        Self {
+            r_max: r_max.max(1),
+            run_start: None,
+            run_len: 0,
+        }
+    }
+
+    /// Feed the next block's disk id. Returns where it lands in staging and any
+    /// prior run that must flush first.
+    pub fn push(&mut self, disk_id: u32) -> WriteRunStep {
+        let mut flush = None;
+        if self.run_len > 0 {
+            let start = self.run_start.expect("run_len>0 implies run_start set");
+            let consecutive = disk_id == start + self.run_len as u32;
+            if !consecutive || self.run_len == self.r_max {
+                flush = Some((start, self.run_len));
+                self.run_start = None;
+                self.run_len = 0;
+            }
+        }
+        let slot = self.run_len;
+        if self.run_start.is_none() {
+            self.run_start = Some(disk_id);
+        }
+        self.run_len += 1;
+        WriteRunStep { flush, slot }
+    }
+
+    /// Drain the final pending run (the end-of-loop flush). Returns `None` on an
+    /// empty accumulator (empty offload loop, or already-drained).
+    pub fn finish(&mut self) -> Option<(u32, usize)> {
+        if self.run_len == 0 {
+            return None;
+        }
+        let out = (
+            self.run_start.expect("run_len>0 implies run_start set"),
+            self.run_len,
+        );
+        self.run_start = None;
+        self.run_len = 0;
+        Some(out)
+    }
+}
+
 pub trait StorageBackend: Send + Sync {
     /// Synchronously fulfil all `requests`, returning when the corresponding
     /// HBM destinations are populated and visible on `stream`. The backend
@@ -199,6 +287,48 @@ pub trait StorageBackend: Send + Sync {
             )?;
         }
         Ok(())
+    }
+
+    /// Tier-2-WRITE (ATLAS_HSS_COALESCE_WRITE_RUNS): write a run of `run_len`
+    /// strictly-consecutive same-layer blocks in ONE contiguous op. `base_key`
+    /// carries the run's FIRST block (`run_start`; kv_head/kind ignored); `src`
+    /// is exactly `run_len · block_bytes`, block `i` at `src[i·block_bytes]` (each
+    /// slice byte-identical to the `write_block_from_host` image for
+    /// `run_start + i`). Because `block_offset` is linear and gapless, the run
+    /// occupies ONE span `[block_offset(run_start), +run_len·block_bytes)`, so a
+    /// single `pwrite` reproduces `run_len` per-block writes byte-for-byte.
+    ///
+    /// DEFAULT fans out to `run_len` `write_block_from_host` calls over
+    /// `run_start..run_start+run_len` — byte- AND op-identical to the
+    /// un-coalesced write path, so RDMA/Cascade inherit correctness with zero
+    /// change (and `run_len == 1` is exactly one `write_block_from_host`).
+    /// io_uring and posix override it with ONE wide `pwrite`.
+    fn write_blocks_run(&mut self, base_key: GroupKey, run_len: usize, src: &[u8]) -> Result<()> {
+        let spec = self.group_layout();
+        let block_bytes = spec.block_bytes() as usize;
+        let expect = run_len * block_bytes;
+        if src.len() != expect {
+            anyhow::bail!(
+                "write_blocks_run: src len {} != run bytes {expect} ({run_len} × {block_bytes})",
+                src.len()
+            );
+        }
+        for i in 0..run_len {
+            let off = i * block_bytes;
+            self.write_block_from_host(
+                GroupKey::new(base_key.layer, base_key.block + i as u32, 0, KvKind::K),
+                &src[off..off + block_bytes],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Whether this backend can service `write_blocks_run` as a single wide op
+    /// with its staging sized for multi-block runs (io_uring/posix built with a
+    /// run cap ⇒ `r_max > 1`). DEFAULT `false`: RDMA/Cascade keep the per-block
+    /// fan-out (out of scope), and the caller stays on the per-block write path.
+    fn supports_write_run_coalescing(&self) -> bool {
+        false
     }
 
     /// Optionally pre-register `[base, base+len)` as the read-landing region.
@@ -556,6 +686,324 @@ mod coalesce_tests {
         tier1.sort();
         tier2.sort();
         assert_eq!(tier2, tier1, "Tier-2 scatter ops must equal the Tier-1 op multiset");
+    }
+
+    // ── ATLAS_HSS_COALESCE_WRITE_RUNS (Tier-2-WRITE): the online write-run
+    //    accumulator + wide-write byte-identity, all GPU-free. ──
+
+    /// Deterministic per-block on-disk image so byte-identity tests can prove a
+    /// wide write lands EXACTLY the concatenation of the per-block images.
+    fn block_image(layer: u32, id: u32, block_bytes: usize) -> Vec<u8> {
+        let mut v = vec![0u8; block_bytes];
+        let seed = layer.wrapping_mul(0x9E3779B1).wrapping_add(id.wrapping_mul(0x85EBCA77));
+        for (i, b) in v.iter_mut().enumerate() {
+            *b = (seed.wrapping_add(i as u32).wrapping_mul(2654435761) >> 13) as u8;
+        }
+        v
+    }
+
+    /// Strictly-consecutive ids under the cap collapse to ONE run; `finish`
+    /// drains it (the end-of-loop flush).
+    #[test]
+    fn write_run_planner_fresh_seq_one_run() {
+        let mut p = WriteRunPlanner::new(8);
+        for (i, id) in (0..4u32).enumerate() {
+            let step = p.push(id);
+            assert_eq!(step.flush, None);
+            assert_eq!(step.slot, i);
+        }
+        assert_eq!(p.finish(), Some((0, 4)));
+        assert_eq!(p.finish(), None, "drained accumulator yields nothing");
+    }
+
+    /// A gap flushes the prior run before staging the post-gap block at slot 0.
+    #[test]
+    fn write_run_planner_gap_splits() {
+        let mut p = WriteRunPlanner::new(8);
+        assert_eq!(p.push(0), WriteRunStep { flush: None, slot: 0 });
+        assert_eq!(p.push(1), WriteRunStep { flush: None, slot: 1 });
+        // id 3 is non-consecutive with 2 → flush [0,2), current lands at slot 0.
+        assert_eq!(p.push(3), WriteRunStep { flush: Some((0, 2)), slot: 0 });
+        assert_eq!(p.push(4), WriteRunStep { flush: None, slot: 1 });
+        assert_eq!(p.finish(), Some((3, 2)));
+    }
+
+    /// Duplicate and descending ids both break the run (not exactly +1).
+    #[test]
+    fn write_run_planner_dup_and_descending_break() {
+        let mut p = WriteRunPlanner::new(8);
+        p.push(5);
+        // dup 5: 5 != 5+1 → flush [5,1).
+        assert_eq!(p.push(5), WriteRunStep { flush: Some((5, 1)), slot: 0 });
+        // descending 4: 4 != 5+1 → flush [5,1) again.
+        assert_eq!(p.push(4), WriteRunStep { flush: Some((5, 1)), slot: 0 });
+        assert_eq!(p.finish(), Some((4, 1)));
+    }
+
+    /// The cap forces a flush even on a consecutive id; ceil(len/cap) runs, last
+    /// short — mirrors plan_runs_cap_splits_last_short on the write side.
+    #[test]
+    fn write_run_planner_cap_splits_last_short() {
+        let mut p = WriteRunPlanner::new(3);
+        let mut flushes = Vec::new();
+        for id in 0..8u32 {
+            let step = p.push(id);
+            if let Some(f) = step.flush {
+                flushes.push(f);
+            }
+        }
+        if let Some(f) = p.finish() {
+            flushes.push(f);
+        }
+        assert_eq!(flushes, vec![(0, 3), (3, 3), (6, 2)]);
+        assert!(flushes.iter().all(|&(_, len)| len <= 3));
+        assert_eq!(flushes.iter().map(|&(_, l)| l).sum::<usize>(), 8);
+    }
+
+    /// r_max == 1 (degenerate / effectively per-block) flushes every block on its
+    /// own — byte- AND op-identical to the Tier-1 per-block write.
+    #[test]
+    fn write_run_planner_cap_one_is_per_block() {
+        let mut p = WriteRunPlanner::new(1);
+        let mut flushes = Vec::new();
+        for id in 0..4u32 {
+            if let Some(f) = p.push(id).flush {
+                flushes.push(f);
+            }
+        }
+        if let Some(f) = p.finish() {
+            flushes.push(f);
+        }
+        assert_eq!(flushes, vec![(0, 1), (1, 1), (2, 1), (3, 1)]);
+        // 0 is clamped to 1 (never a zero-len run).
+        let mut p0 = WriteRunPlanner::new(0);
+        assert_eq!(p0.push(9), WriteRunStep { flush: None, slot: 0 });
+        assert_eq!(p0.push(10), WriteRunStep { flush: Some((9, 1)), slot: 0 });
+    }
+
+    /// Empty offload loop: `finish` on an untouched accumulator is a no-op (the
+    /// drain must be safe when total == 0 / start >= total).
+    #[test]
+    fn write_run_planner_empty_finish_none() {
+        let mut p = WriteRunPlanner::new(8);
+        assert_eq!(p.finish(), None);
+    }
+
+    /// NO-LOST / NO-DUP oracle: over ANY id sequence, the multiset of blocks
+    /// covered (each push's staged (run-relative slot) resolved to its absolute
+    /// id via the run it flushes in, + the finish tail) equals the input exactly.
+    #[test]
+    fn write_run_planner_covers_input_no_loss() {
+        let seqs: &[&[u32]] = &[
+            &[0, 1, 2, 3],
+            &[0, 1, 3, 4, 5],
+            &[5, 5, 4, 6, 7],
+            &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+            &[],
+            &[42],
+        ];
+        for seq in seqs {
+            for &r_max in &[1usize, 3, 8] {
+                let mut p = WriteRunPlanner::new(r_max);
+                // Reconstruct absolute ids of every flushed run: a run (start,len)
+                // covers ids start..start+len.
+                let mut covered: Vec<u32> = Vec::new();
+                let mut pending_start: Option<u32> = None;
+                let mut pending_len = 0usize;
+                for &id in seq.iter() {
+                    let step = p.push(id);
+                    if let Some((s, l)) = step.flush {
+                        for k in 0..l {
+                            covered.push(s + k as u32);
+                        }
+                        pending_start = None;
+                        pending_len = 0;
+                    }
+                    // Track the current run so `slot` stays consistent with len.
+                    if pending_start.is_none() {
+                        pending_start = Some(id);
+                        pending_len = 0;
+                    }
+                    assert_eq!(step.slot, pending_len, "slot must equal current run len");
+                    pending_len += 1;
+                }
+                if let Some((s, l)) = p.finish() {
+                    for k in 0..l {
+                        covered.push(s + k as u32);
+                    }
+                }
+                let mut got = covered.clone();
+                got.sort();
+                let mut want = seq.to_vec();
+                want.sort();
+                assert_eq!(got, want, "seq {seq:?} r_max {r_max}: no block lost/dup");
+            }
+        }
+    }
+
+    /// HEADLINE write byte-identity oracle (mirrors
+    /// `tier2_scatter_op_multiset_equals_tier1`): for an id stream on a fixed
+    /// layer, the multiset of (layer, disk_offset, block_image) per-block ops
+    /// DECOMPOSED from the run path == the multiset the Tier-1 per-block write
+    /// emits. Asserts on concrete BYTES (each block's image), not just op counts.
+    #[test]
+    fn write_run_op_multiset_equals_per_block() {
+        let s = spec();
+        let bb = s.block_bytes() as usize;
+        let layer = 3u32;
+        // Fresh run + cap-forced split + gap + dup + descending in one stream.
+        let ids = [0u32, 1, 2, 3, 4, 7, 7, 6, 100, 101];
+        let r_max = 3usize;
+
+        // Tier-1 oracle: one op per id at its own block_offset, carrying its image.
+        let mut tier1: Vec<(u32, u64, Vec<u8>)> = ids
+            .iter()
+            .map(|&id| (layer, s.block_offset(id), block_image(layer, id, bb)))
+            .collect();
+
+        // Run path: stage images into a reused staging buffer, emit one wide op
+        // per flushed run, then DECOMPOSE it back to per-block ops.
+        let mut planner = WriteRunPlanner::new(r_max);
+        let mut staging = vec![0u8; r_max * bb];
+        let mut wide_ops: Vec<(u32, u64, Vec<u8>)> = Vec::new(); // (layer, offset, run bytes)
+        for &id in ids.iter() {
+            let step = planner.push(id);
+            if let Some((st, len)) = step.flush {
+                wide_ops.push((layer, s.block_offset(st), staging[..len * bb].to_vec()));
+            }
+            let off = step.slot * bb;
+            staging[off..off + bb].copy_from_slice(&block_image(layer, id, bb));
+        }
+        if let Some((st, len)) = planner.finish() {
+            wide_ops.push((layer, s.block_offset(st), staging[..len * bb].to_vec()));
+        }
+
+        // Decompose each wide op into per-block (layer, offset, image) ops.
+        let mut tier2: Vec<(u32, u64, Vec<u8>)> = Vec::new();
+        for (l, base_off, bytes) in wide_ops {
+            let run_len = bytes.len() / bb;
+            for i in 0..run_len {
+                let off = base_off + (i as u64) * bb as u64;
+                tier2.push((l, off, bytes[i * bb..(i + 1) * bb].to_vec()));
+            }
+        }
+        tier1.sort();
+        tier2.sort();
+        assert_eq!(
+            tier2, tier1,
+            "write-run decomposed ops must equal the Tier-1 per-block write multiset (bytes incl.)"
+        );
+    }
+
+    /// In-memory "disk" byte-diff: applying the wide write (staging → one span at
+    /// block_offset(run_start)) yields a BYTE-FOR-BYTE identical file image to R
+    /// separate per-block writes. This is the exact offset arithmetic the real
+    /// io_uring/posix `write_blocks_run` pwrite performs, proven without a GPU.
+    #[test]
+    fn wide_write_bytes_equal_per_block_writes() {
+        let s = spec();
+        let bb = s.block_bytes() as usize;
+        let layer = 0u32;
+        for (ids, r_max) in [
+            (&[0u32, 1, 2, 3][..], 8usize),  // one run
+            (&[0, 1, 3, 4][..], 8),          // gap
+            (&[0, 1, 2, 3, 4, 5][..], 2),    // cap split
+            (&[9][..], 8),                    // single block (R=1)
+        ] {
+            let span = (ids.iter().copied().max().unwrap() as usize + 1) * bb;
+            let mut disk_per_block = vec![0u8; span];
+            let mut disk_wide = vec![0u8; span];
+
+            // Per-block writes.
+            for &id in ids {
+                let off = s.block_offset(id) as usize;
+                disk_per_block[off..off + bb].copy_from_slice(&block_image(layer, id, bb));
+            }
+
+            // Wide writes driven by the planner.
+            let mut p = WriteRunPlanner::new(r_max);
+            let mut staging = vec![0u8; r_max * bb];
+            let do_flush = |start: u32, len: usize, staging: &[u8], disk: &mut [u8]| {
+                let off = s.block_offset(start) as usize;
+                disk[off..off + len * bb].copy_from_slice(&staging[..len * bb]);
+            };
+            for &id in ids {
+                let step = p.push(id);
+                if let Some((st, len)) = step.flush {
+                    do_flush(st, len, &staging, &mut disk_wide);
+                }
+                let o = step.slot * bb;
+                staging[o..o + bb].copy_from_slice(&block_image(layer, id, bb));
+            }
+            if let Some((st, len)) = p.finish() {
+                do_flush(st, len, &staging, &mut disk_wide);
+            }
+
+            assert_eq!(disk_wide, disk_per_block, "ids {ids:?} r_max {r_max}: byte-identical");
+        }
+    }
+
+    /// The default `write_blocks_run` (RDMA/Cascade inherit it) fans out to
+    /// `run_len` per-block writes — op-equivalent to calling `write_block_from_host`
+    /// `run_len` times over run_start..run_start+run_len. Also: a wrong src length
+    /// bails.
+    #[test]
+    fn default_write_blocks_run_op_equivalent_to_per_block() {
+        let s = spec();
+        let nkv = s.num_kv_heads as usize;
+        let gs = s.group_stride as usize;
+        let bb = s.block_bytes() as usize;
+        let run_len = 3usize;
+        let run_start = 5u32;
+        let layer = 2u32;
+        let src = vec![0u8; run_len * bb];
+
+        // Subject: default write_blocks_run.
+        let mut subject = Recorder { spec: s, reads: vec![], writes: vec![] };
+        subject
+            .write_blocks_run(GroupKey::new(layer, run_start, 0, KvKind::K), run_len, &src)
+            .unwrap();
+
+        // Oracle: run_len per-block writes at run_start..run_start+run_len.
+        let mut oracle = Recorder { spec: s, reads: vec![], writes: vec![] };
+        for i in 0..run_len {
+            let blk = run_start + i as u32;
+            oracle
+                .write_block_from_host(GroupKey::new(layer, blk, 0, KvKind::K), &src[i * bb..(i + 1) * bb])
+                .unwrap();
+        }
+        assert_eq!(subject.writes, oracle.writes);
+        // Each block is 2*nkv per-head writes.
+        assert_eq!(subject.writes.len(), run_len * 2 * nkv);
+        let _ = gs;
+
+        // Length guard: src not run_len*block_bytes bails.
+        let bad = vec![0u8; run_len * bb - 1];
+        assert!(
+            subject
+                .write_blocks_run(GroupKey::new(layer, run_start, 0, KvKind::K), run_len, &bad)
+                .is_err()
+        );
+        // Default backends do not claim run-coalescing support.
+        assert!(!subject.supports_write_run_coalescing());
+    }
+
+    /// Write-offset math: a run [run_start, run_start+R) targets
+    /// disk_offset == block_offset(run_start) with len == R*block_bytes; block i
+    /// lands at run_offset + i*block_bytes, and R*block_bytes stays 4096-aligned.
+    #[test]
+    fn write_run_offset_math() {
+        let s = spec();
+        let bb = s.block_bytes();
+        for run_start in [0u32, 3, 100] {
+            for r in 1..=8u32 {
+                let run_off = s.block_offset(run_start);
+                assert_eq!((r as u64 * bb) % 4096, 0);
+                for i in 0..r {
+                    assert_eq!(run_off + (i as u64) * bb, s.block_offset(run_start + i));
+                }
+            }
+        }
     }
 
     /// group.rs contiguity extension: for a run of R consecutive ids,

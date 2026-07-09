@@ -74,6 +74,38 @@ impl HighSpeedSwap {
         unreachable!()
     }
 
+    // ATLAS_HSS_COALESCE_WRITE_RUNS surface — type-checked against the
+    // spark-model offload loop's `with_local` closures on non-cuda builds.
+    // `write_run_cap` reports "off" so the loop keeps the per-block path.
+    pub fn write_run_cap(&self) -> Option<(usize, usize)> {
+        None
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn stage_block_into(
+        &mut self,
+        stream: u64,
+        layer: u32,
+        block: u32,
+        k_block_dev: u64,
+        do_predict: bool,
+        k_block_host: &[half::bf16],
+        v_block_host: &[half::bf16],
+        out: &mut [u8],
+    ) -> anyhow::Result<()> {
+        unreachable!()
+    }
+
+    pub fn flush_write_run(
+        &mut self,
+        layer: u32,
+        run_start: u32,
+        run_len: usize,
+        staging: &[u8],
+    ) -> anyhow::Result<()> {
+        unreachable!()
+    }
+
     pub fn attend_layer_on_stream(
         &mut self,
         seq_slot: usize,
