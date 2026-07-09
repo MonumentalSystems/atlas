@@ -153,6 +153,19 @@ impl GpuBackend for AtlasCudaBackend {
         Ok(())
     }
 
+    fn copy_d2h_on_stream_async(&self, src: DevicePtr, dst: &mut [u8], stream: u64) -> Result<()> {
+        // Enqueue only — NO per-copy sync. The caller fuses N of these then
+        // `synchronize(stream)` once. Ordered on `stream` after prior work, so a
+        // single trailing sync guarantees all copies land before `dst` is read.
+        let status = unsafe {
+            cuMemcpyDtoHAsync_v2(dst.as_mut_ptr() as *mut c_void, src.0, dst.len(), stream)
+        };
+        if status != 0 {
+            bail!("cuMemcpyDtoHAsync_v2 (on_stream_async) failed: status {status}");
+        }
+        Ok(())
+    }
+
     fn copy_d2d(&self, src: DevicePtr, dst: DevicePtr, bytes: usize) -> Result<()> {
         let status = unsafe { cuMemcpyDtoDAsync_v2(dst.0, src.0, bytes, self.default_stream) };
         if status != 0 {

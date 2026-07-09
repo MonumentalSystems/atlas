@@ -117,6 +117,16 @@ pub trait GpuBackend: Send + Sync {
         self.copy_d2h(src, dst)
     }
 
+    /// Enqueue a D2H copy on `stream` WITHOUT synchronizing. The caller MUST
+    /// `synchronize(stream)` before reading `dst`. This enables a FUSED gather:
+    /// enqueue many copies then sync ONCE, instead of one CPU↔GPU round-trip per
+    /// copy (the decode-ring spill does 2×layers copies per spill — 60 syncs on
+    /// Holo-35B). Default impl falls back to the synchronous per-copy path
+    /// (correct, just not fused); the CUDA backend overrides it to drop the sync.
+    fn copy_d2h_on_stream_async(&self, src: DevicePtr, dst: &mut [u8], stream: u64) -> Result<()> {
+        self.copy_d2h_on_stream(src, dst, stream)
+    }
+
     /// Copy device to device.
     fn copy_d2d(&self, src: DevicePtr, dst: DevicePtr, bytes: usize) -> Result<()>;
 

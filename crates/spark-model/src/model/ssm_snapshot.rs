@@ -128,6 +128,10 @@ struct DecodeSpillStats {
     spills: AtomicU64,
     bp_spins: AtomicU64,
     sync_fallbacks: AtomicU64,
+    /// Cumulative µs in the D2H gather vs the tier `put`, so we can attribute the
+    /// per-spill cost (the gather's 2×layers copies vs the cold-tier write).
+    gather_us: AtomicU64,
+    put_us: AtomicU64,
 }
 static DECODE_SPILL_STATS: LazyLock<DecodeSpillStats> = LazyLock::new(|| DecodeSpillStats {
     enabled: std::env::var_os("ATLAS_DECODE_RING_STATS").is_some(),
@@ -139,7 +143,16 @@ static DECODE_SPILL_STATS: LazyLock<DecodeSpillStats> = LazyLock::new(|| DecodeS
     spills: AtomicU64::new(0),
     bp_spins: AtomicU64::new(0),
     sync_fallbacks: AtomicU64::new(0),
+    gather_us: AtomicU64::new(0),
+    put_us: AtomicU64::new(0),
 });
+
+/// FUSED decode-ring spill gather (`ATLAS_SSM_DECODE_FUSED_GATHER`): enqueue all
+/// 2×layers D2H copies on the worker stream, then synchronize ONCE — instead of
+/// the default one `cuStreamSynchronize` per copy (60 CPU↔GPU round-trips/spill
+/// on Holo-35B). Default OFF = byte-identical to the per-copy-synced path.
+static DECODE_FUSED_GATHER: LazyLock<bool> =
+    LazyLock::new(|| std::env::var_os("ATLAS_SSM_DECODE_FUSED_GATHER").is_some());
 
 /// Whether to emit a stats line at this spill count. Pure so the cadence is
 /// unit-testable without touching the atomics.
@@ -161,6 +174,13 @@ impl DecodeSpillStats {
             self.sync_fallbacks.fetch_add(1, Ordering::Relaxed);
         }
     }
+    #[inline]
+    fn note_timing(&self, gather_us: u64, put_us: u64) {
+        if self.enabled {
+            self.gather_us.fetch_add(gather_us, Ordering::Relaxed);
+            self.put_us.fetch_add(put_us, Ordering::Relaxed);
+        }
+    }
     /// Count one spill; periodically log the running totals (INFO, per operator rule).
     #[inline]
     fn note_spill(&self) {
@@ -171,10 +191,14 @@ impl DecodeSpillStats {
         if stats_should_log(n, self.log_every) {
             let bp = self.bp_spins.load(Ordering::Relaxed);
             let sf = self.sync_fallbacks.load(Ordering::Relaxed);
+            let g = self.gather_us.load(Ordering::Relaxed);
+            let p = self.put_us.load(Ordering::Relaxed);
             tracing::info!(
                 "DECODE_RING_STATS: spills={n} bp_spins={bp} sync_fallbacks={sf} \
-                 bp_spins_per_spill={:.3}",
-                bp as f64 / n as f64
+                 bp_spins_per_spill={:.3} gather_ms/spill={:.2} put_ms/spill={:.2}",
+                bp as f64 / n as f64,
+                g as f64 / n as f64 / 1000.0,
+                p as f64 / n as f64 / 1000.0,
             );
         }
     }
@@ -282,29 +306,58 @@ fn run_spill_worker(
         let frame = req.seq * l_phys + req.lane;
         let mut blob = vec![0u8; blob_bytes];
         let per_layer = h_bytes + conv_bytes;
+        let stats = DECODE_SPILL_STATS.enabled;
+        let fused = *DECODE_FUSED_GATHER;
+        let g0 = if stats { Some(std::time::Instant::now()) } else { None };
         let mut ok = true;
+        // FUSED path: enqueue every D2H async on the worker's stream, then a SINGLE
+        // trailing synchronize — one CPU↔GPU round-trip instead of 2×layers. The
+        // copies are stream-ordered after `wait_event`, so one sync guarantees all
+        // bytes land before `store.put` reads `blob`. Default path syncs per copy.
         for i in 0..num_layers {
             let off = i * per_layer;
-            if gpu
-                .copy_d2h_on_stream(
-                    h_ptrs[i].offset(frame * h_bytes),
-                    &mut blob[off..off + h_bytes],
-                    spill_stream,
-                )
-                .is_err()
-                || gpu
-                    .copy_d2h_on_stream(
+            let (hd, cd) = if fused {
+                (
+                    gpu.copy_d2h_on_stream_async(
+                        h_ptrs[i].offset(frame * h_bytes),
+                        &mut blob[off..off + h_bytes],
+                        spill_stream,
+                    ),
+                    gpu.copy_d2h_on_stream_async(
                         c_ptrs[i].offset(frame * conv_bytes),
                         &mut blob[off + h_bytes..off + per_layer],
                         spill_stream,
-                    )
-                    .is_err()
-            {
+                    ),
+                )
+            } else {
+                (
+                    gpu.copy_d2h_on_stream(
+                        h_ptrs[i].offset(frame * h_bytes),
+                        &mut blob[off..off + h_bytes],
+                        spill_stream,
+                    ),
+                    gpu.copy_d2h_on_stream(
+                        c_ptrs[i].offset(frame * conv_bytes),
+                        &mut blob[off + h_bytes..off + per_layer],
+                        spill_stream,
+                    ),
+                )
+            };
+            if hd.is_err() || cd.is_err() {
                 ok = false;
                 break;
             }
         }
+        if fused && ok && gpu.synchronize(spill_stream).is_err() {
+            ok = false;
+        }
+        let gather_us = g0.map(|t| t.elapsed().as_micros() as u64).unwrap_or(0);
+        let p0 = if stats { Some(std::time::Instant::now()) } else { None };
         let put_ok = ok && store.put(req.cold_key, &blob).unwrap_or(false);
+        if stats {
+            let put_us = p0.map(|t| t.elapsed().as_micros() as u64).unwrap_or(0);
+            DECODE_SPILL_STATS.note_timing(gather_us, put_us);
+        }
         if !put_ok {
             // A non-dropping store (host-RAM / peer / a correctly-sized NVMe
             // arena) must never reach here. If it does, the bytes did NOT land in
