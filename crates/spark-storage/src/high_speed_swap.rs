@@ -356,22 +356,23 @@ impl HighSpeedSwap {
                 group_layout.group_stride,
             );
         }
-        // ATLAS_HSS_COALESCE_RUNS (Tier-2 run merging) — DEFAULT OFF (inverse of
-        // the Tier-1 parse: only 1/true/on/yes enable). For a sequence whose
-        // disk_block_ids are CONSECUTIVE, the local-NVMe READ backends merge a run
-        // of R such blocks into ONE pread/ReadFixed of R·block_bytes and SCATTER
-        // each block to its (non-adjacent) slot per-block — the disk read collapses
-        // R→1, the H2D stays per-block. Fragmented seqs degrade to R=1 (Tier-1).
-        // Tier-2 PRESUPPOSES Tier-1 (needs block-sized-or-wider buffers + the block
-        // read path): if requested while ATLAS_HSS_COALESCE_BLOCKS is off, warn and
-        // disable. WRITE stays Tier-1; cascade/RDMA keep the per-head fan-out.
-        // Ships inert (default off) until GPU-validated — NO perf claim here.
-        let runs_requested = matches!(
+        // ATLAS_HSS_COALESCE_RUNS (Tier-2 run merging) — DEFAULT ON (opt out =0).
+        // For a sequence whose disk_block_ids are CONSECUTIVE, the local-NVMe READ
+        // backends merge a run of R such blocks into ONE pread/ReadFixed of
+        // R·block_bytes and SCATTER each block to its (non-adjacent) slot per-block
+        // — the disk read collapses R→1, the H2D stays per-block. Fragmented seqs
+        // degrade to R=1 (Tier-1). GPU-validated bit-identical (needle recall) with
+        // +31-45% HSS decode on top of Tier-1 (Holo-35B, contiguous-id seq).
+        // PRESUPPOSES Tier-1 (block-sized buffers + block read path): if on while
+        // ATLAS_HSS_COALESCE_BLOCKS is off, warn and disable. WRITE stays Tier-1;
+        // cascade/RDMA keep the per-head fan-out. Bounce grows to qd·run_cap (~8MB
+        // at qd8/1MiB) — trivial on GB10; a memlock warn guards tighter hosts.
+        let runs_requested = !matches!(
             std::env::var("ATLAS_HSS_COALESCE_RUNS")
                 .ok()
                 .as_deref()
                 .map(str::trim),
-            Some("1") | Some("true") | Some("on") | Some("yes")
+            Some("0") | Some("false") | Some("off") | Some("no")
         );
         let coalesce_runs = if runs_requested && !coalesce_blocks {
             tracing::warn!(

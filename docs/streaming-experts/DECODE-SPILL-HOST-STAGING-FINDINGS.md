@@ -177,6 +177,19 @@ blocks. **Default ON** (opt out `=0`). Follow-up: Tier-2 ~1MB run-merging (merge
 consecutive-id block runs; needs bounce+scatter, fragmentation-gated) + coalesce
 the cascade/RDMA backends (currently inherit per-head fan-out).
 
+### HSS Tier-2 run-merging — validated, default ON (2026-07-09)
+On top of Tier-1, HSS decode was still ~5-7× off no-offload (read-bound on
+per-block preads). For a consecutive-disk-id sequence, merge a run of R blocks
+into one `pread(R*block_bytes)` + per-block scatter-H2D (`ATLAS_HSS_COALESCE_RUNS`,
+commit `7a55ddb6`, plan_runs sorts a COPY so each block's dst rides its own Copy
+struct; r_max=32 / 1MiB cap; fragmented → R=1 = Tier-1). GPU A/B (Holo-35B): needle
+recall PASS both (bit-identical scatter); **decode +31% @4K (14.6→19.1), +45% @8K
+(8.5→12.3 tok/s)**, prefill flat (read-only). Full HSS decode arc @8K: per-head
+4KiB 3.1 → Tier-1 block 8.5 → Tier-2 run 12.3 tok/s (**4.0×**), ~4.5× off the 55.8
+no-offload ceiling (residual = per-block H2D scatter + write path + rehydration
+volume). **Default ON** (opt out `=0`). Follow-ups: coalesce the H2D scatter /
+write path; cascade+RDMA backends still per-head.
+
 ## Status
 
 Landed on `feat/streaming-experts-mvp` (reviewed, unit-tested): seq-sharded pool +
