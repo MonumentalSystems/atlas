@@ -51,6 +51,25 @@ Even an 8188-token chunk (W512, ~2 chunks for a 10.9K prompt) sits at 1.4× base
 - **For over-core deployments, default the window to ~32–64** (512–1024 resident tok/seq). Raise it only if prefill TTFT is the binding constraint and HBM is spare.
 - **Raw-throughput / HBM-abundant:** the GB10 saturates at an 8–16K-token prefill batch (per operator measurement); run the window at `max_seq_len/block_size` (no HBM shrink) to match baseline.
 
+## Addendum: attributing the full-window "write-through tax" (W1024)
+
+At window=1024 (max_prefill 16380 ⇒ the ~11K prompt is **1 chunk**, no chunking, everything resident) HSS still costs **~500ms over the no-HSS baseline** (2327 vs 1833 ms). W1024 is the *best case* for write-run coalescing — one chunk means all 681 blocks/layer are strictly-consecutive disk-ids (681 pwrites → ~11 runs) — so it's the sharpest test of whether the write-side I/O opts move it. They don't:
+
+| W1024 arm | prefill | Δ vs BASE | vs baseline 1833ms |
+|---|--:|--:|--:|
+| BASE (default write path) | 2327ms | — | +494ms |
+| + `ATLAS_HSS_COALESCE_WRITE_RUNS=1` | 2304ms | −22ms (~1%) | +471ms |
+| + `ATLAS_HSS_PINNED_OFFLOAD=1` | 2241ms | −86ms (~4%) | +408ms |
+| + both | 2232ms | −95ms (~4%) | +399ms |
+
+- **Write-run coalescing = −22ms even here** (near the ~10ms run-to-run noise). Collapsing 681→11 pwrites/layer recovers almost nothing ⇒ prefill writes hide behind compute. Consistent with the −0.1% at window-8.
+- **Pinned D2H = −86ms**, which *refutes* the "unpinned 106 MiB @ 0.17 GB/s ⇒ 600ms" hypothesis: the offload D2H largely overlaps compute; only a small tail is exposed.
+- **~400ms of the residual is neither writes nor the copy.** It stays inside `forward` (2207ms with both flags vs baseline's 1809ms) — the offload's host-side gather/assembly (`stage_block_into`), per-block predictor projection, and pool bookkeeping, all run to write a disk copy that at this window is **never read back**. The write-side I/O opts address <20% of the tax; the bulk is the offload host-path, not I/O.
+
+**Decode at W1024 (non-spilling, all KV resident):** 7.1 tok/s, TTFT 1712ms over the ~11K context (server-logged, cross-checked by a two-point non-streaming timing). Slow because decode attends the full ~11K resident KV each step on a 3B-active MoE — not an HSS effect (no streaming fires at this window).
+
+**KV data volume:** Holo-3.1-35B-A3B is hybrid — only **10 of 40 layers are full-attention** (GQA 2 KV heads, head_dim 256); the 30 SSM layers hold fixed recurrent state, no KV. fp8 KV = **10 KiB/token** ⇒ ~11K tokens = **106 MiB** (bf16 = 212 MiB). (The `/hss` files are pre-allocated capacity, not live data.)
+
 ## Reproduce
 
 `/home/ms/.claude/jobs/42b99a42/tmp/prefill-chunking-ab.sh` (A + W08/W16/W32/W64 + D08) and `prefill-knee-ext.sh` (W128/W256/W512). Serve Holo-35B with `ATLAS_PREFILL_PROFILE=1`, one cold ~11K prompt, grep `PREFILL_PROFILE`. See also the decode-side companion: `DECODE-SPILL-HOST-STAGING-FINDINGS.md`.
