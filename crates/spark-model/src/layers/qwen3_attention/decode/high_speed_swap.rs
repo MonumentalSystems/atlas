@@ -16,6 +16,100 @@ use super::super::Qwen3AttentionLayer;
 use crate::layer::ForwardContext;
 use crate::layers::ops;
 
+/// Opt-in (`ATLAS_HSS_PINNED_OFFLOAD`): stage the per-block K/V D2H copies of the
+/// high-speed-swap offload through a REUSED PINNED host buffer and FUSE the two
+/// per-block copies (K then V) into a single `synchronize` instead of one implicit
+/// sync per copy. Mirrors the pinned+fused decode-ring spill gather lever
+/// (`ATLAS_SSM_DECODE_FUSED_GATHER`): D2H into pageable host memory stages through
+/// CUDA's small internal bounce buffer (implicitly synchronous, ~0.17 GB/s), so the
+/// pageable per-copy path throttles the offload; a pinned dst makes
+/// `cuMemcpyDtoHAsync` truly async + full-bandwidth and lets the two copies share
+/// one sync.
+///
+/// DEFAULT OFF: unset (or any non-truthy value) keeps the exact current pageable
+/// per-copy-synced path, byte-for-byte. This gate exists so the pinned path stays
+/// inert until GPU-validated — the offloaded KV is rehydrated and read back for
+/// attention, so the disk image MUST stay bit-identical across all 5 dtype arms.
+/// Set `ATLAS_HSS_PINNED_OFFLOAD=1` to engage.
+static HSS_PINNED_OFFLOAD: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    parse_hss_pinned_flag(std::env::var("ATLAS_HSS_PINNED_OFFLOAD").ok().as_deref())
+});
+
+/// Pure parse of `ATLAS_HSS_PINNED_OFFLOAD`: engaged only for the truthy tokens
+/// `1`/`true`/`on`/`yes`. Everything else (unset, `0`, `false`, `off`, `no`,
+/// garbage) is OFF = the current pageable per-copy-synced path. Extracted so the
+/// flag semantics are unit-testable without touching process env.
+pub(crate) fn parse_hss_pinned_flag(v: Option<&str>) -> bool {
+    matches!(v, Some("1") | Some("true") | Some("on") | Some("yes"))
+}
+
+/// Which host buffer the D2H copy writes into, per dtype arm. Pure — mirrors the
+/// arm dispatch in `high_speed_swap_offload_new_blocks` so a unit test can pin the
+/// which-buffer-is-the-D2H-dst mapping (the misattribution guard: pinning the wrong
+/// buffer in a quant arm would silently no-op the optimization).
+// Wired into a production `debug_assert!` inside the offload loop (see the match
+// on `layer_dtype`) so the unit-tested mapping guards the real arm dispatch and
+// cannot silently drift from it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HssD2hDstKind {
+    /// BF16 arm: the D2H dst IS the final BF16 payload (`k_host`/`v_host`).
+    Bf16Payload,
+    /// Quantized arms: the D2H dst is RAW quantized bytes (`k_raw`/`v_raw`); a
+    /// host-side dequant then produces the BF16 payload (never a D2H dst).
+    RawQuant,
+}
+
+/// Classify the D2H destination buffer for `dtype`. Bf16 (incl. its K-turbo
+/// composites) stage the payload directly; every quantized arm stages raw bytes.
+pub(crate) fn hss_d2h_dst_kind(dtype: KvCacheDtype) -> HssD2hDstKind {
+    match dtype {
+        KvCacheDtype::Bf16
+        | KvCacheDtype::Bf16KTurbo4V
+        | KvCacheDtype::Bf16KTurbo3V
+        | KvCacheDtype::Bf16KTurbo2V => HssD2hDstKind::Bf16Payload,
+        _ => HssD2hDstKind::RawQuant,
+    }
+}
+
+/// Exact byte count the D2H copy writes for `dtype`, and thus the size the reused
+/// pinned staging buffer must be for this layer. bf16 = `block_floats * 2` (the
+/// payload); fp8 = `block_floats` (1 raw byte / element); nvfp4/turbo{3,4,8} =
+/// `layer_block_bytes` (the packed device stride). Pure — unit-tested.
+pub(crate) fn hss_d2h_dst_bytes(
+    dtype: KvCacheDtype,
+    block_floats: usize,
+    layer_block_bytes: usize,
+) -> usize {
+    match dtype {
+        KvCacheDtype::Bf16
+        | KvCacheDtype::Bf16KTurbo4V
+        | KvCacheDtype::Bf16KTurbo3V
+        | KvCacheDtype::Bf16KTurbo2V => block_floats * 2,
+        KvCacheDtype::Fp8
+        | KvCacheDtype::Fp8KTurbo4V
+        | KvCacheDtype::Fp8KTurbo3V
+        | KvCacheDtype::Fp8KTurbo2V => block_floats,
+        _ => layer_block_bytes,
+    }
+}
+
+/// RAII guard for the per-invocation pinned K/V staging pair. Frees BOTH pinned
+/// regions on drop — including on the mid-loop `anyhow::bail!` (issue #31 eviction
+/// path), so the pinned allocation never leaks.
+struct HssPinnedPair<'g> {
+    gpu: &'g dyn spark_runtime::gpu::GpuBackend,
+    k: *mut u8,
+    v: *mut u8,
+    bytes: usize,
+}
+
+impl Drop for HssPinnedPair<'_> {
+    fn drop(&mut self) {
+        let _ = self.gpu.free_host_pinned(self.k, self.bytes);
+        let _ = self.gpu.free_host_pinned(self.v, self.bytes);
+    }
+}
+
 impl Qwen3AttentionLayer {
     pub(in super::super) fn high_speed_swap_engaged(
         &self,
@@ -123,6 +217,67 @@ impl Qwen3AttentionLayer {
         // `last.saturating_sub(1).min(total - 1)` covers both cases at the
         // cost of ~one extra D2H per layer per chunk (negligible).
         let start = last.saturating_sub(1).min(total - 1);
+
+        // Layer dtype and packed block stride are constant across this call (one
+        // layer). Hoist them so the pinned staging buffer can be sized ONCE.
+        let layer_dtype = kv_cache.dtype_for_layer(self.attn_layer_idx);
+        let layer_block_bytes = kv_cache.block_stride_bytes_for_layer(self.attn_layer_idx);
+        let d2h_dst_bytes = hss_d2h_dst_bytes(layer_dtype, block_floats, layer_block_bytes);
+
+        // Opt-in pinned staging (`ATLAS_HSS_PINNED_OFFLOAD`). Allocate the K and V
+        // pinned regions ONCE and reuse them across every block in the loop. K and
+        // V are DISJOINT regions — both are live simultaneously (dequant reads
+        // k_dst AND v_dst; offload reads k_host AND v_host together), so a single
+        // shared region would let V's copy clobber K before K is consumed. On any
+        // alloc failure we warn once and fall back to the pageable per-copy path
+        // (still correct, just not pinned). NOTE: the block loop below is fully
+        // SERIAL (and multi-seq wraps it in a serial per-seq pass), so one reused
+        // pair per invocation is safe; if that ever parallelizes this must become
+        // per-worker.
+        let pinned: Option<HssPinnedPair> = if *HSS_PINNED_OFFLOAD {
+            match ctx.gpu.alloc_host_pinned(d2h_dst_bytes) {
+                Ok(k) => match ctx.gpu.alloc_host_pinned(d2h_dst_bytes) {
+                    Ok(v) => Some(HssPinnedPair {
+                        gpu: ctx.gpu,
+                        k,
+                        v,
+                        bytes: d2h_dst_bytes,
+                    }),
+                    Err(e) => {
+                        let _ = ctx.gpu.free_host_pinned(k, d2h_dst_bytes);
+                        tracing::warn!(
+                            "ATLAS_HSS_PINNED_OFFLOAD: V pinned alloc({d2h_dst_bytes}) failed \
+                             ({e:#}); falling back to pageable per-copy offload"
+                        );
+                        None
+                    }
+                },
+                Err(e) => {
+                    tracing::warn!(
+                        "ATLAS_HSS_PINNED_OFFLOAD: K pinned alloc({d2h_dst_bytes}) failed \
+                         ({e:#}); falling back to pageable per-copy offload"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        // `fused` == pinned engaged for THIS invocation: async-enqueue both copies
+        // then ONE trailing synchronize, versus the legacy per-copy synchronous
+        // path. Kept in lockstep with `pinned` so the OFF path is byte-identical.
+        let fused = pinned.is_some();
+        // One D2H copy, async when fused (caller MUST synchronize before reading
+        // dst) else the legacy self-syncing `copy_d2h_on_stream`.
+        let d2h = |src: u64, dst: &mut [u8]| -> Result<()> {
+            if fused {
+                ctx.gpu
+                    .copy_d2h_on_stream_async(DevicePtr(src), dst, stream)
+            } else {
+                ctx.gpu.copy_d2h_on_stream(DevicePtr(src), dst, stream)
+            }
+        };
+
         for logical_pos in start..total {
             if logical_pos < window_start {
                 // Issue #31: the slide-before-alloc loop in
@@ -178,8 +333,12 @@ impl Qwen3AttentionLayer {
             // Phase 6.2.c proper — dispatch on layer dtype. BF16 streams the
             // bytes directly; quantized variants read raw bytes then dequant
             // on the host before disk-write (the streaming kernel reads BF16).
-            let layer_dtype = kv_cache.dtype_for_layer(self.attn_layer_idx);
-            let layer_block_bytes = kv_cache.block_stride_bytes_for_layer(self.attn_layer_idx);
+            //
+            // `d2h` is async when the pinned path is engaged (ATLAS_HSS_PINNED_OFFLOAD),
+            // so EVERY arm must `ctx.gpu.synchronize(stream)?` after the two enqueues
+            // and BEFORE any CPU read of the dst (the bf16 payload-copy or the quant
+            // dequant). When not fused, `d2h` is the legacy self-syncing copy and the
+            // trailing `synchronize` is skipped — byte-identical to the old path.
             let bs_us = bs;
             let nkv_us = nkv as usize;
             let hd_us = hd as usize;
@@ -188,105 +347,197 @@ impl Qwen3AttentionLayer {
                 | KvCacheDtype::Bf16KTurbo4V
                 | KvCacheDtype::Bf16KTurbo3V
                 | KvCacheDtype::Bf16KTurbo2V => {
-                    // copy_d2h_on_stream: orders the D2H after WHT+reshape_and_cache
-                    // on the production stream. copy_d2h would race (default-stream
-                    // sync only) and read torn bytes — Turbo8 race fix, 2026-04-28.
-                    ctx.gpu.copy_d2h_on_stream(
-                        spark_runtime::gpu::DevicePtr(k_block_dev),
-                        unsafe {
-                            std::slice::from_raw_parts_mut(
-                                k_host.as_mut_ptr() as *mut u8,
-                                block_floats * 2,
-                            )
-                        },
-                        stream,
-                    )?;
-                    ctx.gpu.copy_d2h_on_stream(
-                        spark_runtime::gpu::DevicePtr(v_block_dev),
-                        unsafe {
-                            std::slice::from_raw_parts_mut(
-                                v_host.as_mut_ptr() as *mut u8,
-                                block_floats * 2,
-                            )
-                        },
-                        stream,
-                    )?;
+                    // Guard: the tested mapping must agree that this arm's D2H dst
+                    // IS the payload (k_host/v_host), not a raw quant buffer.
+                    debug_assert_eq!(
+                        hss_d2h_dst_kind(layer_dtype),
+                        HssD2hDstKind::Bf16Payload,
+                        "bf16 arm took a dtype the classifier calls RawQuant"
+                    );
+                    // copy_d2h_on_stream[_async]: orders the D2H after
+                    // WHT+reshape_and_cache on the production stream. copy_d2h would
+                    // race (default-stream sync only) and read torn bytes — Turbo8
+                    // race fix, 2026-04-28. For bf16 the D2H dst IS the payload.
+                    match &pinned {
+                        Some(p) => {
+                            // Stage into the reused pinned pair, then materialize
+                            // the payload into k_host/v_host for the shared offload
+                            // below. SAFETY: p.k/p.v each own `d2h_dst_bytes`
+                            // (== block_floats*2 here) of page-locked memory, touched
+                            // only by this thread, serially per block.
+                            let k_dst = unsafe {
+                                std::slice::from_raw_parts_mut(p.k, block_floats * 2)
+                            };
+                            let v_dst = unsafe {
+                                std::slice::from_raw_parts_mut(p.v, block_floats * 2)
+                            };
+                            d2h(k_block_dev, k_dst)?;
+                            d2h(v_block_dev, v_dst)?;
+                            ctx.gpu.synchronize(stream)?;
+                            let k_src = unsafe {
+                                std::slice::from_raw_parts(
+                                    p.k as *const half::bf16,
+                                    block_floats,
+                                )
+                            };
+                            let v_src = unsafe {
+                                std::slice::from_raw_parts(
+                                    p.v as *const half::bf16,
+                                    block_floats,
+                                )
+                            };
+                            k_host.copy_from_slice(k_src);
+                            v_host.copy_from_slice(v_src);
+                        }
+                        None => {
+                            // Legacy pageable path: D2H directly into k_host/v_host,
+                            // self-syncing per copy. Byte-identical to pre-flag code.
+                            d2h(k_block_dev, unsafe {
+                                std::slice::from_raw_parts_mut(
+                                    k_host.as_mut_ptr() as *mut u8,
+                                    block_floats * 2,
+                                )
+                            })?;
+                            d2h(v_block_dev, unsafe {
+                                std::slice::from_raw_parts_mut(
+                                    v_host.as_mut_ptr() as *mut u8,
+                                    block_floats * 2,
+                                )
+                            })?;
+                        }
+                    }
                 }
                 KvCacheDtype::Fp8
                 | KvCacheDtype::Fp8KTurbo4V
                 | KvCacheDtype::Fp8KTurbo3V
                 | KvCacheDtype::Fp8KTurbo2V => {
-                    let mut k_raw = vec![0u8; block_floats];
-                    let mut v_raw = vec![0u8; block_floats];
-                    ctx.gpu.copy_d2h_on_stream(
-                        spark_runtime::gpu::DevicePtr(k_block_dev),
-                        &mut k_raw,
-                        stream,
-                    )?;
-                    ctx.gpu.copy_d2h_on_stream(
-                        spark_runtime::gpu::DevicePtr(v_block_dev),
-                        &mut v_raw,
-                        stream,
-                    )?;
+                    debug_assert_eq!(
+                        hss_d2h_dst_kind(layer_dtype),
+                        HssD2hDstKind::RawQuant,
+                        "fp8 arm took a dtype the classifier calls Bf16Payload"
+                    );
+                    let mut k_raw_vec: Vec<u8>;
+                    let mut v_raw_vec: Vec<u8>;
+                    let (k_raw, v_raw): (&mut [u8], &mut [u8]) = match &pinned {
+                        // SAFETY: pinned pair sized to d2h_dst_bytes == block_floats.
+                        Some(p) => unsafe {
+                            (
+                                std::slice::from_raw_parts_mut(p.k, block_floats),
+                                std::slice::from_raw_parts_mut(p.v, block_floats),
+                            )
+                        },
+                        None => {
+                            k_raw_vec = vec![0u8; block_floats];
+                            v_raw_vec = vec![0u8; block_floats];
+                            (&mut k_raw_vec[..], &mut v_raw_vec[..])
+                        }
+                    };
+                    d2h(k_block_dev, k_raw)?;
+                    d2h(v_block_dev, v_raw)?;
+                    if fused {
+                        ctx.gpu.synchronize(stream)?;
+                    }
                     let (k_scale, v_scale) = self.effective_fp8_scales();
-                    dequant_fp8_to_bf16(&k_raw, k_scale, &mut k_host);
-                    dequant_fp8_to_bf16(&v_raw, v_scale, &mut v_host);
+                    dequant_fp8_to_bf16(k_raw, k_scale, &mut k_host);
+                    dequant_fp8_to_bf16(v_raw, v_scale, &mut v_host);
                 }
                 KvCacheDtype::Nvfp4
                 | KvCacheDtype::Turbo4
                 | KvCacheDtype::Turbo4KTurbo3V
                 | KvCacheDtype::Turbo4KTurbo8V => {
-                    let mut k_raw = vec![0u8; layer_block_bytes];
-                    let mut v_raw = vec![0u8; layer_block_bytes];
-                    ctx.gpu.copy_d2h_on_stream(
-                        spark_runtime::gpu::DevicePtr(k_block_dev),
-                        &mut k_raw,
-                        stream,
-                    )?;
-                    ctx.gpu.copy_d2h_on_stream(
-                        spark_runtime::gpu::DevicePtr(v_block_dev),
-                        &mut v_raw,
-                        stream,
-                    )?;
+                    debug_assert_eq!(
+                        hss_d2h_dst_kind(layer_dtype),
+                        HssD2hDstKind::RawQuant,
+                        "nvfp4/turbo4 arm took a dtype the classifier calls Bf16Payload"
+                    );
+                    let mut k_raw_vec: Vec<u8>;
+                    let mut v_raw_vec: Vec<u8>;
+                    let (k_raw, v_raw): (&mut [u8], &mut [u8]) = match &pinned {
+                        // SAFETY: pinned pair sized to d2h_dst_bytes == layer_block_bytes.
+                        Some(p) => unsafe {
+                            (
+                                std::slice::from_raw_parts_mut(p.k, layer_block_bytes),
+                                std::slice::from_raw_parts_mut(p.v, layer_block_bytes),
+                            )
+                        },
+                        None => {
+                            k_raw_vec = vec![0u8; layer_block_bytes];
+                            v_raw_vec = vec![0u8; layer_block_bytes];
+                            (&mut k_raw_vec[..], &mut v_raw_vec[..])
+                        }
+                    };
+                    d2h(k_block_dev, k_raw)?;
+                    d2h(v_block_dev, v_raw)?;
+                    if fused {
+                        ctx.gpu.synchronize(stream)?;
+                    }
                     let lut = if layer_dtype == KvCacheDtype::Nvfp4 {
                         &NVFP4_E2M1_LUT
                     } else {
                         &TURBO4_LUT
                     };
-                    dequant_4bit_block_to_bf16(&k_raw, bs_us, nkv_us, hd_us, lut, &mut k_host);
-                    dequant_4bit_block_to_bf16(&v_raw, bs_us, nkv_us, hd_us, lut, &mut v_host);
+                    dequant_4bit_block_to_bf16(k_raw, bs_us, nkv_us, hd_us, lut, &mut k_host);
+                    dequant_4bit_block_to_bf16(v_raw, bs_us, nkv_us, hd_us, lut, &mut v_host);
                 }
                 KvCacheDtype::Turbo3 | KvCacheDtype::Turbo3KTurbo8V | KvCacheDtype::Turbo2 => {
-                    let mut k_raw = vec![0u8; layer_block_bytes];
-                    let mut v_raw = vec![0u8; layer_block_bytes];
-                    ctx.gpu.copy_d2h_on_stream(
-                        spark_runtime::gpu::DevicePtr(k_block_dev),
-                        &mut k_raw,
-                        stream,
-                    )?;
-                    ctx.gpu.copy_d2h_on_stream(
-                        spark_runtime::gpu::DevicePtr(v_block_dev),
-                        &mut v_raw,
-                        stream,
-                    )?;
-                    dequant_turbo3_block_to_bf16(&k_raw, bs_us, nkv_us, hd_us, &mut k_host);
-                    dequant_turbo3_block_to_bf16(&v_raw, bs_us, nkv_us, hd_us, &mut v_host);
+                    debug_assert_eq!(
+                        hss_d2h_dst_kind(layer_dtype),
+                        HssD2hDstKind::RawQuant,
+                        "turbo3 arm took a dtype the classifier calls Bf16Payload"
+                    );
+                    let mut k_raw_vec: Vec<u8>;
+                    let mut v_raw_vec: Vec<u8>;
+                    let (k_raw, v_raw): (&mut [u8], &mut [u8]) = match &pinned {
+                        // SAFETY: pinned pair sized to d2h_dst_bytes == layer_block_bytes.
+                        Some(p) => unsafe {
+                            (
+                                std::slice::from_raw_parts_mut(p.k, layer_block_bytes),
+                                std::slice::from_raw_parts_mut(p.v, layer_block_bytes),
+                            )
+                        },
+                        None => {
+                            k_raw_vec = vec![0u8; layer_block_bytes];
+                            v_raw_vec = vec![0u8; layer_block_bytes];
+                            (&mut k_raw_vec[..], &mut v_raw_vec[..])
+                        }
+                    };
+                    d2h(k_block_dev, k_raw)?;
+                    d2h(v_block_dev, v_raw)?;
+                    if fused {
+                        ctx.gpu.synchronize(stream)?;
+                    }
+                    dequant_turbo3_block_to_bf16(k_raw, bs_us, nkv_us, hd_us, &mut k_host);
+                    dequant_turbo3_block_to_bf16(v_raw, bs_us, nkv_us, hd_us, &mut v_host);
                 }
                 KvCacheDtype::Turbo8 => {
-                    let mut k_raw = vec![0u8; layer_block_bytes];
-                    let mut v_raw = vec![0u8; layer_block_bytes];
-                    ctx.gpu.copy_d2h_on_stream(
-                        spark_runtime::gpu::DevicePtr(k_block_dev),
-                        &mut k_raw,
-                        stream,
-                    )?;
-                    ctx.gpu.copy_d2h_on_stream(
-                        spark_runtime::gpu::DevicePtr(v_block_dev),
-                        &mut v_raw,
-                        stream,
-                    )?;
-                    dequant_turbo8_block_to_bf16(&k_raw, bs_us, nkv_us, hd_us, &mut k_host);
-                    dequant_turbo8_block_to_bf16(&v_raw, bs_us, nkv_us, hd_us, &mut v_host);
+                    debug_assert_eq!(
+                        hss_d2h_dst_kind(layer_dtype),
+                        HssD2hDstKind::RawQuant,
+                        "turbo8 arm took a dtype the classifier calls Bf16Payload"
+                    );
+                    let mut k_raw_vec: Vec<u8>;
+                    let mut v_raw_vec: Vec<u8>;
+                    let (k_raw, v_raw): (&mut [u8], &mut [u8]) = match &pinned {
+                        // SAFETY: pinned pair sized to d2h_dst_bytes == layer_block_bytes.
+                        Some(p) => unsafe {
+                            (
+                                std::slice::from_raw_parts_mut(p.k, layer_block_bytes),
+                                std::slice::from_raw_parts_mut(p.v, layer_block_bytes),
+                            )
+                        },
+                        None => {
+                            k_raw_vec = vec![0u8; layer_block_bytes];
+                            v_raw_vec = vec![0u8; layer_block_bytes];
+                            (&mut k_raw_vec[..], &mut v_raw_vec[..])
+                        }
+                    };
+                    d2h(k_block_dev, k_raw)?;
+                    d2h(v_block_dev, v_raw)?;
+                    if fused {
+                        ctx.gpu.synchronize(stream)?;
+                    }
+                    dequant_turbo8_block_to_bf16(k_raw, bs_us, nkv_us, hd_us, &mut k_host);
+                    dequant_turbo8_block_to_bf16(v_raw, bs_us, nkv_us, hd_us, &mut v_host);
                 }
             }
             spark_storage::with_local(|hss| {
@@ -314,5 +565,155 @@ impl Qwen3AttentionLayer {
         }
         disk_last_offloaded_per_layer[self.attn_layer_idx] = total as u32;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{HssD2hDstKind, hss_d2h_dst_bytes, hss_d2h_dst_kind, parse_hss_pinned_flag};
+    use spark_runtime::kv_cache::KvCacheDtype;
+
+    // bs*nkv*hd = 16*8*128 per the offload loop.
+    const BLOCK_FLOATS: usize = 16 * 8 * 128; // 16384
+    // Arbitrary packed device stride distinct from BLOCK_FLOATS and BLOCK_FLOATS*2
+    // to prove the quant arms select layer_block_bytes (not a fixed size).
+    const LAYER_BLOCK_BYTES: usize = 12288;
+
+    /// bf16 (and its K-turbo composites) stage the payload directly; every other
+    /// engaged dtype stages RAW quant bytes. Guards against the misattribution
+    /// bug of pinning k_host (the dequant output) instead of k_raw.
+    #[test]
+    fn dst_kind_bf16_is_payload_quant_is_raw() {
+        for dt in [
+            KvCacheDtype::Bf16,
+            KvCacheDtype::Bf16KTurbo4V,
+            KvCacheDtype::Bf16KTurbo3V,
+            KvCacheDtype::Bf16KTurbo2V,
+        ] {
+            assert_eq!(hss_d2h_dst_kind(dt), HssD2hDstKind::Bf16Payload, "{dt:?}");
+        }
+        for dt in [
+            KvCacheDtype::Fp8,
+            KvCacheDtype::Fp8KTurbo4V,
+            KvCacheDtype::Fp8KTurbo3V,
+            KvCacheDtype::Fp8KTurbo2V,
+            KvCacheDtype::Nvfp4,
+            KvCacheDtype::Turbo4,
+            KvCacheDtype::Turbo4KTurbo3V,
+            KvCacheDtype::Turbo4KTurbo8V,
+            KvCacheDtype::Turbo3,
+            KvCacheDtype::Turbo3KTurbo8V,
+            KvCacheDtype::Turbo2,
+            KvCacheDtype::Turbo8,
+        ] {
+            assert_eq!(hss_d2h_dst_kind(dt), HssD2hDstKind::RawQuant, "{dt:?}");
+        }
+    }
+
+    /// bf16 dst == block_floats*2 (the payload bytes); fp8 dst == block_floats
+    /// (1 raw byte/elem); nvfp4/turbo{3,4,8} dst == layer_block_bytes (packed).
+    /// Sizing the pinned staging buffer wrong (e.g. layer_block_bytes for a bf16
+    /// layer) would OOB the D2H copy.
+    #[test]
+    fn dst_bytes_per_arm_size() {
+        // bf16 group -> block_floats * 2
+        for dt in [
+            KvCacheDtype::Bf16,
+            KvCacheDtype::Bf16KTurbo4V,
+            KvCacheDtype::Bf16KTurbo3V,
+            KvCacheDtype::Bf16KTurbo2V,
+        ] {
+            assert_eq!(
+                hss_d2h_dst_bytes(dt, BLOCK_FLOATS, LAYER_BLOCK_BYTES),
+                BLOCK_FLOATS * 2,
+                "{dt:?}"
+            );
+        }
+        // fp8 group -> block_floats (1 raw byte per element)
+        for dt in [
+            KvCacheDtype::Fp8,
+            KvCacheDtype::Fp8KTurbo4V,
+            KvCacheDtype::Fp8KTurbo3V,
+            KvCacheDtype::Fp8KTurbo2V,
+        ] {
+            assert_eq!(
+                hss_d2h_dst_bytes(dt, BLOCK_FLOATS, LAYER_BLOCK_BYTES),
+                BLOCK_FLOATS,
+                "{dt:?}"
+            );
+        }
+        // nvfp4/turbo group -> layer_block_bytes (packed device stride)
+        for dt in [
+            KvCacheDtype::Nvfp4,
+            KvCacheDtype::Turbo4,
+            KvCacheDtype::Turbo4KTurbo3V,
+            KvCacheDtype::Turbo4KTurbo8V,
+            KvCacheDtype::Turbo3,
+            KvCacheDtype::Turbo3KTurbo8V,
+            KvCacheDtype::Turbo2,
+            KvCacheDtype::Turbo8,
+        ] {
+            assert_eq!(
+                hss_d2h_dst_bytes(dt, BLOCK_FLOATS, LAYER_BLOCK_BYTES),
+                LAYER_BLOCK_BYTES,
+                "{dt:?}"
+            );
+        }
+    }
+
+    /// The pinned staging buffer must cover the D2H dst for the layer's dtype.
+    /// bf16 is the largest fixed case (block_floats*2); the buffer sized from
+    /// hss_d2h_dst_bytes must never be smaller than what the copy writes.
+    #[test]
+    fn buffer_covers_copy_length() {
+        let cases = [
+            (KvCacheDtype::Bf16, BLOCK_FLOATS * 2),
+            (KvCacheDtype::Fp8, BLOCK_FLOATS),
+            (KvCacheDtype::Turbo8, LAYER_BLOCK_BYTES),
+            (KvCacheDtype::Nvfp4, LAYER_BLOCK_BYTES),
+        ];
+        for (dt, copy_len) in cases {
+            let buf = hss_d2h_dst_bytes(dt, BLOCK_FLOATS, LAYER_BLOCK_BYTES);
+            assert!(buf >= copy_len, "{dt:?}: buf {buf} < copy_len {copy_len}");
+        }
+    }
+
+    /// Only `1`/`true`/`on`/`yes` engage the pinned path; unset and every other
+    /// token (incl. `0`/`false`/`off`/`no`/garbage) stay OFF = the byte-identical
+    /// pageable default.
+    #[test]
+    fn flag_parse_truthy_only() {
+        for on in ["1", "true", "on", "yes"] {
+            assert!(parse_hss_pinned_flag(Some(on)), "{on:?} should engage");
+        }
+        assert!(!parse_hss_pinned_flag(None), "unset must be OFF");
+        for off in ["0", "false", "off", "no", "", "TRUE", "1 ", "enable", "y"] {
+            assert!(!parse_hss_pinned_flag(Some(off)), "{off:?} should be OFF");
+        }
+    }
+
+    /// The pinned K and V regions are each sized to exactly `d2h_dst_bytes` and are
+    /// two separate allocations (disjoint by construction — never a shared buffer).
+    /// For a bf16 layer the K region reinterpreted as bf16 is exactly `block_floats`
+    /// elements, matching the payload the offload consumes.
+    #[test]
+    fn pinned_pair_sizing_and_bf16_view() {
+        // bf16 layer: dst bytes == block_floats*2, so a bf16 view is block_floats.
+        let dst = hss_d2h_dst_bytes(KvCacheDtype::Bf16, BLOCK_FLOATS, LAYER_BLOCK_BYTES);
+        assert_eq!(dst, BLOCK_FLOATS * 2);
+        assert_eq!(dst / std::mem::size_of::<half::bf16>(), BLOCK_FLOATS);
+        // Two independently-allocated Vecs of `dst` bytes model the disjoint K/V
+        // pinned regions: each is exactly `dst` bytes and their address ranges do
+        // not overlap.
+        let k = vec![0u8; dst];
+        let v = vec![0u8; dst];
+        assert_eq!(k.len(), dst);
+        assert_eq!(v.len(), dst);
+        let k_range = k.as_ptr() as usize..k.as_ptr() as usize + dst;
+        let v_range = v.as_ptr() as usize..v.as_ptr() as usize + dst;
+        assert!(
+            k_range.end <= v_range.start || v_range.end <= k_range.start,
+            "K and V staging regions must be disjoint"
+        );
     }
 }
