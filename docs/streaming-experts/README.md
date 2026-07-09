@@ -65,6 +65,14 @@ nvcc -arch=sm_121 -o uma_probe gate0/uma_probe.cu && ./uma_probe
 bash gate0/nvme_granule_bench.sh <dir-on-local-nvme>
 ```
 
+## Plans
+
+- [`UNIFIED-TIER-PLAN.md`](UNIFIED-TIER-PLAN.md) — client-side tier roadmap (Phases 0–6);
+  the SSM spill tier, per-seq isolation, prefetch, batched attend.
+- [`TIERED-CACHE-CONSOLIDATION.md`](TIERED-CACHE-CONSOLIDATION.md) — duplication audit
+  (5 RDMA clients / 4 NVMe backends / 6 residency policies), the `atlas-tier` core lifted
+  from the peer, and the nine-chunk split of PR #9.
+
 ## Provenance
 
 Synthesized from a 12-agent fable workflow (recon → review → design →
