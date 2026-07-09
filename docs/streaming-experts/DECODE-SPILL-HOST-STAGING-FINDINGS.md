@@ -139,10 +139,17 @@ before `put`).
 This fix is **spill-only** (rolling tier + actual spills); normal decode-boundary
 save is D2D (HBM→HBM), untouched. The pageable-D2H-into-`Vec` *pattern* was
 audited across the other `copy_d2h_on_stream` callers:
-- **`high_speed_swap.rs` KV-block offload — the one real non-SSM candidate.** K/V
-  copies (32KB bf16/block) into a fresh pageable `Vec` per loop iter, hot in
-  prefill offload. Pinning (reused buffer) + K+V-fuse would help; measure against
-  the disk-I/O it shares. Only when `--high-speed-swap`.
+- **`high_speed_swap.rs` KV-block offload — implemented (opt-in) + GPU-tested →
+  NO net win, kept default-OFF.** Pinned+fused offload behind
+  `ATLAS_HSS_PINNED_OFFLOAD` (commit `a723bf6a`, workflow-designed, 3 verify lenses
+  SOUND). GPU validation (Holo-35B, `--high-speed-swap --…-cache-blocks-per-seq 8`):
+  pinned path **confirmed engaged** (`HSS pinned offload ACTIVE`, **8192 B/copy**);
+  **correctness PASS** (needle `ZEBRA-7719` recalled from an offloaded+rehydrated
+  block, both arms — KV bit-identical); **prefill TTFT 746ms OFF vs 741ms ON = no
+  win.** Reason: the KV block is only ~8KB (FP8, 10 attn layers), so the pinned D2H
+  is a negligible fraction of prefill (attention/MoE compute + disk I/O). The
+  "measure net vs disk-I/O" caveat resolved negative — the SSM spill (63MB) was
+  uniquely large enough to matter; this isn't. Left opt-in, harmless-correct.
 - **`moe_grouped_a2.rs` (grouped-MoE metadata) — cheap fusing-only cleanup.** Tiny
   (~0.5–1KB offsets/scales/ptrs) so pinning is pointless, BUT it does 6–7 syncs
   (per-copy internal + a redundant trailing `synchronize`) where 1 suffices;
