@@ -5,6 +5,8 @@
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::LazyLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 
 use anyhow::{Result, bail};
@@ -110,6 +112,81 @@ pub(crate) struct SsmSnapshotPool {
     decode_spiller: Option<DecodeSpiller>,
 }
 
+/// Low-overhead spill-pool instrumentation (opt-in, `ATLAS_DECODE_RING_STATS`).
+/// Relaxed atomics so it never perturbs the decode path it measures. The causal
+/// A/B metric for the worker pool is `bp_spins / spills`: a saturated single
+/// worker makes the decode thread busy-spin waiting for a freed lane
+/// (`SaveDecision::Backpressure`), which more workers should collapse toward 0.
+/// One decode ring per process, so a process-global counter is sufficient.
+struct DecodeSpillStats {
+    enabled: bool,
+    spills: AtomicU64,
+    bp_spins: AtomicU64,
+    sync_fallbacks: AtomicU64,
+}
+static DECODE_SPILL_STATS: LazyLock<DecodeSpillStats> = LazyLock::new(|| DecodeSpillStats {
+    enabled: std::env::var_os("ATLAS_DECODE_RING_STATS").is_some(),
+    spills: AtomicU64::new(0),
+    bp_spins: AtomicU64::new(0),
+    sync_fallbacks: AtomicU64::new(0),
+});
+
+/// Emit a periodic stats line every `STATS_LOG_EVERY` spills. Pure so the cadence
+/// is unit-testable without touching the atomics.
+const STATS_LOG_EVERY: u64 = 2000;
+#[inline]
+fn stats_should_log(spill_count: u64) -> bool {
+    spill_count > 0 && spill_count % STATS_LOG_EVERY == 0
+}
+
+impl DecodeSpillStats {
+    #[inline]
+    fn note_backpressure_spin(&self) {
+        if self.enabled {
+            self.bp_spins.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    #[inline]
+    fn note_sync_fallback(&self) {
+        if self.enabled {
+            self.sync_fallbacks.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    /// Count one spill; periodically log the running totals (INFO, per operator rule).
+    #[inline]
+    fn note_spill(&self) {
+        if !self.enabled {
+            return;
+        }
+        let n = self.spills.fetch_add(1, Ordering::Relaxed) + 1;
+        if stats_should_log(n) {
+            let bp = self.bp_spins.load(Ordering::Relaxed);
+            let sf = self.sync_fallbacks.load(Ordering::Relaxed);
+            tracing::info!(
+                "DECODE_RING_STATS: spills={n} bp_spins={bp} sync_fallbacks={sf} \
+                 bp_spins_per_spill={:.3}",
+                bp as f64 / n as f64
+            );
+        }
+    }
+    /// Final totals at teardown so a short run still emits one line.
+    fn log_final(&self) {
+        if !self.enabled {
+            return;
+        }
+        let (n, bp, sf) = (
+            self.spills.load(Ordering::Relaxed),
+            self.bp_spins.load(Ordering::Relaxed),
+            self.sync_fallbacks.load(Ordering::Relaxed),
+        );
+        tracing::info!(
+            "DECODE_RING_STATS FINAL: spills={n} bp_spins={bp} sync_fallbacks={sf} \
+             bp_spins_per_spill={:.3}",
+            if n > 0 { bp as f64 / n as f64 } else { 0.0 }
+        );
+    }
+}
+
 /// A queued cold-tier spill for the async worker.
 struct SpillJob {
     req: SpillReq,
@@ -147,6 +224,7 @@ impl Drop for DecodeSpiller {
         for h in self.handles.drain(..) {
             let _ = h.join();
         }
+        DECODE_SPILL_STATS.log_final();
     }
 }
 
@@ -650,6 +728,7 @@ impl SsmSnapshotPool {
                         // Async worker owns these in-flight spills — wait for it to
                         // complete one and free a lane, then re-plan. Never re-do
                         // them here (that would double-commit / double-remove).
+                        DECODE_SPILL_STATS.note_backpressure_spin();
                         std::thread::sleep(std::time::Duration::from_micros(50));
                     } else {
                         // No worker: safe to synchronously drain (nothing else
@@ -754,6 +833,7 @@ impl SsmSnapshotPool {
     /// on the save `stream`). Falls back to a synchronous drain if no worker is
     /// attached or the channel is closed.
     fn decode_enqueue_spill(&self, req: SpillReq, gpu: &dyn GpuBackend, stream: u64) -> Result<()> {
+        DECODE_SPILL_STATS.note_spill();
         if let Some(sp) = &self.decode_spiller {
             let ev = gpu.create_event()?;
             gpu.record_event(ev, stream)?;
@@ -782,6 +862,7 @@ impl SsmSnapshotPool {
         gpu: &dyn GpuBackend,
         stream: u64,
     ) -> Result<()> {
+        DECODE_SPILL_STATS.note_sync_fallback();
         let store = self
             .decode_store
             .as_ref()
@@ -1228,6 +1309,17 @@ mod tier_tests {
     use super::*;
     use crate::model::ssm_tier::{MemBlobStore, SnapshotBlobStore};
     use spark_runtime::gpu::mock::MockGpuBackend;
+
+    #[test]
+    fn stats_log_cadence_fires_only_on_multiples() {
+        // Never on 0, then exactly every STATS_LOG_EVERY spills.
+        assert!(!stats_should_log(0));
+        assert!(!stats_should_log(1));
+        assert!(!stats_should_log(STATS_LOG_EVERY - 1));
+        assert!(stats_should_log(STATS_LOG_EVERY));
+        assert!(!stats_should_log(STATS_LOG_EVERY + 1));
+        assert!(stats_should_log(STATS_LOG_EVERY * 3));
+    }
 
     /// Build a small Marconi-only pool (no decode-rollback region).
     fn pool(gpu: &dyn GpuBackend, slots: usize, layers: usize) -> SsmSnapshotPool {
