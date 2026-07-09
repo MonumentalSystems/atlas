@@ -120,23 +120,32 @@ pub(crate) struct SsmSnapshotPool {
 /// One decode ring per process, so a process-global counter is sufficient.
 struct DecodeSpillStats {
     enabled: bool,
+    /// Emit a periodic stats line every `log_every` spills. Env-tunable
+    /// (`ATLAS_DECODE_RING_STATS_EVERY`, default 256) so short/low-concurrency A/B
+    /// runs — which spill far fewer than a saturating high-C run — still print a
+    /// line without a rebuild.
+    log_every: u64,
     spills: AtomicU64,
     bp_spins: AtomicU64,
     sync_fallbacks: AtomicU64,
 }
 static DECODE_SPILL_STATS: LazyLock<DecodeSpillStats> = LazyLock::new(|| DecodeSpillStats {
     enabled: std::env::var_os("ATLAS_DECODE_RING_STATS").is_some(),
+    log_every: std::env::var("ATLAS_DECODE_RING_STATS_EVERY")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(256),
     spills: AtomicU64::new(0),
     bp_spins: AtomicU64::new(0),
     sync_fallbacks: AtomicU64::new(0),
 });
 
-/// Emit a periodic stats line every `STATS_LOG_EVERY` spills. Pure so the cadence
-/// is unit-testable without touching the atomics.
-const STATS_LOG_EVERY: u64 = 2000;
+/// Whether to emit a stats line at this spill count. Pure so the cadence is
+/// unit-testable without touching the atomics.
 #[inline]
-fn stats_should_log(spill_count: u64) -> bool {
-    spill_count > 0 && spill_count % STATS_LOG_EVERY == 0
+fn stats_should_log(spill_count: u64, log_every: u64) -> bool {
+    log_every > 0 && spill_count > 0 && spill_count % log_every == 0
 }
 
 impl DecodeSpillStats {
@@ -159,7 +168,7 @@ impl DecodeSpillStats {
             return;
         }
         let n = self.spills.fetch_add(1, Ordering::Relaxed) + 1;
-        if stats_should_log(n) {
+        if stats_should_log(n, self.log_every) {
             let bp = self.bp_spins.load(Ordering::Relaxed);
             let sf = self.sync_fallbacks.load(Ordering::Relaxed);
             tracing::info!(
@@ -1312,13 +1321,16 @@ mod tier_tests {
 
     #[test]
     fn stats_log_cadence_fires_only_on_multiples() {
-        // Never on 0, then exactly every STATS_LOG_EVERY spills.
-        assert!(!stats_should_log(0));
-        assert!(!stats_should_log(1));
-        assert!(!stats_should_log(STATS_LOG_EVERY - 1));
-        assert!(stats_should_log(STATS_LOG_EVERY));
-        assert!(!stats_should_log(STATS_LOG_EVERY + 1));
-        assert!(stats_should_log(STATS_LOG_EVERY * 3));
+        // Never on 0, then exactly every `log_every` spills.
+        let every = 256u64;
+        assert!(!stats_should_log(0, every));
+        assert!(!stats_should_log(1, every));
+        assert!(!stats_should_log(every - 1, every));
+        assert!(stats_should_log(every, every));
+        assert!(!stats_should_log(every + 1, every));
+        assert!(stats_should_log(every * 3, every));
+        // A zero/disabled cadence never logs.
+        assert!(!stats_should_log(100, 0));
     }
 
     /// Build a small Marconi-only pool (no decode-rollback region).
