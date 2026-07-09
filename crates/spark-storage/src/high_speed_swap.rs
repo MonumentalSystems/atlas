@@ -56,13 +56,17 @@ fn local_nvme_backend(
     dir: &std::path::Path,
     group_layout: GroupLayout,
     qd: usize,
+    coalesce: bool,
 ) -> Result<Box<dyn crate::backend::StorageBackend>> {
     let choice = kv_backend_choice(std::env::var("ATLAS_KV_BACKEND").ok().as_deref());
     if choice != KvBackendChoice::ForcePosix {
         // `IoUringBackend::new` consumes `layout`; on failure it is dropped
         // (fds closed) and the POSIX path below recreates it cleanly.
         let layout = Layout::create(dir, group_layout).context("create layout")?;
-        match IoUringBackend::new(layout, qd) {
+        // `coalesce` sizes the pinned/registered buffers to block_bytes so the
+        // block read/write methods can issue one contiguous op (ATLAS_HSS_
+        // COALESCE_BLOCKS). false = group-sized buffers, byte-identical to before.
+        match IoUringBackend::new_with(layout, qd, coalesce) {
             Ok(b) => {
                 tracing::info!("high-speed-swap: KV overflow tier = local NVMe (io_uring, qd {qd})");
                 return Ok(Box::new(b));
@@ -84,7 +88,9 @@ fn local_nvme_backend(
     // ForcePosix, or io_uring init failed and fallback is allowed.
     let layout = Layout::create(dir, group_layout).context("create layout (posix)")?;
     tracing::info!("high-speed-swap: KV overflow tier = local NVMe (POSIX pread/pwrite)");
-    Ok(Box::new(crate::backend::PosixBackend::new(layout)?))
+    Ok(Box::new(crate::backend::PosixBackend::new_with(
+        layout, coalesce,
+    )?))
 }
 
 pub struct HighSpeedSwap {
@@ -176,6 +182,14 @@ pub struct HighSpeedSwap {
     /// live (the run where the `kv_war_event` fence replaces it); prefetch-off
     /// keeps the unconditional read+sync for byte-for-byte op-identity.
     kv_prefetch_enabled: bool,
+    /// ATLAS_HSS_COALESCE_BLOCKS (Tier-1 I/O coalescing): when set, the offload
+    /// write and the three attend/prefetch read loops issue ONE contiguous
+    /// `block_bytes` op per block (via `read_blocks` / `write_block_from_host`)
+    /// instead of `2·nkv` per-head ~4 KiB ops. Read once here so buffer sizing
+    /// (threaded into the backend ctor) and the caller-side dispatch can never
+    /// disagree. Default OFF ⇒ the per-head request loops and per-head backend
+    /// paths are byte- AND op-identical to before. GPU-validation is a follow-up.
+    coalesce_blocks: bool,
     // Disk-block-ID allocator (Phase 6.1.a, refactored). One global
     // allocator: a `disk_block_id` indexes the SAME logical position
     // across every layer's file, so allocation, refcount, and free list
@@ -316,6 +330,21 @@ impl HighSpeedSwap {
             2, // BF16
             4096,
         );
+        // ATLAS_HSS_COALESCE_BLOCKS (Tier-1 I/O coalescing) — read ONCE, presence-
+        // gated like ATLAS_KV_PREFETCH. Threaded into the local-NVMe backend ctor
+        // (buffer sizing) AND stored for the caller-side dispatch so the two agree.
+        let coalesce_blocks = std::env::var_os("ATLAS_HSS_COALESCE_BLOCKS").is_some();
+        if coalesce_blocks {
+            let block_bytes = group_layout.block_bytes();
+            let ops_per_block = 2 * group_layout.num_kv_heads as u64;
+            tracing::info!(
+                "high-speed-swap: block I/O coalescing ON (ATLAS_HSS_COALESCE_BLOCKS) — one \
+                 {block_bytes}-byte op/block replaces {ops_per_block} per-head ~{}-byte ops; \
+                 io_uring pinned bounces grow to qd×{block_bytes} B (register_buffers size limit \
+                 applies on GB10)",
+                group_layout.group_stride,
+            );
+        }
         // KV overflow tier selection: RDMA RAM blade when $ATLAS_KV_PEER is set,
         // else the local NVMe io_uring backend (default, unchanged).
         let kv_peer = std::env::var("ATLAS_KV_PEER").ok();
@@ -327,18 +356,20 @@ impl HighSpeedSwap {
                         "high-speed-swap: KV overflow tier = RDMA peer {peer} (group_stride {})",
                         group_layout.group_stride
                     );
+                    // RDMA inherits the default per-head block fan-out (correct,
+                    // un-coalesced); no buffer-sizing knob to thread here.
                     Box::new(crate::rdma_kv_backend::RdmaKvBackend::connect(
                         &peer,
                         group_layout,
                     )?)
                 } else {
-                    local_nvme_backend(&cfg.dir, group_layout, cfg.qd as usize)?
+                    local_nvme_backend(&cfg.dir, group_layout, cfg.qd as usize, coalesce_blocks)?
                 }
             }
             #[cfg(not(atlas_rdma_verbs))]
             {
                 let _ = &kv_peer;
-                local_nvme_backend(&cfg.dir, group_layout, cfg.qd as usize)?
+                local_nvme_backend(&cfg.dir, group_layout, cfg.qd as usize, coalesce_blocks)?
             }
         };
         // Restore-destination pool. When zero-copy restore is requested
@@ -499,6 +530,7 @@ impl HighSpeedSwap {
             kv_war_event,
             kv_prefetch_done,
             kv_prefetch_enabled,
+            coalesce_blocks,
             disk_state,
         })
     }

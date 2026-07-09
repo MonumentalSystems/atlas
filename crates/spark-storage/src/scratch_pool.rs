@@ -48,6 +48,23 @@ impl ScratchDims {
     pub fn pool_bytes(&self) -> usize {
         self.num_slots as usize * self.slot_bytes()
     }
+
+    // Pure slot geometry (no allocation), parameterised by the pool base VA so
+    // the ScratchPool accessors below delegate here AND host-side tests can pin
+    // the disk↔device byte-identity map with a fake base (no GPU). These are the
+    // device half of the ATLAS_HSS_COALESCE_BLOCKS proof: a slot is the
+    // byte-identical image of its on-disk block span.
+    pub fn slot_base(&self, base: u64, slot: u32) -> u64 {
+        base + (slot as u64) * (self.slot_bytes() as u64)
+    }
+    /// K stripe VA for (slot, kv_head): slot_base + kv_head·group_stride.
+    pub fn k_ptr(&self, base: u64, slot: u32, kv_head: u16) -> u64 {
+        self.slot_base(base, slot) + (kv_head as u64) * self.group_stride
+    }
+    /// V stripe VA for (slot, kv_head): slot_base + (nkv+kv_head)·group_stride.
+    pub fn v_ptr(&self, base: u64, slot: u32, kv_head: u16) -> u64 {
+        self.slot_base(base, slot) + (self.num_kv_heads as u64 + kv_head as u64) * self.group_stride
+    }
 }
 
 /// Backing store for the scratch pool. `Device` (cuMemAlloc, HBM) is the
@@ -170,16 +187,15 @@ impl ScratchPool {
         self.base
     }
     pub fn slot_dev_ptr(&self, slot: u32) -> u64 {
-        self.base + (slot as u64) * (self.dims.slot_bytes() as u64)
+        self.dims.slot_base(self.base, slot)
     }
     /// K stripe device pointer for (slot, kv_head).
     pub fn slot_k_ptr(&self, slot: u32, kv_head: u16) -> u64 {
-        self.slot_dev_ptr(slot) + (kv_head as u64) * self.dims.group_stride
+        self.dims.k_ptr(self.base, slot, kv_head)
     }
     /// V stripe device pointer for (slot, kv_head).
     pub fn slot_v_ptr(&self, slot: u32, kv_head: u16) -> u64 {
-        self.slot_dev_ptr(slot)
-            + (self.dims.num_kv_heads as u64 + kv_head as u64) * self.dims.group_stride
+        self.dims.v_ptr(self.base, slot, kv_head)
     }
 
     pub fn lookup(&self, key: ResidentKey) -> Option<u32> {

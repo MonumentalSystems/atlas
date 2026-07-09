@@ -8,21 +8,40 @@
 use anyhow::{Context, Result, bail};
 use std::ffi::c_void;
 
-use super::{ReadRequest, StorageBackend};
+use super::{BlockReadRequest, ReadRequest, StorageBackend};
 use crate::cuda_min::{PinnedBuffer, copy_h_to_d_async, stream_sync};
-use crate::group::GroupKey;
+use crate::group::{GroupKey, GroupLayout};
 use crate::layout::Layout;
 
 pub struct PosixBackend {
     layout: Layout,
     bounce: PinnedBuffer,
+    /// Bytes one whole block occupies (== device slot_bytes). The block methods
+    /// (ATLAS_HSS_COALESCE_BLOCKS) stage through `bounce`, so when `coalesce`
+    /// was requested the bounce is sized to THIS instead of group_bytes.
+    block_bytes: usize,
 }
 
 impl PosixBackend {
+    /// Un-coalesced backend (group-sized bounce) — the default, byte-identical
+    /// to before ATLAS_HSS_COALESCE_BLOCKS existed.
     pub fn new(layout: Layout) -> Result<Self> {
-        let bounce = PinnedBuffer::new(layout.group_bytes() as usize)
-            .context("alloc pinned bounce buffer")?;
-        Ok(Self { layout, bounce })
+        Self::new_with(layout, false)
+    }
+
+    /// `coalesce` sizes the pinned bounce to `block_bytes` so the block
+    /// read/write methods can pread/pwrite one contiguous span. Set it iff the
+    /// caller drives the block methods (flag threaded from `HighSpeedSwap::new`).
+    pub fn new_with(layout: Layout, coalesce: bool) -> Result<Self> {
+        let group_bytes = layout.group_bytes() as usize;
+        let block_bytes = layout.block_bytes() as usize;
+        let buf_bytes = if coalesce { block_bytes } else { group_bytes };
+        let bounce = PinnedBuffer::new(buf_bytes).context("alloc pinned bounce buffer")?;
+        Ok(Self {
+            layout,
+            bounce,
+            block_bytes,
+        })
     }
     pub fn layout(&self) -> &Layout {
         &self.layout
@@ -79,6 +98,78 @@ impl StorageBackend for PosixBackend {
         // fsync would be needed for crash durability; skipped for the test
         // path where the file is single-process / single-run.
         let _ = fd;
+        Ok(())
+    }
+
+    fn group_layout(&self) -> GroupLayout {
+        self.layout.spec
+    }
+
+    fn read_blocks(&mut self, requests: &[BlockReadRequest], stream: u64) -> Result<()> {
+        // ONE pread + ONE copy_h_to_d + ONE stream_sync PER BLOCK (2·nkv fewer
+        // syncs than the per-head path — the QD=1 serialisation win).
+        let bytes = self.block_bytes;
+        if self.bounce.bytes < bytes {
+            bail!(
+                "posix backend not built for block coalescing (bounce {} < block_bytes {}); \
+                 construct with new_with(.., coalesce=true)",
+                self.bounce.bytes,
+                bytes
+            );
+        }
+        let bounce_ptr = self.bounce.ptr;
+        for req in requests {
+            let fd = self.layout.fd(req.base_key.layer);
+            let off = self
+                .layout
+                .block_offset(req.base_key.layer, req.base_key.block) as i64;
+            let n = unsafe { libc::pread(fd, bounce_ptr, bytes, off) };
+            if n != bytes as isize {
+                bail!(
+                    "block pread {bytes}@{off} returned {n}, errno {}",
+                    std::io::Error::last_os_error()
+                );
+            }
+            copy_h_to_d_async(req.dst_dev_ptr, bounce_ptr as *const c_void, bytes, stream)?;
+            stream_sync(stream)?;
+        }
+        Ok(())
+    }
+
+    fn read_blocks_async(&mut self, requests: &[BlockReadRequest], stream: u64) -> Result<()> {
+        // Posix has no true async (single shared bounce); same body as
+        // read_blocks, mirroring `read_async` delegating to `read`.
+        self.read_blocks(requests, stream)
+    }
+
+    fn write_block_from_host(&mut self, base_key: GroupKey, src: &[u8]) -> Result<()> {
+        let bytes = self.block_bytes;
+        if src.len() != bytes {
+            bail!(
+                "write_block_from_host: src len {} != block bytes {bytes}",
+                src.len()
+            );
+        }
+        if self.bounce.bytes < bytes {
+            bail!(
+                "posix backend not built for block coalescing (bounce {} < block_bytes {}); \
+                 construct with new_with(.., coalesce=true)",
+                self.bounce.bytes,
+                bytes
+            );
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(src.as_ptr(), self.bounce.ptr as *mut u8, bytes);
+        }
+        let fd = self.layout.fd(base_key.layer);
+        let off = self.layout.block_offset(base_key.layer, base_key.block) as i64;
+        let n = unsafe { libc::pwrite(fd, self.bounce.ptr, bytes, off) };
+        if n != bytes as isize {
+            bail!(
+                "block pwrite {bytes}@{off} returned {n}, errno {}",
+                std::io::Error::last_os_error()
+            );
+        }
         Ok(())
     }
 }

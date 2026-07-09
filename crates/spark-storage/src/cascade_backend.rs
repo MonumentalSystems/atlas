@@ -204,6 +204,14 @@ impl StorageBackend for CascadeBackend {
         // directly into the UMA pool. (T1 hits copy_h2d locally regardless.)
         self.backing.register_landing_region(base, len)
     }
+
+    fn group_layout(&self) -> GroupLayout {
+        // Geometry is the backing's (the group-id ↔ address bijection is the
+        // same on every tier). Cascade inherits the DEFAULT block read/write
+        // (per-head fan-out through its own read/write_from_host = T1 caching) —
+        // correct, just un-coalesced. Native T1 block coalescing is a follow-up.
+        self.backing.group_layout()
+    }
 }
 
 impl Drop for CascadeBackend {

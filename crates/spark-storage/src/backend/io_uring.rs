@@ -10,9 +10,9 @@ use io_uring::{IoUring, opcode, types};
 use std::ffi::c_void;
 use std::os::fd::RawFd;
 
-use super::{ReadRequest, StorageBackend};
+use super::{BlockReadRequest, ReadRequest, StorageBackend};
 use crate::cuda_min::{CudaEvent, PinnedBuffer, copy_h_to_d_async, stream_sync};
-use crate::group::GroupKey;
+use crate::group::{GroupKey, GroupLayout};
 use crate::layout::Layout;
 
 pub struct IoUringBackend {
@@ -21,10 +21,27 @@ pub struct IoUringBackend {
     buffers: Vec<PinnedBuffer>,
     events: Vec<Option<CudaEvent>>, // event per buffer, None = idle
     qd: usize,
+    /// Bytes one whole block occupies (== device slot_bytes). Cached for the
+    /// ATLAS_HSS_COALESCE_BLOCKS single-op read/write. When `coalesce` is set
+    /// the pinned buffers below are sized to THIS (not group_bytes) so a
+    /// block ReadFixed / pwrite fits — a block op into a group-sized registered
+    /// iovec would be silent corruption, so the block methods hard-check it.
+    block_bytes: usize,
 }
 
 impl IoUringBackend {
+    /// Un-coalesced backend (group-sized buffers) — the default, byte-identical
+    /// to before ATLAS_HSS_COALESCE_BLOCKS existed.
     pub fn new(layout: Layout, qd: usize) -> Result<Self> {
+        Self::new_with(layout, qd, false)
+    }
+
+    /// `coalesce` sizes the pinned/registered buffers to `block_bytes` (=
+    /// `2·nkv·group_stride`) so the block read/write methods can issue ONE
+    /// contiguous op. Set it iff the caller will drive the block methods
+    /// (ATLAS_HSS_COALESCE_BLOCKS on); the flag is threaded from
+    /// `HighSpeedSwap::new` so buffer sizing and the caller's dispatch agree.
+    pub fn new_with(layout: Layout, qd: usize, coalesce: bool) -> Result<Self> {
         if qd == 0 {
             bail!("queue depth must be ≥ 1");
         }
@@ -35,9 +52,11 @@ impl IoUringBackend {
             .context("io_uring build")?;
 
         let group_bytes = layout.group_bytes() as usize;
+        let block_bytes = layout.block_bytes() as usize;
+        let buf_bytes = if coalesce { block_bytes } else { group_bytes };
         let mut buffers = Vec::with_capacity(qd);
         for _ in 0..qd {
-            buffers.push(PinnedBuffer::new(group_bytes)?);
+            buffers.push(PinnedBuffer::new(buf_bytes)?);
         }
         // Register the pinned host buffers with io_uring for zero-copy
         // direct-IO. After this, ReadFixed at index `i` lands in `buffers[i]`.
@@ -60,6 +79,7 @@ impl IoUringBackend {
             buffers,
             events,
             qd,
+            block_bytes,
         })
     }
 
@@ -195,6 +215,91 @@ impl IoUringBackend {
         }
         Ok(())
     }
+
+    /// ATLAS_HSS_COALESCE_BLOCKS block-read body — structurally the per-head
+    /// `read_inner` (same QD ring, free-buf stack, per-buffer CudaEvent reuse,
+    /// terminal-sync discipline) but each op moves ONE contiguous `block_bytes`
+    /// span at the block base offset into the slot base. Kept SEPARATE from
+    /// `read_inner` so the per-head flag-OFF path stays textually + op-identical.
+    fn read_block_inner(
+        &mut self,
+        requests: &[BlockReadRequest],
+        stream: u64,
+        sync_at_end: bool,
+    ) -> Result<()> {
+        // Guard the sizing coupling: a block ReadFixed into a group-sized
+        // registered iovec is silent corruption. Fail loud instead.
+        if self.buffers[0].bytes < self.block_bytes {
+            bail!(
+                "io_uring backend not built for block coalescing (buffer {} < block_bytes {}); \
+                 construct with new_with(.., coalesce=true) — the ATLAS_HSS_COALESCE_BLOCKS flag \
+                 must be set before backend construction",
+                self.buffers[0].bytes,
+                self.block_bytes
+            );
+        }
+        let bytes = self.block_bytes as u32;
+        if requests.len() > u16::MAX as usize {
+            bail!("io_uring batch too large: {}", requests.len());
+        }
+        let mut next_submit = 0;
+        let mut completed = 0;
+        let mut free_bufs: Vec<u16> = (0..self.qd as u16).rev().collect();
+
+        while completed < requests.len() {
+            while next_submit < requests.len() {
+                let Some(&buf_idx) = free_bufs.last() else {
+                    break;
+                };
+                self.wait_buffer_free(buf_idx as usize)?;
+                free_bufs.pop();
+                let req = &requests[next_submit];
+                let fd = self.layout.fd(req.base_key.layer);
+                let off = self
+                    .layout
+                    .block_offset(req.base_key.layer, req.base_key.block);
+                let user = ((next_submit as u64) << 16) | (buf_idx as u64);
+                self.submit_read(fd, off, bytes, buf_idx, user)?;
+                next_submit += 1;
+            }
+            self.ring
+                .submit_and_wait(1)
+                .context("io_uring submit_and_wait")?;
+            let cq = self.ring.completion();
+            for cqe in cq {
+                let user = cqe.user_data();
+                let buf_idx = (user & 0xFFFF) as u16;
+                let req_idx = (user >> 16) as usize;
+                let result = cqe.result();
+                if result < 0 {
+                    bail!("io_uring block read failed for req {req_idx}: errno {}", -result);
+                }
+                if result as u32 != bytes {
+                    bail!("io_uring short block read: req {req_idx} got {result}, expected {bytes}");
+                }
+                let req = &requests[req_idx];
+                let buf = &self.buffers[buf_idx as usize];
+                copy_h_to_d_async(
+                    req.dst_dev_ptr,
+                    buf.ptr as *const c_void,
+                    bytes as usize,
+                    stream,
+                )?;
+                let ev = CudaEvent::new()?;
+                ev.record(stream)?;
+                self.events[buf_idx as usize] = Some(ev);
+                free_bufs.push(buf_idx);
+                completed += 1;
+            }
+        }
+        if sync_at_end {
+            stream_sync(stream)?;
+            for slot in self.events.iter_mut() {
+                *slot = None;
+            }
+        }
+        Ok(())
+    }
 }
 
 impl StorageBackend for IoUringBackend {
@@ -230,6 +335,53 @@ impl StorageBackend for IoUringBackend {
         if n != bytes as isize {
             bail!(
                 "pwrite {bytes}@{off} returned {n}, errno {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        Ok(())
+    }
+
+    fn group_layout(&self) -> GroupLayout {
+        self.layout.spec
+    }
+
+    fn read_blocks(&mut self, requests: &[BlockReadRequest], stream: u64) -> Result<()> {
+        // Byte-identical to the per-head `read` semantics: terminal stream_sync.
+        self.read_block_inner(requests, stream, true)
+    }
+
+    fn read_blocks_async(&mut self, requests: &[BlockReadRequest], stream: u64) -> Result<()> {
+        // No terminal host sync (prefetch path) — mirrors `read_async`.
+        self.read_block_inner(requests, stream, false)
+    }
+
+    fn write_block_from_host(&mut self, base_key: GroupKey, src: &[u8]) -> Result<()> {
+        let bytes = self.block_bytes;
+        if src.len() != bytes {
+            bail!(
+                "write_block_from_host: src len {} != block bytes {bytes}",
+                src.len()
+            );
+        }
+        // buffers[0] must be block-sized (the write path stages through it too).
+        if self.buffers[0].bytes < bytes {
+            bail!(
+                "io_uring backend not built for block coalescing (buffer {} < block_bytes {}); \
+                 construct with new_with(.., coalesce=true)",
+                self.buffers[0].bytes,
+                bytes
+            );
+        }
+        self.wait_buffer_free(0)?;
+        unsafe {
+            std::ptr::copy_nonoverlapping(src.as_ptr(), self.buffers[0].ptr as *mut u8, bytes);
+        }
+        let fd = self.layout.fd(base_key.layer);
+        let off = self.layout.block_offset(base_key.layer, base_key.block) as i64;
+        let n = unsafe { libc::pwrite(fd, self.buffers[0].ptr, bytes, off) };
+        if n != bytes as isize {
+            bail!(
+                "block pwrite {bytes}@{off} returned {n}, errno {}",
                 std::io::Error::last_os_error()
             );
         }

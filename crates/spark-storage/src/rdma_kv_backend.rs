@@ -590,6 +590,13 @@ impl StorageBackend for RdmaKvBackend {
         }
         Ok(()) // async — reaped lazily / drained before the next read
     }
+
+    fn group_layout(&self) -> GroupLayout {
+        // Inherits the DEFAULT block read/write (per-head fan-out over the
+        // one-sided verbs path) — correct, un-coalesced. Native multi-group RDMA
+        // coalescing is a noted follow-up.
+        self.layout
+    }
 }
 
 impl Drop for RdmaKvBackend {

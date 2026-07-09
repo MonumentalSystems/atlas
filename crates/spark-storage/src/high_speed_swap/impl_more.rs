@@ -6,7 +6,7 @@ use anyhow::Result;
 use std::ffi::c_void;
 
 use super::{HighSpeedSwap, SeqScratch};
-use crate::backend::ReadRequest;
+use crate::backend::{BlockReadRequest, ReadRequest};
 use crate::config::HighSpeedSwapConfig;
 use crate::cuda_min::{
     CudaCtx, copy_d_to_d_async, copy_d_to_h_async, copy_h_to_d_async, stream_sync,
@@ -116,22 +116,49 @@ impl HighSpeedSwap {
                 bs * nkv * hd
             );
         }
-        for kh in 0..nkv {
-            let mut k_stripe = Vec::with_capacity(bs * hd * 2);
-            let mut v_stripe = Vec::with_capacity(bs * hd * 2);
-            for tok in 0..bs {
-                let base = (tok * nkv + kh) * hd;
-                for x in &k_block_host[base..base + hd] {
-                    k_stripe.extend_from_slice(&x.to_le_bytes());
+        if self.coalesce_blocks {
+            // ATLAS_HSS_COALESCE_BLOCKS: pack all nkv K/V stripes into ONE
+            // block_bytes host image (each raw stripe padded to group_stride) and
+            // issue ONE contiguous block write instead of 2·nkv per-head pwrites.
+            let group_stride = self.backend.group_layout().group_stride as usize;
+            let mut k_stripes: Vec<Vec<u8>> = Vec::with_capacity(nkv);
+            let mut v_stripes: Vec<Vec<u8>> = Vec::with_capacity(nkv);
+            for kh in 0..nkv {
+                let mut k_stripe = Vec::with_capacity(bs * hd * 2);
+                let mut v_stripe = Vec::with_capacity(bs * hd * 2);
+                for tok in 0..bs {
+                    let base = (tok * nkv + kh) * hd;
+                    for x in &k_block_host[base..base + hd] {
+                        k_stripe.extend_from_slice(&x.to_le_bytes());
+                    }
+                    for x in &v_block_host[base..base + hd] {
+                        v_stripe.extend_from_slice(&x.to_le_bytes());
+                    }
                 }
-                for x in &v_block_host[base..base + hd] {
-                    v_stripe.extend_from_slice(&x.to_le_bytes());
-                }
+                k_stripes.push(k_stripe);
+                v_stripes.push(v_stripe);
             }
+            let buf = assemble_block_write_buffer(nkv, group_stride, &k_stripes, &v_stripes);
             self.backend
-                .write_from_host(GroupKey::new(layer, block, kh as u16, KvKind::K), &k_stripe)?;
-            self.backend
-                .write_from_host(GroupKey::new(layer, block, kh as u16, KvKind::V), &v_stripe)?;
+                .write_block_from_host(GroupKey::new(layer, block, 0, KvKind::K), &buf)?;
+        } else {
+            for kh in 0..nkv {
+                let mut k_stripe = Vec::with_capacity(bs * hd * 2);
+                let mut v_stripe = Vec::with_capacity(bs * hd * 2);
+                for tok in 0..bs {
+                    let base = (tok * nkv + kh) * hd;
+                    for x in &k_block_host[base..base + hd] {
+                        k_stripe.extend_from_slice(&x.to_le_bytes());
+                    }
+                    for x in &v_block_host[base..base + hd] {
+                        v_stripe.extend_from_slice(&x.to_le_bytes());
+                    }
+                }
+                self.backend
+                    .write_from_host(GroupKey::new(layer, block, kh as u16, KvKind::K), &k_stripe)?;
+                self.backend
+                    .write_from_host(GroupKey::new(layer, block, kh as u16, KvKind::V), &v_stripe)?;
+            }
         }
         // Drop the resident-cache copy (if any). The on-disk image was just
         // overwritten; without invalidation, attend_layer_on_stream would
@@ -401,6 +428,12 @@ impl HighSpeedSwap {
             // not-yet-consumed slot (`rank(&pinned)` excludes them).
             let mut pinned: Vec<u32> = Vec::new();
             let mut reqs: Vec<ReadRequest> = Vec::new();
+            // ATLAS_HSS_COALESCE_BLOCKS: one BlockReadRequest per missing block
+            // (dst = slot base) instead of 2·nkv per-head reqs. Exactly ONE of
+            // `reqs`/`breqs` is populated per call (flag chooses); both are
+            // non-empty iff ≥1 block is missing, so the #11 empty-skip guard and
+            // its op-identity reasoning are preserved.
+            let mut breqs: Vec<BlockReadRequest> = Vec::new();
 
             for (c_idx, s) in seqs.iter().enumerate() {
                 let blocks = s.seq_block_ids;
@@ -428,15 +461,22 @@ impl HighSpeedSwap {
                             self.scratch[s.seq_slot].score_host_buf[blk as usize],
                         );
                         block_table[row + i] = slot as i32;
-                        for kh in 0..self.model.num_kv_heads {
-                            reqs.push(ReadRequest {
-                                group: GroupKey::new(layer, blk, kh, KvKind::K),
-                                dst_dev_ptr: self.pool.slot_k_ptr(slot, kh),
+                        if self.coalesce_blocks {
+                            breqs.push(BlockReadRequest {
+                                base_key: GroupKey::new(layer, blk, 0, KvKind::K),
+                                dst_dev_ptr: self.pool.slot_dev_ptr(slot),
                             });
-                            reqs.push(ReadRequest {
-                                group: GroupKey::new(layer, blk, kh, KvKind::V),
-                                dst_dev_ptr: self.pool.slot_v_ptr(slot, kh),
-                            });
+                        } else {
+                            for kh in 0..self.model.num_kv_heads {
+                                reqs.push(ReadRequest {
+                                    group: GroupKey::new(layer, blk, kh, KvKind::K),
+                                    dst_dev_ptr: self.pool.slot_k_ptr(slot, kh),
+                                });
+                                reqs.push(ReadRequest {
+                                    group: GroupKey::new(layer, blk, kh, KvKind::V),
+                                    dst_dev_ptr: self.pool.slot_v_ptr(slot, kh),
+                                });
+                            }
                         }
                     }
                 }
@@ -447,9 +487,14 @@ impl HighSpeedSwap {
             // io_uring's unconditional trailing `stream_sync` (an accidental
             // WAR-narrowing barrier) is now replaced by the `kv_war_event`
             // fence. Prefetch-off keeps the unconditional read+sync for
-            // byte-for-byte op-identity.
-            if !self.kv_prefetch_enabled || !reqs.is_empty() {
-                self.backend.read(&reqs, stream)?;
+            // byte-for-byte op-identity. `breqs.is_empty() ⟺ reqs.is_empty()`
+            // (both non-empty iff ≥1 missing block), so this guard is unchanged.
+            if !self.kv_prefetch_enabled || !reqs.is_empty() || !breqs.is_empty() {
+                if self.coalesce_blocks {
+                    self.backend.read_blocks(&breqs, stream)?;
+                } else {
+                    self.backend.read(&reqs, stream)?;
+                }
             }
 
             copy_h_to_d_async(
@@ -610,6 +655,9 @@ impl HighSpeedSwap {
             }
             // Second pass: assign + read missing blocks.
             let mut reqs: Vec<ReadRequest> = Vec::new();
+            // ATLAS_HSS_COALESCE_BLOCKS: one BlockReadRequest per missing block
+            // (see the batched path). Exactly one of reqs/breqs is populated.
+            let mut breqs: Vec<BlockReadRequest> = Vec::new();
             for &blk in &missing {
                 let key = ResidentKey { layer, block: blk };
                 let candidates = self.eviction.rank(&pinned);
@@ -621,22 +669,34 @@ impl HighSpeedSwap {
                 // Find this block's index in the tile so the block_table is right.
                 let idx = tile.iter().position(|&x| x == blk).unwrap();
                 block_table[idx] = slot as i32;
-                for kh in 0..self.model.num_kv_heads {
-                    reqs.push(ReadRequest {
-                        group: GroupKey::new(layer, blk, kh, KvKind::K),
-                        dst_dev_ptr: self.pool.slot_k_ptr(slot, kh),
+                if self.coalesce_blocks {
+                    breqs.push(BlockReadRequest {
+                        base_key: GroupKey::new(layer, blk, 0, KvKind::K),
+                        dst_dev_ptr: self.pool.slot_dev_ptr(slot),
                     });
-                    reqs.push(ReadRequest {
-                        group: GroupKey::new(layer, blk, kh, KvKind::V),
-                        dst_dev_ptr: self.pool.slot_v_ptr(slot, kh),
-                    });
+                } else {
+                    for kh in 0..self.model.num_kv_heads {
+                        reqs.push(ReadRequest {
+                            group: GroupKey::new(layer, blk, kh, KvKind::K),
+                            dst_dev_ptr: self.pool.slot_k_ptr(slot, kh),
+                        });
+                        reqs.push(ReadRequest {
+                            group: GroupKey::new(layer, blk, kh, KvKind::V),
+                            dst_dev_ptr: self.pool.slot_v_ptr(slot, kh),
+                        });
+                    }
                 }
             }
             // #11: skip the no-op read ONLY when prefetch is live (see the
             // fused path and the `kv_prefetch_enabled` field doc). Prefetch-off
             // keeps the unconditional read+sync for byte-for-byte op-identity.
-            if !self.kv_prefetch_enabled || !reqs.is_empty() {
-                self.backend.read(&reqs, stream)?;
+            // `breqs.is_empty() ⟺ reqs.is_empty()`, so the guard is unchanged.
+            if !self.kv_prefetch_enabled || !reqs.is_empty() || !breqs.is_empty() {
+                if self.coalesce_blocks {
+                    self.backend.read_blocks(&breqs, stream)?;
+                } else {
+                    self.backend.read(&reqs, stream)?;
+                }
             }
 
             // 4. Tiled attention launch.
@@ -719,6 +779,9 @@ impl HighSpeedSwap {
         // Score order for eviction victims; `assign` skips already-pinned slots.
         let candidates = self.eviction.rank(&[]);
         let mut reqs: Vec<ReadRequest> = Vec::new();
+        // ATLAS_HSS_COALESCE_BLOCKS: one BlockReadRequest per assigned block
+        // (dst = slot base). Exactly one of reqs/breqs is populated per call.
+        let mut breqs: Vec<BlockReadRequest> = Vec::new();
         for &blk in seq_block_ids {
             let key = ResidentKey { layer, block: blk };
             if let Some(slot) = self.pool.lookup(key) {
@@ -735,24 +798,31 @@ impl HighSpeedSwap {
             };
             self.pool.pin(slot);
             self.eviction.touch(slot);
-            for kh in 0..self.model.num_kv_heads {
-                reqs.push(ReadRequest {
-                    group: GroupKey::new(layer, blk, kh, KvKind::K),
-                    dst_dev_ptr: self.pool.slot_k_ptr(slot, kh),
+            if self.coalesce_blocks {
+                breqs.push(BlockReadRequest {
+                    base_key: GroupKey::new(layer, blk, 0, KvKind::K),
+                    dst_dev_ptr: self.pool.slot_dev_ptr(slot),
                 });
-                reqs.push(ReadRequest {
-                    group: GroupKey::new(layer, blk, kh, KvKind::V),
-                    dst_dev_ptr: self.pool.slot_v_ptr(slot, kh),
-                });
+            } else {
+                for kh in 0..self.model.num_kv_heads {
+                    reqs.push(ReadRequest {
+                        group: GroupKey::new(layer, blk, kh, KvKind::K),
+                        dst_dev_ptr: self.pool.slot_k_ptr(slot, kh),
+                    });
+                    reqs.push(ReadRequest {
+                        group: GroupKey::new(layer, blk, kh, KvKind::V),
+                        dst_dev_ptr: self.pool.slot_v_ptr(slot, kh),
+                    });
+                }
             }
         }
-        if !reqs.is_empty() {
+        if !reqs.is_empty() || !breqs.is_empty() {
             // #11: order this evict-victim H2D AFTER the main stream's
             // `step_tile` reads (recorded by the decode loop via
             // `record_kv_read_event`). `stream` here is `prefetch_stream`; the
-            // CPU does not block. `reqs` non-empty ⟺ ≥1 `assign` ⟺ ≥1 slot
+            // CPU does not block. non-empty reqs/breqs ⟺ ≥1 `assign` ⟺ ≥1 slot
             // about to be overwritten — exactly when the fence is needed. A
-            // pins-only prefetch (empty `reqs`) never waits.
+            // pins-only prefetch (both empty) never waits.
             self.kv_war_event.wait(stream)?; // #11 WAR — UNCHANGED
             // #11-refinement: fully-async prefetch — enqueue the tier read + H2D
             // on `prefetch_stream` WITHOUT a terminal host stream_sync (the
@@ -761,7 +831,11 @@ impl HighSpeedSwap {
             // in-order stream AFTER the H2D, and the NEXT attend waits it
             // cross-stream on the main stream. Staging/bounce reuse is made safe
             // internally by each async backend (per-bounce copy events + FIFO).
-            self.backend.read_async(&reqs, stream)?;
+            if self.coalesce_blocks {
+                self.backend.read_blocks_async(&breqs, stream)?;
+            } else {
+                self.backend.read_async(&reqs, stream)?;
+            }
             self.kv_prefetch_done.record(stream)?;
         }
         Ok(())
@@ -796,5 +870,88 @@ impl HighSpeedSwap {
     }
     pub fn config(&self) -> &HighSpeedSwapConfig {
         &self.cfg
+    }
+}
+
+/// ATLAS_HSS_COALESCE_BLOCKS write-buffer assembler (pure, host-testable — this
+/// guards the highest-risk correctness item). Produces the single `block_bytes =
+/// 2·nkv·group_stride` host image the coalesced offload write pwrites: K stripe
+/// `kh` at `kh·group_stride`, V stripe `kh` at `(nkv+kh)·group_stride`, each raw
+/// `block_size·head_dim·2`-byte stripe zero-padded up to `group_stride`. This is
+/// byte-identical to the on-disk image the `2·nkv` per-head padded writes
+/// produce (the per-head path also moves the full padded `group_stride` per op),
+/// so a coalesced read-back lands the same bytes — a raw concatenation (no
+/// per-stripe padding) would pass the length check but write a WRONG image that
+/// only surfaces as garbage KV at attend time.
+pub(crate) fn assemble_block_write_buffer(
+    nkv: usize,
+    group_stride: usize,
+    k_stripes: &[Vec<u8>],
+    v_stripes: &[Vec<u8>],
+) -> Vec<u8> {
+    debug_assert_eq!(k_stripes.len(), nkv);
+    debug_assert_eq!(v_stripes.len(), nkv);
+    let mut buf = vec![0u8; 2 * nkv * group_stride];
+    for kh in 0..nkv {
+        let k = &k_stripes[kh];
+        let v = &v_stripes[kh];
+        debug_assert!(k.len() <= group_stride && v.len() <= group_stride);
+        let k_off = kh * group_stride;
+        let v_off = (nkv + kh) * group_stride;
+        buf[k_off..k_off + k.len()].copy_from_slice(k);
+        buf[v_off..v_off + v.len()].copy_from_slice(v);
+    }
+    buf
+}
+
+#[cfg(test)]
+mod coalesce_write_tests {
+    use super::assemble_block_write_buffer;
+
+    /// The assembled buffer is exactly block_bytes; each stripe is recovered at
+    /// its group_stride-pitched slot; with group_stride == raw it byte-equals
+    /// the K0..K(nkv-1)‖V0..V(nkv-1) concatenation; pad bytes are zero.
+    #[test]
+    fn assembles_padded_block_image() {
+        // Two kv_heads, group_stride 8, raw stripe 6 (2 bytes tail padding).
+        let nkv = 2;
+        let gs = 8;
+        let raw = 6;
+        let k: Vec<Vec<u8>> = (0..nkv)
+            .map(|h| (0..raw).map(|i| 0x10 * (h as u8 + 1) + i as u8).collect())
+            .collect();
+        let v: Vec<Vec<u8>> = (0..nkv)
+            .map(|h| (0..raw).map(|i| 0x80 + 0x10 * (h as u8) + i as u8).collect())
+            .collect();
+        let buf = assemble_block_write_buffer(nkv, gs, &k, &v);
+        assert_eq!(buf.len(), 2 * nkv * gs);
+        for kh in 0..nkv {
+            let k_off = kh * gs;
+            let v_off = (nkv + kh) * gs;
+            assert_eq!(&buf[k_off..k_off + raw], k[kh].as_slice());
+            assert_eq!(&buf[v_off..v_off + raw], v[kh].as_slice());
+            // Tail padding is zero.
+            assert!(buf[k_off + raw..k_off + gs].iter().all(|&b| b == 0));
+            assert!(buf[v_off + raw..v_off + gs].iter().all(|&b| b == 0));
+        }
+    }
+
+    /// group_stride == raw ⇒ no padding ⇒ pure ordered concatenation
+    /// K0‖K1‖…‖V0‖V1‖… (the Holo case bs*hd*2 == gs == 4096).
+    #[test]
+    fn unpadded_is_plain_concatenation() {
+        let nkv = 3;
+        let gs = 4;
+        let k: Vec<Vec<u8>> = (0..nkv).map(|h| vec![h as u8; gs]).collect();
+        let v: Vec<Vec<u8>> = (0..nkv).map(|h| vec![0xF0 | h as u8; gs]).collect();
+        let buf = assemble_block_write_buffer(nkv, gs, &k, &v);
+        let mut expected = Vec::new();
+        for s in &k {
+            expected.extend_from_slice(s);
+        }
+        for s in &v {
+            expected.extend_from_slice(s);
+        }
+        assert_eq!(buf, expected);
     }
 }

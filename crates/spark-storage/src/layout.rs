@@ -88,6 +88,20 @@ impl Layout {
     pub fn group_bytes(&self) -> u64 {
         self.spec.group_bytes()
     }
+
+    /// File offset of `block`'s base within `layer`'s file (ATLAS_HSS_COALESCE_
+    /// BLOCKS). `layer` only selects the fd — the offset is layer-agnostic, so a
+    /// block op never straddles the per-layer file boundary. Delegates to
+    /// `GroupLayout::block_offset` so the stride formula lives in one place.
+    pub fn block_offset(&self, layer: u32, block: u32) -> u64 {
+        let _ = layer;
+        self.spec.block_offset(block)
+    }
+
+    /// Bytes one whole block occupies on disk (== device slot_bytes).
+    pub fn block_bytes(&self) -> u64 {
+        self.spec.block_bytes()
+    }
 }
 
 #[cfg(unix)]
