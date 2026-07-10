@@ -111,15 +111,26 @@ $SSH "$PEER_SSH" "ss -ltn 2>/dev/null | grep -q ':${PEER_PORT}[[:space:]]'" \
 say "peer port :$PEER_PORT free"
 
 # Auto-detect rails from the RDMA devices present, unless told otherwise.
+# Only ACTIVE ports: the alphabetically-first IB device is frequently DOWN (e.g.
+# rocep1s0f0 while roceP2p1s0f1 carries the link), so a naive `ls | head -1`
+# picks a dead rail and the handshake hangs or fails obscurely.
+active_rails() {  # $1 = "" for local, else an ssh target
+  local runner=(bash -c); [ -n "${1:-}" ] && runner=($SSH "$1")
+  "${runner[@]}" '
+    for d in /sys/class/infiniband/*; do
+      [ -e "$d/ports/1/state" ] || continue
+      case "$(cat "$d/ports/1/state")" in *ACTIVE*) basename "$d";; esac
+    done' 2>/dev/null
+}
 if [ -z "$PEER_RAILS" ]; then
-  PEER_RAILS=$($SSH "$PEER_SSH" 'ls /sys/class/infiniband 2>/dev/null' | awk '{printf "%s:3 ", $1}')
-  [ -n "$PEER_RAILS" ] || die "no RDMA devices under /sys/class/infiniband on $PEER_SSH; pass --peer-rails"
-  say "auto-detected peer rails: $PEER_RAILS (gid idx 3; override with --peer-rails)"
+  PEER_RAILS=$(active_rails "$PEER_SSH" | awk '{printf "%s:3 ", $1}')
+  [ -n "$PEER_RAILS" ] || die "no ACTIVE RDMA port on $PEER_SSH (check /sys/class/infiniband/*/ports/1/state); pass --peer-rails"
+  say "auto-detected peer rails (ACTIVE only): $PEER_RAILS"
 fi
 if [ -z "$CLIENT_RAIL" ]; then
-  CLIENT_RAIL="$(ls /sys/class/infiniband 2>/dev/null | head -1):3"
-  [ "$CLIENT_RAIL" != ":3" ] || die "no local RDMA device; pass --client-rail <dev>:<gid_idx>"
-  say "auto-detected client rail: $CLIENT_RAIL"
+  CLIENT_RAIL="$(active_rails "" | head -1):3"
+  [ "$CLIENT_RAIL" != ":3" ] || die "no ACTIVE local RDMA port; pass --client-rail <dev>:<gid_idx>"
+  say "auto-detected client rail (ACTIVE only): $CLIENT_RAIL"
 fi
 say "caps: ${MAX_BLADE_GB} GB peer RAM / ${SWAP_CAP_GB} GB peer disk"
 say "profile=$PROFILE: blob=${BLOB} B, slots=$SLOTS (arena=$((ARENA/1024)) KiB), keys=$KEYS"
