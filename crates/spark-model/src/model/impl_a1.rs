@@ -114,6 +114,13 @@ impl TransformerModel {
             },
         );
 
+        // Capability gate (PCND): an SSM tier env var set on a model with no
+        // recurrent state was a SILENT no-op (the `num_ssm_layers > 0` arms
+        // below skip construction without ever reading the vars) — now a
+        // startup error, BEFORE pools/weights/any peer connect. No tier vars
+        // set (or a capable model) ⇒ byte-identical.
+        super::ssm_tier::ensure_ssm_tier_capability(&config)?;
+
         // Build SSM state pool (with MTP intermediate/checkpoint pools only if speculative decoding enabled)
         // num_intermediates = K (per-token SSM h/conv state snapshots).
         // For MTP K=2/3/4 verify: K = num_drafts + 1.

@@ -68,6 +68,40 @@ impl SnapshotTransport for MockSnapshotTransport {
     }
 }
 
+/// Keyed paging seam for `PagingSnapshotStore`: the PEER owns residency, so
+/// the ops are key-addressed (opaque u64 → blob) — a different contract from
+/// the offset-addressed [`SnapshotTransport`] above (do not conflate the two).
+/// Production = the RDMA paging arena (one shared residency map per peer);
+/// tests = an in-process mock peer, which is what makes the cross-model
+/// isolation regression test hardware-free. The `Box<dyn>` indirection costs
+/// one vtable hop per op — irrelevant next to a multi-ms RDMA round trip; do
+/// NOT "optimize" it back to the concrete type (that kills testability).
+pub(crate) trait PagingTransport: Send + Sync {
+    /// Store `bytes` under `key` on the peer. Never rejects (the peer spills
+    /// its coldest slot to NVMe).
+    fn paging_put(&self, key: u64, bytes: &[u8]) -> Result<()>;
+    /// Fetch `key` into `out`. `Ok(false)` = not resident anywhere (a miss).
+    fn paging_get(&self, key: u64, out: &mut [u8]) -> Result<bool>;
+    /// Drop `key` from the peer's residency (RAM and swap).
+    fn paging_remove(&self, key: u64) -> Result<()>;
+}
+
+// Pure delegation to the arena's inherent paging ops (fully-qualified so the
+// inherent method — not this trait method — is what's called).
+// REVIEW CAREFULLY: a put/get transposition here would corrupt production
+// while every mock-backed test still passes.
+impl PagingTransport for spark_storage::RdmaSnapshotArena {
+    fn paging_put(&self, key: u64, bytes: &[u8]) -> Result<()> {
+        spark_storage::RdmaSnapshotArena::paging_put(self, key, bytes)
+    }
+    fn paging_get(&self, key: u64, out: &mut [u8]) -> Result<bool> {
+        spark_storage::RdmaSnapshotArena::paging_get(self, key, out)
+    }
+    fn paging_remove(&self, key: u64) -> Result<()> {
+        spark_storage::RdmaSnapshotArena::paging_remove(self, key)
+    }
+}
+
 // Phase 4b Inc 2: the real transport is spark-storage's offset-addressed
 // `RdmaSnapshotArena` (CX7 verbs + kv-peer blade; a `connect`-errors stub when
 // verbs aren't built). We own `SnapshotTransport` here, so implementing it for

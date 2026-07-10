@@ -56,9 +56,13 @@ impl std::fmt::Display for PromoteReject {
 /// The inner `Mutex` is held ONLY for the map insert/remove — NEVER across the
 /// leader's `.await` (the scheduler round-trip). The scheduler thread never
 /// touches this lock, so there is no lock cycle and no deadlock (constraint c).
+/// Followers parked on one in-flight promotion, each awaiting the leader's
+/// result over its own oneshot.
+type PromoteWaiters = Vec<oneshot::Sender<Result<i32, PromoteReject>>>;
+
 #[derive(Default)]
 pub struct PromotionManager {
-    inflight: Mutex<HashMap<String, Vec<oneshot::Sender<Result<i32, PromoteReject>>>>>,
+    inflight: Mutex<HashMap<String, PromoteWaiters>>,
 }
 
 enum Role {

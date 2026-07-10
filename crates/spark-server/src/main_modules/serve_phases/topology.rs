@@ -69,6 +69,18 @@ pub(crate) fn resolve_topology(
     config.ep_world_size = ep_size;
     // Streaming Experts (opt-in; no-op when --stream-experts is absent).
     config.expert_streaming = args.stream_experts.is_some();
+    // Capability gate (PCND): expert streaming on a dense model must fail
+    // fast HERE — before `stream_all_experts` skips expert tensors at weight
+    // load and before decode CUDA graphs are suppressed — never a silent
+    // no-op. Keyed on config.num_experts, never on observed tensors (EP
+    // ranks legitimately own zero local expert tensors).
+    if config.expert_streaming && !config.has_experts() {
+        anyhow::bail!(
+            "--stream-experts: model '{}' is dense (num_experts=0) — the expert \
+             streaming tier cannot be populated by this model; remove --stream-experts",
+            config.model_type,
+        );
+    }
     config.expert_store_dir = args.stream_experts.clone();
     config.expert_arena_layers = args.expert_arena_layers;
     config.expert_backend = args.expert_backend.clone();

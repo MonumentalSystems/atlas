@@ -536,8 +536,12 @@ pub(crate) fn validate_config(config: &ModelConfig) -> Result<()> {
         );
     }
 
-    let has_ssm =
-        config.layer_types.contains(&LayerType::LinearAttention) || config.linear_num_key_heads > 0;
+    // SSOT: `has_recurrent_state()` (num_ssm_layers() > 0) is THE SSM
+    // capability predicate — it also covers interval-derived hybrid configs
+    // with empty `layer_types`, which the old `contains(LinearAttention)`
+    // expression missed. The `linear_num_key_heads` disjunct is kept for the
+    // inconsistent-config case (head dims set but no SSM layers declared).
+    let has_ssm = config.has_recurrent_state() || config.linear_num_key_heads > 0;
     if has_ssm && config.linear_num_key_heads == 0 && config.mamba_num_heads == 0 {
         anyhow::bail!(
             "SSM model detected but linear_num_key_heads is 0 in config.json. \

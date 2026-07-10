@@ -68,6 +68,7 @@ fn setup_model(
         ep_world_size: 1,
         num_experts: 0,
         peak_memory_multiplier: None,
+        stream_all_experts: false,
     };
     use spark_runtime::weights::WeightLoader;
     let store = loader.load(model_dir, gpu.as_ref(), 1024 * 1024 * 1024)?;
@@ -114,6 +115,7 @@ fn setup_model(
         spark_runtime::kv_cache::KvCacheDtype::Fp8,
         1024 * 1024 * 1024, // inference_reserve: 1 GB
         0.90,               // gpu_memory_utilization
+        0,                  // target_kv_tokens (0 = util-derived, byte-identical)
         0,                  // ssm_cache_slots
         Vec::new(),         // layer_dtypes
         0,                  // ssm_checkpoint_interval

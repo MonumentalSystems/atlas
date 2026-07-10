@@ -62,7 +62,9 @@ pub(crate) fn build_tier_store(
                         fp.get(),
                     );
                     return Ok(Arc::new(PagingSnapshotStore::new(
-                        arena, blob_bytes, namespace,
+                        Box::new(arena),
+                        blob_bytes,
+                        namespace,
                     )));
                 }
                 Err(e) => tracing::warn!(
@@ -247,7 +249,9 @@ pub(crate) fn build_decode_tier_store(
                 fp.get(),
             );
             Ok(Arc::new(PagingSnapshotStore::new(
-                arena, blob_bytes, namespace,
+                Box::new(arena),
+                blob_bytes,
+                namespace,
             )))
         }
         _ => {

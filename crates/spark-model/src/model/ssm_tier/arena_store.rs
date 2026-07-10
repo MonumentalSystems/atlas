@@ -10,7 +10,7 @@ use std::sync::atomic::Ordering;
 use anyhow::Result;
 use parking_lot::Mutex;
 
-use super::{BlobStoreStats, SnapshotBlobStore, SnapshotTransport};
+use super::{BlobStoreStats, PagingTransport, SnapshotBlobStore, SnapshotTransport};
 
 /// WS-A paging-mode store: the PEER owns residency + an NVMe swap file, so this
 /// store just forwards PUT/GET/REMOVE over the arena's control channel. Unlike
@@ -19,7 +19,9 @@ use super::{BlobStoreStats, SnapshotBlobStore, SnapshotTransport};
 /// slot to disk. This is the "infinite depth" tier + shared across clients (one
 /// peer-owned map) that the bounded RDMA/host-RAM stores can't give.
 pub(crate) struct PagingSnapshotStore {
-    arena: spark_storage::RdmaSnapshotArena,
+    /// Keyed paging seam: the RDMA arena in production, a shared in-process
+    /// mock peer in the cross-model isolation tests.
+    arena: Box<dyn PagingTransport>,
     blob_bytes: usize,
     /// Per-model namespace folded into every key so a SHARED peer never serves
     /// one model's SSM state to another (the prefix_hash is model-independent —
@@ -32,7 +34,7 @@ pub(crate) struct PagingSnapshotStore {
 
 impl PagingSnapshotStore {
     pub(crate) fn new(
-        arena: spark_storage::RdmaSnapshotArena,
+        arena: Box<dyn PagingTransport>,
         blob_bytes: usize,
         namespace: NonZeroU64,
     ) -> Self {
@@ -236,3 +238,7 @@ pub(crate) type ArenaSnapshotStore = RdmaSnapshotStore;
 #[cfg(test)]
 #[path = "arena_store_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "paging_isolation_tests.rs"]
+mod paging_isolation_tests;
