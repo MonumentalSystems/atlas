@@ -37,7 +37,10 @@ const K: u64 = 0x5EED_F00D_CAFE_D00D;
 // Models residency + the arena only (no LRU eviction / NVMe spill /
 // read-pins: collision semantics don't depend on those).
 
-struct MockPagingPeer {
+// `pub(super)` so the sibling `decode_isolation_tests` module (the cross-
+// CLIENT decode-salt regressions) can drive the SAME byte-faithful mock peer
+// instead of transcribing a second copy.
+pub(super) struct MockPagingPeer {
     blob_bytes: usize,
     inner: Mutex<MockPeerInner>,
     arena: MockSnapshotTransport,
@@ -50,7 +53,7 @@ struct MockPeerInner {
 }
 
 impl MockPagingPeer {
-    fn new(blob_bytes: usize, slots: usize) -> Self {
+    pub(super) fn new(blob_bytes: usize, slots: usize) -> Self {
         Self {
             blob_bytes,
             inner: Mutex::new(MockPeerInner {

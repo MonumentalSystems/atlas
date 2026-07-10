@@ -229,10 +229,13 @@ pub(crate) fn build_decode_tier_store(
                     )
                 })?;
             // Namespace = ATLAS_SSM_DECODE_NS (explicit u64 override, strict)
-            // or mix64(fingerprint, DECODE_DOMAIN): the DOMAIN separator keeps
-            // decode spills off the same model's Marconi keys (both tiers share
-            // ONE peer residency whenever blob_bytes match) and the fingerprint
-            // keeps them off OTHER models' decode spills. NOTE the manager-side
+            // or mix64(mix64(fingerprint, DECODE_DOMAIN), client_salt): the
+            // DOMAIN separator keeps decode spills off the same model's Marconi
+            // keys (both tiers share ONE peer residency whenever blob_bytes
+            // match), the fingerprint keeps them off OTHER models' decode
+            // spills, and the per-process client salt keeps them off other
+            // same-model CLIENTS' spills (cold keys are slot coordinates —
+            // identical across processes without it). NOTE the manager-side
             // cold_key also folds DECODE_DOMAIN over (seq, logical) — that fold
             // stays: removing it while this ns is overridden would re-collide
             // decode with Marconi. Resolved BEFORE the (fatal) connect.

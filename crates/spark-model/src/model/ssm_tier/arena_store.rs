@@ -242,3 +242,7 @@ mod tests;
 #[cfg(test)]
 #[path = "paging_isolation_tests.rs"]
 mod paging_isolation_tests;
+
+#[cfg(test)]
+#[path = "decode_isolation_tests.rs"]
+mod decode_isolation_tests;

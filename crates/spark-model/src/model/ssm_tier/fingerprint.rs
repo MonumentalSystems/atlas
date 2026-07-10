@@ -242,25 +242,85 @@ pub(crate) fn resolve_swap_ns(fp: ModelFingerprint) -> Result<NonZeroU64> {
     )
 }
 
-/// Decode namespace: `ATLAS_SSM_DECODE_NS` override (same strictness) else
-/// `mix64(fingerprint, DECODE_DOMAIN)` — the DOMAIN SEPARATOR must survive
-/// (decode + Marconi share ONE peer residency whenever blob_bytes match) and
-/// so must model identity (the bare constant collided two models' decode
-/// spills). Never DECODE_DOMAIN alone, never the fingerprint alone.
-pub(crate) fn resolve_decode_ns(fp: ModelFingerprint) -> Result<NonZeroU64> {
-    let mixed = mix64(fp.get(), atlas_kernels::DECODE_DOMAIN);
-    // Zero-avoidance (p = 2^-64). It must NOT fall back to `fp.nonzero()`: that is
-    // exactly the Marconi swap namespace, so the decode tier would alias onto it
-    // and the two tiers of one model would cross-serve. Fall back to the domain
-    // constant instead — distinct from the fingerprint by construction.
-    let derived = NonZeroU64::new(mixed).unwrap_or_else(|| {
+/// Per-process decode CLIENT salt — resolved ONCE (`OnceLock`) so every decode
+/// store built in this process folds the SAME salt: `cold_key` determinism
+/// within a process is an invariant the spill FIFO / epoch guard rest on.
+///
+/// `ATLAS_SSM_DECODE_CLIENT_ID` pins it (strict parse; 0 is PERMITTED — the
+/// salt is key material folded through `mix64`, not a sentinel); unset ⇒
+/// fresh OS entropy per process. Entropy failure is a hard startup error,
+/// never a silent zero-salt (a degraded shared salt would quietly reintroduce
+/// cross-client key sharing).
+fn decode_client_salt() -> Result<u64> {
+    use std::sync::OnceLock;
+    static SALT: OnceLock<u64> = OnceLock::new();
+    if let Some(&s) = SALT.get() {
+        return Ok(s);
+    }
+    let salt = match std::env::var("ATLAS_SSM_DECODE_CLIENT_ID").ok() {
+        Some(raw) => parse_u64_strict("ATLAS_SSM_DECODE_CLIENT_ID", &raw)?,
+        None => atlas_tier::entropy::random_u64()?,
+    };
+    // A racing thread may have won `get_or_init` meanwhile; both then return
+    // the ONE stored value — the process-wide salt is still unique.
+    Ok(*SALT.get_or_init(|| salt))
+}
+
+/// Env-free core of the decode namespace:
+/// `mix64(mix64(fingerprint, DECODE_DOMAIN), client_salt)`.
+///
+/// Every layer is load-bearing: the DOMAIN separator keeps decode keys off the
+/// same model's Marconi keys (both tiers share ONE peer residency whenever
+/// blob_bytes match); the fingerprint keeps them off OTHER models' decode
+/// spills; the CLIENT salt keeps them off other same-model PROCESSES' spills —
+/// decode keys are SLOT COORDINATES (`cold_key(seq, logical)`), byte-identical
+/// across same-model clients, so without the salt two clients on one peer
+/// cross-serve and cross-delete each other's rollback state.
+///
+/// Zero-avoidance (each layer p = 2^-64) falls back exactly ONE layer: never
+/// `fp` bare (that IS the Marconi swap namespace), never `DECODE_DOMAIN` alone
+/// (model-blind). Total over all inputs.
+pub(crate) fn derive_decode_ns_salted(fp: u64, salt: u64) -> NonZeroU64 {
+    let base = NonZeroU64::new(mix64(fp, atlas_kernels::DECODE_DOMAIN)).unwrap_or_else(|| {
         NonZeroU64::new(atlas_kernels::DECODE_DOMAIN).expect("DECODE_DOMAIN is a non-zero constant")
     });
-    resolve_ns_from(
-        std::env::var("ATLAS_SSM_DECODE_NS").ok().as_deref(),
-        "ATLAS_SSM_DECODE_NS",
-        derived,
-    )
+    NonZeroU64::new(mix64(base.get(), salt)).unwrap_or(base)
+}
+
+/// Decode namespace: `ATLAS_SSM_DECODE_NS` override (strict, wins UNSALTED —
+/// the escape hatch fully determines the ns) else the per-process salted
+/// derivation [`derive_decode_ns_salted`]. Decode blobs are process-ephemeral
+/// (pid-named local arenas, all-Absent manager init, no store enumeration —
+/// never recovered across runs), so the per-process rotation loses nothing;
+/// the generated salt is INFO-logged so an operator can pin/reproduce it.
+pub(crate) fn resolve_decode_ns(fp: ModelFingerprint) -> Result<NonZeroU64> {
+    if let Ok(raw) = std::env::var("ATLAS_SSM_DECODE_NS") {
+        // Mirror the ATLAS_MODEL_ID warn in `ModelFingerprint::derive`: the
+        // override is the documented escape hatch, and exactly as dangerous.
+        tracing::warn!(
+            "ATLAS_SSM_DECODE_NS={raw:?} bypasses the per-process decode client salt: decode \
+             keys are SLOT COORDINATES (not content hashes), so two processes sharing this \
+             value on one peer WILL cross-serve and cross-delete each other's rollback state \
+             (silent corruption + spurious 'cold MISS on live target'). Ensure a DISTINCT \
+             value per process, or unset it and pin ATLAS_SSM_DECODE_CLIENT_ID instead."
+        );
+        if std::env::var_os("ATLAS_SSM_DECODE_CLIENT_ID").is_some() {
+            tracing::warn!(
+                "ATLAS_SSM_DECODE_CLIENT_ID is IGNORED while ATLAS_SSM_DECODE_NS is set \
+                 (the explicit namespace fully determines the wire keys)"
+            );
+        }
+        return parse_ns("ATLAS_SSM_DECODE_NS", &raw);
+    }
+    let salt = decode_client_salt()?;
+    let ns = derive_decode_ns_salted(fp.get(), salt);
+    tracing::info!(
+        "SSM decode ns = {ns:#018x} (fp {:#018x} ⊕ DECODE_DOMAIN ⊕ client_salt \
+         {salt:#018x}); decode keys are CLIENT-PRIVATE on a shared peer; pin \
+         ATLAS_SSM_DECODE_CLIENT_ID={salt:#x} to reproduce this namespace",
+        fp.get(),
+    );
+    Ok(ns)
 }
 
 /// Env-free core (unit-testable without process-global setenv races).
@@ -275,19 +335,24 @@ pub(crate) fn resolve_ns_from(
     }
 }
 
-/// Strict override parser: decimal or `0x`-hex u64. Unparseable values are a
-/// hard error (PCND — the old code silently `.ok()`-swallowed a mistyped
-/// override into the model-blind default). 0 is a hard error: the ns=0
-/// passthrough is removed, a shared peer must always be namespaced.
-pub(crate) fn parse_ns(var: &str, raw: &str) -> Result<NonZeroU64> {
+/// Strict u64 parser: decimal or `0x`-hex. Junk is a hard startup error, never
+/// a silent fallthrough (PCND). Unlike [`parse_ns`], 0 is PERMITTED — callers
+/// needing `NonZeroU64` layer that check on top.
+pub(crate) fn parse_u64_strict(var: &str, raw: &str) -> Result<u64> {
     let s = raw.trim();
     let parsed = match s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
         Some(hex) => u64::from_str_radix(hex, 16),
         None => s.parse::<u64>(),
     };
-    let v = parsed.map_err(|e| {
-        anyhow!("{var}={raw:?} is not a valid u64 namespace (decimal or 0x-hex): {e}")
-    })?;
+    parsed.map_err(|e| anyhow!("{var}={raw:?} is not a valid u64 (decimal or 0x-hex): {e}"))
+}
+
+/// Strict override parser: decimal or `0x`-hex u64. Unparseable values are a
+/// hard error (PCND — the old code silently `.ok()`-swallowed a mistyped
+/// override into the model-blind default). 0 is a hard error: the ns=0
+/// passthrough is removed, a shared peer must always be namespaced.
+pub(crate) fn parse_ns(var: &str, raw: &str) -> Result<NonZeroU64> {
+    let v = parse_u64_strict(var, raw)?;
     NonZeroU64::new(v).ok_or_else(|| {
         anyhow!(
             "{var}=0 is invalid: the ns=0 passthrough is removed (it silently \

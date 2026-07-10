@@ -18,6 +18,11 @@
 # spills + byte-identity into a DEVICE buffer; SMOKE_MODE=kv-isolation proves two
 # client salts on one shared arena cannot cross-serve each other's KV blocks.
 #
+# The decode phase (SMOKE_MODE=decode-isolation, kind=0) proves the SSM
+# decode-tier client salt: two same-model clients on one shared arena — client B
+# must MISS (and must not delete) client A's slot-coordinate rollback blobs; a
+# third same-salt connection HITs them all byte-identically as the control.
+#
 # PORTABILITY: nothing here is specific to one fleet. Hosts, ports, rails and NVMe
 # paths come from flags/env or a config file. Per AGENTS.md's PCND invariant there
 # are NO implicit host defaults: if the peer is not configured, we fail fast with an
@@ -209,18 +214,35 @@ else
   say "skipped (SSM phase already failed)"
 fi
 
+# ── 3c. SSM decode-tier client isolation (two salts, kind=0) ─────────────────
+hdr "client: SSM decode client-salt isolation (two clients, one shared arena)"
+DECODE_RC=0
+if [ "$RC" -eq 0 ]; then
+  set +e
+  ATLAS_SNAP_PEER="${PEER_DATA}:${PEER_PORT}" \
+  ATLAS_EXPERT_RDMA_DEV="${CLIENT_RAIL%%:*}" ATLAS_EXPERT_RDMA_GID="${CLIENT_RAIL##*:}" \
+  SMOKE_BLOB="$BLOB" SMOKE_SLOTS="$SLOTS" SMOKE_KEYS="$KEYS" SMOKE_MODE=decode-isolation \
+    "$CLIENT_BIN" 2>&1 | sed 's/^/  /'
+  DECODE_RC=${PIPESTATUS[0]}
+  set -e
+  [ "$DECODE_RC" -eq 0 ] || say "decode-isolation phase FAILED (rc=$DECODE_RC)"
+else
+  say "skipped (SSM phase already failed)"
+fi
+
 # ── 4. evidence the spill actually happened (a green PUT/GET alone proves little) ──
 hdr "peer-side evidence"
 $SSH "$PEER_SSH" "grep -icE 'spill|evict|swap' /tmp/atlas-peer-${RUN_ID}.log" | sed 's/^/  spill-or-evict log lines: /'
 $SSH "$PEER_SSH" "du -sh '$SWAP_DIR' 2>/dev/null | cut -f1" | sed 's/^/  swap dir size: /'
 
 hdr "RESULT"
-if [ "$RC" -eq 0 ] && [ "$KV_RC" -eq 0 ]; then
-  echo "  PASS — two-machine RDMA paging round-trips (v2-only wire: SSM kind=0 + KV kind=1 + isolation),"
-  echo "         byte-identical after peer-side NVMe spills"
+if [ "$RC" -eq 0 ] && [ "$KV_RC" -eq 0 ] && [ "$DECODE_RC" -eq 0 ]; then
+  echo "  PASS — two-machine RDMA paging round-trips (v2-only wire: SSM kind=0 + KV kind=1 + isolation"
+  echo "         + decode client-salt isolation), byte-identical after peer-side NVMe spills"
 else
-  echo "  FAIL — SSM phase rc=$RC, KV phase rc=$KV_RC"
+  echo "  FAIL — SSM phase rc=$RC, KV phase rc=$KV_RC, decode-isolation phase rc=$DECODE_RC"
   $SSH "$PEER_SSH" "tail -30 /tmp/atlas-peer-${RUN_ID}.log" | sed 's/^/    peer: /'
 fi
 [ "$RC" -eq 0 ] || exit "$RC"
-exit "$KV_RC"
+[ "$KV_RC" -eq 0 ] || exit "$KV_RC"
+exit "$DECODE_RC"

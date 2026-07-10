@@ -39,10 +39,15 @@ fn main() -> anyhow::Result<()> {
 
     // put | get | putget (default) — the SSM paging modes (v2, kind=0); or
     // kv | kv-isolation — the Step B KV paging kind (PAGING_MAGIC_V2, kind=1)
-    // driven through the real KvPagingBackend StorageBackend client.
+    // driven through the real KvPagingBackend StorageBackend client; or
+    // decode-isolation — two SSM decode clients (same model, different
+    // per-process client salts) on one shared arena (v2, kind=0).
     let mode = std::env::var("SMOKE_MODE").unwrap_or_else(|_| "putget".into());
     if mode == "kv" || mode == "kv-isolation" {
         return kv_main(&addr, blob, slots, n, &mode);
+    }
+    if mode == "decode-isolation" {
+        return decode_isolation_main(&addr, blob, slots, n);
     }
 
     let arena_bytes = (slots * blob) as u64;
@@ -107,6 +112,87 @@ fn main() -> anyhow::Result<()> {
          single fault-from-disk {one_get_us}us",
         put_ms / n as f64,
         get_ms / n as f64,
+    );
+    Ok(())
+}
+
+/// SMOKE_MODE=decode-isolation — two SSM DECODE clients (same model
+/// fingerprint, DIFFERENT per-process client salts) against ONE shared peer
+/// paging arena (v2 handshake, kind=0). Decode cold keys are SLOT COORDINATES
+/// (client-local `(seq, logical)` indices), so both clients derive
+/// byte-identical pre-namespace keys — only the per-process client salt folded
+/// into the decode namespace (`ATLAS_SSM_DECODE_CLIENT_ID` in the model serve)
+/// keeps client B from faulting or deleting client A's rollback blobs.
+///
+/// Phase 1: client A PUTs `n` keys (n ≫ slots forces peer NVMe spills).
+/// Phase 2: client B (salt 2) must MISS every key; its removes must not leak.
+/// Phase 3: a THIRD connection with A's salt HITs all byte-identically — the
+/// control proving phase 2's misses are isolation, not a dead connection.
+#[cfg(all(feature = "cuda", atlas_rdma_verbs))]
+fn decode_isolation_main(addr: &str, blob: usize, slots: usize, n: u64) -> anyhow::Result<()> {
+    use atlas_tier::hash::mix64;
+    use spark_storage::RdmaSnapshotArena;
+
+    // Mirrors the SHAPE of spark-model's shipped derivation:
+    //   ns(salt)  = mix64(mix64(fp, DECODE_DOMAIN), client_salt)
+    //   wire(key) = mix64(cold_key, ns)
+    // DECODE_DOMAIN_LIT is an illustrative transcription of
+    // `atlas_kernels::DECODE_DOMAIN` (spark-storage has no atlas-kernels dep);
+    // the property under test is salt isolation on one shared arena, not the
+    // production constant's value.
+    const DECODE_DOMAIN_LIT: u64 = 0xD3C0_DE12_A5B6_C7D8;
+    const FP: u64 = 0xFEED_FACE_CAFE_BEEF; // fixed test "model" (as in kv_main)
+    let ns = |salt: u64| mix64(mix64(FP, DECODE_DOMAIN_LIT), salt);
+    let (ns_a, ns_b) = (ns(1), ns(2));
+
+    let arena_bytes = (slots * blob) as u64;
+    let pat = |k: u64| -> Vec<u8> {
+        let mut v = vec![0u8; blob];
+        for (i, x) in v.iter_mut().enumerate() {
+            *x = (k as u8) ^ (i as u8).wrapping_mul(37) ^ 0x5A;
+        }
+        v
+    };
+    println!(
+        "connecting SSM decode-isolation @ {addr}: {slots}-slot arena × {blob} B, {n} keys \
+         (forces {} disk spills)",
+        n.saturating_sub(slots as u64)
+    );
+    // Client A: PUT everything under its salted namespace.
+    let a = RdmaSnapshotArena::connect_paging(addr, arena_bytes, blob)?;
+    for k in 0..n {
+        a.paging_put(mix64(k, ns_a), &pat(k))?;
+    }
+    // Client B (same model, different salt): every GET must MISS, and its
+    // removes must not touch A's blobs (the cross-client delete hazard).
+    let b = RdmaSnapshotArena::connect_paging(addr, arena_bytes, blob)?;
+    let mut out = vec![0u8; blob];
+    for k in 0..n {
+        let hit = b.paging_get(mix64(k, ns_b), &mut out)?;
+        anyhow::ensure!(
+            !hit,
+            "DECODE ISOLATION BROKEN: client B was served client A's rollback blob (key {k})"
+        );
+        b.paging_remove(mix64(k, ns_b))?;
+    }
+    // Control: a third connection with A's salt HITs all byte-identically.
+    let a2 = RdmaSnapshotArena::connect_paging(addr, arena_bytes, blob)?;
+    for k in 0..n {
+        let hit = a2.paging_get(mix64(k, ns_a), &mut out)?;
+        anyhow::ensure!(
+            hit,
+            "control MISS on key {k}: blob lost — dead connection, or B's removes \
+             leaked across namespaces"
+        );
+        anyhow::ensure!(
+            out == pat(k),
+            "control CORRUPTED: key {k} not byte-identical"
+        );
+    }
+    println!(
+        "DECODE ISOLATION OK ✅  two client salts on one shared peer arena: B missed all \
+         {n} of A's slot-coordinate keys (and B's removes did not leak); a same-salt \
+         control connection restored all {n} byte-identical after peer NVMe spills"
     );
     Ok(())
 }
