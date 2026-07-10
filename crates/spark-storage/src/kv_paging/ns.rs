@@ -53,32 +53,14 @@ pub const KV_NS_VERSION: u64 = 1;
 /// `atlas_kernels::DECODE_DOMAIN`.
 pub const KV_DOMAIN: u64 = 0x4B56_5041_4745_0001;
 
-const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
-
 /// Vendored FNV-1a/64 — byte-identical to spark-model's `fingerprint.rs`
 /// copy; both are pinned to the published FNV reference vectors.
-pub(crate) const fn fnv1a_64(bytes: &[u8]) -> u64 {
-    let mut h = FNV_OFFSET;
-    let mut i = 0;
-    while i < bytes.len() {
-        h = (h ^ bytes[i] as u64).wrapping_mul(FNV_PRIME);
-        i += 1;
-    }
-    h
-}
+pub(crate) use atlas_tier::hash::{FNV_OFFSET, fnv1a_64};
 
-/// splitmix64 finalizer over `a ^ b·GOLDEN` — byte-identical to spark-model's
-/// `mix64` and to `PagingSnapshotStore::wire`'s fold (cross-crate
-/// frozen-literal pinned in `ns_tests.rs`).
-pub(crate) fn mix64(a: u64, b: u64) -> u64 {
-    let mut h = a ^ b.wrapping_mul(0x9E37_79B9_7F4A_7C15);
-    h ^= h >> 30;
-    h = h.wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    h ^= h >> 27;
-    h = h.wrapping_mul(0x94D0_49BB_1331_11EB);
-    h ^ (h >> 31)
-}
+// SSOT: this was a FOURTH transcription of the splitmix64 constants — its own doc
+// comment asserted it was "byte-identical to spark-model's mix64", which is the
+// violation stating itself. One definition, in atlas_tier::hash.
+pub(crate) use atlas_tier::hash::mix64;
 
 fn put_u64(buf: &mut Vec<u8>, tag: u8, v: u64) {
     buf.push(tag);

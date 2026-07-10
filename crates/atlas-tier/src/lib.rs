@@ -24,6 +24,7 @@
 //! which re-exports this core so existing consumers compile unchanged.
 
 mod direct_swap;
+pub mod hash;
 mod mem;
 mod residency;
 mod traits;

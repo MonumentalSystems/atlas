@@ -50,39 +50,17 @@ use std::num::NonZeroU64;
 use anyhow::{Result, anyhow, bail};
 use atlas_core::config::ModelConfig;
 
+// SSOT: the durable-key hash primitives live in atlas-tier (pure, dep-free, a
+// common ancestor of this crate and spark-storage's kv_paging). They were
+// transcribed in three places; the constants are now defined exactly once.
+pub(crate) use atlas_tier::hash::{FNV_OFFSET, fnv1a_64, mix64};
+
 /// Bump = deliberate fleet-wide cache-key rotation (document it).
 // v2 (2026-07-10): added hidden_size / num_attention_heads / intermediate_size /
 // moe_intermediate_size / num_experts_per_tok (tags 0x16-0x1a). v1 omitted them, so
 // two distinct models differing only in residual/FFN width collided. Bumping the
 // version is a DELIBERATE, one-time fleet cache-key rotation (greenfield: no shim).
 pub(crate) const FP_VERSION: u64 = 2;
-
-const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
-
-/// FNV-1a/64 over a byte stream. Deterministic across toolchains, platforms
-/// and rebuilds — see the module header for why this is load-bearing.
-pub(crate) const fn fnv1a_64(bytes: &[u8]) -> u64 {
-    let mut h = FNV_OFFSET;
-    let mut i = 0;
-    while i < bytes.len() {
-        h = (h ^ bytes[i] as u64).wrapping_mul(FNV_PRIME);
-        i += 1;
-    }
-    h
-}
-
-/// splitmix64 finalizer over `a ^ b·GOLDEN` — domain-separated mixing (the
-/// decode namespace is `mix64(fingerprint, DECODE_DOMAIN)`). Same finalizer
-/// family as `PagingSnapshotStore::wire()`; deterministic forever.
-pub(crate) fn mix64(a: u64, b: u64) -> u64 {
-    let mut h = a ^ b.wrapping_mul(0x9E37_79B9_7F4A_7C15);
-    h ^= h >> 30;
-    h = h.wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    h ^= h >> 27;
-    h = h.wrapping_mul(0x94D0_49BB_1331_11EB);
-    h ^ (h >> 31)
-}
 
 fn put_u64(buf: &mut Vec<u8>, tag: u8, v: u64) {
     buf.push(tag);

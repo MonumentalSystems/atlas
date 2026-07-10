@@ -238,3 +238,34 @@ fn wire_fold_is_deterministic_per_store_instance() {
     let other = store(&peer, ns_of(&dense()));
     assert_ne!(s1.wire(K), other.wire(K));
 }
+
+/// GOLDEN PIN on the PERSISTED key. `wire_fold_is_deterministic_per_store_instance`
+/// above proves self-consistency, so it would still pass if the entire fold
+/// rotated — while every key already written to a peer's NVMe swap file became
+/// unreachable. This pins the actual `u64` that goes on the wire and onto disk.
+///
+/// It also pins the SSOT identity `wire(key) == mix64(key, ns)`: `wire()` used to
+/// be a third hand-transcription of the splitmix64 constants and now delegates to
+/// `atlas_tier::hash::mix64`. If those ever diverge, this fails.
+///
+/// DO NOT update the literal to make this pass — a change here is a deliberate
+/// fleet-wide cache flush and must be versioned.
+#[test]
+fn wire_key_is_mix64_of_key_and_ns() {
+    let peer = Arc::new(MockPagingPeer::new(BLOB, 8));
+    // The pinned hybrid-MoE fingerprint (fingerprint_tests::golden_fingerprint_*).
+    let ns = NonZeroU64::new(0x5629_922c_51a1_6a10).unwrap();
+    let s = store(&peer, ns);
+    let key = 0x0123_4567_89ab_cdef_u64;
+
+    assert_eq!(
+        s.wire(key),
+        0x51f6_0258_9d95_1e89,
+        "persisted wire key rotated"
+    );
+    assert_eq!(
+        s.wire(key),
+        mix64(key, ns.get()),
+        "wire() must BE mix64(key, ns)"
+    );
+}

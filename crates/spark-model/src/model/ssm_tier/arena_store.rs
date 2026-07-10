@@ -49,12 +49,12 @@ impl PagingSnapshotStore {
     /// (same model+key → same wire key → cache hit) with negligible cross-model
     /// collision, same 64-bit contract as `prefix_hash` itself.
     fn wire(&self, key: u64) -> u64 {
-        let mut h = key ^ self.namespace.get().wrapping_mul(0x9E37_79B9_7F4A_7C15);
-        h ^= h >> 30;
-        h = h.wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        h ^= h >> 27;
-        h = h.wrapping_mul(0x94D0_49BB_1331_11EB);
-        h ^ (h >> 31)
+        // SSOT: this WAS a third transcription of the splitmix64 constants. It is
+        // exactly `mix64(key, ns)` — same operands, same order — so routing it
+        // through the one definition in `atlas_tier::hash` is VALUE-PRESERVING:
+        // no key rotates, no FP_VERSION bump. Proven by the golden pin in
+        // `paging_isolation_tests::wire_key_is_mix64_of_key_and_ns`.
+        atlas_tier::hash::mix64(key, self.namespace.get())
     }
 }
 
