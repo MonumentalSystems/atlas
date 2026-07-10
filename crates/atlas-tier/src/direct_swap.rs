@@ -12,6 +12,16 @@ use anyhow::{Result, bail};
 
 use crate::traits::SwapStore;
 
+/// `O_DIRECT` is a Linux-only open flag (macOS has no equivalent — `F_NOCACHE`
+/// is an `fcntl`, not an open flag). The type itself must still compile on every
+/// unix because `spark_storage::snapshot_swap` re-exports it unconditionally and
+/// the workspace has a macOS/metal CI job; off Linux it simply opens buffered.
+/// That is harmless: the NVMe cold tier only ever runs on the Linux fleet.
+#[cfg(target_os = "linux")]
+const DIRECT_FLAGS: i32 = libc::O_DIRECT;
+#[cfg(not(target_os = "linux"))]
+const DIRECT_FLAGS: i32 = 0;
+
 /// O_DIRECT fixed-stride swap file on NVMe (the peer's cold tier). `record_bytes`
 /// MUST be a 4 KiB multiple (O_DIRECT) — the SSM snapshot blob (66,846,720 B =
 /// 16,320 × 4 KiB) already is. Records are addressed by `disk_slot` at
@@ -40,7 +50,7 @@ impl DirectSwapFile {
             .write(true)
             .create(true)
             .truncate(true)
-            .custom_flags(libc::O_DIRECT)
+            .custom_flags(DIRECT_FLAGS)
             .open(path)
             .map_err(|e| anyhow::anyhow!("open O_DIRECT {}: {e}", path.display()))?;
         Ok(Self {
