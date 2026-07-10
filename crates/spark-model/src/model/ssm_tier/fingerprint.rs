@@ -97,22 +97,28 @@ impl ModelFingerprint {
         );
         // The fingerprint is GEOMETRY-ONLY. It cannot distinguish two checkpoints
         // with byte-identical config — a fine-tune, an RL variant, a continued
-        // pre-train of one base. Those derive the same namespace and would share a
-        // shared peer's cache. We cannot fail fast (config carries no weight
-        // identity), so warn loudly exactly when it matters: a SHARED paging peer
-        // is selected and the operator gave neither a salt nor an explicit ns.
-        let shared_peer = std::env::var("ATLAS_SSM_SWAP").ok().as_deref() == Some("1")
+        // pre-train of one base. Those derive the same namespace and would share
+        // one store's cache. We cannot fail fast (config carries no weight
+        // identity), so warn loudly exactly when it matters: a SHARED store backs
+        // the tier and the operator gave neither a salt nor an explicit ns.
+        //
+        // NOT just a peer: ATLAS_SSM_SWAP=1 is a LOCAL swap FILE, which two
+        // processes pointed at one swap dir share exactly as dangerously. Saying
+        // "peer" here sent an operator hunting for an RDMA peer that was never
+        // configured (found by running the serve path, not by any unit test).
+        let shared_store = std::env::var("ATLAS_SSM_SWAP").ok().as_deref() == Some("1")
             || std::env::var("ATLAS_SSM_DECODE_TIER").ok().as_deref() == Some("peer");
         let overridden = std::env::var_os("ATLAS_SSM_SWAP_NS").is_some()
             || std::env::var_os("ATLAS_SSM_DECODE_NS").is_some();
-        if shared_peer && model_id.is_empty() && !overridden {
+        if shared_store && model_id.is_empty() && !overridden {
             tracing::warn!(
-                "shared paging peer selected but ATLAS_MODEL_ID is unset: the fingerprint is \
+                "a SHARED SSM cache store is selected (ATLAS_SSM_SWAP=1 local swap file, or \
+                 ATLAS_SSM_DECODE_TIER=peer) but ATLAS_MODEL_ID is unset: the fingerprint is \
                  derived from config GEOMETRY ONLY, so two checkpoints with identical config \
                  (fine-tunes, RL variants, continued pre-train of one base) will SHARE cache \
                  keys and silently cross-serve recurrent state. Set ATLAS_MODEL_ID to a stable \
                  per-checkpoint string (or set ATLAS_SSM_SWAP_NS / ATLAS_SSM_DECODE_NS \
-                 explicitly) when co-locating such models on one peer."
+                 explicitly) when co-locating such models on one store."
             );
         }
         Ok(fp)

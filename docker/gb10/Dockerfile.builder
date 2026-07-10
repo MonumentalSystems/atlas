@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1.7
 # Atlas reproducible BUILD environment — pins every native/FFI dependency so a
 # `cargo build` "just works" without remembering CUTLASS_HOME / FLASHINFER_HOME /
 # CUDA-13.2 / the GDN AOT libs. This is the env behind the hand-built
@@ -46,6 +47,25 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 ENV PATH="/root/.cargo/bin:${PATH}"
 ENV RUSTUP_TOOLCHAIN=stable
 ENV CUDA_HOME=/usr/local/cuda
+
+# sccache: caches rustc invocations across builds/branches/worktrees.
+# MEASURED on this repo (spark-storage, release): 18.4 s cold -> 1.7 s warm.
+#
+# Two things it does NOT do, so nobody over-expects it:
+#   * It does not cache the ~150 nvcc kernel compiles. `atlas-kernels/build.rs`
+#     invokes nvcc DIRECTLY, so RUSTC_WRAPPER never sees them. That build script
+#     has its own within-build dedup; a persistent kernel cache is separate work.
+#   * It cannot cache an INCREMENTAL rustc call (sccache reports the call as
+#     non-cacheable). Release already implies incremental=0; CARGO_INCREMENTAL=0
+#     below makes a `cargo build` (dev profile) inside this image cacheable too.
+ARG SCCACHE_VER=0.15.0
+RUN curl -fsSL "https://github.com/mozilla/sccache/releases/download/v${SCCACHE_VER}/sccache-v${SCCACHE_VER}-$(uname -m)-unknown-linux-musl.tar.gz" \
+      | tar -xz -C /tmp && \
+    mv /tmp/sccache-v${SCCACHE_VER}-$(uname -m)-unknown-linux-musl/sccache /usr/local/bin/sccache && \
+    chmod +x /usr/local/bin/sccache && sccache --version
+ENV RUSTC_WRAPPER=sccache
+ENV SCCACHE_DIR=/sccache
+ENV CARGO_INCREMENTAL=0
 
 # CUTLASS (header-only; build.rs compiles cutlass_nvfp4_gemm.cu against it).
 ENV CUTLASS_HOME=/opt/cutlass
@@ -96,7 +116,20 @@ ENV ATLAS_CUTLASS_NVFP4_GEMM=1
 # 13.1 ABI (format {maj}0{min}0). Proper fix = bump cudarc to a 13.2-aware version.
 ENV CUDARC_CUDA_VERSION=13010
 
-RUN cargo build --release -p spark-server
+# BuildKit cache mounts persist ACROSS image builds (a plain RUN layer would
+# discard $SCCACHE_DIR the moment it finishes). `sccache --show-stats` is printed
+# so a build that silently stops caching is visible rather than merely slow.
+# Needs BuildKit (default in modern docker; else DOCKER_BUILDKIT=1).
+#
+# CARGO_HOME is /root/.cargo here (rustup's default), NOT /usr/local/cargo.
+# `target/` is deliberately NOT cache-mounted: the runtime stage does
+# `COPY --from=builder /build/target/release/spark`, and a cache mount is not
+# part of the layer, so that COPY would find nothing.
+RUN --mount=type=cache,target=/sccache,sharing=locked \
+    --mount=type=cache,target=/root/.cargo/registry,sharing=locked \
+    --mount=type=cache,target=/root/.cargo/git,sharing=locked \
+    cargo build --release -p spark-server && \
+    sccache --show-stats
 
 # GDN AOT shared lib. The re-link path needs gdn_holo_0.o (AOT-exported bf16
 # kernel), which is NOT in-tree — but the fully-linked libatlasgdn.so IS
