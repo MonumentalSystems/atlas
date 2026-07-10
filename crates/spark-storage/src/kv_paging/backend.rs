@@ -134,12 +134,24 @@ impl KvPagingBackend {
             ))
             .context("send kv paging v2 header")?;
 
-        let mut rs = RailSet::begin(&mut stream, &specs)?;
         let bb = block_bytes as usize;
-        let mut parts: Vec<(PinnedBuffer, u32)> = Vec::with_capacity(rs.n_rails());
+        // `parts` (the pinned bounce buffers) MUST be declared BEFORE `rs` (the
+        // Verbs that hold the MRs registered against those buffers). reg_mr's
+        // contract: the addr must outlive the Verbs (the MR is dereg'd on
+        // `Verbs::drop` → rs_destroy). On the SUCCESS path both are consumed
+        // into `PagingRail { verbs, bounce }`, whose field order dereg's before
+        // free. But on ANY early return between reg_mr and building `rails`
+        // (e.g. `finish_rw` failing when the peer rejects), the two are dropped
+        // as locals in REVERSE declaration order — so `parts` last means the
+        // pinned memory is freed AFTER `rs` deregisters the MRs, not before.
+        let mut parts: Vec<(PinnedBuffer, u32)> = Vec::new();
+        let mut rs = RailSet::begin(&mut stream, &specs)?;
+        parts.reserve(rs.n_rails());
         for rail in &mut rs.rails {
             let bounce = PinnedBuffer::new(bb).context("alloc pinned kv paging bounce")?;
-            // SAFETY: bounce lives as long as the rail (and thus the MR).
+            // SAFETY: bounce lives as long as the rail (and thus the MR) — on
+            // both the success path (co-owned in PagingRail) and the error path
+            // (parts outlives rs by declaration order above).
             let keys = unsafe { rail.verbs.reg_mr(bounce.ptr, bb, false)? };
             parts.push((bounce, keys.lkey));
         }
