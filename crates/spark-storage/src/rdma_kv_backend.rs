@@ -30,16 +30,14 @@
 
 use std::collections::HashMap;
 use std::ffi::c_void;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::net::TcpStream;
 
 use anyhow::{Context, Result, bail};
 
 use crate::backend::{ReadRequest, StorageBackend};
 use crate::cuda_min::{CudaEvent, PinnedBuffer, copy_h_to_d_async, stream_sync};
-use crate::expert_peer::{STATUS_OK, VerbsClientParams};
 use crate::group::{GroupKey, GroupLayout};
-use crate::cache_peer::CacheServerParams;
 use crate::rdma_verbs::Verbs;
 
 /// One registered pinned bounce in a rail's pipeline ring.
@@ -242,8 +240,12 @@ unsafe impl Sync for RdmaKvBackend {}
 
 impl RdmaKvBackend {
     /// Connect to a KV blade at `addr`, size + register the peer arena, bring up
-    /// N rails (RC QPs across the CX7 adapters), and allocate each rail's ring.
+    /// N rails (RC QPs across the CX7 adapters) via
+    /// [`atlas_rdma::railset::RailSet`], and allocate each rail's ring.
     pub fn connect(addr: &str, layout: GroupLayout) -> Result<Self> {
+        use atlas_rdma::env::{first_set, first_set_u32};
+        use atlas_rdma::railset::{RailSet, RailSpec};
+
         let group_bytes = layout.group_bytes() as usize;
         let num_groups = (layout.num_layers as u64)
             * 2
@@ -252,19 +254,26 @@ impl RdmaKvBackend {
         let total_bytes = num_groups * layout.group_stride;
 
         // Rail devices: rail 0 from the expert env (shared CX7 link), rail 1 from
-        // the KV rail-2 env. Dual-rail only when ATLAS_KV_DUAL_RAIL=1.
-        let dev0 = std::env::var("ATLAS_EXPERT_RDMA_DEV").unwrap_or_else(|_| "roceP2p1s0f1".into());
-        let gid0 = env_u32("ATLAS_EXPERT_RDMA_GID", 3);
-        let dev1 = std::env::var("ATLAS_KV_RAIL2_DEV").unwrap_or_else(|_| "rocep1s0f1".into());
-        let gid1 = env_u32("ATLAS_KV_RAIL2_GID", 3);
+        // the KV rail-2 env. Dual-rail only when ATLAS_KV_DUAL_RAIL=1. Fresh
+        // random 24-bit PSN per rail.
+        let spec =
+            |dev: String, gid: u32| RailSpec::new(dev, gid, rand::random::<u32>() & 0xff_ffff);
+        let rail0 = spec(
+            first_set(&["ATLAS_EXPERT_RDMA_DEV"], "roceP2p1s0f1"),
+            first_set_u32(&["ATLAS_EXPERT_RDMA_GID"], 3),
+        );
         let dual = std::env::var("ATLAS_KV_DUAL_RAIL").ok().as_deref() == Some("1");
-        let rail_devs: Vec<(String, u32)> = if dual {
-            vec![(dev0, gid0), (dev1, gid1)]
+        let specs: Vec<RailSpec> = if dual {
+            let rail1 = spec(
+                first_set(&["ATLAS_KV_RAIL2_DEV"], "rocep1s0f1"),
+                first_set_u32(&["ATLAS_KV_RAIL2_GID"], 3),
+            );
+            vec![rail0, rail1]
         } else {
-            vec![(dev0, gid0)]
+            vec![rail0]
         };
-        let n_rails = rail_devs.len();
-        let depth: usize = env_u32("ATLAS_KV_PIPELINE_DEPTH", 16).clamp(1, 128) as usize;
+        let n_rails = specs.len();
+        let depth: usize = first_set_u32(&["ATLAS_KV_PIPELINE_DEPTH"], 16).clamp(1, 128) as usize;
 
         let mut stream =
             TcpStream::connect(addr).with_context(|| format!("connect kv peer {addr}"))?;
@@ -272,27 +281,39 @@ impl RdmaKvBackend {
         stream
             .write_all(&total_bytes.to_le_bytes())
             .context("send kv total_bytes")?;
-        stream.write_all(&[n_rails as u8]).context("send n_rails")?;
 
-        // Create each rail's QP + bounce ring.
-        let mut rails: Vec<Rail> = Vec::with_capacity(n_rails);
-        for (dev, gid) in &rail_devs {
-            let psn = rand::random::<u32>() & 0xff_ffff;
-            let mut verbs = Verbs::create(dev, *gid, psn)?;
+        // [u8 n_rails] + one QP per rail, then each rail's bounce ring
+        // (LOCAL_WRITE-only landing MRs — `remote_read == false`, invariant).
+        let mut rs = RailSet::begin(&mut stream, &specs)?;
+        let mut rings: Vec<Vec<Bounce>> = Vec::with_capacity(n_rails);
+        for rail in &mut rs.rails {
             let mut bounces = Vec::with_capacity(depth);
             for _ in 0..depth {
                 let buf = PinnedBuffer::new(group_bytes).context("alloc pinned kv bounce")?;
                 // SAFETY: buf lives as long as the rail (and thus the MR).
-                let keys = unsafe { verbs.reg_mr(buf.ptr, group_bytes, false)? };
+                let keys = unsafe { rail.verbs.reg_mr(buf.ptr, group_bytes, false)? };
                 bounces.push(Bounce {
                     buf,
                     lkey: keys.lkey,
                     copy_done: None,
                 });
             }
-            rails.push(Rail {
+            rings.push(bounces);
+        }
+
+        // Peer's per-rail QP + rkey (shared base), client params, connect, ack.
+        let server = rs.finish_rw(&mut stream, "kv peer")?;
+        // Shared arena base: every rail publishes the same one (keep the LAST,
+        // the pre-RailSet loop-overwrite behavior).
+        let base = server.last().map(|sp| sp.base_addr).unwrap_or(0);
+        let rails: Vec<Rail> = rs
+            .into_verbs()
+            .into_iter()
+            .zip(rings)
+            .zip(&server)
+            .map(|((verbs, bounces), sp)| Rail {
                 verbs,
-                remote_rkey: 0, // filled from the handshake below
+                remote_rkey: sp.rkey,
                 free: (0..depth).collect(),
                 bounces,
                 inflight: HashMap::new(),
@@ -300,44 +321,8 @@ impl RdmaKvBackend {
                 dst_lkeys: HashMap::new(),
                 region: None,
                 direct_inflight: 0,
-            });
-        }
-
-        // Read the peer's per-rail QP + rkey (shared base).
-        let mut b1 = [0u8; 1];
-        stream.read_exact(&mut b1).context("read peer n_rails")?;
-        if b1[0] as usize != n_rails {
-            bail!("peer granted {} rails, wanted {n_rails}", b1[0]);
-        }
-        let mut base = 0u64;
-        let mut server: Vec<CacheServerParams> = Vec::with_capacity(n_rails);
-        for _ in 0..n_rails {
-            let sp = CacheServerParams::read_from(&mut stream).context("read kv server params")?;
-            base = sp.base_addr;
-            server.push(sp);
-        }
-        // Reply with each rail's client QP, then connect.
-        stream
-            .write_all(&[n_rails as u8])
-            .context("send client n_rails")?;
-        for rail in &rails {
-            VerbsClientParams {
-                qpn: rail.verbs.qpn(),
-                psn: rail.verbs.psn(),
-                gid: rail.verbs.gid(),
-            }
-            .write_to(&mut stream)
-            .context("send kv client params")?;
-        }
-        for (rail, sp) in rails.iter_mut().zip(&server) {
-            rail.verbs.connect(sp.qpn, sp.psn, &sp.gid)?;
-            rail.remote_rkey = sp.rkey;
-        }
-        let mut ack = [0u8; 1];
-        stream.read_exact(&mut ack).context("read kv ready ack")?;
-        if ack[0] != STATUS_OK {
-            bail!("kv peer refused connection (ack {})", ack[0]);
-        }
+            })
+            .collect();
         tracing::info!(
             "RdmaKvBackend connected to {addr}: {:.1} GiB blade, {n_rails} rail(s), \
              group_stride {}, pipeline depth {depth}",
@@ -423,13 +408,6 @@ impl RdmaKvBackend {
         }
         Ok(())
     }
-}
-
-fn env_u32(k: &str, default: u32) -> u32 {
-    std::env::var(k)
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(default)
 }
 
 impl RdmaKvBackend {

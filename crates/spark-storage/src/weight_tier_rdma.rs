@@ -143,28 +143,6 @@ impl RdmaWeightLoader {
 }
 
 #[cfg(atlas_rdma_verbs)]
-fn env_str(keys: &[&str], default: &str) -> String {
-    for k in keys {
-        if let Ok(v) = std::env::var(k)
-            && !v.is_empty()
-        {
-            return v;
-        }
-    }
-    default.to_string()
-}
-
-#[cfg(atlas_rdma_verbs)]
-fn env_u32(keys: &[&str], default: u32) -> u32 {
-    for k in keys {
-        if let Some(v) = std::env::var(k).ok().and_then(|s| s.parse().ok()) {
-            return v;
-        }
-    }
-    default
-}
-
-#[cfg(atlas_rdma_verbs)]
 impl RdmaWeightLoader {
     fn load_impl(
         &self,
@@ -174,16 +152,18 @@ impl RdmaWeightLoader {
     ) -> Result<WeightStore> {
         use std::collections::HashMap;
         use std::ffi::c_void;
-        use std::io::{Read, Write};
+        use std::io::Write;
         use std::net::TcpStream;
 
         use anyhow::{Context, bail};
 
-        use crate::expert_peer::{MODE_VERBS, STATUS_OK, VerbsClientParams, read_server_rails};
+        use crate::expert_peer::MODE_VERBS;
         use crate::rdma_verbs::Verbs;
         use crate::weight_peer::{
             rail_for_tensor, read_weight_manifest, tensor_remote_addr, write_model_request,
         };
+        use atlas_rdma::env::{first_nonempty, first_set_u32};
+        use atlas_rdma::railset::{RailSet, RailSpec};
         use spark_runtime::weights::{WeightDtype, WeightTensor};
 
         // 1. Connect + request the model + read the manifest.
@@ -246,30 +226,32 @@ impl RdmaWeightLoader {
             }
         }
 
-        // 4. Verbs handshake. Rail 0 defaults to the shared expert CX7 link;
-        // dual-rail is opt-in (ATLAS_WEIGHT_DUAL_RAIL=1). ATLAS_WEIGHT_* overrides
-        // fall back to the ATLAS_EXPERT_* names so a single fabric config serves
-        // both tiers.
-        let dev0 = env_str(
-            &["ATLAS_WEIGHT_RDMA_DEV", "ATLAS_EXPERT_RDMA_DEV"],
-            "roceP2p1s0f1",
+        // 4. Verbs handshake via RailSet. Rail 0 defaults to the shared expert
+        // CX7 link; dual-rail is opt-in (ATLAS_WEIGHT_DUAL_RAIL=1). ATLAS_WEIGHT_*
+        // overrides fall back to the ATLAS_EXPERT_* names so a single fabric
+        // config serves both tiers (weight semantics: an exported-but-EMPTY
+        // override is SKIPPED — `first_nonempty`). Fresh random 24-bit PSN/rail.
+        let spec =
+            |dev: String, gid: u32| RailSpec::new(dev, gid, rand::random::<u32>() & 0xff_ffff);
+        let rail0 = spec(
+            first_nonempty(&["ATLAS_WEIGHT_RDMA_DEV", "ATLAS_EXPERT_RDMA_DEV"], "roceP2p1s0f1"),
+            first_set_u32(&["ATLAS_WEIGHT_RDMA_GID", "ATLAS_EXPERT_RDMA_GID"], 3),
         );
-        let gid0 = env_u32(&["ATLAS_WEIGHT_RDMA_GID", "ATLAS_EXPERT_RDMA_GID"], 3);
-        let dev1 = env_str(
-            &["ATLAS_WEIGHT_RAIL2_DEV", "ATLAS_EXPERT_RAIL2_DEV"],
-            "rocep1s0f1",
-        );
-        let gid1 = env_u32(&["ATLAS_WEIGHT_RAIL2_GID", "ATLAS_EXPERT_RAIL2_GID"], 3);
         let dual = std::env::var("ATLAS_WEIGHT_DUAL_RAIL").ok().as_deref() == Some("1");
-        let rail_devs: Vec<(String, u32)> = if dual {
-            vec![(dev0, gid0), (dev1, gid1)]
+        let specs: Vec<RailSpec> = if dual {
+            let rail1 = spec(
+                first_nonempty(&["ATLAS_WEIGHT_RAIL2_DEV", "ATLAS_EXPERT_RAIL2_DEV"], "rocep1s0f1"),
+                first_set_u32(&["ATLAS_WEIGHT_RAIL2_GID", "ATLAS_EXPERT_RAIL2_GID"], 3),
+            );
+            vec![rail0, rail1]
         } else {
-            vec![(dev0, gid0)]
+            vec![rail0]
         };
-        let n_rails = rail_devs.len();
+        let n_rails = specs.len();
 
         stream.write_all(&[MODE_VERBS]).context("send verbs mode")?;
-        stream.write_all(&[n_rails as u8]).context("send n_rails")?;
+        // [u8 n_rails] + one QP per rail.
+        let mut rs = RailSet::begin(&mut stream, &specs)?;
 
         // One pinned, registered bounce per rail, sized to the largest retained
         // tensor. Tensors are processed serially per rail (post → poll), so one
@@ -284,34 +266,27 @@ impl RdmaWeightLoader {
         }
         let bounce_len = (max_len as usize).max(1);
 
-        struct Rail {
-            verbs: Verbs,
-            bounce_ptr: *mut u8,
-            bounce_lkey: u32,
-        }
-        let mut rails: Vec<Rail> = Vec::with_capacity(n_rails);
+        // LOCAL_WRITE-only landing MRs (`remote_read == false`, invariant).
         // Track pinned allocations to free AFTER the rails (MRs) are dropped.
         let mut pinned: Vec<*mut u8> = Vec::with_capacity(n_rails);
-        for (dev, gid) in &rail_devs {
-            let psn = rand::random::<u32>() & 0xff_ffff;
-            let mut v = Verbs::create(dev, *gid, psn)?;
+        let mut bounce_lkeys: Vec<u32> = Vec::with_capacity(n_rails);
+        for rail in &mut rs.rails {
             let ptr = gpu
                 .alloc_host_pinned(bounce_len)
                 .context("alloc pinned RDMA landing bounce")?;
             // SAFETY: ptr backs `bounce_len` pinned bytes that outlive the MR
             // (freed after the rails are dropped below).
-            let keys = unsafe { v.reg_mr(ptr as *mut c_void, bounce_len, false) }
+            let keys = unsafe { rail.verbs.reg_mr(ptr as *mut c_void, bounce_len, false) }
                 .context("register RDMA landing bounce")?;
             pinned.push(ptr);
-            rails.push(Rail {
-                verbs: v,
-                bounce_ptr: ptr,
-                bounce_lkey: keys.lkey,
-            });
+            bounce_lkeys.push(keys.lkey);
         }
 
-        // Peer publishes per-rail per-SHARD (base, rkey). Validate shard counts.
-        let server = read_server_rails(&mut stream, n_rails).context("read verbs server params")?;
+        // Peer publishes per-rail per-SHARD (base, rkey). Validate shard counts
+        // BEFORE replying (a mismatch bails with no client params written).
+        let server = rs
+            .read_server_ro(&mut stream)
+            .context("read verbs server params")?;
         for sp in &server {
             if sp.layers.len() != num_shards {
                 bail!(
@@ -322,29 +297,23 @@ impl RdmaWeightLoader {
         }
 
         // Reply with our QP params, connect each rail, await the ready ack.
-        stream
-            .write_all(&[n_rails as u8])
-            .context("send client n_rails")?;
-        for r in &rails {
-            VerbsClientParams {
-                qpn: r.verbs.qpn(),
-                psn: r.verbs.psn(),
-                gid: r.verbs.gid(),
-            }
-            .write_to(&mut stream)
-            .context("send verbs client params")?;
+        rs.complete(&mut stream, &server, "weight peer")?;
+        struct Rail {
+            verbs: Verbs,
+            bounce_ptr: *mut u8,
+            bounce_lkey: u32,
         }
-        for (i, r) in rails.iter_mut().enumerate() {
-            let sp = &server[i];
-            r.verbs.connect(sp.qpn, sp.psn, &sp.gid)?;
-        }
-        let mut ack = [0u8; 1];
-        stream
-            .read_exact(&mut ack)
-            .context("read verbs ready ack")?;
-        if ack[0] != STATUS_OK {
-            bail!("weight peer refused connection (ack {})", ack[0]);
-        }
+        let mut rails: Vec<Rail> = rs
+            .into_verbs()
+            .into_iter()
+            .zip(&pinned)
+            .zip(&bounce_lkeys)
+            .map(|((verbs, &bounce_ptr), &bounce_lkey)| Rail {
+                verbs,
+                bounce_ptr,
+                bounce_lkey,
+            })
+            .collect();
         tracing::info!(
             "RDMA weight loader connected to {} ({} shards, {} resident tensors, {n_rails} rail(s))",
             manifest.model_id,

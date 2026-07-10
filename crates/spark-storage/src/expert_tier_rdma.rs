@@ -164,67 +164,63 @@ impl RdmaTier {
     }
 }
 
-#[cfg(atlas_rdma_verbs)]
-fn env_u32(k: &str, default: u32) -> u32 {
-    std::env::var(k)
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(default)
-}
-
-/// Bring up the one-sided verbs transport: create N rails, register the arena on
-/// each, exchange per-rail QP params over the TCP control channel, connect
-/// INIT->RTR->RTS, await the ack. Dual-rail is env-driven (ATLAS_EXPERT_DUAL_RAIL
-/// =1): rail 0 = ATLAS_EXPERT_RDMA_DEV/GID (the existing single-rail defaults),
-/// rail 1 = ATLAS_EXPERT_RAIL2_DEV/GID (default rocep1s0f1 / 3). Single-rail is
-/// the default and is byte-for-byte the previous path.
+/// Bring up the one-sided verbs transport via [`atlas_rdma::railset::RailSet`]:
+/// create N rails, register the arena on each, exchange per-rail QP params over
+/// the TCP control channel, connect INIT->RTR->RTS, await the ack. Dual-rail is
+/// env-driven (ATLAS_EXPERT_DUAL_RAIL=1): rail 0 = ATLAS_EXPERT_RDMA_DEV/GID
+/// (the existing single-rail defaults), rail 1 = ATLAS_EXPERT_RAIL2_DEV/GID
+/// (default rocep1s0f1 / 3). Single-rail is the default and is byte-for-byte
+/// the previous path.
 #[cfg(atlas_rdma_verbs)]
 fn connect_verbs(
     stream: &mut TcpStream,
     arena: &ExpertArena,
     num_layers: u32,
 ) -> Result<Transport> {
-    use crate::expert_peer::{MODE_VERBS, VerbsClientParams, read_server_rails};
-    use crate::rdma_verbs::Verbs;
+    use crate::expert_peer::MODE_VERBS;
+    use atlas_rdma::env::{first_set, first_set_u32};
+    use atlas_rdma::railset::{RailSet, RailSpec};
 
     stream
         .write_all(&[MODE_VERBS])
         .context("send verbs transport mode")?;
 
     // Rail 0 from the expert env (the cabled CX7 link); rail 1 from the expert
-    // rail-2 env. Dual-rail only when ATLAS_EXPERT_DUAL_RAIL=1.
-    let dev0 = std::env::var("ATLAS_EXPERT_RDMA_DEV").unwrap_or_else(|_| "roceP2p1s0f1".into());
-    let gid0 = env_u32("ATLAS_EXPERT_RDMA_GID", 3);
-    let dev1 = std::env::var("ATLAS_EXPERT_RAIL2_DEV").unwrap_or_else(|_| "rocep1s0f1".into());
-    let gid1 = env_u32("ATLAS_EXPERT_RAIL2_GID", 3);
+    // rail-2 env. Dual-rail only when ATLAS_EXPERT_DUAL_RAIL=1. PSN = fresh
+    // random 24-bit per rail (caller-supplied by RailSet design).
+    let spec = |dev: String, gid: u32| RailSpec::new(dev, gid, rand::random::<u32>() & 0xff_ffff);
+    let rail0 = spec(
+        first_set(&["ATLAS_EXPERT_RDMA_DEV"], "roceP2p1s0f1"),
+        first_set_u32(&["ATLAS_EXPERT_RDMA_GID"], 3),
+    );
     let dual = std::env::var("ATLAS_EXPERT_DUAL_RAIL").ok().as_deref() == Some("1");
-    let rail_devs: Vec<(String, u32)> = if dual {
-        vec![(dev0, gid0), (dev1, gid1)]
+    let specs: Vec<RailSpec> = if dual {
+        let rail1 = spec(
+            first_set(&["ATLAS_EXPERT_RAIL2_DEV"], "rocep1s0f1"),
+            first_set_u32(&["ATLAS_EXPERT_RAIL2_GID"], 3),
+        );
+        vec![rail0, rail1]
     } else {
-        vec![(dev0, gid0)]
+        vec![rail0]
     };
-    let n_rails = rail_devs.len();
 
-    // Tell the peer how many rails we want to stripe across.
-    stream.write_all(&[n_rails as u8]).context("send n_rails")?;
-
-    // Create each rail's QP and register the WHOLE arena as its READ landing MR
-    // (LOCAL_WRITE only). The N MRs pin the SAME arena pages (one lkey per rail).
-    // SAFETY: the arena's pinned buffer lives as long as the tier (and thus every
-    // MR); base_ptr()/total_bytes() describe exactly that allocation.
-    let mut verbs_rails: Vec<Verbs> = Vec::with_capacity(n_rails);
-    let mut arena_lkeys: Vec<u32> = Vec::with_capacity(n_rails);
-    for (dev, gid) in &rail_devs {
-        let psn = rand::random::<u32>() & 0xff_ffff;
-        let mut v = Verbs::create(dev, *gid, psn)?;
-        let keys = unsafe { v.reg_mr(arena.base_ptr(), arena.total_bytes(), false)? };
+    // [u8 n_rails] + one QP per rail, then register the WHOLE arena as each
+    // rail's READ landing MR (LOCAL_WRITE only — `remote_read == false` is the
+    // access-flag invariant for every client landing buffer). The N MRs pin the
+    // SAME arena pages (one lkey per rail).
+    let mut rs = RailSet::begin(stream, &specs)?;
+    let mut arena_lkeys: Vec<u32> = Vec::with_capacity(rs.n_rails());
+    for rail in &mut rs.rails {
+        // SAFETY: the arena's pinned buffer lives as long as the tier (and thus
+        // every MR); base_ptr()/total_bytes() describe exactly that allocation.
+        let keys = unsafe { rail.verbs.reg_mr(arena.base_ptr(), arena.total_bytes(), false)? };
         arena_lkeys.push(keys.lkey);
-        verbs_rails.push(v);
     }
 
     // Peer publishes N per-rail QP + per-layer MR tables; validate each rail's
-    // layer count against the manifest.
-    let server = read_server_rails(stream, n_rails).context("read verbs server params")?;
+    // layer count against the manifest BEFORE replying (a mismatch must bail
+    // with no client params written — the pre-RailSet behavior).
+    let server = rs.read_server_ro(stream).context("read verbs server params")?;
     for sp in &server {
         if sp.layers.len() != num_layers as usize {
             bail!(
@@ -234,36 +230,19 @@ fn connect_verbs(
         }
     }
 
-    // Reply with each rail's client QP, then connect each rail to its peer rail.
-    stream
-        .write_all(&[n_rails as u8])
-        .context("send client n_rails")?;
-    for v in &verbs_rails {
-        VerbsClientParams {
-            qpn: v.qpn(),
-            psn: v.psn(),
-            gid: v.gid(),
-        }
-        .write_to(stream)
-        .context("send verbs client params")?;
-    }
-    let mut rails: Vec<Rail> = Vec::with_capacity(n_rails);
-    for ((mut v, arena_lkey), sp) in verbs_rails.into_iter().zip(arena_lkeys).zip(server) {
-        v.connect(sp.qpn, sp.psn, &sp.gid)?;
-        rails.push(Rail {
-            verbs: v,
+    // Reply with each rail's client QP, connect each rail, await the ack.
+    rs.complete(stream, &server, "verbs peer")?;
+    let rails: Vec<Rail> = rs
+        .into_verbs()
+        .into_iter()
+        .zip(arena_lkeys)
+        .zip(server)
+        .map(|((verbs, arena_lkey), sp)| Rail {
+            verbs,
             arena_lkey,
             layers: sp.layers,
-        });
-    }
-
-    let mut ack = [0u8; 1];
-    stream
-        .read_exact(&mut ack)
-        .context("read verbs ready ack")?;
-    if ack[0] != STATUS_OK {
-        bail!("verbs peer refused connection (ack {})", ack[0]);
-    }
+        })
+        .collect();
     Ok(Transport::Verbs(rails))
 }
 

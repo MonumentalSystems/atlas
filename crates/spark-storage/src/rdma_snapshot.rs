@@ -61,16 +61,16 @@ mod stub {
 
 #[cfg(all(feature = "cuda", atlas_rdma_verbs))]
 mod imp {
-use std::io::{Read, Write};
+use std::io::Write;
 use std::net::TcpStream;
 use std::sync::Mutex;
 
 use anyhow::{Result, bail};
 
 use crate::cuda_min::PinnedBuffer;
-use crate::expert_peer::{STATUS_OK, VerbsClientParams};
-use crate::cache_peer::CacheServerParams;
 use crate::rdma_verbs::Verbs;
+use atlas_rdma::env::{first_set, first_set_u32};
+use atlas_rdma::railset::{RailSet, RailSpec};
 
 /// One rail: its QP + a single persistent registered bounce (`blob_bytes`).
 struct SnapRail {
@@ -113,13 +113,6 @@ pub struct RdmaSnapshotArena {
 unsafe impl Send for RdmaSnapshotArena {}
 unsafe impl Sync for RdmaSnapshotArena {}
 
-fn env_u32(k: &str, default: u32) -> u32 {
-    std::env::var(k)
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(default)
-}
-
 impl RdmaSnapshotArena {
     /// Handshake with the snapshot peer at `addr` and register `blob_bytes`
     /// bounces. Rail devices/GIDs reuse the KV env (`ATLAS_EXPERT_RDMA_DEV`/`GID`
@@ -138,17 +131,25 @@ impl RdmaSnapshotArena {
     }
 
     fn connect_inner(addr: &str, arena_bytes: u64, blob_bytes: usize, paging: bool) -> Result<Self> {
-        let dev0 = std::env::var("ATLAS_EXPERT_RDMA_DEV").unwrap_or_else(|_| "roceP2p1s0f1".into());
-        let gid0 = env_u32("ATLAS_EXPERT_RDMA_GID", 3);
-        let dev1 = std::env::var("ATLAS_KV_RAIL2_DEV").unwrap_or_else(|_| "rocep1s0f1".into());
-        let gid1 = env_u32("ATLAS_KV_RAIL2_GID", 3);
+        // Rail env: the KV triple verbatim (shared CX7 fabric config). Fresh
+        // random 24-bit PSN per rail.
+        let spec =
+            |dev: String, gid: u32| RailSpec::new(dev, gid, rand::random::<u32>() & 0xff_ffff);
+        let rail0 = spec(
+            first_set(&["ATLAS_EXPERT_RDMA_DEV"], "roceP2p1s0f1"),
+            first_set_u32(&["ATLAS_EXPERT_RDMA_GID"], 3),
+        );
         let dual = std::env::var("ATLAS_KV_DUAL_RAIL").ok().as_deref() == Some("1");
-        let rail_devs: Vec<(String, u32)> = if dual {
-            vec![(dev0, gid0), (dev1, gid1)]
+        let specs: Vec<RailSpec> = if dual {
+            let rail1 = spec(
+                first_set(&["ATLAS_KV_RAIL2_DEV"], "rocep1s0f1"),
+                first_set_u32(&["ATLAS_KV_RAIL2_GID"], 3),
+            );
+            vec![rail0, rail1]
         } else {
-            vec![(dev0, gid0)]
+            vec![rail0]
         };
-        let n_rails = rail_devs.len();
+        let n_rails = specs.len();
 
         let mut stream =
             TcpStream::connect(addr).map_err(|e| anyhow::anyhow!("connect snapshot peer {addr}: {e}"))?;
@@ -162,7 +163,8 @@ impl RdmaSnapshotArena {
         } else {
             stream.write_all(&arena_bytes.to_le_bytes())?;
         }
-        stream.write_all(&[n_rails as u8])?;
+        // [u8 n_rails] + one QP per rail.
+        let mut rs = RailSet::begin(&mut stream, &specs)?;
 
         // ONE contiguous staging buffer (ATLAS_SSM_STAGING) registered on EVERY
         // rail → each rail gets its own lkey over the SAME memory, so a chunk
@@ -170,62 +172,39 @@ impl RdmaSnapshotArena {
         let staging_on = std::env::var("ATLAS_SSM_STAGING").ok().as_deref() == Some("1");
         let staging = if staging_on { Some(PinnedBuffer::new(blob_bytes)?) } else { None };
 
-        let mut rails: Vec<SnapRail> = Vec::with_capacity(n_rails);
-        for (dev, gid) in &rail_devs {
-            let psn = rand::random::<u32>() & 0xff_ffff;
-            let mut verbs = Verbs::create(dev, *gid, psn)?;
+        // Per-rail bounce + shared staging MRs, both LOCAL_WRITE only
+        // (`remote_read == false`, invariant — we WRITE from and READ into them).
+        let mut parts: Vec<(PinnedBuffer, u32, u32)> = Vec::with_capacity(n_rails);
+        for rail in &mut rs.rails {
             let bounce = PinnedBuffer::new(blob_bytes)?;
-            // SAFETY: bounce lives as long as the rail (and thus the MR); local
-            // read (remote_read=false — we WRITE from it and READ into it).
-            let keys = unsafe { verbs.reg_mr(bounce.ptr, blob_bytes, false)? };
-            // Register the SHARED staging buffer on this rail (local-write, same
-            // access as the bounce). SAFETY: staging outlives the rail (both live
-            // in ArenaInner, dropped together).
+            // SAFETY: bounce lives as long as the rail (and thus the MR).
+            let keys = unsafe { rail.verbs.reg_mr(bounce.ptr, blob_bytes, false)? };
+            // SAFETY: staging outlives the rail (both live in ArenaInner,
+            // dropped together).
             let staging_lkey = match &staging {
-                Some(s) => unsafe { verbs.reg_mr(s.ptr, blob_bytes, false)?.lkey },
+                Some(s) => unsafe { rail.verbs.reg_mr(s.ptr, blob_bytes, false)?.lkey },
                 None => 0,
             };
-            rails.push(SnapRail {
-                verbs,
-                bounce,
-                lkey: keys.lkey,
-                remote_rkey: 0,
-                staging_lkey,
-            });
+            parts.push((bounce, keys.lkey, staging_lkey));
         }
 
-        // Peer's per-rail QP + shared arena base/rkey.
-        let mut b1 = [0u8; 1];
-        stream.read_exact(&mut b1)?;
-        if b1[0] as usize != n_rails {
-            bail!("snapshot peer granted {} rails, wanted {n_rails}", b1[0]);
-        }
-        let mut base = 0u64;
-        let mut server: Vec<CacheServerParams> = Vec::with_capacity(n_rails);
-        for _ in 0..n_rails {
-            let sp = CacheServerParams::read_from(&mut stream)?;
-            base = sp.base_addr;
-            server.push(sp);
-        }
-        // Reply with each rail's client QP, then connect.
-        stream.write_all(&[n_rails as u8])?;
-        for rail in &rails {
-            VerbsClientParams {
-                qpn: rail.verbs.qpn(),
-                psn: rail.verbs.psn(),
-                gid: rail.verbs.gid(),
-            }
-            .write_to(&mut stream)?;
-        }
-        for (rail, sp) in rails.iter_mut().zip(&server) {
-            rail.verbs.connect(sp.qpn, sp.psn, &sp.gid)?;
-            rail.remote_rkey = sp.rkey;
-        }
-        let mut ack = [0u8; 1];
-        stream.read_exact(&mut ack)?;
-        if ack[0] != STATUS_OK {
-            bail!("snapshot peer refused connection (ack {})", ack[0]);
-        }
+        // Peer's per-rail QP + shared arena base/rkey, client params, connect,
+        // ack. Shared base: keep the LAST (pre-RailSet loop-overwrite behavior).
+        let server = rs.finish_rw(&mut stream, "snapshot peer")?;
+        let base = server.last().map(|sp| sp.base_addr).unwrap_or(0);
+        let rails: Vec<SnapRail> = rs
+            .into_verbs()
+            .into_iter()
+            .zip(parts)
+            .zip(&server)
+            .map(|((verbs, (bounce, lkey, staging_lkey)), sp)| SnapRail {
+                verbs,
+                bounce,
+                lkey,
+                remote_rkey: sp.rkey,
+                staging_lkey,
+            })
+            .collect();
         tracing::info!(
             "RdmaSnapshotArena connected to {addr}: {:.1} GiB arena, {n_rails} rail(s), blob {blob_bytes} B",
             arena_bytes as f64 / (1024.0 * 1024.0 * 1024.0),

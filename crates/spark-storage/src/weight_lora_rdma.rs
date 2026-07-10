@@ -153,14 +153,15 @@ impl RdmaLoraLoader {
     ) -> Result<()> {
         use std::collections::HashMap;
         use std::ffi::c_void;
-        use std::io::{Read, Write};
+        use std::io::Write;
         use std::net::TcpStream;
 
         use anyhow::{Context, bail};
 
-        use crate::expert_peer::{MODE_VERBS, STATUS_OK, VerbsClientParams, read_server_rails};
-        use crate::rdma_verbs::Verbs;
+        use crate::expert_peer::MODE_VERBS;
         use crate::weight_peer::{read_weight_manifest, tensor_remote_addr, write_model_request};
+        use atlas_rdma::env::{first_set, first_set_u32};
+        use atlas_rdma::railset::{RailSet, RailSpec};
 
         let by_name: HashMap<&str, &LoraLandTarget> = targets
             .iter()
@@ -188,19 +189,25 @@ impl RdmaLoraLoader {
             );
         }
 
-        // 2. Single-rail verbs handshake (adapter = one shard, few MB).
-        let dev = std::env::var("ATLAS_LORA_RDMA_DEV")
-            .or_else(|_| std::env::var("ATLAS_WEIGHT_RDMA_DEV"))
-            .or_else(|_| std::env::var("ATLAS_EXPERT_RDMA_DEV"))
-            .unwrap_or_else(|_| "roceP2p1s0f1".to_string());
-        let gid: u32 = std::env::var("ATLAS_LORA_RDMA_GID")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(3);
-        let n_rails = 1usize;
+        // 2. Single-rail verbs handshake via RailSet (adapter = one shard, few
+        // MB). LoRA env: DEV chains LORA→WEIGHT→EXPERT (an exported-but-EMPTY
+        // var counts as set — `first_set`); GID reads ONLY ATLAS_LORA_RDMA_GID
+        // (no chain, deliberately). Always 1 rail; fresh random 24-bit PSN.
+        let specs = vec![RailSpec::new(
+            first_set(
+                &[
+                    "ATLAS_LORA_RDMA_DEV",
+                    "ATLAS_WEIGHT_RDMA_DEV",
+                    "ATLAS_EXPERT_RDMA_DEV",
+                ],
+                "roceP2p1s0f1",
+            ),
+            first_set_u32(&["ATLAS_LORA_RDMA_GID"], 3),
+            rand::random::<u32>() & 0xff_ffff,
+        )];
 
         stream.write_all(&[MODE_VERBS]).context("send verbs mode")?;
-        stream.write_all(&[n_rails as u8]).context("send n_rails")?;
+        let mut rs = RailSet::begin(&mut stream, &specs)?;
 
         let max_len = retained.iter().map(|t| t.len).max().unwrap_or(0);
         if max_len > u32::MAX as u64 {
@@ -208,17 +215,19 @@ impl RdmaLoraLoader {
         }
         let bounce_len = (max_len as usize).max(1);
 
-        let psn = rand::random::<u32>() & 0xff_ffff;
-        let mut verbs = Verbs::create(&dev, gid, psn)?;
         let bounce = gpu
             .alloc_host_pinned(bounce_len)
             .context("alloc pinned RDMA landing bounce")?;
+        // LOCAL_WRITE-only landing MR (`remote_read == false`, invariant).
         // SAFETY: `bounce` backs `bounce_len` pinned bytes that outlive the MR.
-        let keys = unsafe { verbs.reg_mr(bounce as *mut c_void, bounce_len, false) }
+        let keys = unsafe { rs.rails[0].verbs.reg_mr(bounce as *mut c_void, bounce_len, false) }
             .context("register RDMA landing bounce")?;
 
-        let server = read_server_rails(&mut stream, n_rails).context("read verbs server params")?;
-        let sp = &server[0];
+        // Validate the shard table BEFORE replying (bail = no client params).
+        let server = rs
+            .read_server_ro(&mut stream)
+            .context("read verbs server params")?;
+        let sp = server[0].clone();
         if sp.layers.len() != num_shards {
             bail!(
                 "peer published {} shard MRs but manifest has {num_shards}",
@@ -226,24 +235,12 @@ impl RdmaLoraLoader {
             );
         }
 
-        stream
-            .write_all(&[n_rails as u8])
-            .context("send client n_rails")?;
-        VerbsClientParams {
-            qpn: verbs.qpn(),
-            psn: verbs.psn(),
-            gid: verbs.gid(),
-        }
-        .write_to(&mut stream)
-        .context("send verbs client params")?;
-        verbs.connect(sp.qpn, sp.psn, &sp.gid)?;
-        let mut ack = [0u8; 1];
-        stream
-            .read_exact(&mut ack)
-            .context("read verbs ready ack")?;
-        if ack[0] != STATUS_OK {
-            bail!("lora peer refused connection (ack {})", ack[0]);
-        }
+        rs.complete(&mut stream, &server, "lora peer")?;
+        let mut verbs = rs
+            .into_verbs()
+            .into_iter()
+            .next()
+            .expect("single lora rail");
 
         // 3. Pull each tensor into the bounce, convert/repack, land into slot.
         for (idx, rec) in retained.iter().enumerate() {

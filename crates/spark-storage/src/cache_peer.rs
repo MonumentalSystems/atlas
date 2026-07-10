@@ -24,48 +24,11 @@
 
 use anyhow::{Context, Result, bail};
 
-/// The peer's half of the KV handshake: its QP identity + the single RW MR.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct CacheServerParams {
-    pub qpn: u32,
-    pub psn: u32,
-    pub gid: [u8; 16],
-    pub base_addr: u64,
-    pub rkey: u32,
-}
-
-impl CacheServerParams {
-    pub fn write_to<W: std::io::Write>(&self, w: &mut W) -> Result<()> {
-        w.write_all(&self.qpn.to_le_bytes())?;
-        w.write_all(&self.psn.to_le_bytes())?;
-        w.write_all(&self.gid)?;
-        w.write_all(&self.base_addr.to_le_bytes())?;
-        w.write_all(&self.rkey.to_le_bytes())?;
-        Ok(())
-    }
-
-    pub fn read_from<R: std::io::Read>(r: &mut R) -> Result<Self> {
-        let mut b4 = [0u8; 4];
-        let mut b8 = [0u8; 8];
-        let mut gid = [0u8; 16];
-        r.read_exact(&mut b4).context("kv qpn")?;
-        let qpn = u32::from_le_bytes(b4);
-        r.read_exact(&mut b4).context("kv psn")?;
-        let psn = u32::from_le_bytes(b4);
-        r.read_exact(&mut gid).context("kv gid")?;
-        r.read_exact(&mut b8).context("kv base")?;
-        let base_addr = u64::from_le_bytes(b8);
-        r.read_exact(&mut b4).context("kv rkey")?;
-        let rkey = u32::from_le_bytes(b4);
-        Ok(Self {
-            qpn,
-            psn,
-            gid,
-            base_addr,
-            rkey,
-        })
-    }
-}
+// The RW-blade handshake codec moved verbatim to the CUDA-free `atlas-rdma`
+// crate (RailSet extraction, Step B); re-exported at its old path so the
+// server below and both RW clients are zero-diff. Byte layout golden-pinned
+// in `tests/rdma_wire_golden.rs`, frozen vs the live gx10 peer.
+pub use atlas_rdma::wire::CacheServerParams;
 
 #[cfg(unix)]
 pub use server_impl::{RdmaConfig, serve};
@@ -530,17 +493,7 @@ mod tests {
         assert_eq!(server_impl::carve_disk_slots(None, 100, 0, bb), (1, 0));
     }
 
-    #[test]
-    fn kv_server_params_round_trip() {
-        let sp = CacheServerParams {
-            qpn: 0x4242,
-            psn: 0x0012_3456 & 0xff_ffff,
-            gid: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 192, 168, 178, 12],
-            base_addr: 0x7f00_1234_0000,
-            rkey: 0xdead_beef,
-        };
-        let mut buf = Vec::new();
-        sp.write_to(&mut buf).unwrap();
-        assert_eq!(CacheServerParams::read_from(&mut &buf[..]).unwrap(), sp);
-    }
+    // `kv_server_params_round_trip` moved WITH the codec to
+    // `crates/atlas-rdma/tests/wire_roundtrip.rs` (RailSet extraction Step B);
+    // the exact byte layout stays pinned by `tests/rdma_wire_golden.rs` here.
 }

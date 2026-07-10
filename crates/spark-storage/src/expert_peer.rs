@@ -21,141 +21,18 @@
 
 use anyhow::{Context, Result, bail};
 
-pub const STATUS_OK: u8 = 0;
-pub const STATUS_ERR: u8 = 1;
+// The handshake wire codecs moved verbatim to the CUDA-free `atlas-rdma`
+// crate (RailSet extraction, Step B); re-exported here at their old paths so
+// the server below and every external user are zero-diff. The byte layouts
+// are golden-pinned in `tests/rdma_wire_golden.rs` and frozen vs the live
+// gx10 peer.
+pub use atlas_rdma::wire::{
+    MODE_TCP, MODE_VERBS, STATUS_ERR, STATUS_OK, VerbsClientParams, VerbsServerParams,
+    read_server_rails, write_server_rails,
+};
+
 /// Sentinel request that asks the server to close the connection.
 pub const SHUTDOWN_MARKER: u32 = u32::MAX;
-
-// ── Transport selection (sent by the client right after the manifest) ──
-/// Two-sided TCP record streaming (the Stage-4 Phase-A path).
-pub const MODE_TCP: u8 = 0;
-/// One-sided RDMA READ over verbs (WS2 Phase B): the server publishes its
-/// store's MRs and the client READs records directly into its arena.
-pub const MODE_VERBS: u8 = 1;
-
-/// The server's half of the verbs handshake: its QP identity plus, per MoE
-/// layer, the base virtual address + rkey of that layer file's registered MR.
-/// `remote_addr(layer, expert) = layers[layer].0 + expert * record_stride`.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct VerbsServerParams {
-    pub qpn: u32,
-    pub psn: u32,
-    pub gid: [u8; 16],
-    /// `(mr_base_addr, rkey)` for each MoE layer, layer-indexed.
-    pub layers: Vec<(u64, u32)>,
-}
-
-/// The client's half: just its QP identity (its arena MR is local-only).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct VerbsClientParams {
-    pub qpn: u32,
-    pub psn: u32,
-    pub gid: [u8; 16],
-}
-
-impl VerbsServerParams {
-    /// Wire form: `[u32 qpn][u32 psn][16 gid][u32 n_layers]{[u64 base][u32 rkey]}*`.
-    pub fn write_to<W: std::io::Write>(&self, w: &mut W) -> Result<()> {
-        w.write_all(&self.qpn.to_le_bytes())?;
-        w.write_all(&self.psn.to_le_bytes())?;
-        w.write_all(&self.gid)?;
-        w.write_all(&(self.layers.len() as u32).to_le_bytes())?;
-        for (base, rkey) in &self.layers {
-            w.write_all(&base.to_le_bytes())?;
-            w.write_all(&rkey.to_le_bytes())?;
-        }
-        Ok(())
-    }
-
-    pub fn read_from<R: std::io::Read>(r: &mut R) -> Result<Self> {
-        let qpn = read_u32(r)?;
-        let psn = read_u32(r)?;
-        let mut gid = [0u8; 16];
-        r.read_exact(&mut gid).context("read server gid")?;
-        let n = read_u32(r)? as usize;
-        if n == 0 || n > 4096 {
-            bail!("implausible verbs layer count: {n}");
-        }
-        let mut layers = Vec::with_capacity(n);
-        for _ in 0..n {
-            let mut b8 = [0u8; 8];
-            r.read_exact(&mut b8).context("read mr base")?;
-            let base = u64::from_le_bytes(b8);
-            let rkey = read_u32(r)?;
-            layers.push((base, rkey));
-        }
-        Ok(Self {
-            qpn,
-            psn,
-            gid,
-            layers,
-        })
-    }
-}
-
-impl VerbsClientParams {
-    /// Wire form: `[u32 qpn][u32 psn][16 gid]`.
-    pub fn write_to<W: std::io::Write>(&self, w: &mut W) -> Result<()> {
-        w.write_all(&self.qpn.to_le_bytes())?;
-        w.write_all(&self.psn.to_le_bytes())?;
-        w.write_all(&self.gid)?;
-        Ok(())
-    }
-
-    pub fn read_from<R: std::io::Read>(r: &mut R) -> Result<Self> {
-        let qpn = read_u32(r)?;
-        let psn = read_u32(r)?;
-        let mut gid = [0u8; 16];
-        r.read_exact(&mut gid).context("read client gid")?;
-        Ok(Self { qpn, psn, gid })
-    }
-}
-
-fn read_u32<R: std::io::Read>(r: &mut R) -> Result<u32> {
-    let mut b = [0u8; 4];
-    r.read_exact(&mut b).context("read u32")?;
-    Ok(u32::from_le_bytes(b))
-}
-
-/// Frame N per-rail `VerbsServerParams` for the dual-rail expert tier: a leading
-/// `[u8 n_rails]` count followed by each rail's params — exactly how `cache_peer`
-/// frames its per-rail `CacheServerParams`. Single-rail (`n == 1`) is the default,
-/// byte-for-byte the pre-dual-rail path plus the one-byte count prefix. This is
-/// pure wire logic, un-gated so it unit-tests on the metal/skip build with no
-/// rdma-core.
-pub fn write_server_rails<W: std::io::Write>(w: &mut W, rails: &[VerbsServerParams]) -> Result<()> {
-    if rails.is_empty() || rails.len() > 8 {
-        bail!("implausible server rail count: {}", rails.len());
-    }
-    w.write_all(&[rails.len() as u8])?;
-    for sp in rails {
-        sp.write_to(w)?;
-    }
-    Ok(())
-}
-
-/// Read `want` per-rail `VerbsServerParams` framed by a leading `[u8 n_rails]`.
-/// Bails if the framed count is zero, absurd (> 8), or != `want` — the client
-/// already negotiated `want` rails, so any other count is a protocol error.
-pub fn read_server_rails<R: std::io::Read>(
-    r: &mut R,
-    want: usize,
-) -> Result<Vec<VerbsServerParams>> {
-    let mut b1 = [0u8; 1];
-    r.read_exact(&mut b1).context("read server rail count")?;
-    let n = b1[0] as usize;
-    if n == 0 || n > 8 {
-        bail!("implausible server rail count: {n}");
-    }
-    if n != want {
-        bail!("server framed {n} rails but client negotiated {want}");
-    }
-    let mut rails = Vec::with_capacity(n);
-    for _ in 0..n {
-        rails.push(VerbsServerParams::read_from(r)?);
-    }
-    Ok(rails)
-}
 
 /// Serialize a request: `(layer, expert)`.
 pub fn encode_request(layer: u32, expert: u32) -> [u8; 8] {
@@ -524,105 +401,7 @@ mod tests {
         assert_eq!(decode_request(&s), (SHUTDOWN_MARKER, SHUTDOWN_MARKER));
     }
 
-    #[test]
-    fn verbs_server_params_round_trip() {
-        let sp = VerbsServerParams {
-            qpn: 0x1234,
-            psn: 0x00ab_cdef & 0xff_ffff,
-            gid: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 192, 168, 178, 12],
-            layers: vec![(0x7f00_0000_0000, 1001), (0x7f00_0100_0000, 1002)],
-        };
-        let mut buf = Vec::new();
-        sp.write_to(&mut buf).unwrap();
-        let back = VerbsServerParams::read_from(&mut &buf[..]).unwrap();
-        assert_eq!(sp, back);
-    }
-
-    #[test]
-    fn verbs_client_params_round_trip() {
-        let cp = VerbsClientParams {
-            qpn: 0x9999,
-            psn: 0x0055_5555,
-            gid: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
-        };
-        let mut buf = Vec::new();
-        cp.write_to(&mut buf).unwrap();
-        let back = VerbsClientParams::read_from(&mut &buf[..]).unwrap();
-        assert_eq!(cp, back);
-    }
-
-    #[test]
-    fn server_rails_round_trip() {
-        // The dual-rail framing: N `VerbsServerParams` with a leading count.
-        let mk = |qpn| VerbsServerParams {
-            qpn,
-            psn: 0x0012_3456 & 0xff_ffff,
-            gid: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 192, 168, 178, 12],
-            // Same base VA across rails (shared pages), distinct rkeys per rail.
-            layers: vec![
-                (0x7f00_0000_0000, 1001 + qpn),
-                (0x7f00_0100_0000, 1002 + qpn),
-            ],
-        };
-        let rails = vec![mk(0x1111), mk(0x2222)];
-        let mut buf = Vec::new();
-        write_server_rails(&mut buf, &rails).unwrap();
-        let back = read_server_rails(&mut &buf[..], 2).unwrap();
-        assert_eq!(rails, back);
-    }
-
-    #[test]
-    fn single_rail_framing_round_trips() {
-        // n == 1 is the default path; must round-trip through the framing.
-        let sp = VerbsServerParams {
-            qpn: 7,
-            psn: 9,
-            gid: [1u8; 16],
-            layers: vec![(0x1000, 42)],
-        };
-        let mut buf = Vec::new();
-        write_server_rails(&mut buf, std::slice::from_ref(&sp)).unwrap();
-        // Leading count byte then the single params struct.
-        assert_eq!(buf[0], 1);
-        let back = read_server_rails(&mut &buf[..], 1).unwrap();
-        assert_eq!(back, vec![sp]);
-    }
-
-    #[test]
-    fn read_server_rails_rejects_mismatch() {
-        // Framed count (1) != what the caller negotiated (2) -> protocol error.
-        let sp = VerbsServerParams {
-            qpn: 1,
-            psn: 2,
-            gid: [0u8; 16],
-            layers: vec![(0x1000, 7)],
-        };
-        let mut buf = Vec::new();
-        write_server_rails(&mut buf, std::slice::from_ref(&sp)).unwrap();
-        assert!(read_server_rails(&mut &buf[..], 2).is_err());
-    }
-
-    #[test]
-    fn read_server_rails_rejects_zero_count() {
-        // A zero rail count is a corrupt/hostile frame.
-        let buf = [0u8; 1];
-        assert!(read_server_rails(&mut &buf[..], 1).is_err());
-    }
-
-    #[test]
-    fn write_server_rails_rejects_empty() {
-        let mut buf = Vec::new();
-        assert!(write_server_rails(&mut buf, &[]).is_err());
-    }
-
-    #[test]
-    fn verbs_server_params_reject_absurd_layer_count() {
-        // A corrupt/hostile count must Err, not attempt a huge allocation.
-        let mut buf = Vec::new();
-        buf.extend_from_slice(&1u32.to_le_bytes()); // qpn
-        buf.extend_from_slice(&2u32.to_le_bytes()); // psn
-        buf.extend_from_slice(&[0u8; 16]); // gid
-        buf.extend_from_slice(&99_999u32.to_le_bytes()); // n_layers (absurd)
-        assert!(VerbsServerParams::read_from(&mut &buf[..]).is_err());
-    }
+    // The codec round-trip / validation tests moved WITH the codecs to
+    // `crates/atlas-rdma/tests/wire_roundtrip.rs` (RailSet extraction Step B);
+    // the exact byte layouts stay pinned by `tests/rdma_wire_golden.rs` here.
 }

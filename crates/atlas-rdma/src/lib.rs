@@ -19,13 +19,34 @@
 //! skipped) and published to direct dependents via the `links` metadata
 //! `DEP_ATLAS_RDMA_SHIM_HAS_VERBS` — see build.rs for the full story.
 
+/// Rail-env resolution helpers (`first_set` / `first_nonempty` /
+/// `first_set_u32`) — un-gated, pure `std::env`.
+pub mod env;
+/// Client handshake steps as pure `Read`/`Write` byte functions (identity
+/// tuples, no `Verbs`) — un-gated so the transcript goldens run everywhere.
+pub mod handshake;
+/// The golden handshake wire codecs (both server-param dialects, rails
+/// framing, mode/status bytes) — un-gated, frozen vs the live gx10 peer.
+pub mod wire;
+
 /// Safe-ish wrapper over the C shim: one [`verbs::Verbs`] == one RC QP.
 /// Compiled only where the shim is (`cfg(atlas_rdma_verbs)`).
 #[cfg(atlas_rdma_verbs)]
 pub mod verbs;
 
+/// RailSet — the one client-side rail bring-up (Step B of the extraction).
+/// Gated with the shim: it creates and connects real QPs.
+#[cfg(atlas_rdma_verbs)]
+pub mod railset;
+
+#[cfg(atlas_rdma_verbs)]
+pub use railset::{Rail, RailSet, RailSpec};
 #[cfg(atlas_rdma_verbs)]
 pub use verbs::{Gid, MrKeys, Verbs};
+pub use wire::{
+    CacheServerParams, MODE_TCP, MODE_VERBS, RemoteQp, STATUS_ERR, STATUS_OK, VerbsClientParams,
+    VerbsServerParams,
+};
 
 /// `true` iff this build of atlas-rdma compiled the verbs shim (i.e. the
 /// `atlas_rdma_verbs` cfg was emitted by build.rs). A permanent, always-
