@@ -87,7 +87,32 @@ nothing ever evicts. Independent corroboration of the write-through tax document
 `/home/ms/.claude/jobs/42b99a42/tmp/needle-longctx.sh` (fp8) and `needle-hp.sh` (bf16, adds
 `--kv-high-precision-layers max`).
 
-## Diagnosis (2026-07-10): cumulative fp8 precision, not the warm path or a structural bug
+## Diagnosis (2026-07-10)
+
+### UPDATE — the root cause is the FlashInfer GDN kernel, not "cumulative precision"
+
+The precision sweep below (kept for the record) was bisecting the wrong axis: every run used the **FlashInfer
+GDN kernel** (`libatlasgdn.so`, prod default `ATLAS_GDN_FLASHINFER=1`). Flipping **only** that flag settles it:
+
+| GDN kernel (cold 200K, prod fp8 everywhere else — native-fp8 attn+ssm, fp8 KV) | needles |
+|---|---|
+| FlashInfer `.so` (`ATLAS_GDN_FLASHINFER=1`, prod) | **7/8 FAIL** (VAULT-CIRRUS) |
+| in-tree FLA chunked (`ATLAS_GDN_FLASHINFER=0`) | **8/8 PASS** |
+
+Only `ATLAS_GDN_FLASHINFER` changed. So the **FlashInfer GDN kernel loses long-context coherence** in a way the
+in-tree FLA chunked kernel (`gated_delta_rule_fla`: `recompute_wu → chunk_delta_h_ksplit → chunk_fwd_o`, fp32
+`h_state`) does not. The "cumulative precision" result is real but was **compensation**: with the lossy
+FlashInfer kernel you need bf16 projections + bf16 KV to add enough margin to pass; with the accurate FLA kernel
+you pass at full fp8. Everything reconciles (FlashInfer+fp8 fail; FlashInfer+bf16-proj+bf16-KV pass;
+FLA+fp8 pass). The FlashInfer `.so` hard-codes bf16 GDN output with no Rust-visible dtype knob — very likely the
+same BF16-truncation source tracked for the in-tree kernels in Avarok #248 / PR #290, but baked into the cubin.
+
+**Recommendation (revised):** serve long-context with **`ATLAS_GDN_FLASHINFER=0`** — 8/8 at 200K while keeping
+full fp8 speed on projections + KV, at ~7% slower prefill (FLA vs FlashInfer). Durable perf-preserving fix:
+rebuild `libatlasgdn.so` with an F32 (or better-accumulated) GDN output — the F32-output pattern in PR #290 /
+#248 is the reference. The ~2.6× prefill/decode slope (F4) remains a separate, benign kernel-efficiency effect.
+
+### Original precision sweep (superseded as the root cause; retained for the record)
 
 Root-caused by a cold-vs-warm bisect + a one-knob-at-a-time precision sweep, all on the **same CUTLASS prod
 image** (`atlas-gb10:spillpool`, full native-fp8 + CUTLASS env set — a host `cargo build` is the WRONG numeric
