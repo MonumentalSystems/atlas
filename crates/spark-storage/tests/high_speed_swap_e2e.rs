@@ -741,7 +741,7 @@ fn batched_prefetch_coexist_matches_serial_bitwise() {
 fn prefetch_coexist_c1_mixed_matches_serial_bitwise() {
     let dir = tempdir("batch-prefetch-c1mixed");
     let ctx = CudaCtx::new(0).expect("cuda init");
-    let mut rng = ChaCha8Rng::seed_from_u64(0xC1_A1_5ED_7);
+    let mut rng = ChaCha8Rng::seed_from_u64(0xC1A1_5ED7);
     let total =
         SEQ_BLOCKS as usize * BLOCK_SIZE as usize * NUM_KV_HEADS as usize * HEAD_DIM as usize;
     let k = random_bf16(total, &mut rng);

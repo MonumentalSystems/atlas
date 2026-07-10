@@ -70,6 +70,9 @@ fn handle_paging_op_pins_get_and_auto_releases() {
 // ─────────────────────────── protocol tests ───────────────────────────
 
 #[test]
+// Deliberate constant asserts: these are load-bearing protocol pins (the shared
+// port disambiguates on them) and must stay visible runtime test failures.
+#[allow(clippy::assertions_on_constants)]
 fn magic_above_legacy_range() {
     // A legacy client's total_bytes is validated <= 1<<42; both paging magics
     // must be strictly above so neither is mistaken for a size, and distinct.
@@ -144,7 +147,7 @@ fn paging_header_v1_v2_legacy_and_reject() {
 }
 
 /// WIRE-GOLDEN (verify's ask): freeze the exact v1 handshake byte layout so a
-/// future codec edit can't silently shift it and strand the deployed peer.
+/// future codec edit can't silently shift it under a running fleet peer.
 #[test]
 fn v1_handshake_wire_golden() {
     // What connect_paging emits for arena=0x1000, blob=0x40, 1 rail:
@@ -162,7 +165,7 @@ fn v1_handshake_wire_golden() {
             0x40, 0, 0, 0, 0, 0, 0, 0,    // blob 0x40
             0x01, // n_rails
         ],
-        "v1 handshake bytes must never shift — the deployed peer depends on this"
+        "v1 handshake bytes must never shift while any in-repo client sends them (Step C retires v1)"
     );
 }
 

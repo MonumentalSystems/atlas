@@ -200,6 +200,9 @@ mod tests {
     /// span sits at block_offset + i·group_stride, matching the slot pointers
     /// (K at slot_base + kh·gs, V at slot_base + (nkv+kh)·gs).
     #[test]
+    // The `0*nkv` / `1*nkv` below deliberately spell out `i = kind*nkv + kh`
+    // so the index-map assertion reads like the layout formula it pins.
+    #[allow(clippy::erasing_op, clippy::identity_op)]
     fn per_head_spans_tile_the_block_exactly() {
         let l = GroupLayout::new(80, 4096, 8, 16, 128, 2, 4096);
         let block = 5u32;

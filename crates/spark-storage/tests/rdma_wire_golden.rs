@@ -175,6 +175,9 @@ fn model_request_framing_golden() {
 
 /// Every protocol constant the older deployed peer binary knows, frozen.
 #[test]
+// Deliberate constant asserts: frozen protocol pins, kept as runtime test
+// failures (not const blocks) so a drift reports through the test harness.
+#[allow(clippy::assertions_on_constants)]
 fn protocol_consts_frozen() {
     assert_eq!(STATUS_OK, 0);
     assert_eq!(STATUS_ERR, 1);

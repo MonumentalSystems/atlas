@@ -86,6 +86,9 @@ fn capacity_exhaustion_then_recovery() {
 /// Pure-arithmetic guard for the single capacity lever (meta.rs:42):
 /// `max_blocks_per_seq.saturating_mul(max_batch_size.max(1))`. No GPU needed.
 #[test]
+// The `.max(1)` on literals deliberately mirrors the meta.rs:42 clamp formula
+// term-for-term, so each case reads as the formula it guards.
+#[allow(clippy::unnecessary_min_or_max)]
 fn widening_formula() {
     // C=1: capacity unchanged (byte-identical single-seq path).
     assert_eq!(8u32.saturating_mul(1u32.max(1)), 8);

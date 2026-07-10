@@ -15,8 +15,8 @@
 // VERBATIM into the CUDA-/verbs-free `atlas-tier` crate and is re-exported
 // below, so `cache_peer.rs` / `rdma_snapshot.rs` / `cache_peer_main.rs` keep
 // their `crate::snapshot_swap::*` paths unchanged. What REMAINS here is the
-// peer-specific half: the TCP control protocol (byte-frozen — the deployed
-// gx10 peers speak v1), the paging loops, the client codec, and the
+// peer-specific half: the TCP control protocol (byte-frozen, golden-pinned —
+// what the fleet peer binary speaks), the paging loops, the client codec, and the
 // `MmapSlotArena` over the peer's RDMA-registered mmap MR — split into the
 // `wire` and `mmap_arena` sub-modules.
 

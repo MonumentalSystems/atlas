@@ -12,7 +12,8 @@
 // replies [status] (+ [offset] for ALLOC/GET-hit). Data still moves one-sided
 // over RDMA into/out of `slot_offset(slot)`; only tiny control messages cross
 // TCP. Peer and client halves deliberately share this ONE module so the wire
-// format (byte-frozen — the deployed gx10 peers speak v1) can never drift.
+// format (byte-frozen, golden-pinned — it is what the fleet peer binary
+// speaks) can never drift.
 
 use std::io::{Read, Write};
 
@@ -22,7 +23,8 @@ use super::{SlotArena, SnapshotResidency, SwapStore};
 
 /// First-u64 sentinel selecting the paging protocol v1 (> 1<<42, so a legacy KV
 /// `total_bytes` can never collide). "PAGE" + version. v1 == SSM snapshots, no
-/// kind byte (the deployed gx10:9920 peer + clients speak this — keep byte-exact).
+/// kind byte. In-repo clients (`rdma_snapshot::connect_paging`) still send it —
+/// keep byte-exact until Step C migrates every sender to v2.
 pub const PAGING_MAGIC: u64 = 0x5041_4745_0000_0001;
 
 /// Paging protocol v2 (item 8): after the magic comes a `[u8 kind]` byte so ONE
@@ -46,7 +48,7 @@ impl PagingKind {
 
 /// Parse the paging handshake header after the caller has read the first u64.
 /// v1 magic → (SSM, arena_bytes, blob_bytes) with NO kind byte on the wire
-/// (byte-exact with the deployed peer). v2 magic → read `[u8 kind]` then the two
+/// (byte-exact, golden-pinned). v2 magic → read `[u8 kind]` then the two
 /// sizes. Any other first u64 is a legacy KV `total_bytes` → `Ok(None)` so the
 /// caller takes the dumb one-sided path. Rejects unsupported kinds (≥2).
 pub fn parse_paging_header<R: Read>(
@@ -213,7 +215,7 @@ fn write_reply<W: Write>(w: &mut W, reply: &PagingReply) -> Result<()> {
 /// on another connection cannot evict the slot mid-read. `pinned` threads the
 /// connection's currently-pinned key across calls. Needs NO new opcode and no
 /// client change (auto-release on next op / disconnect) → wire-compatible with
-/// the deployed peer.
+/// the frozen control protocol.
 fn handle_paging_op<A: SlotArena, S: SwapStore>(
     res: &mut SnapshotResidency<A, S>,
     op: u8,
