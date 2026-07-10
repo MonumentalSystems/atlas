@@ -245,6 +245,7 @@ impl RdmaKvBackend {
     ///     stall on every reuse and defeat run-ahead), `track=true` (record a
     ///     copy event per reaped READ), and NO terminal `stream_sync` — mirror-
     ///     RAW is closed by the caller's `kv_prefetch_done`.
+    ///
     /// The zero-copy branch is shared verbatim (see `read_zero_copy` / §G: it
     /// keeps its own leading WAR host sync, the one honestly-unremovable block).
     fn read_common(

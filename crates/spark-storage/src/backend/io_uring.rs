@@ -166,7 +166,7 @@ impl IoUringBackend {
 impl IoUringBackend {
     /// Body shared by `read` (sync) and `read_async`. When `sync_at_end` is
     /// true it is textually the pre-#11-refinement `read`: terminal `stream_sync`
-    /// + event wipe. When false (async prefetch), it drops BOTH — the persistent
+    /// \+ event wipe. When false (async prefetch), it drops BOTH — the persistent
     /// per-buffer `self.events` are kept so `wait_buffer_free` gates cross-call
     /// bounce reuse device-side without a host sync, and mirror-RAW is closed by
     /// the caller's `kv_prefetch_done`.

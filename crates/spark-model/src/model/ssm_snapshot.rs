@@ -157,17 +157,17 @@ static DECODE_SPILL_STATS: LazyLock<DecodeSpillStats> = LazyLock::new(|| DecodeS
 /// is unchanged (same bytes, one sync before `put`), so it is ON by default; opt
 /// out with `ATLAS_SSM_DECODE_FUSED_GATHER=0`.
 static DECODE_FUSED_GATHER: LazyLock<bool> = LazyLock::new(|| {
-    match std::env::var("ATLAS_SSM_DECODE_FUSED_GATHER").ok().as_deref() {
-        Some("0") | Some("false") | Some("off") | Some("no") => false,
-        _ => true,
-    }
+    !matches!(
+        std::env::var("ATLAS_SSM_DECODE_FUSED_GATHER").ok().as_deref(),
+        Some("0") | Some("false") | Some("off") | Some("no")
+    )
 });
 
 /// Whether to emit a stats line at this spill count. Pure so the cadence is
 /// unit-testable without touching the atomics.
 #[inline]
 fn stats_should_log(spill_count: u64, log_every: u64) -> bool {
-    log_every > 0 && spill_count > 0 && spill_count % log_every == 0
+    log_every > 0 && spill_count > 0 && spill_count.is_multiple_of(log_every)
 }
 
 impl DecodeSpillStats {
@@ -1008,10 +1008,10 @@ impl SsmSnapshotPool {
         let Some(mgr) = self.decode_rolling.as_ref() else {
             return;
         };
-        if let Some(key) = mgr.lock().drop_slot(ssm_slot, ring_slot) {
-            if let Some(store) = &self.decode_store {
-                store.remove(key);
-            }
+        if let Some(key) = mgr.lock().drop_slot(ssm_slot, ring_slot)
+            && let Some(store) = &self.decode_store
+        {
+            store.remove(key);
         }
     }
 

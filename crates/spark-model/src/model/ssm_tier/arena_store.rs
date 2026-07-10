@@ -4,6 +4,7 @@
 //! fixed-slot arena store (RDMA or local file, via [`SnapshotTransport`]).
 
 use std::collections::HashMap;
+use std::num::NonZeroU64;
 use std::sync::atomic::Ordering;
 
 use anyhow::Result;
@@ -23,15 +24,17 @@ pub(crate) struct PagingSnapshotStore {
     /// Per-model namespace folded into every key so a SHARED peer never serves
     /// one model's SSM state to another (the prefix_hash is model-independent —
     /// same tokens collide across models, but their recurrent state differs).
-    /// 0 = no namespacing (single-model fleet / passthrough).
-    namespace: u64,
+    /// `NonZeroU64`: the old ns=0 passthrough (which silently cross-served
+    /// state between models) is unrepresentable — the namespace is either an
+    /// explicit override or the config-derived model fingerprint.
+    namespace: NonZeroU64,
 }
 
 impl PagingSnapshotStore {
     pub(crate) fn new(
         arena: spark_storage::RdmaSnapshotArena,
         blob_bytes: usize,
-        namespace: u64,
+        namespace: NonZeroU64,
     ) -> Self {
         Self {
             arena,
@@ -44,10 +47,7 @@ impl PagingSnapshotStore {
     /// (same model+key → same wire key → cache hit) with negligible cross-model
     /// collision, same 64-bit contract as `prefix_hash` itself.
     fn wire(&self, key: u64) -> u64 {
-        if self.namespace == 0 {
-            return key;
-        }
-        let mut h = key ^ self.namespace.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        let mut h = key ^ self.namespace.get().wrapping_mul(0x9E37_79B9_7F4A_7C15);
         h ^= h >> 30;
         h = h.wrapping_mul(0xBF58_476D_1CE4_E5B9);
         h ^= h >> 27;

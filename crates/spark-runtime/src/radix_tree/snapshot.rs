@@ -216,7 +216,8 @@ impl SsmSnapshotIndex {
     /// perturbs serving; the line is the Phase-0 measurement surface (hit-rate,
     /// mean restore anchor, mean recompute tok/turn — the #278 metrics).
     fn log_stats_if_due(&self) {
-        if self.stats.lookups % 64 != 0 || std::env::var_os("ATLAS_SSM_SNAP_STATS").is_none() {
+        if !self.stats.lookups.is_multiple_of(64) || std::env::var_os("ATLAS_SSM_SNAP_STATS").is_none()
+        {
             return;
         }
         let s = &self.stats;
@@ -312,7 +313,7 @@ impl SsmSnapshotIndex {
     /// the hot token-8192 anchor out-scores, so warm restore falls back to 8192
     /// and recomputes thousands of SSM tokens (~4400 tok, ~7.6s TTFT/turn).
     /// Exactly ONE entry is exempted, scoped to the active session, so any pool
-    /// >=2 always has a victim and never deadlocks. Correctness-safe: restore
+    /// \>=2 always has a victim and never deadlocks. Correctness-safe: restore
     /// re-validates session_hash+prefix_hash+depth, so changing the victim
     /// cannot cause a wrong-position restore.
     ///

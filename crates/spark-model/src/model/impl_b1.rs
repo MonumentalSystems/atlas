@@ -163,7 +163,7 @@ impl TransformerModel {
     /// for prefill). Returns `dst` when an adapter pool is resident (so the
     /// routed bgmv reads it) or `DevicePtr(0)` when there is no LoRA (apply
     /// sites then take the byte-identical installed-pair fallback). Resolution
-    /// + `count`-fill go through the unit-tested
+    /// \+ `count`-fill go through the unit-tested
     /// [`crate::lora::build_seq_slot_host`].
     pub(crate) fn upload_seq_slot_uniform(
         &self,

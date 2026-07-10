@@ -332,6 +332,7 @@ impl HighSpeedSwap {
     /// attention kernel. For prefill query at absolute position `q_pos`,
     /// pass `(q_pos % block_size) + 1` to mask out future positions in
     /// the active block.
+    #[allow(clippy::too_many_arguments)]
     pub fn attend_layer_on_stream_with_q_pos(
         &mut self,
         seq_slot: usize,

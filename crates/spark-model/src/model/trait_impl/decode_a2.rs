@@ -371,7 +371,7 @@ impl TransformerModel {
             let mut disk_states: Vec<SeqDiskState> = if hss_engaged {
                 seqs.iter_mut()
                     .map(|s| {
-                        let s: &mut SequenceState = &mut **s;
+                        let s: &mut SequenceState = s;
                         SeqDiskState {
                             block_table: &s.block_table,
                             disk_block_ids: &mut s.disk_block_ids,
@@ -445,28 +445,28 @@ impl TransformerModel {
                 // its overflowed-seq KV now (side stream) — hidden behind the
                 // compute already enqueued on the main stream. Only overflowed
                 // seqs (disk history exceeds resident HBM) need the tier read.
-                if kv_prefetch {
-                    if let Some(Some(next_attn)) = attn_idx_of.get(layer_idx + 1).copied() {
-                        spark_storage::with_local(|hss| {
-                            // #11: record the WAR fence on the MAIN stream at the
-                            // prefetch boundary, BEFORE the side-stream fan-out.
-                            // The main stream is in-order, so this dominates every
-                            // `step_tile` KV read enqueued so far this step (all
-                            // prior attention layers) regardless of the internal
-                            // attend shape (C=1 delegate, C≥2 fused, C≥2 serial).
-                            // Each `prefetch_layer` below waits it on
-                            // `prefetch_stream` before its overwriting H2D, closing
-                            // the cross-stream WAR without a full sync.
-                            hss.record_kv_read_event(stream)?;
-                            for ds in disk_states.iter() {
-                                if ds.disk_block_ids.len() > ds.block_table.len() {
-                                    hss.prefetch_layer(next_attn, ds.disk_block_ids)?;
-                                }
+                if kv_prefetch
+                    && let Some(Some(next_attn)) = attn_idx_of.get(layer_idx + 1).copied()
+                {
+                    spark_storage::with_local(|hss| {
+                        // #11: record the WAR fence on the MAIN stream at the
+                        // prefetch boundary, BEFORE the side-stream fan-out.
+                        // The main stream is in-order, so this dominates every
+                        // `step_tile` KV read enqueued so far this step (all
+                        // prior attention layers) regardless of the internal
+                        // attend shape (C=1 delegate, C≥2 fused, C≥2 serial).
+                        // Each `prefetch_layer` below waits it on
+                        // `prefetch_stream` before its overwriting H2D, closing
+                        // the cross-stream WAR without a full sync.
+                        hss.record_kv_read_event(stream)?;
+                        for ds in disk_states.iter() {
+                            if ds.disk_block_ids.len() > ds.block_table.len() {
+                                hss.prefetch_layer(next_attn, ds.disk_block_ids)?;
                             }
-                            anyhow::Ok(())
-                        })
-                        .expect("local installed checked in hss_engaged")?;
-                    }
+                        }
+                        anyhow::Ok(())
+                    })
+                    .expect("local installed checked in hss_engaged")?;
                 }
 
                 if conc_hsd {

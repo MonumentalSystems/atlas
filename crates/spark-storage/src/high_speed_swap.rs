@@ -116,7 +116,7 @@ pub struct HighSpeedSwap {
     attn: TiledAttention,
     eviction: EvictionPolicy,
     /// Phase 2: per-sequence transient orchestrator scratch — accumulator planes
-    /// + the single-use projection/score/tile buffers. Indexed by `seq_slot`
+    /// \+ the single-use projection/score/tile buffers. Indexed by `seq_slot`
     /// (the batch position) so two concurrent sequences never clobber each
     /// other's partial softmax / scratch (the C=8 race that killed the
     /// tile-pipeline). Lazily grown on first use of each slot; a serial pass

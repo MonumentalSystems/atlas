@@ -1568,6 +1568,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::assertions_on_constants)] // deliberate compile-time layout documentation
     fn seq_slot_meta_offset_gaps_do_not_collide() {
         // The small fixed-layout paths (single-seq decode, eager verify_a, and
         // the graphed verify_b/c/c2/d) place the seq_slot buffer at meta_base

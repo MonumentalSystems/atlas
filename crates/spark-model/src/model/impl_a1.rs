@@ -198,7 +198,14 @@ impl TransformerModel {
         // (host-RAM/peer are non-dropping regardless).
         if ssm_snapshots.decode_rolling_enabled() {
             let min_slots = decode_ring_slots * max_batch_size;
+            // Stable config-derived fingerprint: namespaces this model's keys
+            // on a SHARED paging peer (logged at INFO so operators can pin it).
+            let fp = super::ssm_tier::ModelFingerprint::derive(
+                &config,
+                ssm_snapshots.spill_blob_bytes(),
+            )?;
             let decode_store = super::ssm_tier::build_decode_tier_store(
+                fp,
                 ssm_snapshots.spill_blob_bytes(),
                 min_slots,
             )?;
@@ -226,10 +233,17 @@ impl TransformerModel {
                 );
                 // Host-RAM by default; ATLAS_SSM_RDMA_TIER=host:port routes spills
                 // to a remote blade instead (Phase 4b). Falls back to host-RAM on
-                // connect failure — never a hard model-init error.
-                Some(super::ssm_tier::build_tier_store(
+                // connect failure — never a hard model-init error. Err = CONFIG
+                // error only (bad ATLAS_SSM_SWAP_NS override / underivable
+                // fingerprint) — PCND fail-fast before any connect.
+                let fp = super::ssm_tier::ModelFingerprint::derive(
+                    &config,
                     ssm_snapshots.spill_blob_bytes(),
-                ))
+                )?;
+                Some(super::ssm_tier::build_tier_store(
+                    fp,
+                    ssm_snapshots.spill_blob_bytes(),
+                )?)
             } else {
                 None
             };

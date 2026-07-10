@@ -28,12 +28,14 @@
 //! private device pointers); this file defines the **store** the bytes land in.
 
 mod arena_store;
+mod fingerprint;
 mod selectors;
 mod store;
 mod transport;
 mod unified;
 
 pub(crate) use arena_store::{ArenaSnapshotStore, PagingSnapshotStore, RdmaSnapshotStore};
+pub(crate) use fingerprint::ModelFingerprint;
 pub(crate) use selectors::{build_decode_tier_store, build_tier_store, ssm_tier_enabled};
 pub(crate) use store::{BlobStoreStats, MemBlobStore, SnapshotBlobStore};
 pub(crate) use transport::{FileSnapshotArena, MockSnapshotTransport, SnapshotTransport};

@@ -382,7 +382,7 @@ impl TransformerModel {
             decode_seqs
                 .iter_mut()
                 .map(|s| {
-                    let s: &mut SequenceState = &mut **s;
+                    let s: &mut SequenceState = s;
                     SeqDiskState {
                         block_table: &s.block_table,
                         disk_block_ids: &mut s.disk_block_ids,
