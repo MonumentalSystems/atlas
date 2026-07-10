@@ -86,3 +86,71 @@ nothing ever evicts. Independent corroboration of the write-through tax document
 
 `/home/ms/.claude/jobs/42b99a42/tmp/needle-longctx.sh` (fp8) and `needle-hp.sh` (bf16, adds
 `--kv-high-precision-layers max`).
+
+## Diagnosis (2026-07-10)
+
+### UPDATE — the root cause is the FlashInfer GDN kernel, not "cumulative precision"
+
+The precision sweep below (kept for the record) was bisecting the wrong axis: every run used the **FlashInfer
+GDN kernel** (`libatlasgdn.so`, prod default `ATLAS_GDN_FLASHINFER=1`). Flipping **only** that flag settles it:
+
+| GDN kernel (cold 200K, prod fp8 everywhere else — native-fp8 attn+ssm, fp8 KV) | needles |
+|---|---|
+| FlashInfer `.so` (`ATLAS_GDN_FLASHINFER=1`, prod) | **7/8 FAIL** (VAULT-CIRRUS) |
+| in-tree FLA chunked (`ATLAS_GDN_FLASHINFER=0`) | **8/8 PASS** |
+
+Only `ATLAS_GDN_FLASHINFER` changed. So the **FlashInfer GDN kernel loses long-context coherence** in a way the
+in-tree FLA chunked kernel (`gated_delta_rule_fla`: `recompute_wu → chunk_delta_h_ksplit → chunk_fwd_o`, fp32
+`h_state`) does not. The "cumulative precision" result is real but was **compensation**: with the lossy
+FlashInfer kernel you need bf16 projections + bf16 KV to add enough margin to pass; with the accurate FLA kernel
+you pass at full fp8. Everything reconciles (FlashInfer+fp8 fail; FlashInfer+bf16-proj+bf16-KV pass;
+FLA+fp8 pass). The FlashInfer `.so` hard-codes bf16 GDN output with no Rust-visible dtype knob — very likely the
+same BF16-truncation source tracked for the in-tree kernels in Avarok #248 / PR #290, but baked into the cubin.
+
+**Recommendation (revised):** serve long-context with **`ATLAS_GDN_FLASHINFER=0`** — 8/8 at 200K while keeping
+full fp8 speed on projections + KV, at ~7% slower prefill (FLA vs FlashInfer). Durable perf-preserving fix:
+rebuild `libatlasgdn.so` with an F32 (or better-accumulated) GDN output — the F32-output pattern in PR #290 /
+#248 is the reference. The ~2.6× prefill/decode slope (F4) remains a separate, benign kernel-efficiency effect.
+
+### Original precision sweep (superseded as the root cause; retained for the record)
+
+Root-caused by a cold-vs-warm bisect + a one-knob-at-a-time precision sweep, all on the **same CUTLASS prod
+image** (`atlas-gb10:spillpool`, full native-fp8 + CUTLASS env set — a host `cargo build` is the WRONG numeric
+config and cannot reproduce this).
+
+**Step 1 — kill the warm hypothesis.** The model is a **hybrid: 30 of 40 layers are GDN linear-attention**
+(recurrent state *outside* the KV cache); only 10 are full-attention. The benchmark runs warm (at 200K only
+~76K of 209K is freshly prefilled), so it was natural to suspect SSM-snapshot / prefix-replay drift. But a
+**cold single-pass 200K** (fresh salt, whole context prefilled in one contiguous pass, no snapshot restore, no
+KV reuse — `--request-timeout 0` required or the long cold prefill dies mid-decode) **misses the SAME needle,
+7/8.** ⇒ the miss is **depth-intrinsic**, and the snapshot / prefix-cache machinery is **exonerated**.
+
+**Step 2 — precision, not structure.** Cold 200K at max precision (bf16 attn+ssm projections + bf16 KV)
+recalls **8/8**. A structural bug (RoPE range, chunk-boundary math, index truncation) would not be fixed by
+raising precision — those are exonerated.
+
+**Step 3 — no single fp8 path is the culprit; the error is cumulative.** One knob at a time, cold 200K:
+
+| config | needles | missed |
+|---|---|---|
+| prod: fp8 proj + fp8 KV | 7/8 | VAULT-CIRRUS (~51K, mid) |
+| `NATIVE_FP8_SSM=0` only (bf16 SSM proj) | 7/8 | VAULT-CIRRUS |
+| `NATIVE_FP8_ATTN=0` only (bf16 attn proj) | 7/8 | VAULT-CIRRUS |
+| bf16 KV only (`--kv-high-precision-layers max`) | 7/8 | VAULT-CIRRUS |
+| bf16 **both** proj, fp8 KV | 7/8 | **VAULT-HALCYON (~200K, deepest)** ← miss shifted |
+| bf16 proj **+** bf16 KV | **8/8 PASS** | — |
+
+The missed needle **shifting** from mid-context (fixed by bf16 projections) to the deepest position (still sunk
+by residual fp8-KV error, which accumulates most at 200K) is the signature of cumulative, threshold-crossing
+precision loss across **three independent fp8 paths** — attention projections, SSM projections, and KV cache.
+
+**Why vLLM passes (F1):** it does not stack these downgrades — notably it keeps the SSM/GDN recurrent path at
+higher precision (Atlas's `h_state` carry is fp32 at `ssm_pool.rs:230`, but its SSM *projections* and FLA WY
+chunk intermediates are bf16/native-fp8).
+
+**Recommendation.** For long-context *correctness* on this model, serve with `ATLAS_HOLO_NATIVE_FP8_ATTN=0
+ATLAS_HOLO_NATIVE_FP8_SSM=0 --kv-high-precision-layers max` (8/8 at 200K), at a prefill-throughput cost
+(native-fp8 was the big speed lever). The durable fix is better fp8 *scaling* / fp32-accumulate in these paths
+(especially pushing GDN/SSM toward fp32) so speed and correctness coexist. **The ~2.6× prefill/decode slope
+(F4) is a separate, benign kernel-efficiency effect (small tiles + serial per-CTA KV loop + fp8 sync-dequant);
+the prefill online-softmax is provably correct — do not conflate the slope with the miss.**
