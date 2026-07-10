@@ -44,6 +44,9 @@ spark-comm = { path = "../spark-comm", default-features = false }
 # Same opt-out pattern as spark-runtime above — keeps metal builds
 # from silently re-enabling spark-storage's cuda default.
 spark-storage = { path = "../spark-storage", default-features = false }
+# Generic tiered-cache core (CUDA-free) — the unified SSM spill store
+# (ATLAS_SSM_TIER_UNIFIED) wraps its Residency; see model/ssm_tier.rs.
+atlas-tier = { path = "../atlas-tier" }
 anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

@@ -179,6 +179,22 @@ pub(crate) fn ssm_tier_enabled() -> bool {
     std::env::var_os("ATLAS_SSM_TIER").is_some()
 }
 
+/// Opt-in truthy parse for `ATLAS_SSM_TIER_UNIFIED` (style-matching
+/// `ATLAS_HSS_COALESCE_WRITE_RUNS` in spark-storage/high_speed_swap.rs).
+fn unified_flag_truthy(v: Option<&str>) -> bool {
+    matches!(v.map(str::trim), Some("1") | Some("true") | Some("on") | Some("yes"))
+}
+
+/// TIERED-CACHE-CONSOLIDATION §4 fix, step 3: whether the client-side SSM
+/// spill stores route through the ONE lifted policy core
+/// ([`atlas_tier::Residency`] — two-level LRU, never rejects) instead of the
+/// per-store policies (MemBlobStore FIFO, RdmaSnapshotStore drop-on-full).
+/// DEFAULT OFF ⇒ the selectors construct exactly today's stores, byte- and
+/// behavior-identical.
+pub(crate) fn ssm_tier_unified() -> bool {
+    unified_flag_truthy(std::env::var("ATLAS_SSM_TIER_UNIFIED").ok().as_deref())
+}
+
 /// Build the SSM spill-tier store (called only when `ssm_tier_enabled()`).
 /// `ATLAS_SSM_RDMA_TIER=host:port` selects the RDMA arena
 /// ([`RdmaSnapshotStore`] over a peer blade, `ATLAS_SSM_RDMA_ARENA_SLOTS` slots,
@@ -234,6 +250,35 @@ pub(crate) fn build_tier_store(blob_bytes: usize) -> std::sync::Arc<dyn Snapshot
         // in a build without the RDMA verbs (the stub arena always errors).
         match spark_storage::RdmaSnapshotArena::connect(&peer, arena_bytes, blob_bytes) {
             Ok(arena) => {
+                if ssm_tier_unified() {
+                    // §4 fix (the LIVE bug arm): replace the drop-on-full
+                    // fixed-slot allocator with the peer's LRU/never-reject
+                    // Residency, client-side, over the same remote arena — an
+                    // arena-full PUT now LRU-spills the coldest blob to the
+                    // local swap tier instead of silently discarding the spill.
+                    let hot = Box::new(TransportSlotArena {
+                        transport: Box::new(arena),
+                        slot_bytes: blob_bytes,
+                        num_slots: slots,
+                    });
+                    let swap = build_unified_swap(blob_bytes, "marconi-rdma");
+                    match UnifiedSnapshotStore::new(hot, swap, blob_bytes) {
+                        Ok(s) => {
+                            tracing::info!(
+                                "SSM spill tier = UNIFIED residency over RDMA peer {peer} \
+                                 ({slots} hot slots × {blob_bytes} B, LRU spill, never rejects)"
+                            );
+                            return Arc::new(s);
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "SSM unified residency init failed ({e:#}); \
+                                 falling back to host-RAM"
+                            );
+                            return Arc::new(MemBlobStore::new(0));
+                        }
+                    }
+                }
                 tracing::info!(
                     "SSM spill tier = RDMA peer {peer} ({slots} slots × {blob_bytes} B = \
                      {:.2} GiB arena)",
@@ -243,6 +288,27 @@ pub(crate) fn build_tier_store(blob_bytes: usize) -> std::sync::Arc<dyn Snapshot
             }
             Err(e) => tracing::warn!(
                 "SSM RDMA tier connect to {peer} failed ({e:#}); falling back to host-RAM"
+            ),
+        }
+    }
+    if ssm_tier_unified() {
+        // §4 fix (host-RAM arm): one policy core instead of the FIFO
+        // MemBlobStore — a bounded LRU hot arena that spills (never rejects)
+        // into the swap tier. NOTE: unlike today's lazily-growing unbounded
+        // store, the hot arena is allocated up front (slots × blob_bytes).
+        let hot_slots = unified_hot_slots();
+        let hot = Box::new(atlas_tier::VecSlotArena::new(blob_bytes, hot_slots));
+        let swap = build_unified_swap(blob_bytes, "marconi-host");
+        match UnifiedSnapshotStore::new(hot, swap, blob_bytes) {
+            Ok(s) => {
+                tracing::info!(
+                    "SSM spill tier = UNIFIED residency in host RAM ({hot_slots} hot slots × \
+                     {blob_bytes} B, LRU spill, never rejects)"
+                );
+                return Arc::new(s);
+            }
+            Err(e) => tracing::warn!(
+                "SSM unified residency init failed ({e:#}); falling back to host-RAM store"
             ),
         }
     }
@@ -535,6 +601,170 @@ impl SnapshotBlobStore for RdmaSnapshotStore {
 pub(crate) type ArenaSnapshotStore = RdmaSnapshotStore;
 
 // ─────────────────────────────────────────────────────────────────────────
+// §4 unification (TIERED-CACHE-CONSOLIDATION step 3) — ATLAS_SSM_TIER_UNIFIED
+//
+// The SAME logical tier historically got a DIFFERENT eviction policy per
+// backing store: MemBlobStore evicts FIFO by insertion order (latent — the
+// production cap is always 0), RdmaSnapshotStore drops-on-full with no recency
+// at all (live), while the peer's paging Residency does two-level LRU and
+// never rejects. FIFO/drop-on-full defeat the HBM pool's session-aware victim
+// selection: the carefully chosen victim spills into a tier that re-picks its
+// own victim by insertion order — or silently discards it.
+//
+// Flag ON routes the client-side spill stores through the ONE policy core
+// lifted from the peer (`atlas_tier::Residency`: LRU over a hot arena, spill
+// to a swap tier, NEVER reject, uncapped disk ⇒ nothing ever dropped). Flag
+// OFF (default) constructs exactly today's stores — byte/behavior-identical.
+// The gather/scatter of the ~60 per-layer device regions stays ABOVE this
+// boundary in SsmSnapshotPool::{spill_slot,fault_in_slot}; the store only ever
+// moves ONE contiguous host blob, so no scatter-capable SwapStore is needed
+// and the StorageBackend refusals above remain true.
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Adapts a [`SnapshotTransport`] (flat offset-addressed remote/file arena) to
+/// the [`atlas_tier::SlotArena`] hot-tier seam: slot `i` lives at offset
+/// `i × slot_bytes` — the same fixed-slot geometry [`RdmaSnapshotStore`] uses,
+/// so the peer arena layout is unchanged under the flag.
+struct TransportSlotArena {
+    transport: Box<dyn SnapshotTransport>,
+    slot_bytes: usize,
+    num_slots: usize,
+}
+
+impl atlas_tier::SlotArena for TransportSlotArena {
+    fn slot_bytes(&self) -> usize {
+        self.slot_bytes
+    }
+    fn num_slots(&self) -> usize {
+        self.num_slots
+    }
+    fn read_slot(&self, slot: usize, out: &mut [u8]) -> Result<()> {
+        if slot >= self.num_slots || out.len() != self.slot_bytes {
+            anyhow::bail!("TransportSlotArena::read_slot({slot}) out of range / size mismatch");
+        }
+        self.transport.read_blob((slot * self.slot_bytes) as u64, out)
+    }
+    fn write_slot(&mut self, slot: usize, bytes: &[u8]) -> Result<()> {
+        if slot >= self.num_slots || bytes.len() != self.slot_bytes {
+            anyhow::bail!("TransportSlotArena::write_slot({slot}) out of range / size mismatch");
+        }
+        self.transport.write_blob((slot * self.slot_bytes) as u64, bytes)
+    }
+}
+
+/// The flag-ON [`SnapshotBlobStore`]: a `Mutex`-shared [`atlas_tier::Residency`]
+/// (the peer's exact paging core, in-process). PUT never returns `Ok(false)`
+/// for a right-sized blob — a full hot arena LRU-spills its coldest resident
+/// into the swap tier, and the uncapped disk (`max_disk_slots = 0`) means
+/// nothing is ever dropped, which also satisfies the decode tier's HARD
+/// non-dropping requirement BY CONSTRUCTION rather than by sizing. The Mutex
+/// is held across the byte move — the same tradeoff the peer's
+/// `run_paging_loop_shared` documents (map op + one blob memcpy per call).
+pub(crate) struct UnifiedSnapshotStore {
+    inner: Mutex<atlas_tier::Residency<Box<dyn atlas_tier::SlotArena>, Box<dyn atlas_tier::SwapStore>>>,
+    blob_bytes: usize,
+    pub stats: BlobStoreStats,
+}
+
+impl UnifiedSnapshotStore {
+    fn new(
+        arena: Box<dyn atlas_tier::SlotArena>,
+        swap: Box<dyn atlas_tier::SwapStore>,
+        blob_bytes: usize,
+    ) -> Result<Self> {
+        // Uncapped disk tier: keys are NEVER dropped (a capped disk would let
+        // make_disk_room silently discard live decode rollback targets).
+        let residency = atlas_tier::Residency::new(arena, swap)?;
+        Ok(Self { inner: Mutex::new(residency), blob_bytes, stats: BlobStoreStats::default() })
+    }
+}
+
+impl SnapshotBlobStore for UnifiedSnapshotStore {
+    fn put(&self, key: u64, bytes: &[u8]) -> Result<bool> {
+        // Fixed-size tier: an off-size blob is a caller bug — refuse gracefully
+        // (same contract as RdmaSnapshotStore), never corrupt a slot.
+        if bytes.len() != self.blob_bytes {
+            self.stats.put_rejects.fetch_add(1, Ordering::Relaxed);
+            return Ok(false);
+        }
+        self.inner.lock().put_blob(key, bytes)?;
+        self.stats.puts.fetch_add(1, Ordering::Relaxed);
+        Ok(true) // never full — the residency spills, it doesn't reject
+    }
+
+    fn get(&self, key: u64, out: &mut [u8]) -> Result<bool> {
+        // Defensive: never scatter a wrong-sized blob into a slot.
+        if out.len() != self.blob_bytes {
+            self.stats.get_misses.fetch_add(1, Ordering::Relaxed);
+            return Ok(false);
+        }
+        let hit = self.inner.lock().get_blob(key, out)?;
+        if hit {
+            self.stats.get_hits.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.stats.get_misses.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(hit)
+    }
+
+    fn remove(&self, key: u64) {
+        self.inner.lock().remove(key);
+    }
+
+    fn len(&self) -> usize {
+        self.inner.lock().total_keys()
+    }
+
+    fn bytes_resident(&self) -> usize {
+        // Hot (RAM-arena) bytes; swapped records live in the swap tier.
+        self.inner.lock().resident_count() * self.blob_bytes
+    }
+}
+
+/// The unified stores' swap tier. `ATLAS_SSM_TIER_SWAP_DIR` selects the lifted
+/// O_DIRECT NVMe swap file (needs a 4 KiB-multiple blob — the O_DIRECT
+/// stride); otherwise (or on any setup failure) host-RAM records — still
+/// LRU-ordered and never-reject, just RAM-resident like today's stores.
+fn build_unified_swap(blob_bytes: usize, tag: &str) -> Box<dyn atlas_tier::SwapStore> {
+    if let Some(dir) = std::env::var("ATLAS_SSM_TIER_SWAP_DIR").ok().filter(|s| !s.is_empty()) {
+        if blob_bytes > 0 && blob_bytes.is_multiple_of(4096) {
+            let make = || -> Result<atlas_tier::DirectSwapFile> {
+                std::fs::create_dir_all(&dir)?;
+                let path = std::path::Path::new(&dir)
+                    .join(format!("atlas-ssm-{tag}.{}.swap", std::process::id()));
+                atlas_tier::DirectSwapFile::create(&path, blob_bytes)
+            };
+            match make() {
+                Ok(f) => {
+                    tracing::info!("unified SSM tier ({tag}): O_DIRECT swap file in {dir}");
+                    return Box::new(f);
+                }
+                Err(e) => tracing::info!(
+                    "unified SSM tier ({tag}): swap dir {dir} unusable ({e:#}); \
+                     using host-RAM swap"
+                ),
+            }
+        } else {
+            tracing::info!(
+                "unified SSM tier ({tag}): blob_bytes {blob_bytes} is not a 4 KiB multiple \
+                 (O_DIRECT stride); using host-RAM swap"
+            );
+        }
+    }
+    Box::new(atlas_tier::MemSwapStore::new(blob_bytes))
+}
+
+/// Hot-arena slot count for the unified stores (`ATLAS_SSM_TIER_SLOTS`,
+/// default 64). The hot arena is allocated up front at `slots × blob_bytes`.
+fn unified_hot_slots() -> usize {
+    std::env::var("ATLAS_SSM_TIER_SLOTS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(64)
+        .max(1)
+}
+
+// ─────────────────────────────────────────────────────────────────────────
 // Local-NVMe transport for the decode rolling tier (`FileSnapshotArena`)
 //
 // The decode cold tier needs a HOST-LOCAL NVMe destination as an alternative to
@@ -635,6 +865,32 @@ pub(crate) fn build_decode_tier_store(
                         "ATLAS_SSM_DECODE_TIER=nvme requires ATLAS_SSM_DECODE_NVME_DIR=<dir>"
                     )
                 })?;
+            if ssm_tier_unified() && blob_bytes > 0 && blob_bytes.is_multiple_of(4096) {
+                // §4 unification: a RAM hot cache over the lifted O_DIRECT swap
+                // file. The uncapped disk tier (max_disk_slots = 0) makes
+                // NON-DROPPING hold BY CONSTRUCTION instead of by arena sizing
+                // — a decode rollback target can never be refused or dropped.
+                std::fs::create_dir_all(&dir)?;
+                let path = std::path::Path::new(&dir)
+                    .join(format!("atlas-decode-ring.{}.swap", std::process::id()));
+                let swap = atlas_tier::DirectSwapFile::create(&path, blob_bytes)?;
+                let hot_slots = unified_hot_slots().min(min_slots + 1);
+                let hot = Box::new(atlas_tier::VecSlotArena::new(blob_bytes, hot_slots));
+                let store = UnifiedSnapshotStore::new(hot, Box::new(swap), blob_bytes)?;
+                tracing::info!(
+                    "SSM decode cold tier = UNIFIED residency ({hot_slots} hot RAM slots + \
+                     O_DIRECT swap in {dir}; non-dropping by construction ≥ min_slots \
+                     {min_slots})"
+                );
+                return Ok(Arc::new(store));
+            }
+            if ssm_tier_unified() {
+                tracing::info!(
+                    "SSM decode cold tier: ATLAS_SSM_TIER_UNIFIED set but blob_bytes \
+                     {blob_bytes} is not a 4 KiB multiple (O_DIRECT stride); keeping the \
+                     sized arena store"
+                );
+            }
             // Provision to the worst-case cold residency + headroom slot so the
             // non-dropping invariant holds by construction (an undersized arena
             // would return Ok(false) on a live target = corruption).
@@ -872,6 +1128,188 @@ mod tests {
                 assert!(s.put(k, &[0; 4]).unwrap(), "non-dropping: nothing refused");
             }
             assert_eq!(s.len(), 2000);
+        }
+    }
+
+    // ── §4 unification (ATLAS_SSM_TIER_UNIFIED) ────────────────────────────
+
+    #[test]
+    fn unified_flag_truthy_parse_matches_hss_style() {
+        for on in ["1", "true", "on", "yes", " 1 ", "yes "] {
+            assert!(unified_flag_truthy(Some(on)), "{on:?} must engage the flag");
+        }
+        for off in ["", "0", "false", "off", "no", "TRUE", "2"] {
+            assert!(!unified_flag_truthy(Some(off)), "{off:?} must stay off");
+        }
+        assert!(!unified_flag_truthy(None), "unset = default OFF");
+    }
+
+    fn unified_store(slots: usize) -> UnifiedSnapshotStore {
+        UnifiedSnapshotStore::new(
+            Box::new(atlas_tier::VecSlotArena::new(BLOB, slots)),
+            Box::new(atlas_tier::MemSwapStore::new(BLOB)),
+            BLOB,
+        )
+        .unwrap()
+    }
+
+    /// THE §4 fix: where the bounded stores FIFO-evict or drop-on-full, the
+    /// unified store never rejects — overflow LRU-spills to the swap tier and
+    /// every key faults back byte-identical.
+    #[test]
+    fn unified_store_never_rejects_and_faults_back() {
+        let s = unified_store(2);
+        for k in 0..32u64 {
+            assert!(s.put(k, &[k as u8; BLOB]).unwrap(), "put {k} must never be refused");
+        }
+        assert_eq!(s.len(), 32, "all keys tracked — nothing dropped");
+        let mut o = [0u8; BLOB];
+        for k in 0..32u64 {
+            assert!(s.get(k, &mut o).unwrap(), "key {k} present");
+            assert_eq!(o, [k as u8; BLOB], "key {k} byte-identical");
+        }
+        assert_eq!(s.stats.put_rejects.load(Ordering::Relaxed), 0);
+    }
+
+    /// LRU (not FIFO): touching the oldest-inserted key protects it — the
+    /// spill victim is the least-recently-USED key. (A capped MemBlobStore
+    /// would evict key 1 here; RdmaSnapshotStore would refuse key 3 outright.)
+    #[test]
+    fn unified_store_victim_is_lru_not_fifo_and_not_a_reject() {
+        let s = unified_store(2);
+        assert!(s.put(1, &[1; BLOB]).unwrap());
+        assert!(s.put(2, &[2; BLOB]).unwrap());
+        let mut o = [0u8; BLOB];
+        assert!(s.get(1, &mut o).unwrap()); // touch 1 → 2 is now coldest
+        assert!(s.put(3, &[3; BLOB]).unwrap(), "no drop-on-full");
+        assert_eq!(s.bytes_resident(), 2 * BLOB, "two hot slots resident");
+        // The hot-again key SURVIVED IN THE HOT TIER: getting key 1 is a
+        // resident hit (no disk fault), where FIFO would have evicted it as
+        // oldest-inserted; key 2 was the LRU spill victim and faults back.
+        let faults0 = s.inner.lock().stats().faults_from_disk;
+        assert!(s.get(1, &mut o).unwrap(), "hot-again key survives");
+        assert_eq!(o, [1u8; BLOB]);
+        assert_eq!(
+            s.inner.lock().stats().faults_from_disk,
+            faults0,
+            "key 1 was still RESIDENT — the LRU victim was key 2, not the FIFO-oldest"
+        );
+        assert!(s.get(2, &mut o).unwrap(), "spilled key faults back, never dropped");
+        assert_eq!(o, [2u8; BLOB]);
+        assert_eq!(
+            s.inner.lock().stats().faults_from_disk,
+            faults0 + 1,
+            "key 2 came back via a disk fault"
+        );
+        assert!(s.get(3, &mut o).unwrap());
+        assert_eq!(o, [3u8; BLOB]);
+    }
+
+    /// Read-pins are honored through the unified store: a read-pinned key can
+    /// never be chosen as the LRU spill victim while pinned (the peer's
+    /// mid-RDMA-READ guarantee survives the in-process adoption), and returns
+    /// to normal LRU rotation after the last unpin.
+    #[test]
+    fn unified_store_honors_read_pins() {
+        let s = unified_store(2);
+        assert!(s.put(1, &[1; BLOB]).unwrap());
+        assert!(s.put(2, &[2; BLOB]).unwrap());
+        s.inner.lock().pin_read(1);
+        // Churn well past arena capacity: every spill victim must be a key
+        // OTHER than the pinned one.
+        for k in 10..20u64 {
+            assert!(s.put(k, &[k as u8; BLOB]).unwrap(), "puts never rejected while pinned");
+        }
+        let mut o = [0u8; BLOB];
+        {
+            let mut r = s.inner.lock();
+            assert_eq!(r.read_pin_count(1), 1);
+            let faults0 = r.stats().faults_from_disk;
+            assert!(r.get_blob(1, &mut o).unwrap(), "pinned key present");
+            assert_eq!(
+                r.stats().faults_from_disk,
+                faults0,
+                "pinned key stayed RESIDENT through the churn — never spilled"
+            );
+            r.unpin_read(1);
+            assert_eq!(r.read_pin_count(1), 0);
+        }
+        assert_eq!(o, [1u8; BLOB], "pinned key bytes intact");
+        // After the last unpin the key is evictable again: more churn spills
+        // it, and it faults back byte-identical (never dropped).
+        for k in 20..30u64 {
+            assert!(s.put(k, &[k as u8; BLOB]).unwrap());
+        }
+        let faults1 = s.inner.lock().stats().faults_from_disk;
+        assert!(s.get(1, &mut o).unwrap(), "unpinned key spilled but never dropped");
+        assert_eq!(o, [1u8; BLOB]);
+        assert_eq!(
+            s.inner.lock().stats().faults_from_disk,
+            faults1 + 1,
+            "unpinned key was evicted normally and faulted back from swap"
+        );
+    }
+
+    #[test]
+    fn unified_store_wrong_size_refused_gracefully() {
+        let s = unified_store(2);
+        assert!(!s.put(1, &[0; BLOB + 1]).unwrap(), "off-size put refused, not corrupt");
+        assert!(s.put(1, &[7; BLOB]).unwrap());
+        let mut big = [0u8; BLOB + 4];
+        assert!(!s.get(1, &mut big).unwrap(), "never scatter a wrong-sized blob");
+        assert_eq!(big, [0u8; BLOB + 4], "out untouched on refusal");
+    }
+
+    #[test]
+    fn unified_store_remove_is_clean_miss() {
+        let s = unified_store(2);
+        assert!(s.put(1, &[1; BLOB]).unwrap());
+        s.remove(1);
+        let mut o = [0u8; BLOB];
+        assert!(!s.get(1, &mut o).unwrap());
+        assert_eq!(s.len(), 0);
+    }
+
+    /// Unified over the SAME transport geometry the bounded RDMA store uses:
+    /// where `RdmaSnapshotStore` returns Ok(false) at slot 5, the unified wrap
+    /// keeps accepting (LRU spill to the swap tier) — the live §4 bug arm.
+    #[test]
+    fn unified_over_transport_never_drops_where_bounded_store_did() {
+        const SLOTS: usize = 4;
+        let hot = Box::new(TransportSlotArena {
+            transport: Box::new(MockSnapshotTransport::new(SLOTS * BLOB)),
+            slot_bytes: BLOB,
+            num_slots: SLOTS,
+        });
+        let s = UnifiedSnapshotStore::new(
+            hot,
+            Box::new(atlas_tier::MemSwapStore::new(BLOB)),
+            BLOB,
+        )
+        .unwrap();
+        let mut o = [0u8; BLOB];
+        for k in 0..16u64 {
+            assert!(s.put(k, &[k as u8; BLOB]).unwrap(), "arena-full put {k} accepted");
+        }
+        for k in 0..16u64 {
+            assert!(s.get(k, &mut o).unwrap(), "key {k} recoverable");
+            assert_eq!(o, [k as u8; BLOB]);
+        }
+    }
+
+    /// DEFAULT-OFF byte/behavior identity: with the flag unset the selectors
+    /// construct exactly today's stores with today's policies — the bounded
+    /// arena still drop-on-fulls here, the FIFO MemBlobStore still evicts
+    /// oldest-inserted (`cap_evicts_fifo` above), and `build_tier_store` still
+    /// yields the unbounded host-RAM store
+    /// (`build_tier_store_defaults_to_host_ram_unbounded` below).
+    #[test]
+    fn unified_flag_default_off_preserves_todays_policies() {
+        if std::env::var_os("ATLAS_SSM_TIER_UNIFIED").is_none() {
+            assert!(!ssm_tier_unified(), "flag must default OFF");
+            let s = rdma_store(1);
+            assert!(s.put(1, &[1; BLOB]).unwrap());
+            assert!(!s.put(2, &[2; BLOB]).unwrap(), "flag OFF: drop-on-full unchanged");
         }
     }
 
