@@ -18,6 +18,10 @@ cuda = ["dep:spark-runtime", "spark-runtime/cuda"]
 metal = []
 
 [dependencies]
+# The generic tiered-cache core (SlotArena/SwapStore/Residency/DirectSwapFile)
+# lifted out of snapshot_swap.rs — CUDA- and verbs-free by construction, so it
+# is safe on the `default-features = false` peer path (atlas-expert-pack).
+atlas-tier = { path = "../atlas-tier" }
 cufile-sys = { path = "../cufile-sys" }
 # Only for the cuda-gated RDMA weight loader (see the `cuda` feature note). The
 # non-cuda peer server + wire types never touch it, so it stays optional and the

@@ -195,6 +195,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "atlas-tier"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "libc",
+]
+
+[[package]]
 name = "atomic-waker"
 version = "1.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2161,6 +2169,7 @@ name = "spark-storage"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "atlas-tier",
  "cc",
  "cufile-sys",
  "half",

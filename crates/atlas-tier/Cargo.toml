@@ -1,0 +1,21 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+[package]
+name = "atlas-tier"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+description = "Atlas: generic tiered-cache core (SlotArena / SwapStore / Residency) — CUDA- and verbs-free"
+
+# HARD CONSTRAINT (tiered-cache consolidation step 2): this crate is the
+# CUDA-free, verbs-free paging core the peer daemons build on. Its dependency
+# budget is anyhow (+ libc for the O_DIRECT swap file on unix) — adding a GPU
+# or RDMA dependency here destroys the `atlas-expert-pack`
+# default-features = false property that keeps the peers CUDA-free.
+[dependencies]
+anyhow = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[lints]
+workspace = true
