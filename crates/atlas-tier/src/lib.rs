@@ -19,7 +19,7 @@
 //! This crate is CPU/disk-only: deps are `anyhow` + `libc` (unix). It is fully
 //! unit-testable without RDMA or a GPU, and it is the reason the peer daemons
 //! (`atlas-expert-pack`, `spark-storage` with `default-features = false`)
-//! build CUDA-free. The peer wire protocol (PAGING_MAGIC, paging loops, client
+//! build CUDA-free. The peer wire protocol (PAGING_MAGIC_V2, paging loops, client
 //! codec) deliberately did NOT move — it stays in `spark-storage::snapshot_swap`,
 //! which re-exports this core so existing consumers compile unchanged.
 

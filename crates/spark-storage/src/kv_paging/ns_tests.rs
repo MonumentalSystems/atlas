@@ -123,8 +123,9 @@ fn every_field_flips_the_namespace() {
 
 #[test]
 fn flag_selection_is_strict() {
-    // Flag OFF (unset / "0") ⇒ the legacy dumb one-sided path, byte-identical
-    // (connect_kv_peer_backend calls the untouched RdmaKvBackend::connect).
+    // Flag OFF (unset / "0") ⇒ the raw dumb one-sided path
+    // (connect_kv_peer_backend calls RdmaKvBackend::connect — same data
+    // plane; since Step C its handshake is the v2 header with blob == 0).
     assert!(!kv_paging_selected(None).unwrap());
     assert!(!kv_paging_selected(Some("0")).unwrap());
     assert!(kv_paging_selected(Some("1")).unwrap());
@@ -133,24 +134,27 @@ fn flag_selection_is_strict() {
     assert!(kv_paging_selected(Some("")).is_err());
 }
 
-/// Flag OFF byte-identity, wire half: the legacy client's first u64 (a bare
-/// `total_bytes` = num_groups × group_stride) still rides the peer's
-/// `Ok(None)` legacy escape — for a REALISTIC Holo-like sizing, not just the
-/// tiny 12345 pin in wire_tests.
+/// Flag OFF wire half (Step C: the bare `total_bytes` handshake is retired):
+/// `RdmaKvBackend` now sends the v2 header with `blob_bytes == 0` (RAW
+/// one-sided mode). Pin that a REALISTIC Holo-like total round-trips through
+/// encode/parse and stays under the peer's explicit arena sanity bound.
 #[test]
-fn legacy_first_u64_still_parses_as_legacy() {
+fn flag_off_raw_v2_header_round_trips() {
+    use crate::snapshot_swap::{PagingKind, encode_paging_v2_header, parse_paging_header};
     let l = layout();
     let num_groups = (l.num_layers as u64) * 2 * (l.num_blocks as u64) * (l.num_kv_heads as u64);
-    let total = num_groups * l.group_stride; // what RdmaKvBackend::connect sends
+    let total = num_groups * l.group_stride; // what RdmaKvBackend::connect sizes
     assert!(
         total <= (1 << 42),
-        "legacy totals stay under the dispatch bound"
+        "raw totals stay under the peer's arena sanity bound"
     );
-    let mut c = std::io::Cursor::new(Vec::new());
+    let w = encode_paging_v2_header(PagingKind::KV, total, 0);
+    let first = u64::from_le_bytes(w[0..8].try_into().unwrap());
+    let mut c = std::io::Cursor::new(w[8..].to_vec());
     assert_eq!(
-        crate::snapshot_swap::parse_paging_header(total, &mut c).unwrap(),
-        None,
-        "flag-OFF clients must keep taking the dumb one-sided path"
+        parse_paging_header(first, &mut c).unwrap(),
+        (PagingKind::KV, total, 0),
+        "flag-OFF clients ride the RAW one-sided mode (blob_bytes == 0)"
     );
 }
 

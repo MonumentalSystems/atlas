@@ -70,18 +70,6 @@ fn handle_paging_op_pins_get_and_auto_releases() {
 // ─────────────────────────── protocol tests ───────────────────────────
 
 #[test]
-// Deliberate constant asserts: these are load-bearing protocol pins (the shared
-// port disambiguates on them) and must stay visible runtime test failures.
-#[allow(clippy::assertions_on_constants)]
-fn magic_above_legacy_range() {
-    // A legacy client's total_bytes is validated <= 1<<42; both paging magics
-    // must be strictly above so neither is mistaken for a size, and distinct.
-    assert!(PAGING_MAGIC > (1u64 << 42));
-    assert!(PAGING_MAGIC_V2 > (1u64 << 42));
-    assert_ne!(PAGING_MAGIC, PAGING_MAGIC_V2);
-}
-
-#[test]
 fn stripe_plan_covers_every_byte_once() {
     for (blob, chunk, rails) in [
         (64usize, 16usize, 2usize), // even split
@@ -116,29 +104,43 @@ fn stripe_plan_covers_every_byte_once() {
     assert!(stripe_plan(0, 16, 2).iter().all(|r| r.is_empty()));
 }
 
+/// v2-only header parse (Step C): SSM, KV, the RAW-mode blob==0 sentinel, and
+/// every rejection arm — unsupported kind, bare legacy total_bytes, v1 magic.
 #[test]
-fn paging_header_v1_v2_legacy_and_reject() {
-    // v1: no kind byte on the wire → SSM.
-    let mut body = Vec::new();
-    body.extend_from_slice(&0x1000u64.to_le_bytes()); // arena
-    body.extend_from_slice(&0x40u64.to_le_bytes()); // blob
+fn paging_header_v2_parse_and_reject() {
+    // v2 SSM: [kind][arena][blob].
+    let mut body = vec![PagingKind::SSM.0];
+    body.extend_from_slice(&0x1000u64.to_le_bytes());
+    body.extend_from_slice(&0x40u64.to_le_bytes());
     let mut c = std::io::Cursor::new(body);
     assert_eq!(
-        parse_paging_header(PAGING_MAGIC, &mut c).unwrap(),
-        Some((PagingKind::SSM, 0x1000, 0x40))
+        parse_paging_header(PAGING_MAGIC_V2, &mut c).unwrap(),
+        (PagingKind::SSM, 0x1000, 0x40)
     );
-    // v2: [kind][arena][blob].
+    // v2 KV.
     let mut body = vec![PagingKind::KV.0];
     body.extend_from_slice(&0x2000u64.to_le_bytes());
     body.extend_from_slice(&0x80u64.to_le_bytes());
     let mut c = std::io::Cursor::new(body);
     assert_eq!(
         parse_paging_header(PAGING_MAGIC_V2, &mut c).unwrap(),
-        Some((PagingKind::KV, 0x2000, 0x80))
+        (PagingKind::KV, 0x2000, 0x80)
     );
-    // legacy KV bare total_bytes → None (dumb path).
+    // v2 RAW mode: blob_bytes == 0 PARSES — routing it off the paging
+    // registry (per-connection arena, client-owned allocator) is the peer's
+    // job, not the parser's.
+    let mut body = vec![PagingKind::KV.0];
+    body.extend_from_slice(&0x3000u64.to_le_bytes());
+    body.extend_from_slice(&0u64.to_le_bytes());
+    let mut c = std::io::Cursor::new(body);
+    assert_eq!(
+        parse_paging_header(PAGING_MAGIC_V2, &mut c).unwrap(),
+        (PagingKind::KV, 0x3000, 0)
+    );
+    // A bare legacy total_bytes first-u64 → hard error (retired in Step C;
+    // pre-Step-C it silently selected the dumb one-sided path).
     let mut c = std::io::Cursor::new(Vec::new());
-    assert_eq!(parse_paging_header(12345, &mut c).unwrap(), None);
+    assert!(parse_paging_header(12345, &mut c).is_err());
     // unsupported kind (RO tier) → hard error, never a bogus arena.
     let mut body = vec![3u8];
     body.extend_from_slice(&[0u8; 16]);
@@ -146,26 +148,36 @@ fn paging_header_v1_v2_legacy_and_reject() {
     assert!(parse_paging_header(PAGING_MAGIC_V2, &mut c).is_err());
 }
 
-/// WIRE-GOLDEN (verify's ask): freeze the exact v1 handshake byte layout so a
-/// future codec edit can't silently shift it under a running fleet peer.
+/// WIRE-GOLDEN (Step C): the RETIRED v1 magic 0x5041_4745_0000_0001 is
+/// AFFIRMATIVELY rejected with a dedicated, legible diagnostic — never
+/// reinterpreted as a size or a v2 header — so a stale pre-Step-C binary
+/// fails loudly at handshake instead of silently degrading.
 #[test]
-fn v1_handshake_wire_golden() {
-    // What connect_paging emits for arena=0x1000, blob=0x40, 1 rail:
-    //   [PAGING_MAGIC u64 le][arena u64 le][blob u64 le][n_rails u8]
-    let mut w = Vec::new();
-    w.extend_from_slice(&PAGING_MAGIC.to_le_bytes());
-    w.extend_from_slice(&0x1000u64.to_le_bytes());
-    w.extend_from_slice(&0x40u64.to_le_bytes());
-    w.push(1u8);
+fn v1_magic_is_affirmatively_rejected() {
+    let mut c = std::io::Cursor::new(Vec::new());
+    let err = parse_paging_header(0x5041_4745_0000_0001, &mut c).unwrap_err();
+    assert!(
+        err.to_string().contains("v1 client no longer supported"),
+        "v1 rejection must be the dedicated diagnostic, got: {err}"
+    );
+    // The retired constant itself stays pinned (it is what stale binaries send).
+    assert_eq!(PAGING_MAGIC_V1_RETIRED, 0x5041_4745_0000_0001);
+}
+
+/// WIRE-GOLDEN (Step C): the RAW one-sided mode header — `blob_bytes == 0` —
+/// exactly what `RdmaKvBackend` (ATLAS_KV_PAGING off) and the bounded/unified
+/// snapshot fallback send in place of the retired bare `total_bytes`.
+#[test]
+fn v2_raw_mode_wire_golden() {
     assert_eq!(
-        w,
+        encode_paging_v2_header(PagingKind::KV, 0x4_0000_0000, 0).to_vec(),
         vec![
-            0x01, 0x00, 0x00, 0x00, 0x45, 0x47, 0x41, 0x50, // PAGING_MAGIC LE
-            0x00, 0x10, 0, 0, 0, 0, 0, 0, // arena 0x1000
-            0x40, 0, 0, 0, 0, 0, 0, 0,    // blob 0x40
-            0x01, // n_rails
+            0x02, 0x00, 0x00, 0x00, 0x45, 0x47, 0x41, 0x50, // PAGING_MAGIC_V2 LE
+            0x01, // kind = KV
+            0x00, 0x00, 0x00, 0x00, 0x04, 0, 0, 0, // arena = 16 GiB
+            0x00, 0, 0, 0, 0, 0, 0, 0, // blob = 0 → RAW one-sided mode
         ],
-        "v1 handshake bytes must never shift while any in-repo client sends them (Step C retires v1)"
+        "v2 RAW-mode handshake bytes are frozen"
     );
 }
 
@@ -186,7 +198,7 @@ fn v2_handshake_wire_golden() {
         ],
         "v2 KV handshake bytes are frozen (the deployed fleet peer parses them)"
     );
-    // SSM (kind = 0): what connect_paging will send after the Step C v1→v2 flip.
+    // SSM (kind = 0): what connect_paging sends (Step C flipped it v1→v2).
     assert_eq!(
         encode_paging_v2_header(PagingKind::SSM, 0x1000, 0x40).to_vec(),
         vec![
@@ -207,13 +219,15 @@ fn v2_encode_parses_back() {
     for (kind, arena, blob) in [
         (PagingKind::KV, 0x40_0000u64, 0x1_0000u64),
         (PagingKind::SSM, 0x1000, 0x40),
+        (PagingKind::KV, 0x3000, 0),  // RAW one-sided (RdmaKvBackend)
+        (PagingKind::SSM, 0x2000, 0), // RAW one-sided (snapshot fallback)
     ] {
         let w = encode_paging_v2_header(kind, arena, blob);
         let first = u64::from_le_bytes(w[0..8].try_into().unwrap());
         let mut c = std::io::Cursor::new(w[8..].to_vec());
         assert_eq!(
             parse_paging_header(first, &mut c).unwrap(),
-            Some((kind, arena, blob))
+            (kind, arena, blob)
         );
     }
 }

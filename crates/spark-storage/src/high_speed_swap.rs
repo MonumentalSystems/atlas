@@ -494,12 +494,13 @@ impl HighSpeedSwap {
                         "high-speed-swap: KV overflow tier = RDMA peer {peer} (group_stride {})",
                         group_layout.group_stride
                     );
-                    // ATLAS_KV_PAGING selection seam (default OFF ⇒ the legacy
-                    // dumb one-sided RdmaKvBackend, byte-identical; =1 ⇒ the
-                    // peer-owned paging backend, v2 handshake kind=KV). The
-                    // elem_bytes literal 2 mirrors the BF16 arg to
-                    // GroupLayout::new above. Legacy inherits the default
-                    // per-head block fan-out; paging overrides block-granular.
+                    // ATLAS_KV_PAGING selection seam (default OFF ⇒ the raw
+                    // dumb one-sided RdmaKvBackend — same data plane, v2 RAW
+                    // handshake blob=0 since Step C; =1 ⇒ the peer-owned
+                    // paging backend, v2 handshake kind=KV). The elem_bytes
+                    // literal 2 mirrors the BF16 arg to GroupLayout::new
+                    // above. Raw inherits the default per-head block
+                    // fan-out; paging overrides block-granular.
                     crate::kv_paging::connect_kv_peer_backend(
                         &peer,
                         group_layout,

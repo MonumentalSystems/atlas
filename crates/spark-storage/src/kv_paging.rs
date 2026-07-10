@@ -3,10 +3,12 @@
 //! KV as a first-class paging kind (Step B of the tiered-cache
 //! consolidation, DEFAULT-OFF behind `ATLAS_KV_PAGING`).
 //!
-//! Today's KV overflow tier (`rdma_kv_backend`) takes the "dumb one-sided
-//! path": the client sends a bare `[u64 total_bytes]`, the peer registers ONE
-//! RW MR, and the CLIENT owns a static allocator (`base + group_id ×
-//! group_stride`) over a fixed arena — no peer residency, no NVMe spill.
+//! The flag-OFF KV overflow tier (`rdma_kv_backend`) takes the "dumb
+//! one-sided path": the peer registers ONE RW MR and the CLIENT owns a static
+//! allocator (`base + group_id × group_stride`) over a fixed arena — no peer
+//! residency, no NVMe spill. Since Step C it selects that mode with the v2
+//! header's `blob_bytes == 0` RAW sentinel (the bare `[u64 total_bytes]`
+//! handshake is retired).
 //! This module is the alternative client: it sends the paging handshake
 //! (`PAGING_MAGIC_V2`, kind = `PagingKind::KV`) so KV inherits what the SSM
 //! snapshot tier already has — peer-owned residency, an NVMe-backed cold tier
@@ -23,9 +25,9 @@
 //! salt (see [`ns`]); `PagingKind::KV` in the handshake plus the
 //! [`ns::KV_DOMAIN`] fold domain-separate KV from SSM.
 //!
-//! FLAG OFF (`ATLAS_KV_PAGING` unset/0) the selection helper returns the
-//! untouched legacy `RdmaKvBackend` — byte-identical connect and data plane,
-//! so any regression bisects on this single flag.
+//! FLAG OFF (`ATLAS_KV_PAGING` unset/0) the selection helper returns the raw
+//! one-sided `RdmaKvBackend` — identical data plane (v2 RAW handshake since
+//! Step C), so any regression bisects on this single flag.
 
 pub mod ns;
 

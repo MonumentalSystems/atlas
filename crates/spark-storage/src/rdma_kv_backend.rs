@@ -100,9 +100,17 @@ impl RdmaKvBackend {
         let mut stream =
             TcpStream::connect(addr).with_context(|| format!("connect kv peer {addr}"))?;
         stream.set_nodelay(true).ok();
+        // v2 RAW one-sided mode (Step C): blob_bytes == 0 tells the peer to
+        // hand this connection a private fixed arena with a CLIENT-owned
+        // allocator — the same data plane the pre-Step-C bare `total_bytes`
+        // handshake selected, now signalled explicitly.
         stream
-            .write_all(&total_bytes.to_le_bytes())
-            .context("send kv total_bytes")?;
+            .write_all(&crate::snapshot_swap::encode_paging_v2_header(
+                crate::snapshot_swap::PagingKind::KV,
+                total_bytes,
+                0,
+            ))
+            .context("send kv raw-mode v2 header")?;
 
         // [u8 n_rails] + one QP per rail, then each rail's bounce ring
         // (LOCAL_WRITE-only landing MRs — `remote_read == false`, invariant).

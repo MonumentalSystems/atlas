@@ -4,9 +4,12 @@
 //
 // Inc 2: the TCP control channel between a paging client and the peer. It rides
 // the SAME stream the peer used for the RDMA handshake (which today just idles).
-// Backward-compatible: a paging client sends `PAGING_MAGIC` as its first u64
-// where a legacy KV client sends `total_bytes` (validated <= 1<<42); the magic
-// is far above that range, so legacy clients are never mis-parsed.
+// v2-only since Step C: EVERY client's first bytes are
+// `[u64 PAGING_MAGIC_V2][u8 kind][u64 arena_bytes][u64 blob_bytes]`.
+// `blob_bytes == 0` selects the RAW one-sided mode (per-connection arena,
+// client-owned allocator, no residency — the pre-Step-C "legacy" data plane,
+// now selected explicitly); anything else is a paging arena. The retired v1
+// magic and the bare-`total_bytes` legacy escape are affirmatively rejected.
 //
 // After the shared rail handshake, the loop is: client sends [op][key], peer
 // replies [status] (+ [offset] for ALLOC/GET-hit). Data still moves one-sided
@@ -21,14 +24,16 @@ use anyhow::{Context, Result, bail};
 
 use super::{SlotArena, SnapshotResidency, SwapStore};
 
-/// First-u64 sentinel selecting the paging protocol v1 (> 1<<42, so a legacy KV
-/// `total_bytes` can never collide). "PAGE" + version. v1 == SSM snapshots, no
-/// kind byte. In-repo clients (`rdma_snapshot::connect_paging`) still send it —
-/// keep byte-exact until Step C migrates every sender to v2.
-pub const PAGING_MAGIC: u64 = 0x5041_4745_0000_0001;
+/// The RETIRED v1 first-u64 ("PAGE" + 1). Recognized ONLY to reject it with a
+/// dedicated diagnostic — Step C deleted the v1 dialect (no kind byte) and the
+/// bare-`total_bytes` legacy escape, so a stale binary fails legibly at
+/// handshake instead of being reinterpreted.
+const PAGING_MAGIC_V1_RETIRED: u64 = 0x5041_4745_0000_0001;
 
-/// Paging protocol v2 (item 8): after the magic comes a `[u8 kind]` byte so ONE
-/// peer serves a registry of per-(kind, shape) arenas. Also > 1<<42.
+/// The ONLY accepted first u64 on the RW paging port ("PAGE" + 2, v2-only
+/// since Step C): after the magic comes a `[u8 kind]` byte so ONE peer serves
+/// a registry of per-(kind, shape) arenas, then `[u64 arena_bytes]`
+/// `[u64 blob_bytes]` — `blob_bytes == 0` selects the RAW one-sided mode.
 pub const PAGING_MAGIC_V2: u64 = 0x5041_4745_0000_0002;
 
 /// The tier a paging arena serves. Only the RW paging kinds (SSM, KV-as-paging)
@@ -47,41 +52,47 @@ impl PagingKind {
 }
 
 /// Parse the paging handshake header after the caller has read the first u64.
-/// v1 magic → (SSM, arena_bytes, blob_bytes) with NO kind byte on the wire
-/// (byte-exact, golden-pinned). v2 magic → read `[u8 kind]` then the two
-/// sizes. Any other first u64 is a legacy KV `total_bytes` → `Ok(None)` so the
-/// caller takes the dumb one-sided path. Rejects unsupported kinds (≥2).
-pub fn parse_paging_header<R: Read>(
-    first: u64,
-    r: &mut R,
-) -> Result<Option<(PagingKind, u64, u64)>> {
-    let kind = if first == PAGING_MAGIC {
-        PagingKind::SSM
-    } else if first == PAGING_MAGIC_V2 {
-        let mut kb = [0u8; 1];
-        r.read_exact(&mut kb).context("read paging kind")?;
-        let k = PagingKind(kb[0]);
-        if !k.is_paging_rw() {
-            bail!(
-                "paging: unsupported kind {} (only SSM/KV ride this handshake)",
-                kb[0]
-            );
-        }
-        k
-    } else {
-        return Ok(None); // legacy KV total_bytes — not a paging client
-    };
+/// v2-only (Step C): the first u64 MUST be [`PAGING_MAGIC_V2`], then
+/// `[u8 kind][u64 arena_bytes][u64 blob_bytes]`. `blob_bytes == 0` = the RAW
+/// one-sided mode (per-connection arena, client-owned allocator — the caller
+/// routes it OFF the paging registry). Rejects unsupported kinds (≥2), the
+/// retired v1 magic (dedicated diagnostic so a stale binary fails legibly),
+/// and any other first u64 (e.g. a pre-Step-C bare legacy `total_bytes`).
+pub fn parse_paging_header<R: Read>(first: u64, r: &mut R) -> Result<(PagingKind, u64, u64)> {
+    if first == PAGING_MAGIC_V1_RETIRED {
+        bail!(
+            "paging: v1 client no longer supported (magic {first:#x}); rebuild the client — \
+             every connect now sends [u64 PAGING_MAGIC_V2][u8 kind][u64 arena_bytes][u64 blob_bytes]"
+        );
+    }
+    if first != PAGING_MAGIC_V2 {
+        bail!(
+            "paging: first u64 {first:#x} is not PAGING_MAGIC_V2 (the bare legacy total_bytes \
+             handshake was retired in Step C; RAW one-sided clients send the v2 header with \
+             blob_bytes == 0)"
+        );
+    }
+    let mut kb = [0u8; 1];
+    r.read_exact(&mut kb).context("read paging kind")?;
+    let kind = PagingKind(kb[0]);
+    if !kind.is_paging_rw() {
+        bail!(
+            "paging: unsupported kind {} (only SSM/KV ride this handshake)",
+            kb[0]
+        );
+    }
     let mut b8 = [0u8; 8];
     r.read_exact(&mut b8).context("read paging arena_bytes")?;
     let arena_bytes = u64::from_le_bytes(b8);
     r.read_exact(&mut b8).context("read paging blob_bytes")?;
     let blob_bytes = u64::from_le_bytes(b8);
-    Ok(Some((kind, arena_bytes, blob_bytes)))
+    Ok((kind, arena_bytes, blob_bytes))
 }
 
-/// Encode the CLIENT half of the v2 paging handshake header (what a Step-B
-/// KV paging client sends first; SSM's `connect_paging` still speaks v1 until
-/// Step C migrates it):
+/// Encode the CLIENT half of the v2 paging handshake header — what EVERY
+/// client sends first since Step C: KV paging (`KvPagingBackend`), SSM paging
+/// (`connect_paging`), and both RAW one-sided modes (`RdmaKvBackend` and the
+/// bounded/unified snapshot fallback) via `blob_bytes == 0`:
 /// `[u64 PAGING_MAGIC_V2 LE][u8 kind][u64 arena_bytes LE][u64 blob_bytes LE]`
 /// — 25 bytes, followed by the unchanged `[u8 n_rails]` RailSet exchange.
 /// Lives in this ONE shared module (beside `parse_paging_header`, its peer

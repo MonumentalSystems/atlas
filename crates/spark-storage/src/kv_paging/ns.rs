@@ -179,8 +179,9 @@ pub fn resolve_salt_from(raw: Option<&str>) -> Result<Option<u64>> {
         .transpose()
 }
 
-/// `ATLAS_KV_PAGING` selection (env-free core): unset or `0` ⇒ the legacy
-/// dumb one-sided `RdmaKvBackend` path, byte-identical; `1` ⇒ the peer-owned
+/// `ATLAS_KV_PAGING` selection (env-free core): unset or `0` ⇒ the raw dumb
+/// one-sided `RdmaKvBackend` path (client-owned allocator; since Step C its
+/// handshake is the v2 header with `blob_bytes == 0`); `1` ⇒ the peer-owned
 /// paging backend. Anything else is a startup ERROR (PCND — a typo must never
 /// silently pick a path).
 pub fn kv_paging_selected(raw: Option<&str>) -> Result<bool> {
@@ -189,7 +190,7 @@ pub fn kv_paging_selected(raw: Option<&str>) -> Result<bool> {
         Some("1") => Ok(true),
         Some(other) => Err(anyhow!(
             "ATLAS_KV_PAGING={other:?} is invalid: 1 = peer-owned paging KV, 0/unset = the \
-             legacy one-sided KV blade"
+             raw one-sided KV blade"
         )),
     }
 }
@@ -197,7 +198,7 @@ pub fn kv_paging_selected(raw: Option<&str>) -> Result<bool> {
 /// `ATLAS_KV_PAGING_ARENA_GB` (REQUIRED when the flag is on — no implicit
 /// default, PCND): the peer warm-arena size in GiB (fractional accepted),
 /// floored to a multiple of `block_bytes` and required to hold ≥ 1 block.
-/// The legacy path sized the peer to `num_groups × group_stride` (every group
+/// The raw path sized the peer to `num_groups × group_stride` (every group
 /// a guaranteed slot); the paging arena is a deliberately smaller warm cache
 /// over the peer's NVMe swap, so the operator must choose it explicitly.
 pub fn resolve_arena_bytes_from(raw: Option<&str>, block_bytes: u64) -> Result<u64> {

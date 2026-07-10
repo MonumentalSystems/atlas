@@ -2,8 +2,9 @@
 
 //! `KvPagingBackend` — the KV overflow tier as a PAGING client (flag-ON arm
 //! of `ATLAS_KV_PAGING`), plus [`connect_kv_peer_backend`], the single
-//! selection seam `HighSpeedSwap` calls (flag OFF ⇒ the untouched legacy
-//! `RdmaKvBackend`, byte-identical).
+//! selection seam `HighSpeedSwap` calls (flag OFF ⇒ the raw one-sided
+//! `RdmaKvBackend`, identical data plane; since Step C its handshake is the
+//! v2 header with `blob_bytes == 0`).
 //!
 //! Data plane (strictly synchronous, ONE control op in flight — the peer's
 //! read-pin lifecycle releases a GET pin on the connection's NEXT op, which
@@ -411,11 +412,12 @@ impl Drop for KvPagingBackend {
 }
 
 /// THE selection seam `HighSpeedSwap::new_on_stream` calls when
-/// `$ATLAS_KV_PEER` is set. Flag OFF (`ATLAS_KV_PAGING` unset/0) ⇒ the legacy
-/// `RdmaKvBackend::connect(peer, layout)` — the identical, untouched call:
-/// byte-identical handshake and data plane, so a regression bisects on this
-/// one flag. Flag ON ⇒ resolve the required env (PCND: fail fast), derive the
-/// namespace, and connect the paging backend.
+/// `$ATLAS_KV_PEER` is set. Flag OFF (`ATLAS_KV_PAGING` unset/0) ⇒ the raw
+/// one-sided `RdmaKvBackend::connect(peer, layout)` — the identical call and
+/// data plane (since Step C its handshake is the v2 header with blob == 0),
+/// so a regression bisects on this one flag. Flag ON ⇒ resolve the required
+/// env (PCND: fail fast), derive the namespace, and connect the paging
+/// backend.
 pub fn connect_kv_peer_backend(
     peer: &str,
     layout: GroupLayout,

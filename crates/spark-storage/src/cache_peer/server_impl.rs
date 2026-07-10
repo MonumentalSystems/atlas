@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
-// Accept loop + per-connection lifecycle for the RW blade: first-u64 dispatch
-// (paging magic vs legacy bare `total_bytes`), the server-side rail handshake
-// holding the crate's SINGLE `reg_mr_rw` call site (the access flag is a
-// security invariant and stays AT the call site — census-pinned by
-// `tests/reg_mr_flag_audit.rs`), and the two data planes: the shared paging
-// control loop vs the legacy idle-until-hangup blade.
+// Accept loop + per-connection lifecycle for the RW blade: the v2-only
+// handshake parse (paging vs RAW one-sided mode, selected by `blob_bytes`),
+// the server-side rail handshake holding the crate's SINGLE `reg_mr_rw` call
+// site (the access flag is a security invariant and stays AT the call site —
+// census-pinned by `tests/reg_mr_flag_audit.rs`), and the two data planes:
+// the shared paging control loop vs the RAW idle-until-hangup blade.
 
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 
@@ -125,41 +125,41 @@ fn handle_conn(
     use std::io::{Read, Write};
     stream.set_nodelay(true).ok();
 
-    // 1. Client tells us how much RAM to register and how many rails it
-    //    wants. Backward-compatible paging select (WS-A): a paging client
-    //    sends `PAGING_MAGIC` as its first u64 (far above the legacy
-    //    `total_bytes` range, which is validated <= 1<<42), then
-    //    `[u64 arena_bytes][u64 blob_bytes]`. A legacy KV client's first u64
-    //    IS `total_bytes`, so it is never mis-parsed.
+    // 1. Client handshake (v2-only since Step C): EVERY client sends
+    //    `[u64 PAGING_MAGIC_V2][u8 kind][u64 arena_bytes][u64 blob_bytes]`.
+    //    blob_bytes > 0 → paging mode (peer-owned residency over the shared
+    //    per-(kind, blob) registry arena). blob_bytes == 0 → RAW one-sided
+    //    mode: a per-connection anonymous arena with a client-owned allocator
+    //    (the pre-Step-C "legacy" data plane, now selected explicitly).
+    //    `parse_paging_header` rejects the retired v1 magic and any bare
+    //    legacy total_bytes with a legible diagnostic.
     let mut b8 = [0u8; 8];
-    stream
-        .read_exact(&mut b8)
-        .context("read total_bytes/magic")?;
+    stream.read_exact(&mut b8).context("read paging magic")?;
     let first = u64::from_le_bytes(b8);
-    // v1/v2 paging magic → (kind, arena_bytes, blob_bytes); legacy KV bare
-    // total_bytes → None. `parse_paging_header` reads the kind byte (v2) +
-    // the two sizes off the stream and rejects unsupported kinds.
-    let (total, paging): (usize, Option<(u8, usize)>) =
-        match crate::snapshot_swap::parse_paging_header(first, &mut stream)? {
-            Some((kind, arena_bytes, blob)) => {
-                let arena_bytes = arena_bytes as usize;
-                let blob = blob as usize;
-                if blob == 0 || arena_bytes == 0 || !arena_bytes.is_multiple_of(blob) {
-                    bail!("paging: bad arena_bytes {arena_bytes} / blob_bytes {blob}");
-                }
-                // Reject BEFORE the rail handshake when this peer has no swap
-                // dir — the client's connect_paging then errors cleanly and
-                // falls back to the bounded/host-RAM tier.
-                if rdma.swap_dir.is_none() {
-                    bail!("paging client but peer started without --swap-dir; refusing");
-                }
-                (arena_bytes, Some((kind.0, blob)))
-            }
-            None => (first as usize, None),
-        };
+    let (kind, arena_bytes, blob) = crate::snapshot_swap::parse_paging_header(first, &mut stream)?;
+    let total = arena_bytes as usize;
+    let blob = blob as usize;
+    // Explicit arena sanity bound. Pre-Step-C the `1<<42` check did double
+    // duty (legacy-vs-magic dispatch AND size sanity); the dispatch role is
+    // gone but the bound stays — arena size must never be limited only by
+    // the (default-unlimited, warn-only) blade ledger.
     if total == 0 || total > (1usize << 42) {
-        bail!("implausible kv blade size: {total}");
+        bail!("implausible blade arena size: {total}");
     }
+    let paging: Option<(u8, usize)> = if blob == 0 {
+        None // RAW one-sided mode
+    } else {
+        if !total.is_multiple_of(blob) {
+            bail!("paging: arena_bytes {total} not a multiple of blob_bytes {blob}");
+        }
+        // Reject BEFORE the rail handshake when this peer has no swap
+        // dir — the client's connect_paging then errors cleanly and
+        // falls back to the bounded/host-RAM tier.
+        if rdma.swap_dir.is_none() {
+            bail!("paging client but peer started without --swap-dir; refusing");
+        }
+        Some((kind.0, blob))
+    };
     let mut b1 = [0u8; 1];
     stream.read_exact(&mut b1).context("read n_rails")?;
     let n_rails = b1[0] as usize;
@@ -170,7 +170,7 @@ fn handle_conn(
         );
     }
 
-    // Acquire the arena to register. Legacy: a per-connection anonymous
+    // Acquire the arena to register. RAW mode: a per-connection anonymous
     // mapping, charged per-conn. Paging (WS-A): the process-global SHARED
     // arena (charged ONCE at init) so every client's QPs point at the SAME
     // physical slots → a snapshot PUT by one client is GET-able by another.
@@ -181,7 +181,7 @@ fn handle_conn(
         )?),
         None => None,
     };
-    // Per-connection arena + blade reservation (legacy only), kept alive
+    // Per-connection arena + blade reservation (RAW mode only), kept alive
     // until teardown; the shared arena's reservation lives in the static.
     let local: Option<(crate::blade_cap::Reservation, Mmap)> = if shared.is_none() {
         let reservation = ledger.try_reserve(total as u64).context("kv blade cap")?;
@@ -234,8 +234,14 @@ fn handle_conn(
     stream
         .write_all(&[STATUS_OK])
         .context("send kv ready ack")?;
+    let mode = if paging.is_some() {
+        "paging"
+    } else {
+        "raw one-sided"
+    };
     tracing::info!(
-        "cache-peer client connected: {n_rails} rail(s), {:.1} GiB RW blade",
+        "cache-peer client connected: kind {}, {n_rails} rail(s), {:.1} GiB RW blade ({mode})",
+        kind.0,
         total as f64 / (1024.0 * 1024.0 * 1024.0),
     );
 
@@ -252,7 +258,8 @@ fn handle_conn(
         return r;
     }
 
-    // Legacy one-sided KV blade: idle until the client hangs up.
+    // RAW one-sided blade (v2, blob_bytes == 0): the client owns allocation
+    // against the fixed arena; the peer just idles until hangup.
     let mut sink = [0u8; 8];
     loop {
         match stream.read(&mut sink) {

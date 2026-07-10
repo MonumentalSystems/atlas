@@ -314,5 +314,35 @@ regression bisects on one flag. Key facts:
   phase (`SMOKE_MODE=kv` spill/rehydrate byte-identity into a device buffer;
   `SMOKE_MODE=kv-isolation` two-salt no-cross-serve) with the peer at `--swap-cap-gb-kv 0`.
 
-Step C (v1 + legacy-escape deletion) remains gated on B passing hardware; its sender surface
-is unchanged from §recon: `rdma_snapshot.rs` v1 + bare-u64, `rdma_kv_backend.rs` bare-u64.
+Step C (v1 + legacy-escape deletion) — LANDED, see §11. (Historical note: at Step B time its
+sender surface was `rdma_snapshot.rs` v1 + bare-u64, `rdma_kv_backend.rs` bare-u64.)
+
+---
+
+## 11. Status addendum — Chunk 4 Step C LANDED (2026-07-10): v2-only wire
+
+The RW paging port is **v2-only**. Every client now sends the same 25-byte header
+`[u64 PAGING_MAGIC_V2][u8 kind][u64 arena_bytes][u64 blob_bytes]`, and `blob_bytes == 0` is the
+explicit **RAW one-sided mode** sentinel (per-connection anon arena, client-owned allocator, no
+residency — exactly the old `Ok(None)` data plane, re-keyed off the v2 header; blob==0 was
+previously rejected on the paging arm, so the sentinel was unambiguous). Deleted in one commit,
+with the three sender flips:
+
+- `PAGING_MAGIC` (v1) and its parse branch; the `Ok(None)` legacy escape — `parse_paging_header`
+  now returns `Result<(PagingKind, u64, u64)>` and any unknown first u64 hard-bails. The retired
+  v1 magic `0x5041_4745_0000_0001` gets a DEDICATED "v1 client no longer supported" diagnostic
+  (golden-pinned) so a stale binary fails legibly, never silently degrades.
+- The `> 1<<42` first-u64 disambiguation. The peer KEEPS an explicit arena sanity bound
+  (`0 < arena_bytes <= 1<<42`) — the old line did double duty and arena size must not be bounded
+  only by the warn-only blade ledger.
+- Sender flips: `rdma_snapshot.rs connect_paging` v1 → v2 kind=0; `rdma_snapshot.rs` raw mode
+  bare-u64 → v2 kind=0 blob=0 (keeps the selectors.rs bounded/unified fallback alive);
+  `rdma_kv_backend.rs` bare-u64 → v2 kind=1 blob=0 (the flag-OFF KV path — same data plane,
+  new handshake bytes).
+- Goldens updated, not deleted: v1 golden replaced by the v1-affirmative-rejection pin + a RAW-mode
+  (blob=0) byte-vector golden; `protocol_consts_frozen` drops the v1/`1<<42` pins, keeps
+  PAGING_MAGIC_V2 + op/status tuples; CacheServerParams (36B), VerbsClientParams (24B), rails
+  framing, and the control-loop codec goldens are byte-identical (the data plane did not move).
+
+Consequence: the pre-Step-C hardware baseline (put 49ms / get 34ms / fault 1133us) needs
+re-validation — the handshake bytes beneath it changed. The harness covers all modes.

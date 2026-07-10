@@ -92,7 +92,7 @@ struct ArenaInner {
     staging: Option<PinnedBuffer>,
     rr: usize,
     next_wr: u64,
-    /// In legacy (dumb) mode: kept alive for the QP's lifetime, otherwise idle.
+    /// In raw (dumb one-sided) mode: kept alive for the QP's lifetime, else idle.
     /// In paging mode (WS-A): the live control channel — alloc/commit/get/remove
     /// requests ride this stream, interleaved with the RDMA data plane below.
     stream: TcpStream,
@@ -154,15 +154,16 @@ impl RdmaSnapshotArena {
         let mut stream =
             TcpStream::connect(addr).map_err(|e| anyhow::anyhow!("connect snapshot peer {addr}: {e}"))?;
         stream.set_nodelay(true).ok();
-        // Paging clients select the protocol with the magic + blob size; legacy
-        // (dumb one-sided) clients send only arena_bytes. See cache_peer.rs.
-        if paging {
-            stream.write_all(&crate::snapshot_swap::PAGING_MAGIC.to_le_bytes())?;
-            stream.write_all(&arena_bytes.to_le_bytes())?;
-            stream.write_all(&(blob_bytes as u64).to_le_bytes())?;
-        } else {
-            stream.write_all(&arena_bytes.to_le_bytes())?;
-        }
+        // v2 handshake (Step C): both modes send the same 25-byte header.
+        // Paging carries the real blob size; the raw (dumb one-sided) mode
+        // signals itself with blob_bytes == 0 — the peer then hands this
+        // connection a private arena with a client-owned allocator. See
+        // cache_peer/server_impl.rs.
+        stream.write_all(&crate::snapshot_swap::encode_paging_v2_header(
+            crate::snapshot_swap::PagingKind::SSM,
+            arena_bytes,
+            if paging { blob_bytes as u64 } else { 0 },
+        ))?;
         // [u8 n_rails] + one QP per rail.
         let mut rs = RailSet::begin(&mut stream, &specs)?;
 

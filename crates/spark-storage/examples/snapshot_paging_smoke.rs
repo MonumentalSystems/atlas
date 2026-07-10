@@ -37,7 +37,7 @@ fn main() -> anyhow::Result<()> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(32); // >> slots → guarantees disk spill
 
-    // put | get | putget (default) — the SSM (v1) paging modes; or
+    // put | get | putget (default) — the SSM paging modes (v2, kind=0); or
     // kv | kv-isolation — the Step B KV paging kind (PAGING_MAGIC_V2, kind=1)
     // driven through the real KvPagingBackend StorageBackend client.
     let mode = std::env::var("SMOKE_MODE").unwrap_or_else(|_| "putget".into());

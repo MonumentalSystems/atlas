@@ -3,7 +3,7 @@
 // Golden BYTE-VECTOR pins for the RDMA handshake wire format (RailSet
 // extraction, Step A — committed against the PRE-refactor codecs on purpose).
 //
-// The live gx10 peer runs an OLDER binary: these byte layouts are frozen.
+// These byte layouts are frozen — they are what the fleet peer binary speaks.
 // Round-trip tests are structurally blind to a symmetric field reorder
 // (writer and reader move together in a refactor); only hand-written byte
 // vectors catch one. Every field gets DISTINCT byte values so any swap or
@@ -19,8 +19,7 @@ use spark_storage::expert_peer::{
     VerbsServerParams, decode_request, encode_request, read_server_rails, write_server_rails,
 };
 use spark_storage::snapshot_swap::{
-    OP_ALLOC, OP_BYE, OP_COMMIT, OP_GET, OP_REMOVE, PAGING_MAGIC, PAGING_MAGIC_V2, ST_ERR, ST_MISS,
-    ST_OK,
+    OP_ALLOC, OP_BYE, OP_COMMIT, OP_GET, OP_REMOVE, PAGING_MAGIC_V2, ST_ERR, ST_MISS, ST_OK,
 };
 use spark_storage::weight_peer::{MODEL_REQUEST_MAX, read_model_request, write_model_request};
 
@@ -173,22 +172,20 @@ fn model_request_framing_golden() {
     assert_eq!(MODEL_REQUEST_MAX, 8192);
 }
 
-/// Every protocol constant the older deployed peer binary knows, frozen.
+/// Every protocol constant the fleet peer binary speaks, frozen. v2-only
+/// since Step C: PAGING_MAGIC_V2 is the ONLY accepted first u64 on the RW
+/// paging port (the retired v1 magic is affirmatively rejected — pinned in
+/// wire_tests::v1_magic_is_affirmatively_rejected — and the bare legacy
+/// `total_bytes` handshake is gone, so no <= 1<<42 disambiguation remains;
+/// the peer keeps an explicit arena sanity bound instead).
 #[test]
-// Deliberate constant asserts: frozen protocol pins, kept as runtime test
-// failures (not const blocks) so a drift reports through the test harness.
-#[allow(clippy::assertions_on_constants)]
 fn protocol_consts_frozen() {
     assert_eq!(STATUS_OK, 0);
     assert_eq!(STATUS_ERR, 1);
     assert_eq!(MODE_TCP, 0);
     assert_eq!(MODE_VERBS, 1);
     assert_eq!(SHUTDOWN_MARKER, u32::MAX);
-    // First-u64 disambiguation: legacy KV `total_bytes` is validated
-    // <= 1<<42, so the paging magics can never collide with it.
-    assert_eq!(PAGING_MAGIC, 0x5041_4745_0000_0001);
     assert_eq!(PAGING_MAGIC_V2, 0x5041_4745_0000_0002);
-    assert!(PAGING_MAGIC > (1u64 << 42));
     assert_eq!(
         (OP_BYE, OP_ALLOC, OP_COMMIT, OP_GET, OP_REMOVE),
         (0, 1, 2, 3, 4)
