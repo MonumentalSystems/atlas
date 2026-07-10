@@ -96,6 +96,15 @@ fn main() -> Result<()> {
                      \x20                 RAM arena becomes a page-cache over disk\n\
                      --swap-cap-gb <g>: shared disk cap for the paging swap (default 50; 0=unbounded)\n\
                      --swap-cap-gb-ssm/-kv <g>: per-kind disk cap override (own budget, no cross-kind starve; 0=unbounded)\n\
+                     \x20  NOTE: a FINITE ssm cap is what reclaims orphaned per-client decode\n\
+                     \x20  namespaces. Each client folds a fresh salt into its decode/SSM keys,\n\
+                     \x20  so a restarted client abandons its old blobs; those are never touched\n\
+                     \x20  again → always the coldest → dropped LRU once the cap fills (safe:\n\
+                     \x20  SSM/decode is recompute-on-miss). --swap-cap-gb-ssm 0 (unbounded)\n\
+                     \x20  defeats this — dead-client blobs then accumulate until peer restart.\n\
+                     \x20  Do NOT set a KV TTL/drop the same way: kind=1 KV is UNRECOVERABLE\n\
+                     \x20  on miss (needs --swap-cap-gb-kv 0), so KV orphans need content-keys,\n\
+                     \x20  not a cap.\n\
                      client selects via $ATLAS_KV_PEER=host:port ($ATLAS_KV_DUAL_RAIL=1 for both)"
                 );
                 return Ok(());
