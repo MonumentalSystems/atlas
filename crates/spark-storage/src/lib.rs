@@ -52,12 +52,27 @@ pub(crate) mod blade_cap;
 // KV cache overflow blade: RW remote-RAM tier (wire types always available; the
 // verbs server compiles under atlas_rdma_verbs). Faster-than-SSD KV overflow.
 pub mod cache_peer;
-// One-sided RDMA READ/WRITE verbs FFI (WS2 Phase B + KV overflow). CUDA-free so
-// BOTH the non-cuda peer servers and the cuda client tiers can use it. Compiled
-// only where the C shim is (build.rs emits `atlas_rdma_verbs` on Linux + rdma-core).
+// One-sided RDMA READ/WRITE verbs FFI (WS2 Phase B + KV overflow). Moved to
+// the CUDA-free `atlas-rdma` crate (RailSet extraction Step A); re-exported at
+// its old path so every `use crate::rdma_verbs::{Verbs, MrKeys, Gid}` site
+// compiles unchanged. Compiled only where the C shim is (atlas-rdma's build.rs
+// emits `atlas_rdma_verbs` on Linux + rdma-core; ours re-emits it — see build.rs).
 pub mod group;
 #[cfg(atlas_rdma_verbs)]
-pub mod rdma_verbs;
+pub use atlas_rdma::verbs as rdma_verbs;
+
+/// Permanent cfg witness (RailSet extraction Step A): `true` iff the
+/// `atlas_rdma_verbs` cfg was re-emitted for THIS crate by build.rs. The unit
+/// test in `rdma_verbs_probe_tests.rs` asserts it, so a silent cfg
+/// evaporation (e.g. the DEP_ATLAS_RDMA_SHIM_HAS_VERBS re-emit breaking)
+/// fails `cargo test -p spark-storage --lib` on verbs hosts instead of
+/// green-building with all nine gated modules compiled out.
+pub const fn rdma_verbs_enabled() -> bool {
+    cfg!(atlas_rdma_verbs)
+}
+
+#[cfg(test)]
+mod rdma_verbs_probe_tests;
 // T1 tier-cascade placement/eviction policy (pure LRU; unit-testable on
 // metal/skip). The cuda composite backend is `cascade_backend`.
 pub mod cascade_policy;

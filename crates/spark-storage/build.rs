@@ -27,6 +27,12 @@ const KERNELS: &[&str] = &[
 fn main() {
     println!("cargo:rerun-if-env-changed=ATLAS_SKIP_BUILD");
     println!("cargo:rerun-if-env-changed=SKIP_ATLAS_BUILD");
+    // FIRST, before any early return: `rustc-check-cfg` does NOT propagate
+    // across crates, so this crate must declare the cfg name itself or every
+    // `#[cfg(atlas_rdma_verbs)]` below trips `unexpected_cfgs` — a hard error
+    // under `[workspace.lints.rust] warnings = "deny"`. (Emitting it on macOS
+    // too fixes the latent ordering landmine the old macOS arm had.)
+    println!("cargo:rustc-check-cfg=cfg(atlas_rdma_verbs)");
 
     // Apple Silicon hosts have no libcuda and no nvcc. Emit the stub and
     // skip the linker hint so `cargo check` works under
@@ -45,13 +51,27 @@ fn main() {
     // symbols resolved at link time even when the kernel registry is
     // an empty stub.
     link_libcuda();
-    // The one-sided RDMA READ verbs shim (WS2 Phase B) is Linux-only and used by
-    // BOTH the cuda client tier and the non-cuda peer server, so compile it
-    // independent of the cuda feature. Skipped under ATLAS_SKIP_BUILD (the same
-    // CPU/CI convention as nvcc) — hosts without rdma-core dev headers.
-    println!("cargo:rustc-check-cfg=cfg(atlas_rdma_verbs)");
-    if !skip_build() {
-        compile_rdma_shim();
+    // The one-sided RDMA verbs shim now lives in (and is compiled by) the
+    // CUDA-free `atlas-rdma` crate — RailSet extraction Step A. `rustc-cfg`
+    // does NOT cross crate boundaries, so re-emit `atlas_rdma_verbs` here for
+    // this crate's own gated code, keyed off atlas-rdma's `links` metadata
+    // (`cargo:has_verbs=1` → DEP_ATLAS_RDMA_SHIM_HAS_VERBS, visible because we
+    // depend on atlas-rdma DIRECTLY; the cfg ON condition is unchanged:
+    // Linux AND !ATLAS_SKIP_BUILD/SKIP_ATLAS_BUILD, decided in ONE place —
+    // atlas-rdma/build.rs). The `cargo:rustc-link-lib=dylib=ibverbs` directive
+    // also now comes from atlas-rdma and propagates to final links.
+    //
+    // Real `#[cfg(atlas_rdma_verbs)]` gates live ONLY in this crate (the
+    // spark-model / spark-server grep hits are comments): lib.rs (module
+    // gates), blade_cap.rs (comment only), cache_peer.rs, expert_peer.rs,
+    // expert_tier_rdma.rs, weight_peer.rs, weight_tier_rdma.rs,
+    // weight_lora_rdma.rs, rdma_snapshot.rs, high_speed_swap.rs, and
+    // examples/snapshot_paging_smoke.rs (build-script cfgs cover a crate's
+    // examples/tests too). If ANOTHER crate ever grows a real gate, it needs
+    // its own direct atlas-rdma dep plus this same re-emit — DEP_ vars are
+    // invisible to transitive dependents.
+    if std::env::var("DEP_ATLAS_RDMA_SHIM_HAS_VERBS").is_ok() {
+        println!("cargo:rustc-cfg=atlas_rdma_verbs");
     }
     if skip_build() {
         emit_stub();
@@ -60,23 +80,6 @@ fn main() {
     }
     compile_kernels();
     println!("cargo:rerun-if-changed=build.rs");
-}
-
-/// Compile `src/rdma_shim.c` and link libibverbs. Emits `cfg(atlas_rdma_verbs)`
-/// so the Rust `rdma_verbs` FFI module (and the verbs code paths that use it)
-/// only compile where the shim actually exists. Linux only — the macOS arm
-/// returns before this is reached.
-fn compile_rdma_shim() {
-    let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
-    let shim = manifest_dir.join("src/rdma_shim.c");
-    println!("cargo:rerun-if-changed={}", shim.display());
-    cc::Build::new()
-        .file(&shim)
-        .opt_level(2)
-        .warnings(true)
-        .compile("atlas_rdma_shim");
-    println!("cargo:rustc-link-lib=dylib=ibverbs");
-    println!("cargo:rustc-cfg=atlas_rdma_verbs");
 }
 
 fn skip_build() -> bool {

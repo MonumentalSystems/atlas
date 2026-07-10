@@ -172,6 +172,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "atlas-rdma"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "cc",
+]
+
+[[package]]
 name = "atlas-reduce"
 version = "0.1.0"
 dependencies = [
@@ -2170,8 +2178,8 @@ name = "spark-storage"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "atlas-rdma",
  "atlas-tier",
- "cc",
  "cufile-sys",
  "half",
  "io-uring",

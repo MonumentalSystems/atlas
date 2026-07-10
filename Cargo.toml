@@ -16,6 +16,7 @@ members = [
     "crates/cufile-sys",
     "crates/spark-storage",
     "crates/atlas-tier",
+    "crates/atlas-rdma",
     "crates/atlas-expert-pack",
     "crates/xgrammar",
 ]
