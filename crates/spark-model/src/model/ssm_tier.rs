@@ -191,6 +191,30 @@ fn unified_flag_truthy(v: Option<&str>) -> bool {
 /// per-store policies (MemBlobStore FIFO, RdmaSnapshotStore drop-on-full).
 /// DEFAULT OFF ⇒ the selectors construct exactly today's stores, byte- and
 /// behavior-identical.
+///
+/// ⚠ **BEFORE FLIPPING THIS DEFAULT ON**, three flag-ON-only defects found by the
+/// step-3 adversarial review must be fixed. None affect the default path; all three
+/// are latent the moment the flag is engaged in production:
+///
+/// 1. **Lock held across transport I/O.** The RDMA arm's `put` path holds the
+///    `UnifiedSnapshotStore` mutex across a victim evict (remote READ of a ~64 MB
+///    blob, ~5–7 ms) *plus* the new blob's remote WRITE. Today's `RdmaSnapshotStore`
+///    does not. Split the residency map ops from the byte moves — the core already
+///    exposes the two-phase `alloc`/`commit` API needed to run transport I/O outside
+///    the lock.
+/// 2. **Silent downgrade to unbounded host RAM.** If `UnifiedSnapshotStore::new`
+///    fails *after* a successful peer connect, the RDMA arm falls back to
+///    `MemBlobStore::new(0)` (unbounded host RAM) with only a warn, abandoning the
+///    connected arena. It should fall through to the legacy `RdmaSnapshotStore`
+///    instead — the arena is already connected.
+/// 3. **Swap files leak.** Flag-ON swap files (`atlas-ssm-{tag}.{pid}.swap`,
+///    `atlas-decode-ring.{pid}.swap`) are per-PID and never unlinked, and the disk
+///    tier grows unbounded by design. Unlink same-tag stale files on create, or open
+///    with `O_TMPFILE`.
+///
+/// Coverage gap to close alongside: the flag-ON **RDMA** and **decode-NVMe** selector
+/// arms are only component-tested, never exercised through `build_tier_store` /
+/// `build_decode_tier_store` with the env set (the host-RAM arm is).
 pub(crate) fn ssm_tier_unified() -> bool {
     unified_flag_truthy(std::env::var("ATLAS_SSM_TIER_UNIFIED").ok().as_deref())
 }
@@ -1305,12 +1329,23 @@ mod tests {
     /// (`build_tier_store_defaults_to_host_ram_unbounded` below).
     #[test]
     fn unified_flag_default_off_preserves_todays_policies() {
-        if std::env::var_os("ATLAS_SSM_TIER_UNIFIED").is_none() {
-            assert!(!ssm_tier_unified(), "flag must default OFF");
-            let s = rdma_store(1);
-            assert!(s.put(1, &[1; BLOB]).unwrap());
-            assert!(!s.put(2, &[2; BLOB]).unwrap(), "flag OFF: drop-on-full unchanged");
-        }
+        // Pure-logic half: holds regardless of the ambient environment.
+        assert!(!unified_flag_truthy(None), "absent env ⇒ flag OFF");
+        // Env-dependent half. This is the §4 default-OFF regression guard, so it
+        // must NEVER pass vacuously: fail loudly rather than skip when the flag is
+        // exported into the test environment.
+        assert!(
+            std::env::var_os("ATLAS_SSM_TIER_UNIFIED").is_none(),
+            "ATLAS_SSM_TIER_UNIFIED is set in the test environment — unset it. This test is \
+             the default-OFF regression guard for the TIERED-CACHE-CONSOLIDATION §4 fix; \
+             skipping it would green-light a change to the default path. To exercise the \
+             flag-ON arms, run the flag-ON tests selectively instead of exporting the var \
+             across the whole suite."
+        );
+        assert!(!ssm_tier_unified(), "flag must default OFF");
+        let s = rdma_store(1);
+        assert!(s.put(1, &[1; BLOB]).unwrap());
+        assert!(!s.put(2, &[2; BLOB]).unwrap(), "flag OFF: drop-on-full unchanged");
     }
 
     #[test]
