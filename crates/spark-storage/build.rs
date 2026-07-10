@@ -28,6 +28,14 @@ fn main() {
     println!("cargo:rerun-if-env-changed=ATLAS_SKIP_BUILD");
     println!("cargo:rerun-if-env-changed=SKIP_ATLAS_BUILD");
 
+    // FIRST, before ANY early return. `rustc-check-cfg` only *declares* the cfg
+    // name; it does not enable it. If the macOS arm below returns before this
+    // line, the nine `#[cfg(atlas_rdma_verbs)]` sites in this crate become
+    // `unexpected_cfgs`, which is a HARD ERROR under [workspace.lints.rust]
+    // warnings = "deny" — that is the macOS/metal CI failure. Declaring it
+    // unconditionally is always correct: on macOS it stays declared-but-unset.
+    println!("cargo:rustc-check-cfg=cfg(atlas_rdma_verbs)");
+
     // Apple Silicon hosts have no libcuda and no nvcc. Emit the stub and
     // skip the linker hint so `cargo check` works under
     // `--no-default-features --features metal`. Production CUDA builds
@@ -49,7 +57,6 @@ fn main() {
     // BOTH the cuda client tier and the non-cuda peer server, so compile it
     // independent of the cuda feature. Skipped under ATLAS_SKIP_BUILD (the same
     // CPU/CI convention as nvcc) — hosts without rdma-core dev headers.
-    println!("cargo:rustc-check-cfg=cfg(atlas_rdma_verbs)");
     if !skip_build() {
         compile_rdma_shim();
     }
