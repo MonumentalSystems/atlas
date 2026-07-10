@@ -183,10 +183,22 @@ spark-storage / spark-model    (consumers: keep the compute paths, keep GroupLay
 ```
 
 **Consolidate code, not processes.** The one *process* consolidation worth doing is the three
-daemons → one binary with `--serve kv,ssm,experts,lora`. Three-plus instances already run on
-gx10 as separate systemd `--user` units (`:9916` unified, `:9917` snapshot arena, `:9920` WS-A
-paging). Once `atlas-tier` exists they differ only in `reg_mr` flags and whether a manifest is
-served. That makes true the thing §1a.1 currently only claims.
+daemons → one binary with `--serve kv,ssm,experts,lora`. Once `atlas-tier` exists they differ
+only in `reg_mr` flags and whether a manifest is served. That makes true the thing §1a.1
+currently only claims.
+
+> **Deployment correction (measured on gx10, 2026-07-09, `systemctl --user list-units --all`).**
+> An earlier revision of this section said "three-plus instances already run (`:9916` unified,
+> `:9917` snapshot arena, `:9920` WS-A paging)." Not so. **Two** units run, *both* the same
+> `atlas-cache-peer` binary — `atlas-cache-peer.service` (`:9916`) and
+> `atlas-cache-peer-paging.service` (`:9920`). Nothing listens on `:9917`, and there are **no
+> `atlas-expert-peer` / `atlas-weight-peer` units at all.** Since experts speak the expert-peer
+> RO-manifest protocol (`expert_tier_rdma.rs:32` imports `expert_peer::{encode_request,
+> read_manifest}`) and LoRA speaks the weight-peer one (`weight_lora_rdma.rs:163`), **the expert
+> and LoRA RDMA tiers currently have no peer to talk to** — they are default-off. Only KV and
+> SSM-snapshots (the `[u64 total_bytes]` → RW-arena protocol, `cache_peer.rs:265` `reg_mr_rw`)
+> have a live server. This *strengthens* §1a.1: the "one unified blade" is not merely a doc
+> claim over three binaries, it is a doc claim over three **incompatible wire protocols**.
 
 ---
 
@@ -258,3 +270,13 @@ Claims in this document were checked against the branch rather than the PR descr
   `ssm_tier.rs:406` (`free.pop()` → `Ok(false)`), `snapshot_swap.rs:185` (`alloc` →
   `evict_coldest_to_disk`, never rejects);
 - all trait/struct anchors in §1 and §2 confirmed by `grep -n` at the cited lines.
+
+Added 2026-07-09 (independent re-verification):
+
+- the three peers speak **three different wire protocols**, not one: `cache_peer.rs:265`
+  `reg_mr_rw` + `[u64 total_bytes]` arena handshake (KV, SSM) vs `expert_peer.rs:394`
+  `reg_mr(..,true)` REMOTE_READ + JSON manifest (experts) vs `weight_peer.rs:448` REMOTE_READ +
+  weight manifest (weights, **LoRA**). Clients confirm the split: `expert_tier_rdma.rs:32`
+  imports from `expert_peer`, `weight_lora_rdma.rs:163` from `weight_peer`;
+- gx10 runs only `atlas-cache-peer` (×2: `:9916`, `:9920`); no expert/weight peer units exist and
+  `:9917` is not listening ⇒ the expert and LoRA RDMA tiers have no live server (see §5 note).
