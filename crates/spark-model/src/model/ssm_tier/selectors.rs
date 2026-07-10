@@ -3,7 +3,7 @@
 //! Env-driven selectors: which store backs the Marconi spill tier and the
 //! decode rolling tier.
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 
 use super::fingerprint::{ModelFingerprint, resolve_decode_ns, resolve_swap_ns};
 use super::unified::{TransportSlotArena, build_unified_swap, unified_hot_slots};
@@ -254,10 +254,20 @@ pub(crate) fn build_decode_tier_store(
                 namespace,
             )))
         }
-        _ => {
+        // Unset = the documented default: unbounded, non-dropping host RAM.
+        None => {
             tracing::info!("SSM decode cold tier = host-RAM (unbounded, non-dropping)");
             Ok(Arc::new(MemBlobStore::new(0)))
         }
+        // PCND: a typo ("nmve", "peer ", "") must never silently defeat the
+        // tiering intent by falling through to unbounded host RAM, where decode
+        // spills accumulate until OOM on a long session. Fail fast, name the
+        // variable, the bad value, and the accepted values — mirroring the strict
+        // `parse_ns` this chunk introduced one match arm away.
+        Some(other) => bail!(
+            "ATLAS_SSM_DECODE_TIER={other:?} is not recognized (accepted: \"nvme\", \"peer\", or \
+             unset for unbounded host-RAM). Refusing to silently fall back to host-RAM."
+        ),
     }
 }
 

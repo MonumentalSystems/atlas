@@ -51,7 +51,11 @@ use anyhow::{Result, anyhow, bail};
 use atlas_core::config::ModelConfig;
 
 /// Bump = deliberate fleet-wide cache-key rotation (document it).
-pub(crate) const FP_VERSION: u64 = 1;
+// v2 (2026-07-10): added hidden_size / num_attention_heads / intermediate_size /
+// moe_intermediate_size / num_experts_per_tok (tags 0x16-0x1a). v1 omitted them, so
+// two distinct models differing only in residual/FFN width collided. Bumping the
+// version is a DELIBERATE, one-time fleet cache-key rotation (greenfield: no shim).
+pub(crate) const FP_VERSION: u64 = 2;
 
 const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
@@ -113,6 +117,26 @@ impl ModelFingerprint {
             fp.get(),
             cfg.model_type,
         );
+        // The fingerprint is GEOMETRY-ONLY. It cannot distinguish two checkpoints
+        // with byte-identical config — a fine-tune, an RL variant, a continued
+        // pre-train of one base. Those derive the same namespace and would share a
+        // shared peer's cache. We cannot fail fast (config carries no weight
+        // identity), so warn loudly exactly when it matters: a SHARED paging peer
+        // is selected and the operator gave neither a salt nor an explicit ns.
+        let shared_peer = std::env::var("ATLAS_SSM_SWAP").ok().as_deref() == Some("1")
+            || std::env::var("ATLAS_SSM_DECODE_TIER").ok().as_deref() == Some("peer");
+        let overridden = std::env::var_os("ATLAS_SSM_SWAP_NS").is_some()
+            || std::env::var_os("ATLAS_SSM_DECODE_NS").is_some();
+        if shared_peer && model_id.is_empty() && !overridden {
+            tracing::warn!(
+                "shared paging peer selected but ATLAS_MODEL_ID is unset: the fingerprint is \
+                 derived from config GEOMETRY ONLY, so two checkpoints with identical config \
+                 (fine-tunes, RL variants, continued pre-train of one base) will SHARE cache \
+                 keys and silently cross-serve recurrent state. Set ATLAS_MODEL_ID to a stable \
+                 per-checkpoint string (or set ATLAS_SSM_SWAP_NS / ATLAS_SSM_DECODE_NS \
+                 explicitly) when co-locating such models on one peer."
+            );
+        }
         Ok(fp)
     }
 
@@ -155,6 +179,18 @@ impl ModelFingerprint {
             (0x13, cfg.head_dim),
             (0x14, cfg.num_key_value_heads),
             (0x15, cfg.num_experts),
+            // FP_VERSION 2: residual-stream and FFN widths. Omitting these was a
+            // BLOCKING defect — two distinct models differing ONLY in
+            // `hidden_size` / `num_attention_heads` hashed identically and would
+            // have silently cross-served recurrent state on a shared paging peer
+            // (the exact failure this fingerprint exists to prevent). `blob_bytes`
+            // does NOT capture them: it is `num_ssm_layers * (h + conv)` bytes,
+            // which is SSM-state-only and independent of the residual width.
+            (0x16, cfg.hidden_size),
+            (0x17, cfg.num_attention_heads),
+            (0x18, cfg.intermediate_size),
+            (0x19, cfg.moe_intermediate_size),
+            (0x1a, cfg.num_experts_per_tok),
             // SSM state geometry — included alongside blob_bytes because the
             // blob size is a lossy product of these.
             (0x20, cfg.linear_num_key_heads),
@@ -214,7 +250,13 @@ pub(crate) fn resolve_swap_ns(fp: ModelFingerprint) -> Result<NonZeroU64> {
 /// spills). Never DECODE_DOMAIN alone, never the fingerprint alone.
 pub(crate) fn resolve_decode_ns(fp: ModelFingerprint) -> Result<NonZeroU64> {
     let mixed = mix64(fp.get(), atlas_kernels::DECODE_DOMAIN);
-    let derived = NonZeroU64::new(mixed).unwrap_or(fp.nonzero());
+    // Zero-avoidance (p = 2^-64). It must NOT fall back to `fp.nonzero()`: that is
+    // exactly the Marconi swap namespace, so the decode tier would alias onto it
+    // and the two tiers of one model would cross-serve. Fall back to the domain
+    // constant instead — distinct from the fingerprint by construction.
+    let derived = NonZeroU64::new(mixed).unwrap_or_else(|| {
+        NonZeroU64::new(atlas_kernels::DECODE_DOMAIN).expect("DECODE_DOMAIN is a non-zero constant")
+    });
     resolve_ns_from(
         std::env::var("ATLAS_SSM_DECODE_NS").ok().as_deref(),
         "ATLAS_SSM_DECODE_NS",

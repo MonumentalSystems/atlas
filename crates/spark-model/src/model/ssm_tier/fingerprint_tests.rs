@@ -54,12 +54,16 @@ fn fnv1a_64_matches_reference_vectors() {
 // FP_VERSION (and gets a changelog entry).
 #[test]
 fn golden_fingerprint_hybrid_moe_is_pinned() {
-    assert_eq!(fp(&hybrid()), 0x7a19_08d7_ca78_e45b);
+    // FP_VERSION 2 (2026-07-10): rotated by the addition of the width fields
+    // (hidden_size / num_attention_heads / intermediate_size /
+    // moe_intermediate_size / num_experts_per_tok). Deliberate cache flush.
+    assert_eq!(fp(&hybrid()), 0x5629_922c_51a1_6a10);
 }
 
 #[test]
 fn golden_fingerprint_dense_is_pinned() {
-    assert_eq!(fp(&dense()), 0xe0b6_f920_07eb_d0a6);
+    // FP_VERSION 2 — see the hybrid pin above.
+    assert_eq!(fp(&dense()), 0x971e_b3b4_bd13_22f1);
 }
 
 // ── Determinism: same config → same u64, every time ───────────────────
@@ -76,6 +80,15 @@ fn fingerprint_is_deterministic() {
 // encoding (the golden pin alone would still pass whenever the dropped
 // field is unchanged in the fixture).
 #[test]
+/// ⚠ This is a HAND-MAINTAINED list, so despite the name it CANNOT prove the
+/// fingerprint is exhaustive — it only proves the fields listed below are
+/// load-bearing. A `ModelConfig` field that is in neither `derive_with_id` nor
+/// this list is invisible to it. That is not hypothetical: `hidden_size`,
+/// `num_attention_heads`, `intermediate_size`, `moe_intermediate_size` and
+/// `num_experts_per_tok` were absent from BOTH, so this test was green while
+/// two distinct models silently shared a namespace on a paging peer.
+/// When you add a field to `ModelConfig` that changes the produced bytes, add it
+/// to `derive_with_id` AND here, and bump `FP_VERSION`.
 fn every_fingerprint_field_is_load_bearing() {
     let base = fp(&hybrid());
     let muts: Vec<(&str, Box<dyn Fn(&mut ModelConfig)>)> = vec![
@@ -100,6 +113,25 @@ fn every_fingerprint_field_is_load_bearing() {
             Box::new(|c| c.num_key_value_heads += 1),
         ),
         ("num_experts", Box::new(|c| c.num_experts = 0)),
+        // FP_VERSION 2. These five were MISSING from the fingerprint and this
+        // list simultaneously — so this test passed green while two models
+        // differing only in `hidden_size` / `num_attention_heads` collided on a
+        // shared paging peer. Adding a field to `derive_with_id` without adding
+        // it here reproduces exactly that false confidence.
+        ("hidden_size", Box::new(|c| c.hidden_size += 1)),
+        (
+            "num_attention_heads",
+            Box::new(|c| c.num_attention_heads += 1),
+        ),
+        ("intermediate_size", Box::new(|c| c.intermediate_size += 1)),
+        (
+            "moe_intermediate_size",
+            Box::new(|c| c.moe_intermediate_size += 1),
+        ),
+        (
+            "num_experts_per_tok",
+            Box::new(|c| c.num_experts_per_tok += 1),
+        ),
         (
             "linear_num_key_heads",
             Box::new(|c| c.linear_num_key_heads += 1),
@@ -240,4 +272,25 @@ fn override_precedence_and_strict_parse() {
     // 0 is a hard error: the passthrough is removed.
     let err = resolve_ns_from(Some("0"), "V", derived).unwrap_err();
     assert!(format!("{err:#}").contains("passthrough"));
+}
+
+/// The decode namespace must never equal the Marconi (swap) namespace for the
+/// same model: the two tiers share a peer, and an alias would let a decode
+/// rollback blob be served as a Marconi snapshot. The zero-avoidance fallback in
+/// `resolve_decode_ns` previously collapsed onto `fp` itself, which IS the swap
+/// namespace — so the guard is on the fallback, not just the happy path.
+#[test]
+fn decode_ns_never_aliases_the_swap_ns() {
+    for cfg in [hybrid(), dense()] {
+        let f = ModelFingerprint::derive_with_id(&cfg, BLOB, "").unwrap();
+        let swap = resolve_swap_ns(f).unwrap();
+        let decode = resolve_decode_ns(f).unwrap();
+        assert_ne!(
+            swap, decode,
+            "decode namespace aliased the swap namespace for {}",
+            cfg.model_type
+        );
+        // And the swap ns is the fingerprint itself (no override set).
+        assert_eq!(swap.get(), f.get());
+    }
 }
