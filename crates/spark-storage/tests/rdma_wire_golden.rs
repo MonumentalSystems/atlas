@@ -21,7 +21,10 @@ use spark_storage::expert_peer::{
 use spark_storage::snapshot_swap::{
     OP_ALLOC, OP_BYE, OP_COMMIT, OP_GET, OP_REMOVE, PAGING_MAGIC_V2, ST_ERR, ST_MISS, ST_OK,
 };
-use spark_storage::weight_peer::{MODEL_REQUEST_MAX, read_model_request, write_model_request};
+use spark_storage::weight_peer::{
+    MODEL_REQUEST_MAX, WeightManifest, WeightTensorRecord, read_model_request, read_weight_manifest,
+    write_model_request, write_weight_manifest,
+};
 
 fn gid(start: u8) -> [u8; 16] {
     core::array::from_fn(|i| start + i as u8)
@@ -170,6 +173,44 @@ fn model_request_framing_golden() {
     assert_eq!(read_model_request(&mut &buf[..]).unwrap(), "m7");
     assert!(write_model_request(&mut Vec::new(), "").is_err());
     assert_eq!(MODEL_REQUEST_MAX, 8192);
+}
+
+/// A FIXED weight manifest, frozen byte-for-byte. Frame is `[u32 LE len][len
+/// bytes JSON]`. The round-trip test (`manifest_round_trips`) is blind to a
+/// coordinated serde field reorder (writer and reader move together); this pins
+/// the WRITER's exact bytes — what the deployed `atlas-weight-peer` daemon
+/// speaks — and the READER against the same frozen frame.
+#[test]
+fn weight_manifest_framing_golden() {
+    let m = WeightManifest {
+        version: WeightManifest::VERSION,
+        model_id: "m7".to_string(),
+        shard_files: vec!["s0.safetensors".to_string()],
+        shard_lens: vec![0x0102_0304],
+        tensors: vec![WeightTensorRecord {
+            name: "blk.0.attn.weight".to_string(),
+            dtype: "BF16".to_string(),
+            shape: vec![2, 3],
+            offset_in_shard: 0x1000,
+            len: 0x24,
+            shard_index: 0,
+            extra: true,
+        }],
+    };
+    let mut buf = Vec::new();
+    write_weight_manifest(&mut buf, &m).unwrap();
+    #[rustfmt::skip]
+    let expect: Vec<u8> = {
+        let json = br#"{"version":1,"model_id":"m7","shard_files":["s0.safetensors"],"shard_lens":[16909060],"tensors":[{"name":"blk.0.attn.weight","dtype":"BF16","shape":[2,3],"offset_in_shard":4096,"len":36,"shard_index":0,"extra":true}]}"#;
+        let mut v = Vec::with_capacity(4 + json.len());
+        v.extend_from_slice(&(json.len() as u32).to_le_bytes());
+        v.extend_from_slice(json);
+        v
+    };
+    assert_eq!(buf, expect, "weight manifest wire bytes drifted");
+    // The reader must accept exactly these frozen bytes back, structurally ==.
+    let back = read_weight_manifest(&mut &expect[..]).unwrap();
+    assert_eq!(back, m);
 }
 
 /// Every protocol constant the fleet peer binary speaks, frozen. v2-only
