@@ -216,7 +216,7 @@ $SSH "$PEER_SSH" "du -sh '$SWAP_DIR' 2>/dev/null | cut -f1" | sed 's/^/  swap di
 
 hdr "RESULT"
 if [ "$RC" -eq 0 ] && [ "$KV_RC" -eq 0 ]; then
-  echo "  PASS — two-machine RDMA paging round-trips (SSM v1 + KV v2 kind=1 + isolation),"
+  echo "  PASS — two-machine RDMA paging round-trips (v2-only wire: SSM kind=0 + KV kind=1 + isolation),"
   echo "         byte-identical after peer-side NVMe spills"
 else
   echo "  FAIL — SSM phase rc=$RC, KV phase rc=$KV_RC"
