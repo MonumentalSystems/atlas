@@ -163,6 +163,7 @@ fn orchestrator_multi_tile_with_eviction() {
         num_kv_heads: NUM_KV_HEADS,
         head_dim: HEAD_DIM,
         block_size: BLOCK_SIZE,
+        model_fp: None,
     };
     let mut hss = HighSpeedSwap::new(&ctx, cfg, model).unwrap();
 
@@ -308,6 +309,7 @@ fn pool_sized_for_c_times_per_seq_budget() {
         num_kv_heads: NUM_KV_HEADS,
         head_dim: HEAD_DIM,
         block_size: BLOCK_SIZE,
+        model_fp: None,
     };
     let hss = HighSpeedSwap::new(&ctx, cfg, model);
     unsafe { std::env::remove_var("ATLAS_HSS_MAX_SEQS") };
@@ -355,6 +357,7 @@ fn batched_attend_matches_single_seq_bitwise() {
         num_kv_heads: NUM_KV_HEADS,
         head_dim: HEAD_DIM,
         block_size: BLOCK_SIZE,
+        model_fp: None,
     };
     let mut hss = HighSpeedSwap::new(&ctx, cfg, model).unwrap();
 
@@ -491,6 +494,7 @@ fn batched_wide_launch_matches_serial_multitile() {
         num_kv_heads: NUM_KV_HEADS,
         head_dim: HEAD_DIM,
         block_size: BLOCK_SIZE,
+        model_fp: None,
     };
     let mut hss = HighSpeedSwap::new(&ctx, cfg, model).unwrap();
     unsafe { std::env::remove_var("ATLAS_HSS_MAX_SEQS") };
@@ -627,6 +631,7 @@ fn batched_prefetch_coexist_matches_serial_bitwise() {
         num_kv_heads: NUM_KV_HEADS,
         head_dim: HEAD_DIM,
         block_size: BLOCK_SIZE,
+        model_fp: None,
     };
     let mut hss = HighSpeedSwap::new(&ctx, cfg, model).unwrap();
     unsafe { std::env::remove_var("ATLAS_HSS_MAX_SEQS") };
@@ -770,6 +775,7 @@ fn prefetch_coexist_c1_mixed_matches_serial_bitwise() {
         num_kv_heads: NUM_KV_HEADS,
         head_dim: HEAD_DIM,
         block_size: BLOCK_SIZE,
+        model_fp: None,
     };
     let mut hss = HighSpeedSwap::new(&ctx, cfg, model).unwrap();
     unsafe { std::env::remove_var("ATLAS_HSS_MAX_SEQS") };

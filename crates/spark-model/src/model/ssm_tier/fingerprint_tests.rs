@@ -66,6 +66,38 @@ fn golden_fingerprint_dense_is_pinned() {
     assert_eq!(fp(&dense()), 0x971e_b3b4_bd13_22f1);
 }
 
+/// Cross-crate splitmix pin (Step B): these EXACT literals are also asserted
+/// against spark-storage's vendored `kv_paging::ns::mix64` copy
+/// (`ns_tests.rs::mix64_frozen_literals`) — the fold turns (key, ns) into the
+/// durable wire key on BOTH the SSM and KV paging paths, so a drifted
+/// constant in either crate rotates or collides on-peer keys. Drift fails one
+/// side against the shared literals.
+#[test]
+fn mix64_frozen_literals() {
+    assert_eq!(mix64(0, 0), 0x0); // splitmix64's fixed point at zero
+    assert_eq!(mix64(1, 2), 0xbeeb_8da1_658e_ec67);
+    assert_eq!(
+        mix64(0x5EED_F00D_CAFE_D00D, 0xD3C0_DE12_A5B6_C7D8),
+        0xe567_5d86_f750_1640
+    );
+}
+
+/// The KV-paging fp convention: same encoding, blob_bytes = 0 — distinct
+/// from every SSM instance (whose blob is real and non-zero) and frozen like
+/// the other goldens.
+#[test]
+fn golden_kv_fingerprint_is_pinned_and_distinct() {
+    let kv = ModelFingerprint::derive_with_id(&hybrid(), 0, "")
+        .unwrap()
+        .get();
+    assert_eq!(kv, 0x8dea_f1c5_3d0f_3540);
+    assert_ne!(
+        kv,
+        fp(&hybrid()),
+        "KV instance must not equal the SSM instance"
+    );
+}
+
 // ── Determinism: same config → same u64, every time ───────────────────
 #[test]
 fn fingerprint_is_deterministic() {

@@ -12,6 +12,12 @@
 # disk; it then GETs them all back and asserts byte-identity — a fault-from-disk on
 # every evicted key. Runs in seconds. No inference stack, no model weights.
 #
+# Step B adds a KV phase on the SAME peer (started with --swap-cap-gb-kv 0, the
+# miss-proof KV config): SMOKE_MODE=kv drives the real KvPagingBackend (v2
+# handshake, kind=1) through block-granular offload/restore with forced NVMe
+# spills + byte-identity into a DEVICE buffer; SMOKE_MODE=kv-isolation proves two
+# client salts on one shared arena cannot cross-serve each other's KV blocks.
+#
 # PORTABILITY: nothing here is specific to one fleet. Hosts, ports, rails and NVMe
 # paths come from flags/env or a config file. Per AGENTS.md's PCND invariant there
 # are NO implicit host defaults: if the peer is not configured, we fail fast with an
@@ -160,6 +166,7 @@ PEER_PID=$($SSH "$PEER_SSH" "
     --listen 0.0.0.0:${PEER_PORT} \
     --swap-dir '${SWAP_DIR}' \
     --swap-cap-gb ${SWAP_CAP_GB} \
+    --swap-cap-gb-kv 0 \
     --max-blade-gb ${MAX_BLADE_GB} \
     ${RAIL_ARGS} \
     > /tmp/atlas-peer-${RUN_ID}.log 2>&1 &
@@ -184,16 +191,36 @@ SMOKE_BLOB="$BLOB" SMOKE_SLOTS="$SLOTS" SMOKE_KEYS="$KEYS" SMOKE_MODE=putget \
 RC=${PIPESTATUS[0]}
 set -e
 
+# ── 3b. KV paging kind (Step B): block round-trip + spill + two-salt isolation ──
+hdr "client: KV paging kind (v2 handshake, kind=1) — spill/rehydrate + isolation"
+KV_RC=0
+if [ "$RC" -eq 0 ]; then
+  for KV_MODE in kv kv-isolation; do
+    set +e
+    ATLAS_SNAP_PEER="${PEER_DATA}:${PEER_PORT}" \
+    ATLAS_EXPERT_RDMA_DEV="${CLIENT_RAIL%%:*}" ATLAS_EXPERT_RDMA_GID="${CLIENT_RAIL##*:}" \
+    SMOKE_BLOB="$BLOB" SMOKE_SLOTS="$SLOTS" SMOKE_KEYS="$KEYS" SMOKE_MODE="$KV_MODE" \
+      "$CLIENT_BIN" 2>&1 | sed 's/^/  /'
+    MODE_RC=${PIPESTATUS[0]}
+    set -e
+    [ "$MODE_RC" -eq 0 ] || { KV_RC=$MODE_RC; say "KV phase '$KV_MODE' FAILED (rc=$MODE_RC)"; }
+  done
+else
+  say "skipped (SSM phase already failed)"
+fi
+
 # ── 4. evidence the spill actually happened (a green PUT/GET alone proves little) ──
 hdr "peer-side evidence"
 $SSH "$PEER_SSH" "grep -icE 'spill|evict|swap' /tmp/atlas-peer-${RUN_ID}.log" | sed 's/^/  spill-or-evict log lines: /'
 $SSH "$PEER_SSH" "du -sh '$SWAP_DIR' 2>/dev/null | cut -f1" | sed 's/^/  swap dir size: /'
 
 hdr "RESULT"
-if [ "$RC" -eq 0 ]; then
-  echo "  PASS — two-machine RDMA paging round-trip, byte-identical after a peer-side NVMe spill"
+if [ "$RC" -eq 0 ] && [ "$KV_RC" -eq 0 ]; then
+  echo "  PASS — two-machine RDMA paging round-trips (SSM v1 + KV v2 kind=1 + isolation),"
+  echo "         byte-identical after peer-side NVMe spills"
 else
-  echo "  FAIL — client exited $RC"
+  echo "  FAIL — SSM phase rc=$RC, KV phase rc=$KV_RC"
   $SSH "$PEER_SSH" "tail -30 /tmp/atlas-peer-${RUN_ID}.log" | sed 's/^/    peer: /'
 fi
-exit "$RC"
+[ "$RC" -eq 0 ] || exit "$RC"
+exit "$KV_RC"

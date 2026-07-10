@@ -494,12 +494,19 @@ impl HighSpeedSwap {
                         "high-speed-swap: KV overflow tier = RDMA peer {peer} (group_stride {})",
                         group_layout.group_stride
                     );
-                    // RDMA inherits the default per-head block fan-out (correct,
-                    // un-coalesced); no buffer-sizing knob to thread here.
-                    Box::new(crate::rdma_kv_backend::RdmaKvBackend::connect(
+                    // ATLAS_KV_PAGING selection seam (default OFF ⇒ the legacy
+                    // dumb one-sided RdmaKvBackend, byte-identical; =1 ⇒ the
+                    // peer-owned paging backend, v2 handshake kind=KV). The
+                    // elem_bytes literal 2 mirrors the BF16 arg to
+                    // GroupLayout::new above. Legacy inherits the default
+                    // per-head block fan-out; paging overrides block-granular.
+                    crate::kv_paging::connect_kv_peer_backend(
                         &peer,
                         group_layout,
-                    )?)
+                        &model,
+                        2, // BF16 — must match GroupLayout::new's elem_bytes
+                        coalesce_blocks,
+                    )?
                 } else {
                     local_nvme_backend(
                         &cfg.dir,
@@ -573,6 +580,20 @@ impl HighSpeedSwap {
             .filter(|g: &f64| g.is_finite() && *g >= 0.0)
             .unwrap_or(0.0);
         let mut backend: Box<dyn crate::backend::StorageBackend> = if local_gb > 0.0 {
+            // Cascade evictions flush DOWN via per-head write_from_host,
+            // which the block-record KV paging backend refuses — fail fast
+            // at startup (PCND), never on the first T1 eviction mid-decode.
+            if crate::kv_paging::ns::cascade_conflicts_with_paging(
+                std::env::var("ATLAS_KV_PEER").is_ok(),
+                std::env::var("ATLAS_KV_PAGING").ok().as_deref(),
+            )? {
+                anyhow::bail!(
+                    "ATLAS_KV_LOCAL_GB > 0 (cascade T1) is incompatible with \
+                     ATLAS_KV_PAGING=1: cascade flushes evictions via per-head \
+                     write_from_host, which the block-record paging backend cannot \
+                     serve — disable one of the two"
+                );
+            }
             let cap_slots =
                 ((local_gb * 1024.0 * 1024.0 * 1024.0) / group_layout.group_bytes() as f64) as u32;
             Box::new(crate::cascade_backend::CascadeBackend::new(

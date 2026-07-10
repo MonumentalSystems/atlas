@@ -140,6 +140,27 @@ impl ModelFingerprint {
         Ok(fp)
     }
 
+    /// KV-paging fingerprint (Step B, `ATLAS_KV_PAGING`): the SAME canonical
+    /// per-model encoding as the SSM tier, derived with the KV CONVENTION
+    /// `blob_bytes = 0` (tag 0x40 = 0 marks the KV instance; SSM instances
+    /// put their real, non-zero blob size there — so the two never share a
+    /// value, and attention-only models with no SSM tier still get an fp).
+    /// The KV tier folds its full block geometry + dtype + a per-client salt
+    /// DOWNSTREAM at its own call site (`spark_storage::kv_paging::ns`),
+    /// exactly as the module doc above prescribes — do NOT add KV fields
+    /// here (that would rotate SSM keys).
+    pub(crate) fn derive_kv(cfg: &ModelConfig) -> Result<Self> {
+        let model_id = std::env::var("ATLAS_MODEL_ID").unwrap_or_default();
+        let fp = Self::derive_with_id(cfg, 0, &model_id)?;
+        tracing::info!(
+            "KV paging model fingerprint = {:#018x} (model_type={}, \
+             ATLAS_MODEL_ID={model_id:?}); folded into the ATLAS_KV_PAGING namespace",
+            fp.get(),
+            cfg.model_type,
+        );
+        Ok(fp)
+    }
+
     /// Pure derivation (no env, no logging) — the canonical encoding.
     /// FROZEN: field set + order changes require an FP_VERSION bump.
     pub(crate) fn derive_with_id(

@@ -4,8 +4,9 @@
 // SECURITY/CORRECTNESS INVARIANT and must stay a per-caller parameter:
 //
 //   * `reg_mr(.., false)` → IBV_ACCESS_LOCAL_WRITE only (client landing /
-//     bounce buffers — the NIC may DMA in, zero remote access): exactly 8
-//     sites across the five clients.
+//     bounce buffers — the NIC may DMA in, zero remote access): exactly 10
+//     sites across the six clients (Step B added `kv_paging`: bounce ring +
+//     UMA landing region, both remote_read == false).
 //   * `reg_mr(.., true)`  → IBV_ACCESS_REMOTE_READ ONLY, deliberately without
 //     LOCAL_WRITE so PROT_READ mmaps register: exactly 2 server sites
 //     (expert_peer, weight_peer).
@@ -112,8 +113,9 @@ fn scan_tree() -> Census {
 }
 
 /// The modules that are *allowed* to register memory regions.
-const REG_MR_MODULES: [&str; 8] = [
+const REG_MR_MODULES: [&str; 9] = [
     "rdma_kv_backend",
+    "kv_paging",
     "expert_tier_rdma",
     "weight_tier_rdma",
     "weight_lora_rdma",
@@ -125,9 +127,10 @@ const REG_MR_MODULES: [&str; 8] = [
 
 #[test]
 fn client_landing_mrs_are_local_write_only() {
-    // The five RailSet clients: every registration is `remote_read == false`.
+    // The six RailSet clients: every registration is `remote_read == false`.
     // `rdma_kv_backend` is a directory module (rail.rs holds the ring's two).
     assert_eq!(scan_module("rdma_kv_backend"), (3, 0, 0)); // region + zero-copy dst + bounce ring
+    assert_eq!(scan_module("kv_paging"), (2, 0, 0)); // bounce ring + UMA landing region
     assert_eq!(scan_module("expert_tier_rdma"), (1, 0, 0)); // whole arena per rail
     assert_eq!(scan_module("weight_tier_rdma"), (1, 0, 0)); // bounce per rail
     assert_eq!(scan_module("weight_lora_rdma"), (1, 0, 0)); // single bounce
@@ -144,12 +147,15 @@ fn server_store_mrs_keep_their_flags() {
 }
 
 #[test]
-fn totals_are_eight_false_two_true_one_rw() {
+fn totals_are_ten_false_two_true_one_rw() {
+    // Step B (KV paging client) moved the census from (8, 2, 1) to (10, 2, 1):
+    // both new sites are client landing MRs (remote_read == false); the server
+    // side — and the single reg_mr_rw at the cache_peer call site — is untouched.
     let (f, t, rw) = REG_MR_MODULES
         .iter()
         .map(|m| scan_module(m))
         .fold((0, 0, 0), |a, b| (a.0 + b.0, a.1 + b.1, a.2 + b.2));
-    assert_eq!((f, t, rw), (8, 2, 1), "reg_mr access-flag census changed");
+    assert_eq!((f, t, rw), (10, 2, 1), "reg_mr access-flag census changed");
 }
 
 #[test]

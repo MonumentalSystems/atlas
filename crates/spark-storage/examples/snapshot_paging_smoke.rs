@@ -37,10 +37,13 @@ fn main() -> anyhow::Result<()> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(32); // >> slots → guarantees disk spill
 
-    // put | get | putget (default). `get` proves CROSS-CONNECTION sharing: a
-    // separate client process GETs keys an earlier `put` run left in the SHARED
-    // peer arena/swap.
+    // put | get | putget (default) — the SSM (v1) paging modes; or
+    // kv | kv-isolation — the Step B KV paging kind (PAGING_MAGIC_V2, kind=1)
+    // driven through the real KvPagingBackend StorageBackend client.
     let mode = std::env::var("SMOKE_MODE").unwrap_or_else(|_| "putget".into());
+    if mode == "kv" || mode == "kv-isolation" {
+        return kv_main(&addr, blob, slots, n, &mode);
+    }
 
     let arena_bytes = (slots * blob) as u64;
     println!(
@@ -102,6 +105,139 @@ fn main() -> anyhow::Result<()> {
         "PAGING SMOKE OK ✅  {n} blobs through {slots}-slot arena, ALL byte-identical after NVMe \
          spill+fault.  put {put_ms:.0}ms ({:.1}/blob)  get {get_ms:.0}ms ({:.1}/blob)  \
          single fault-from-disk {one_get_us}us",
+        put_ms / n as f64,
+        get_ms / n as f64,
+    );
+    Ok(())
+}
+
+/// SMOKE_MODE=kv — drive the Step B KV paging kind end-to-end over real RDMA:
+/// v2 handshake (kind=1), block-granular ALLOC/WRITE/COMMIT offloads of far
+/// more blocks than the peer RAM arena holds (forcing NVMe spills), then
+/// block-granular GET/READ restores into a DEVICE buffer, asserting
+/// byte-identity (a fault-from-disk on every evicted block).
+///
+/// SMOKE_MODE=kv-isolation — two KV clients (same model fp, DIFFERENT client
+/// salts) against ONE peer arena: client B must MISS client A's blocks (the
+/// KV miss is a hard error naming --swap-cap-gb-kv), both round-trip their
+/// own — the client-local-block-id cross-serve hazard, proven on hardware.
+#[cfg(all(feature = "cuda", atlas_rdma_verbs))]
+fn kv_main(addr: &str, blob: usize, slots: usize, n: u64, mode: &str) -> anyhow::Result<()> {
+    use spark_storage::backend::BlockReadRequest;
+    use spark_storage::backend::StorageBackend;
+    use spark_storage::cuda_min::{DeviceBuffer, copy_d_to_h_async, stream_sync};
+    use spark_storage::group::{GroupKey, GroupLayout, KvKind};
+    use spark_storage::kv_paging::ns::derive_kv_ns;
+    use spark_storage::kv_paging::{KvPagingBackend, KvPagingConnect};
+
+    const NKV: u16 = 8;
+    anyhow::ensure!(
+        blob.is_multiple_of(2 * NKV as usize),
+        "SMOKE_BLOB must be a multiple of {} (2·num_kv_heads)",
+        2 * NKV
+    );
+    // A layout whose block_bytes == SMOKE_BLOB exactly (fields are pub; the
+    // backend only derives block_bytes/group_id from them).
+    let layout = GroupLayout {
+        num_layers: 1,
+        num_blocks: n as u32,
+        num_kv_heads: NKV,
+        group_stride: (blob / (2 * NKV as usize)) as u64,
+        fs_block_size: 4096,
+    };
+    assert_eq!(layout.block_bytes() as usize, blob);
+    let arena_bytes = (slots * blob) as u64;
+    let fp: u64 = 0xFEED_FACE_CAFE_BEEF; // fixed test "model"
+    let connect = |salt: u64| -> anyhow::Result<KvPagingBackend> {
+        KvPagingBackend::connect(
+            addr,
+            layout,
+            KvPagingConnect {
+                arena_bytes,
+                ns: derive_kv_ns(fp, &layout, 2, 16, 128, salt),
+            },
+        )
+    };
+    let pat = |b: u32, tag: u8| -> Vec<u8> {
+        let mut v = vec![0u8; blob];
+        for (i, x) in v.iter_mut().enumerate() {
+            *x = (b as u8) ^ (i as u8).wrapping_mul(29) ^ tag;
+        }
+        v
+    };
+    let key = |b: u32| GroupKey::new(0, b, 0, KvKind::K);
+    let dev = DeviceBuffer::new(blob)?;
+    let mut host = vec![0u8; blob];
+    let read_block = |be: &mut KvPagingBackend, b: u32, host: &mut [u8]| -> anyhow::Result<()> {
+        be.read_blocks(
+            &[BlockReadRequest {
+                base_key: key(b),
+                dst_dev_ptr: dev.ptr,
+            }],
+            0,
+        )?;
+        copy_d_to_h_async(host.as_mut_ptr() as *mut _, dev.ptr, blob, 0)?;
+        stream_sync(0)
+    };
+
+    println!(
+        "connecting KV paging tier @ {addr} [{mode}]: {slots}-slot arena × {blob} B blocks, \
+         {n} blocks (forces {} disk spills)",
+        n.saturating_sub(slots as u64)
+    );
+    if mode == "kv-isolation" {
+        let mut a = connect(0x0000_0000_0000_0001)?;
+        let mut b = connect(0x0000_0000_0000_0002)?;
+        for blk in 0..n as u32 {
+            a.write_block_from_host(key(blk), &pat(blk, 0xA0))?;
+        }
+        // Client B must MISS client A's blocks — the hard error, not bytes.
+        let miss = read_block(&mut b, 0, &mut host);
+        anyhow::ensure!(
+            miss.is_err(),
+            "ISOLATION BROKEN: client B was served client A's KV block"
+        );
+        let msg = format!("{:#}", miss.unwrap_err());
+        anyhow::ensure!(
+            msg.contains("unrecoverable"),
+            "unexpected miss error: {msg}"
+        );
+        // Both clients round-trip their OWN block 0 on the shared arena.
+        b.write_block_from_host(key(0), &pat(0, 0xB0))?;
+        read_block(&mut b, 0, &mut host)?;
+        anyhow::ensure!(host == pat(0, 0xB0), "client B corrupted");
+        read_block(&mut a, 0, &mut host)?;
+        anyhow::ensure!(host == pat(0, 0xA0), "client A corrupted by B's write");
+        println!(
+            "KV ISOLATION OK ✅  two salts on one shared peer arena: B missed A's blocks \
+             (hard error), both round-tripped their own byte-identical"
+        );
+        return Ok(());
+    }
+    // mode == "kv": spill + rehydrate byte-identity through the real backend.
+    let mut be = connect(0x5EED)?;
+    let t0 = std::time::Instant::now();
+    for blk in 0..n as u32 {
+        be.write_block_from_host(key(blk), &pat(blk, 0))?;
+    }
+    let put_ms = t0.elapsed().as_secs_f64() * 1e3;
+    let t1 = std::time::Instant::now();
+    for blk in 0..n as u32 {
+        read_block(&mut be, blk, &mut host)?;
+        anyhow::ensure!(
+            host == pat(blk, 0),
+            "block {blk} CORRUPTED — spill/fault not byte-identical"
+        );
+    }
+    let get_ms = t1.elapsed().as_secs_f64() * 1e3;
+    // Overwrite-in-place (disk-id reuse) survives the peer round-trip.
+    be.write_block_from_host(key(0), &pat(0, 0x77))?;
+    read_block(&mut be, 0, &mut host)?;
+    anyhow::ensure!(host == pat(0, 0x77), "overwrite-in-place corrupted");
+    println!(
+        "KV PAGING SMOKE OK ✅  {n} blocks through {slots}-slot arena, ALL byte-identical \
+         after NVMe spill+fault (+ overwrite-in-place).  put {put_ms:.0}ms ({:.1}/blk)  \
+         get {get_ms:.0}ms ({:.1}/blk)",
         put_ms / n as f64,
         get_ms / n as f64,
     );

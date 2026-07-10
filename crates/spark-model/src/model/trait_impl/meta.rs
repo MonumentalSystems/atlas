@@ -37,6 +37,23 @@ impl TransformerModel {
         // only models would need a different orchestrator. We expose dims
         // unconditionally and let the scheduler decide whether to install,
         // gated by the user's --high-speed-swap CLI choice.
+        //
+        // KV paging identity (ATLAS_KV_PAGING): the SAME config-derived
+        // fingerprint mechanism the SSM tier uses (quant identity + geometry
+        // + ATLAS_MODEL_ID salt), via the KV convention (blob_bytes = 0).
+        // Underivable ⇒ None with a loud warn; the flag-ON connect then
+        // fails fast with an actionable error (PCND). Every other path
+        // ignores the field.
+        let model_fp = match crate::model::ssm_tier::ModelFingerprint::derive_kv(&self.config) {
+            Ok(fp) => Some(fp.nonzero()),
+            Err(e) => {
+                tracing::warn!(
+                    "KV paging fingerprint underivable ({e:#}); ATLAS_KV_PAGING=1 \
+                     will fail fast unless ATLAS_KV_PAGING_NS is set"
+                );
+                None
+            }
+        };
         Some(spark_storage::ModelDims {
             num_layers: self.config.num_hidden_layers as u32,
             // SINGLE CAPACITY LEVER for the HSS disk-id namespace: widen the
@@ -53,6 +70,7 @@ impl TransformerModel {
             num_kv_heads: self.config.num_key_value_heads as u16,
             head_dim: self.config.head_dim as u16,
             block_size: self.kv_cache.lock().block_size() as u16,
+            model_fp,
         })
     }
 

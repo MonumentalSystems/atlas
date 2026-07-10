@@ -79,6 +79,23 @@ pub fn parse_paging_header<R: Read>(
     Ok(Some((kind, arena_bytes, blob_bytes)))
 }
 
+/// Encode the CLIENT half of the v2 paging handshake header (what a Step-B
+/// KV paging client sends first; SSM's `connect_paging` still speaks v1 until
+/// Step C migrates it):
+/// `[u64 PAGING_MAGIC_V2 LE][u8 kind][u64 arena_bytes LE][u64 blob_bytes LE]`
+/// — 25 bytes, followed by the unchanged `[u8 n_rails]` RailSet exchange.
+/// Lives in this ONE shared module (beside `parse_paging_header`, its peer
+/// half) so writer and reader can never drift; byte-frozen and golden-pinned
+/// in `wire_tests.rs`.
+pub fn encode_paging_v2_header(kind: PagingKind, arena_bytes: u64, blob_bytes: u64) -> [u8; 25] {
+    let mut w = [0u8; 25];
+    w[0..8].copy_from_slice(&PAGING_MAGIC_V2.to_le_bytes());
+    w[8] = kind.0;
+    w[9..17].copy_from_slice(&arena_bytes.to_le_bytes());
+    w[17..25].copy_from_slice(&blob_bytes.to_le_bytes());
+    w
+}
+
 /// Round-robin stripe a `blob_bytes` transfer into `chunk_bytes` chunks across
 /// `n_rails`, returning per-rail lists of `(offset, len)`. The offset is the
 /// chunk's position in BOTH the (single, contiguous) staging buffer and the peer

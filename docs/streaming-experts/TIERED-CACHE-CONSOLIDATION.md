@@ -280,3 +280,39 @@ Added 2026-07-09 (independent re-verification):
   imports from `expert_peer`, `weight_lora_rdma.rs:163` from `weight_peer`;
 - gx10 runs only `atlas-cache-peer` (×2: `:9916`, `:9920`); no expert/weight peer units exist and
   `:9917` is not listening ⇒ the expert and LoRA RDMA tiers have no live server (see §5 note).
+
+---
+
+## 10. Status addendum — Chunk 4 Step B LANDED (2026-07-10)
+
+The §1.2 "no client sender" observation is now historical: `spark-storage/src/kv_paging/`
+ships the first real `PAGING_MAGIC_V2` sender — `KvPagingBackend` (kind = `PagingKind::KV`),
+behind the **default-OFF** `ATLAS_KV_PAGING` env flag. Flag OFF is the untouched legacy
+`RdmaKvBackend` (byte-identical bare-`total_bytes` handshake + client-owned allocator), so any
+regression bisects on one flag. Key facts:
+
+- **Record = one whole KV block** (`GroupLayout::block_bytes()`); block-granular
+  `read_blocks`/`write_block_from_host` overrides (1 control RTT per block); strictly
+  synchronous MVP (one control op in flight — required by the peer's release-pin-on-next-op
+  lifecycle). Zero-copy UMA landing (`ATLAS_KV_ZERO_COPY`) preserved; drop order
+  (MR dereg before pool free) inherited.
+- **Keys**: `wire = splitmix64(base_group_id ^ kv_ns·GOLDEN)`; `kv_ns` (KV_NS_VERSION 1,
+  `kv_paging/ns.rs`) folds the model fingerprint (`ModelFingerprint::derive_kv`, blob_bytes=0
+  convention) + full layout identity + `KV_DOMAIN` + a **mandatory per-client salt**
+  (`GroupKey.block` is a client-local pool index — fingerprint-only namespacing would
+  cross-serve same-model clients with certainty). Honest consequence: KV paging buys peer
+  residency + NVMe depth + capacity pooling, NOT cross-client warm hits (needs
+  content-addressed keys, a separate chunk — same seam as the SSM decode-ns residual).
+- **MISS = hard error** client-side; deployment requirement `--swap-cap-gb-kv 0`
+  (an evicted KV block is unrecoverable, unlike recompute-correct SSM snapshots).
+- Config (PCND, all strict-parse): `ATLAS_KV_PAGING=1` requires `ATLAS_KV_PAGING_ARENA_GB`;
+  optional `ATLAS_KV_PAGING_SALT` / `ATLAS_KV_PAGING_NS`.
+- Goldens: v2 handshake byte vectors + kv_ns/mix64 frozen literals landed WITH the sender
+  (`wire_tests.rs`, `kv_paging/ns_tests.rs`, cross-crate pins in `fingerprint_tests.rs`);
+  reg_mr census now (10 false, 2 true, 1 rw) — both new sites client landing MRs.
+- Hardware validation is parent-executed: `scripts/rdma-integration-harness.sh` grew a KV
+  phase (`SMOKE_MODE=kv` spill/rehydrate byte-identity into a device buffer;
+  `SMOKE_MODE=kv-isolation` two-salt no-cross-serve) with the peer at `--swap-cap-gb-kv 0`.
+
+Step C (v1 + legacy-escape deletion) remains gated on B passing hardware; its sender surface
+is unchanged from §recon: `rdma_snapshot.rs` v1 + bare-u64, `rdma_kv_backend.rs` bare-u64.

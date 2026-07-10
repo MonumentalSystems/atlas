@@ -123,6 +123,12 @@ pub mod weight_lora_rdma;
 #[cfg(all(feature = "cuda", atlas_rdma_verbs))]
 pub mod rdma_kv_backend;
 
+// Step B (tiered-cache consolidation): KV as a first-class paging kind behind
+// the default-OFF ATLAS_KV_PAGING flag. The namespace/wire-key derivation and
+// the strict env resolvers are pure and un-gated (unit-testable on the
+// default-features=false peer path); the RDMA client backend is gated like
+// rdma_kv_backend (cuda + verbs) inside the module.
+pub mod kv_paging;
 // Phase 4b: offset-addressed RDMA arena for the SSM-snapshot spill tier (reuses
 // the same verbs + cache-peer blade protocol, keyed by byte offset not GroupKey).
 // Always available — the module provides a `connect`-errors stub when the real
@@ -164,6 +170,8 @@ pub use expert_tier::{
 pub use expert_tier_rdma::RdmaTier;
 #[cfg(feature = "cuda")]
 pub use high_speed_swap::{AttendSeqReq, HighSpeedSwap, install_local, local_installed, with_local};
+#[cfg(all(feature = "cuda", atlas_rdma_verbs))]
+pub use kv_paging::KvPagingBackend;
 #[cfg(all(feature = "cuda", atlas_rdma_verbs))]
 pub use rdma_kv_backend::RdmaKvBackend;
 pub use rdma_snapshot::RdmaSnapshotArena;

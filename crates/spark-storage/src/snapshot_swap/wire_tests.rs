@@ -169,6 +169,55 @@ fn v1_handshake_wire_golden() {
     );
 }
 
+/// WIRE-GOLDEN (Step B lands the first real V2 sender — KvPagingBackend —
+/// so its bytes are pinned the moment it exists): the exact 25-byte
+/// `encode_paging_v2_header` emission, one vector per kind, DISTINCT field
+/// byte values so a symmetric writer+reader field swap cannot hide.
+#[test]
+fn v2_handshake_wire_golden() {
+    // KV (kind = 1): what KvPagingBackend::connect sends first.
+    assert_eq!(
+        encode_paging_v2_header(PagingKind::KV, 0x2000, 0x80).to_vec(),
+        vec![
+            0x02, 0x00, 0x00, 0x00, 0x45, 0x47, 0x41, 0x50, // PAGING_MAGIC_V2 LE ("PAGE" + 2)
+            0x01, // kind = KV
+            0x00, 0x20, 0, 0, 0, 0, 0, 0, // arena 0x2000
+            0x80, 0, 0, 0, 0, 0, 0, 0, // blob 0x80
+        ],
+        "v2 KV handshake bytes are frozen (the deployed fleet peer parses them)"
+    );
+    // SSM (kind = 0): what connect_paging will send after the Step C v1→v2 flip.
+    assert_eq!(
+        encode_paging_v2_header(PagingKind::SSM, 0x1000, 0x40).to_vec(),
+        vec![
+            0x02, 0x00, 0x00, 0x00, 0x45, 0x47, 0x41, 0x50, // PAGING_MAGIC_V2 LE
+            0x00, // kind = SSM
+            0x00, 0x10, 0, 0, 0, 0, 0, 0, // arena 0x1000
+            0x40, 0, 0, 0, 0, 0, 0, 0, // blob 0x40
+        ],
+        "v2 SSM handshake bytes are frozen"
+    );
+    // n_rails follows via RailSet::begin, exactly as v1 (unchanged framing).
+}
+
+/// The encoder and the peer parser are inverse halves of ONE module: every
+/// encoded header parses back to exactly (kind, arena, blob).
+#[test]
+fn v2_encode_parses_back() {
+    for (kind, arena, blob) in [
+        (PagingKind::KV, 0x40_0000u64, 0x1_0000u64),
+        (PagingKind::SSM, 0x1000, 0x40),
+    ] {
+        let w = encode_paging_v2_header(kind, arena, blob);
+        let first = u64::from_le_bytes(w[0..8].try_into().unwrap());
+        let mut c = std::io::Cursor::new(w[8..].to_vec());
+        assert_eq!(
+            parse_paging_header(first, &mut c).unwrap(),
+            Some((kind, arena, blob))
+        );
+    }
+}
+
 /// One PUT (alloc→arena write→commit) then GET, driven through `dispatch`,
 /// with the caller's RDMA-write emulated by writing the returned slot.
 #[test]
