@@ -421,6 +421,9 @@ impl MoeLayer {
                 "moe_topk_sig",
                 "moe_topk_sigmoid_batched",
             ),
+            // b12x fused-MoE weights: built later by the load hook (behind
+            // ATLAS_HOLO_MOE_B12X) once the transposed scale tables exist.
+            b12x: None,
         })
     }
 }

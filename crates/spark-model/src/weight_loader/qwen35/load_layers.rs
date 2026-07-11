@@ -349,6 +349,15 @@ pub(super) fn load_layers(
             moe_layer.build_cutlass_grouped_sfb(gpu, config, stream)?;
         }
 
+        // b12x fused-MoE opt-in repack (ATLAS_HOLO_MOE_B12X): concat the resident
+        // NVFP4 experts into b12x's contiguous [E,2I,H/2]/[E,H,I/2] layout + bake the
+        // scale atoms. Needs the shared gate_ptrs_t/up_ptrs_t/down_ptrs_t (FAST_MOE=full);
+        // EP / null-expert / no-table configs leave b12x=None and the grouped path runs.
+        // Logic lives in b12x_weights.rs (this file is near the allow-listed LoC cap).
+        if std::env::var("ATLAS_HOLO_MOE_B12X").as_deref() == Ok("1") {
+            moe_layer.build_b12x_weights(gpu, config, stream)?;
+        }
+
         // ATLAS_FP8_DEQUANT_MOE_TO_BF16: dequant FP8 experts to BF16 at load,
         // route MoE through the BF16 grouped GEMM + fused-decode kernels.
         // Eliminates the per-layer 0.989 FP8 cosine ceiling. Memory cost:
