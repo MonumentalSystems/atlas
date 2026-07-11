@@ -106,6 +106,10 @@ pub mod probe;
 pub mod scratch_pool;
 #[cfg(feature = "cuda")]
 pub mod tiled_attention;
+// RDMA weight loader — the cuda client of `weight_peer` that one-sided-READs a
+// model's tensors into a `spark_runtime::weights::WeightStore` for fast swaps.
+#[cfg(feature = "cuda")]
+pub mod weight_tier_rdma;
 
 #[cfg(feature = "cuda")]
 pub use backend::{IoUringBackend, PosixBackend, ReadRequest, StorageBackend};
@@ -163,3 +167,5 @@ pub use projection::{PredictorShape, build_projection};
 #[cfg(feature = "cuda")]
 pub use tiled_attention::{TiledAttention, TiledAttentionDims};
 pub use weight_peer::{WeightManifest, WeightTensorRecord};
+#[cfg(feature = "cuda")]
+pub use weight_tier_rdma::RdmaWeightLoader;
