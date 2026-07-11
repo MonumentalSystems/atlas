@@ -28,6 +28,9 @@ mod mem;
 mod residency;
 mod traits;
 
+pub mod entropy;
+pub mod hash;
+
 pub use direct_swap::DirectSwapFile;
 pub use mem::{MemSwapStore, VecSlotArena};
 pub use residency::Residency;
