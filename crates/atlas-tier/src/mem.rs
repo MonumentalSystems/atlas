@@ -9,9 +9,9 @@ use anyhow::{Result, bail};
 
 use crate::traits::{SlotArena, SwapStore};
 
-/// Host-RAM [`SlotArena`] over one flat `Vec<u8>` (promoted from the original
-/// test fake). The hot tier for in-process consumers — e.g. the unified SSM
-/// spill store's RAM cache. Allocates `slot_bytes * num_slots` up front.
+/// Host-RAM [`SlotArena`] over one flat `Vec<u8>`. The hot tier for in-process
+/// consumers — e.g. the unified SSM spill store's RAM cache. Allocates
+/// `slot_bytes * num_slots` up front.
 pub struct VecSlotArena {
     buf: Vec<u8>,
     slot_bytes: usize,
@@ -53,9 +53,9 @@ impl SlotArena for VecSlotArena {
     }
 }
 
-/// Host-RAM [`SwapStore`] over a `HashMap` (promoted from the original test
-/// fake). Records live in ordinary heap memory — the "swap" tier when no NVMe
-/// directory is configured (unbounded, still LRU-ordered by the residency).
+/// Host-RAM [`SwapStore`] over a `HashMap`. Records live in ordinary heap
+/// memory — the "swap" tier when no NVMe directory is configured (unbounded,
+/// still LRU-ordered by the residency).
 pub struct MemSwapStore {
     recs: HashMap<usize, Vec<u8>>,
     record_bytes: usize,

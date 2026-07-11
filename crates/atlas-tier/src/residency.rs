@@ -23,8 +23,6 @@ enum Loc {
 
 /// The page table: `key → Loc` over a bounded [`SlotArena`] (hot) backed by an
 /// unbounded [`SwapStore`] (cold), with LRU eviction of resident slots to disk.
-/// (Historically `SnapshotResidency` — `spark-storage::snapshot_swap` re-exports
-/// it under that name for the peer.)
 pub struct Residency<A: SlotArena, S: SwapStore> {
     arena: A,
     swap: S,

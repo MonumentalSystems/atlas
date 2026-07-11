@@ -410,7 +410,10 @@ fn put_blob_rolls_back_reservation_on_arena_write_failure() {
     assert_eq!(r.total_keys(), 1, "no stranded key-2 entry");
     // The freed slot is reusable and key 1 is intact.
     r.put_blob(3, &blob(3)).unwrap();
-    assert!(r.get_blob(1, &mut out).unwrap() && out == blob(1), "key 1 intact");
+    assert!(
+        r.get_blob(1, &mut out).unwrap() && out == blob(1),
+        "key 1 intact"
+    );
     assert!(
         r.get_blob(3, &mut out).unwrap() && out == blob(3),
         "key 3 reuses the reclaimed slot"
