@@ -35,6 +35,8 @@ pub mod attention_ref;
 pub mod cascade_policy;
 pub mod config;
 pub mod eviction;
+pub mod expert;
+pub mod expert_pack;
 pub mod group;
 pub mod model_dims;
 pub mod predictor_ref;
@@ -89,6 +91,12 @@ pub mod tiled_attention;
 pub use backend::{IoUringBackend, PosixBackend, ReadRequest, StorageBackend};
 pub use config::HighSpeedSwapConfig;
 pub use eviction::EvictionPolicy;
+pub use expert::{
+    ExpertKey, ExpertLayout, ExpertRecordHeader, ExpertRecordId, ExpertRecordSpec, Proj, ProjBytes,
+};
+#[cfg(unix)]
+pub use expert_pack::{ExpertFileReader, ExpertFileWriter};
+pub use expert_pack::{ExpertIndex, ProjData, ProjView, pack_record, unpack_record};
 #[cfg(feature = "cuda")]
 pub use high_speed_swap::{HighSpeedSwap, install_local, local_installed, with_local};
 pub use rdma_snapshot::RdmaSnapshotArena;
