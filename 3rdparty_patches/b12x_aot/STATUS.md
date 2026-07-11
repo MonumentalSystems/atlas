@@ -160,5 +160,27 @@ correct. (Numerics not checked here — random fp4 weights → non-finite; that'
 
 **NOT a P0 blocker anymore:** `proof_sfb_atom.py` stays non-runnable (unchanged) — the SFB
 go/no-go is deferred into the Phase-7 end-to-end A/B (functional P0), which decides ConcatReuse vs
-RebuildFromRaw. **REMAINING: P10 rebuild Atlas → P11 correctness A/B + needle gate → P12 perf.**
-These need the Holo-35B model + serve harness (a separate chunk).
+RebuildFromRaw.
+
+### 2026-07-11 (cont.) — Phase 6 (P10) + functional P0 (P11 correctness) DONE + PASSED.
+
+- **Rebuild WAS required** (the gdnf32-build binary predated the b12x Rust — 0 b12x strings). Rebuilt
+  `spark-server` in-container: `CUTLASS_HOME=/opt/cutlass FLASHINFER_HOME=/opt/flashinfer
+  ATLAS_CUTLASS_NVFP4_GEMM=1 ATLAS_TARGET_MODEL=holo-3.1-35b-a3b cargo build --release -p spark-server`
+  (~2.5min incremental; b12x is dlopen+runtime-gated, no cargo feature). New binary: 12 b12x strings.
+- **Enabling flag discovered**: b12x eligibility needs the transposed `gate/up/down_ptrs_t` tables,
+  built ONLY under **`ATLAS_HOLO_FAST_MOE_MODE=full` + `ATLAS_HOLO_FAST_MOE_LAYERS=0-39`**. Without
+  them `have_t=false` → b12x silently disabled (no warning). This is the non-obvious serve flag.
+- **Served** Holo-3.1-35B-A3B-NVFP4 with `ATLAS_HOLO_MOE_B12X=1 ATLAS_B12X_LIB=<.so>` +
+  FAST_MOE=full + cute-runtime on LD_LIBRARY_PATH. Log: `b12x fused-MoE loaded (max_tokens=1024)` +
+  `built fused weights for 256 experts … strat=ConcatReuse` ×40 layers.
+- **FUNCTIONAL P0 = PASS**: correct output ("23, 29, 31" for primes>20; coherent MoE explanation) and
+  the debug gate fires `N=… routed experts via one resident b12x launch` **×40 per prefill** — the
+  kernel executed, not a silent fallback. **⇒ ConcatReuse is CORRECT; keep the default. No
+  RebuildFromRaw. `proof_sfb_atom.py` moot.** b12x handled a 980-tok prefill in 40 launches.
+- **GOTCHA**: OOM restart race — a killed b12x+FAST_MOE server (~3× expert memory) doesn't release
+  CUDA memory instantly; wait for `nvidia-smi memory.free` to recover before relaunch (GB10=121.6GB).
+
+**REMAINING (perf only): P12** end-to-end prefill TTFT A/B is SSM-DOMINATED on this model
+(30 SSM/10 attn, ~80% SSM) so b12x's MoE-prefill win needs per-layer `ATLAS_MS_PROFILE` isolation,
+not raw TTFT (framework-first: correctness is the deliverable). Plus the needle regression gate.
