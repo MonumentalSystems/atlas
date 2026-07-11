@@ -18,5 +18,10 @@ anyhow = { workspace = true }
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+[dev-dependencies]
+# Tests implement SlotArena/SwapStore fault-injecting fakes, which return
+# `anyhow::Result` — same budget as the runtime dep, nothing new.
+anyhow = { workspace = true }
+
 [lints]
 workspace = true
