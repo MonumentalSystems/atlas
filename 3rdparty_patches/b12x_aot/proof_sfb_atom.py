@@ -31,15 +31,29 @@ def fi_swizzle(scale_u8, n, k):
     # FlashInfer reference: interpret the same bytes as [n, k/16] float8_e4m3fn and run
     # its block-scale interleave / convert_sf_to_mma_layout. (Import path per the pinned
     # FlashInfer rev a671c02.)
-    from flashinfer.fused_moe.cute_dsl.utils import convert_sf_to_mma_layout  # type: ignore
+    from flashinfer.cute_dsl.utils import convert_sf_to_mma_layout  # real module path  # type: ignore
 
     sf = torch.from_numpy(scale_u8.view(np.uint8)).view(torch.float8_e4m3fn).cuda()
-    return convert_sf_to_mma_layout(sf, n=n, k=k).cpu().view(torch.uint8).numpy().ravel()
+    return convert_sf_to_mma_layout(sf, m=n, k=k)  # sig is (sf, m, k, num_groups=1, sf_vec_size=16).cpu().view(torch.uint8).numpy().ravel()
 
 
 def atlas_swizzle(scale_u8, n, k):
     # Atlas reference: pack_weight_sfb(scale_in, scale_out, n, k). Drives the same
     # atlas_cutlass_pack_weight_sfb the grouped path uses (n=N, k=K, [K/16,N] input).
+    # ============================ P0 BLOCKER (read before running) ============================
+# This proof is NOT yet runnable end-to-end. Two things must be supplied first:
+#   1. `atlas_pack_sfb` (imported below) does NOT exist — it must be a thin ctypes/cdylib
+#      wrapper exposing Atlas's COMPILED CUTLASS symbol `atlas_cutlass_pack_weight_sfb`
+#      (crates/spark-runtime/src/cutlass/pack.rs -> the C fn). Build a tiny cdylib that
+#      re-exports it, or link spark-runtime's cutlass staticlib into a ctypes-loadable .so.
+#   2. The FI side (`fi_swizzle`) must first quantize a REAL weight tile via
+#      flashinfer `fp4_quantize(w, is_sf_swizzled_layout=True)` and take THAT swizzled SF as
+#      input to convert_sf_to_mma_layout (the docstring is explicit: convert_sf expects the
+#      fp4_quantize-swizzled 2D SF, not raw ramp bytes). Comparing raw ramp bytes is wrong.
+# Preferred P0 = FUNCTIONAL: feed one expert's Atlas-packed weights+SF through b12x vs Atlas
+#   grouped GEMM, compare output cos (tolerance, atomic-scatter). That sidesteps atom-layout
+#   derivation entirely but needs b12x running (cutlass-dsl 4.4.2 + sm_121a patches).
+# ==========================================================================================
     import atlas_pack_sfb  # thin ctypes wrapper around atlas_cutlass_pack_weight_sfb
 
     return atlas_pack_sfb.pack(scale_u8.tobytes(), n, k)
