@@ -37,6 +37,7 @@ pub mod config;
 pub mod eviction;
 pub mod expert;
 pub mod expert_pack;
+pub mod expert_peer;
 pub mod group;
 pub mod model_dims;
 pub mod predictor_ref;
