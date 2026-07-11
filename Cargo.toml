@@ -8,6 +8,7 @@ members = [
     "crates/atlas-embed",
     "crates/atlas-reduce",
     "crates/atlas-kernels",
+    "crates/atlas-rdma",
     "crates/spark-runtime",
     "crates/spark-comm",
     "crates/spark-model",
