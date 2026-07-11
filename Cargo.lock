@@ -160,6 +160,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "atlas-rdma"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "cc",
+]
+
+[[package]]
 name = "atlas-reduce"
 version = "0.1.0"
 dependencies = [
