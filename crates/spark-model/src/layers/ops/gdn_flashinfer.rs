@@ -78,6 +78,19 @@ fn lib() -> Option<&'static Lib> {
             "ATLAS_GDN_FLASHINFER: FlashInfer GDN kernel loaded (opt-in, f32_out={})",
             !prefill_f32.is_null()
         );
+        // GPU-measured 2026-07-11: the FlashInfer GDN kernel has a LONG-CONTEXT
+        // correctness regression — 7/8 needle recall at 200K where the in-tree
+        // FLA path gets 8/8, on identical weights + fp8 KV. It is NOT the bf16
+        // output truncation (F32-output + F32 WY-inverse re-exports both still
+        // miss); the defect is elsewhere in the FI kernel's state path. Until
+        // fixed, `ATLAS_GDN_FLASHINFER=1` is UNSAFE for long context — prefer
+        // the default (unset = FLA, 8/8, ~7% slower prefill). See
+        // docs/streaming-experts/LONGCTX-NEEDLE-BENCHMARK.md.
+        tracing::warn!(
+            "ATLAS_GDN_FLASHINFER=1 has a long-context correctness regression (7/8 vs FLA 8/8 at \
+             200K); the ~1.3x prefill speedup is only safe at short context. Unset it (=FLA) for \
+             long-context serving until the FI kernel is fixed."
+        );
         Some(Lib {
             prefill: std::mem::transmute::<*mut c_void, PackedFn>(prefill),
             prefill_f32: (!prefill_f32.is_null())
