@@ -102,4 +102,63 @@ non-determinism ⇒ tolerance-only A/B (cos≥0.999, rel-L2≤2e-3), never bit-e
     shim/Rust surface is already final for it (`atlas_b12x_static_*` stubs present).
 
 ## Results log (parent appends)
-- (pending P0…P13)
+
+### 2026-07-11 — Phases 0–5 COMPLETE on dgx-00 GB10 (sm_121a). Export + shim + relink validated.
+
+**Env (P0-env).** Container from `atlas-gb10:gdnf32-build` (ships cutlass-dsl **4.5.0**, so the
+downgrade IS required). Full recipe now captured in `docs/streaming-experts/B12X-PARENT-RUNBOOK.md`.
+Corrections vs the original recipe, all needed to make export actually run (prior session wrote
+the code but never executed it):
+- **tvm_ffi**: not on PyPI as `tvm-ffi`; the package is **`apache-tvm-ffi`** (0.1.12). It is
+  REQUIRED at flashinfer import time (`flashinfer/jit/core.py`), independent of the `--enable-tvm-ffi`
+  compile flag.
+- **cutlass-dsl 4.4.2 vs flashinfer a671c02 namespace gap**: FI references
+  `cute.nvgpu.OperandMajorMode` (a 4.5.x top-level location); in 4.4.2 it lives under
+  `cute.nvgpu.tcgen05`. One-line re-export fixes it (`cfence` refs in FI are all commented — no-op):
+  `sed -i '/^from . import tcgen05$/a from .tcgen05 import OperandMajorMode, OperandSource' <nvgpu/__init__.py>`.
+- torch: `pip install torch --index-url .../cu130` → torch 2.13.0+cu130, CUDA OK. Also need
+  `cuda-python` (for `cuda.bindings.driver` the FI stream-annotation patch imports).
+
+**Export driver (`b12x_export.py`) — FOUR real bugs fixed (all now committed):**
+1. tvm-ffi strip only handled `list`/`tuple` options, but moe_dispatch passes
+   `options="--opt-level 2 --enable-tvm-ffi"` as a **string** → tvm-ffi stayed on → wrong
+   `export_to_c` signature. Now strips the string form too.
+2. `from __future__ import annotations` in moe_dispatch makes the kernel's arg annotations
+   **strings**; the C-header generator dispatches numeric scalars via `isinstance(ann, NumericMeta)`
+   and fails on `'cutlass.Int32'`. Fixed by resolving the scalar/Constexpr/CUstream annotations to
+   real classes on `type(fn).__call__.__annotations__` BEFORE compile (the kernel is a
+   `_DynamicMoELaunch` **instance**, not a plain function).
+3. `_dynamic_task_geometry` real signature is `(state_E, n, routed_rows, *, tile_m, tile_n)`, not
+   the guessed kwargs — geom dump fixed; now emits physical_tiles/max_tasks/rows_padded/cols_pad_k.
+4. Added a live-CUDA-context init before build so the baked `mac` Constexpr comes from the real
+   `get_max_active_clusters(1)` probe (=48=sm_count on GB10, so no functional change here, but robust).
+
+**Export (P3).** `CUTE_DSL_ARCH=sm_121a PYTHONPATH=/opt/flashinfer python3 b12x_export.py
+--out /work/b12x_aot --name b12x_dyn_0 --max-tokens 1024` → **`b12x_dyn_0.{h,o}` + `.geom.txt`**.
+Geometry @ cap=1024: **physical_tiles=319, max_tasks=1276, rows_padded=40832, cols_pad_k=128**.
+
+**Shim freeze (P3) — MUCH simpler than predicted.** The generated `.h` renders every fixed-shape
+tensor arg as a **degenerate `{ void *data; }` struct** (all shapes baked constexpr) — there are NO
+stride/offset descriptors to hand-pack; the runbook's "highest-risk memref freeze" evaporated.
+Counts match exactly: **19 `void*` + 16 `{void*data}` structs + 5 int32 + CUstream** into a
+`void*[42]`. The header's `static inline cute_dsl_b12x_dyn_0_wrapper(...)` builds the arg array, so
+the shim calls it with typed args. Two corrections vs the stub: `packed_a`/`packed_a_storage` are
+the **same** buffer (as are `sfa`/`scale_storage`) passed twice; **all** control buffers are zeroed
+once at alloc (JIT uses `torch.zeros`, workspace reused across calls), not just the 2 barriers.
+Full runtime-arg mapping is `moe_dispatch.py:1781-1824`. The 5 int32: only `num_tokens` varies;
+`max_rows==rows_padded==physical_tiles*128`, `max_tasks`/`max_phys_tiles` are capacity constants.
+
+**Relink (P8) + native launch-smoke (P9-lite).** `g++ -shared b12x_shim.cpp b12x_dyn_0.o
+-o libatlasb12x.so` with `-L$(aot_config --libdir) -lcute_dsl_runtime -L<cuda-13.2 sbsa> -lcudart`.
+All 6 `atlas_b12x_*` symbols export. A ctypes launch-smoke (Holo-shaped device buffers, T=64) →
+**`ret=0`, no CUDA error, no deadlock, output 99.99% written** — the marshalling/ABI/workspace are
+correct. (Numerics not checked here — random fp4 weights → non-finite; that's Phase 7.)
+
+**Artifacts committed in this dir:** `b12x_dyn_0.h` (frozen SSOT), `b12x_dyn_0.geom.txt`,
+`b12x_dyn_0.o`, `libatlasb12x.so` (aarch64 sm_121a; regenerable via the runbook). Also need
+`libcute_dsl_runtime.so` (39MB, from cutlass-dsl) + cudart beside it at deploy.
+
+**NOT a P0 blocker anymore:** `proof_sfb_atom.py` stays non-runnable (unchanged) — the SFB
+go/no-go is deferred into the Phase-7 end-to-end A/B (functional P0), which decides ConcatReuse vs
+RebuildFromRaw. **REMAINING: P10 rebuild Atlas → P11 correctness A/B + needle gate → P12 perf.**
+These need the Holo-35B model + serve harness (a separate chunk).

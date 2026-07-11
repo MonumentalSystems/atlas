@@ -24,18 +24,61 @@ import torch
 
 # ── Strip --enable-tvm-ffi from the cute compile flags (keep --opt-level 2) and capture
 #    the compiled executor, exactly as gdn_export.py wraps cached_compile. ────────────
+import cutlass  # noqa: E402
 import cutlass.cute as cute  # noqa: E402
 
 _orig_compile = cute.compile
 _captured = []
 
 
+def _resolve_str_annotations(fn):
+    """moe_dispatch.py declares `from __future__ import annotations`, so the kernel
+    function's `__annotations__` are STRINGS. The CuTe C-header generator dispatches
+    numeric scalar args via `isinstance(annotation, NumericMeta)` and the stream via
+    `issubclass(annotation, cuda.CUstream)` — both fail on strings, so the exported
+    wrapper would omit / reject the 5 runtime Int32s (num_tokens, max_rows, rows_padded,
+    max_tasks, max_phys_tiles) and the CUstream. Rewrite those specific annotations back
+    to real classes BEFORE compile (the C-header args are frozen during compile, not at
+    export). Pointer/Tensor args dispatch by runtime value type, so leave them as strings.
+    """
+    import cuda.bindings.driver as _cuda_aot  # noqa: PLC0415
+
+    resolve = {
+        "cutlass.Int32": cutlass.Int32,
+        "cutlass.Constexpr": cutlass.Constexpr,
+        "_cuda_aot.CUstream": _cuda_aot.CUstream,
+    }
+    # The dynamic prefill kernel is a `_DynamicMoELaunch` INSTANCE (a callable object),
+    # not a plain function — its runtime signature (what inspect.getfullargspec reads) is
+    # `type(fn).__call__.__annotations__`. Resolve both the object's own annotations and
+    # its `__call__` method's, whichever carries the string annotations.
+    dicts = []
+    own = getattr(fn, "__annotations__", None)
+    if isinstance(own, dict):
+        dicts.append(own)
+    call = getattr(type(fn), "__call__", None)
+    call_ann = getattr(call, "__annotations__", None)
+    if isinstance(call_ann, dict):
+        dicts.append(call_ann)
+    for ann in dicts:
+        for name, a in list(ann.items()):
+            if isinstance(a, str) and a in resolve:
+                ann[name] = resolve[a]
+
+
 def _wrap_compile(*a, **k):
     # Drop the tvm-ffi flag the AOT path can't honour on these kernels (export_to_c
     # renders a plain C shim). Everything else (incl. --opt-level 2) is preserved.
+    # moe_dispatch passes options as a SPACE-SEPARATED STRING ("--opt-level 2
+    # --enable-tvm-ffi"), not a list — strip the flag from either form or the compile
+    # yields a TVMFFIJitCompiledFunction whose export_to_c has the wrong signature.
     opts = k.get("options")
-    if isinstance(opts, (list, tuple)):
+    if isinstance(opts, str):
+        k["options"] = opts.replace("--enable-tvm-ffi", "").replace("  ", " ").strip()
+    elif isinstance(opts, (list, tuple)):
         k["options"] = [o for o in opts if "tvm-ffi" not in str(o)]
+    if a:
+        _resolve_str_annotations(a[0])  # the kernel fn being compiled
     cf = _orig_compile(*a, **k)
     _captured.append(cf)
     return cf
@@ -56,6 +99,15 @@ def main():
 
     E, H, I, TOPK = 256, 2048, 512, 8
     assert E == 256, f"Holo-3.1-35B-A3B is E=256 (brief's E=512 is WRONG); got {E}"
+
+    # Establish a live CUDA driver context BEFORE building the kernel so the baked
+    # `mac` Constexpr comes from the real get_max_active_clusters(1) probe. Without a
+    # current context the DSL silently falls back to sm_count (CUDA_ERROR_INVALID_CONTEXT);
+    # on GB10 that equals the probe (48) but this persistent kernel has grid-wide barriers,
+    # so an over-large mac elsewhere could deadlock — don't rely on the coincidence.
+    if torch.cuda.is_available():
+        torch.zeros(1, device="cuda")
+        torch.cuda.synchronize()
 
     from flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_dispatch import _get_dynamic_kernel
 
@@ -91,18 +143,39 @@ def main():
     cf.export_to_c(args.out, args.name, args.name)
     print(f"EXPORTED -> {args.out}/{args.name}.{{h,o}}")
 
-    # Dump the frozen task geometry ints for the chosen capacity + the memref/arg order
-    # (gdn_dump_meta.py pattern) so b12x_shim.cpp can be FROZEN against the real .h at P3.
+    # Dump the frozen workspace geometry for the chosen capacity so b12x_shim.cpp can size
+    # its cached workspace to match allocate_sm120_dynamic_workspace exactly. The kernel
+    # takes num_tokens/max_rows/rows_padded/max_tasks/max_phys_tiles as RUNTIME Int32; only
+    # num_tokens varies per call — the other four are these capacity constants.
+    # Signature: _dynamic_task_geometry(state_E, n, routed_rows, *, tile_m, tile_n).
     try:
         from flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_dispatch import (
+            _NVFP4_BLOCK_SIZE,
+            _align_up,
             _dynamic_task_geometry,
+            _level_tile_m,
+            _level_tile_n,
         )
 
-        geo = _dynamic_task_geometry(E=E, k=H, n=I, num_topk=TOPK, max_tokens=args.max_tokens)
+        routed_rows = args.max_tokens * TOPK  # each token routes to top_k experts
+        tile_m = _level_tile_m("fp4")
+        tile_n = _level_tile_n("fp4")
+        physical_tiles, gate_tile_cnt, max_tasks = _dynamic_task_geometry(
+            E, I, routed_rows, tile_m=tile_m, tile_n=tile_n
+        )
+        rows_padded = physical_tiles * tile_m
+        cols_pad_k = _align_up(H // _NVFP4_BLOCK_SIZE, 4)
         with open(os.path.join(args.out, f"{args.name}.geom.txt"), "w") as fh:
             fh.write(f"E={E} H={H} I={I} top_k={TOPK} max_tokens={args.max_tokens}\n")
-            fh.write(repr(geo) + "\n")
-        print(f"geometry dumped -> {args.name}.geom.txt")
+            fh.write(
+                f"routed_rows={routed_rows} tile_m={tile_m} tile_n={tile_n} "
+                f"physical_tiles={physical_tiles} gate_tile_cnt={gate_tile_cnt} "
+                f"max_tasks={max_tasks} rows_padded={rows_padded} cols_pad_k={cols_pad_k}\n"
+            )
+        print(
+            f"geometry: physical_tiles={physical_tiles} max_tasks={max_tasks} "
+            f"rows_padded={rows_padded} cols_pad_k={cols_pad_k} -> {args.name}.geom.txt"
+        )
     except Exception as e:  # noqa: BLE001
         print(f"[warn] geometry dump skipped: {str(e)[:200]}")
 
