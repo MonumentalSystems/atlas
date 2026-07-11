@@ -83,6 +83,9 @@ pub mod layout;
 pub mod backend;
 #[cfg(feature = "cuda")]
 pub mod bench;
+// T1 write-back cache composite (wraps any StorageBackend). cuda but not verbs.
+#[cfg(feature = "cuda")]
+pub mod cascade_backend;
 #[cfg(feature = "cuda")]
 pub mod expert_arena;
 #[cfg(feature = "cuda")]
