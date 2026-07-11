@@ -39,6 +39,7 @@ pub mod model_dims;
 pub mod predictor_ref;
 pub mod projection;
 pub mod rdma_snapshot;
+pub mod snapshot_swap;
 
 // `ModelDims` is a plain POD struct (no GPU state) that
 // `spark-model`'s public surface threads through every layer's
