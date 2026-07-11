@@ -6,14 +6,12 @@
 //! atlas-rdma: the one-sided RDMA verbs primitive shared by every Atlas RDMA
 //! tier (experts / KV overflow / weight staging / LoRA / SSM snapshots).
 //!
-//! Step A of the RailSet extraction (tiered-cache consolidation, chunk 2):
-//! this crate OWNS what used to be `spark-storage/src/rdma_verbs.rs` and
-//! `spark-storage/src/rdma_shim.c`, moved verbatim — the shim's QP/RTR/RTS
-//! attribute constants are interop-visible to the live gx10 peer running an
-//! older binary, so the .c file is byte-identical. No client refactor here.
+//! The C shim's QP/RTR/RTS attribute constants and the handshake wire codecs
+//! are a frozen external contract: they must stay byte-compatible with already
+//! deployed peers, so the shim is treated as byte-stable.
 //!
-//! CUDA-free by hard constraint (see Cargo.toml): both the non-cuda peer
-//! daemons (`atlas-expert-pack`) and the cuda client tiers link this.
+//! CUDA-free by hard constraint (see Cargo.toml): both the non-CUDA peer
+//! daemons and the CUDA client tiers link this.
 //!
 //! `cfg(atlas_rdma_verbs)` is decided by build.rs — ON when `target_os` is not
 //! macOS and `ATLAS_SKIP_BUILD`/`SKIP_ATLAS_BUILD` is unset (there is no
@@ -28,7 +26,7 @@ pub mod env;
 /// tuples, no `Verbs`) — un-gated so the transcript goldens run everywhere.
 pub mod handshake;
 /// The golden handshake wire codecs (both server-param dialects, rails
-/// framing, mode/status bytes) — un-gated, frozen vs the live gx10 peer.
+/// framing, mode/status bytes) — un-gated, a frozen external wire contract.
 pub mod wire;
 
 /// Safe-ish wrapper over the C shim: one [`verbs::Verbs`] == one RC QP.
@@ -36,8 +34,8 @@ pub mod wire;
 #[cfg(atlas_rdma_verbs)]
 pub mod verbs;
 
-/// RailSet — the one client-side rail bring-up (Step B of the extraction).
-/// Gated with the shim: it creates and connects real QPs.
+/// RailSet — the one client-side rail bring-up. Gated with the shim: it
+/// creates and connects real QPs.
 #[cfg(atlas_rdma_verbs)]
 pub mod railset;
 
