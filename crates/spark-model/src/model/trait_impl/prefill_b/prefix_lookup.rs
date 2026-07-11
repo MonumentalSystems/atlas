@@ -31,7 +31,8 @@ impl TransformerModel {
                 if self.tokens_have_vision_pad(tokens) || seq.collect_prompt_logprobs.is_some() {
                     spark_runtime::prefix_cache::PrefixMatch::empty()
                 } else {
-                    self.prefix_cache.lookup(tokens, bs, seq.session_hash)
+                    self.prefix_cache
+                        .lookup(tokens, bs, seq.session_hash, seq.adapter_id)
                 };
             // F83 (2026-04-30): on EP>1, head and worker have
             // independent local prefix caches whose match counts can
@@ -58,11 +59,14 @@ impl TransformerModel {
                 let local = prefix_match.matched_tokens as u32;
                 let agreed = self.ep_min_u32(local)? as usize;
                 if agreed < prefix_match.matched_tokens {
-                    self.prefix_cache.release(tokens, bs);
+                    self.prefix_cache.release(tokens, bs, seq.adapter_id);
                     if agreed > 0 {
-                        prefix_match =
-                            self.prefix_cache
-                                .lookup(&tokens[..agreed], bs, seq.session_hash);
+                        prefix_match = self.prefix_cache.lookup(
+                            &tokens[..agreed],
+                            bs,
+                            seq.session_hash,
+                            seq.adapter_id,
+                        );
                     } else {
                         prefix_match = spark_runtime::prefix_cache::PrefixMatch::empty();
                     }

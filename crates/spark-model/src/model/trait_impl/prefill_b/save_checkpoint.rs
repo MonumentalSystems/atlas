@@ -149,6 +149,7 @@ impl TransformerModel {
             boundary_disk,
             bs,
             end_token,
+            seq.adapter_id,
         );
         super::super::super::block_mgmt::cache_acquires_disk_refs(&acquired);
         if let Some(old) = self.prefix_cache.insert_intermediate_snapshot(
@@ -159,6 +160,7 @@ impl TransformerModel {
             snap_id,
             seq.session_hash,
             end_token,
+            seq.adapter_id,
         ) {
             self.ssm_snapshots.free(old);
         }

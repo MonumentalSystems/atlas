@@ -76,6 +76,7 @@ impl TransformerModel {
                 &seq.disk_block_ids,
                 bs,
                 seq.cached_prefix_tokens,
+                seq.adapter_id,
             );
             super::super::block_mgmt::cache_acquires_disk_refs(&acquired);
         }
@@ -146,6 +147,7 @@ impl TransformerModel {
                         snap_id,
                         seq.session_hash,
                         seq.cached_prefix_tokens,
+                        seq.adapter_id,
                     );
                     super::super::block_mgmt::cache_acquires_disk_refs(&acquired);
                     if let Some(old) = displaced {
@@ -159,6 +161,7 @@ impl TransformerModel {
                     &seq.disk_block_ids,
                     bs,
                     seq.cached_prefix_tokens,
+                    seq.adapter_id,
                 );
                 super::super::block_mgmt::cache_acquires_disk_refs(&acquired);
             }
@@ -169,6 +172,7 @@ impl TransformerModel {
                 &seq.disk_block_ids,
                 bs,
                 seq.cached_prefix_tokens,
+                seq.adapter_id,
             );
             super::super::block_mgmt::cache_acquires_disk_refs(&acquired);
         }
@@ -252,6 +256,7 @@ impl TransformerModel {
                         snap_id,
                         seq.session_hash,
                         seq.cached_prefix_tokens,
+                        seq.adapter_id,
                     );
                     super::super::block_mgmt::cache_acquires_disk_refs(&acquired);
                     if let Some(old) = displaced {
@@ -265,6 +270,7 @@ impl TransformerModel {
                     &seq.disk_block_ids,
                     bs,
                     seq.cached_prefix_tokens,
+                    seq.adapter_id,
                 );
                 super::super::block_mgmt::cache_acquires_disk_refs(&acquired);
             }
@@ -275,6 +281,7 @@ impl TransformerModel {
                 &seq.disk_block_ids,
                 bs,
                 seq.cached_prefix_tokens,
+                seq.adapter_id,
             );
             super::super::block_mgmt::cache_acquires_disk_refs(&acquired);
         }

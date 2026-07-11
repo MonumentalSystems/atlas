@@ -174,6 +174,7 @@ impl TransformerModel {
         // every sequence's first decode step.
         let num_attn_layers = self.config.num_attention_layers();
         Ok(SequenceState {
+            adapter_id: 0,
             tokens: Vec::new(),
             block_table: Vec::new(),
             seq_len: 0,
