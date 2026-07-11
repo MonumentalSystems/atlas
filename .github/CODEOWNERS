@@ -32,6 +32,7 @@ crates/spark-comm/                           @tbraun96 @azeezish @rsafier @SeedS
 
 # Storage / NVMe-backed swap.
 crates/spark-storage/                        @tbraun96 @azeezish @rsafier @SeedSource
+crates/atlas-tier/                           @tbraun96 @azeezish @rsafier @SeedSource
 
 # Build, CI, governance. Belt-and-suspenders: the broad `.github/`
 # pattern catches everything in the tree, and the more specific entries
