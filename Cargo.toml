@@ -86,6 +86,7 @@ atlas-activation = { path = "crates/atlas-activation" }
 atlas-embed = { path = "crates/atlas-embed" }
 atlas-reduce = { path = "crates/atlas-reduce" }
 atlas-kernels = { path = "crates/atlas-kernels" }
+atlas-tier = { path = "crates/atlas-tier" }
 
 # W7: the `[patch.crates-io] xgrammar-rs` entry was removed — Atlas now
 # depends on the pure-Rust `crates/xgrammar` crate directly (no FFI,
