@@ -2100,6 +2100,7 @@ dependencies = [
  "anyhow",
  "atlas-core",
  "atlas-kernels",
+ "atlas-tier",
  "base64 0.22.1",
  "half",
  "image",
