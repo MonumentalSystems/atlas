@@ -17,6 +17,7 @@ metal = []
 [dependencies]
 cufile-sys = { path = "../cufile-sys" }
 atlas-tier = { workspace = true }
+atlas-rdma = { workspace = true }
 anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
