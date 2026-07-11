@@ -1,0 +1,395 @@
+delta_rule_sm120_f32_out.patch — FP32 GDN output (o_dtype=Float32 direct store).
+
+The GDN output is the fp32 accumulator; the stock kernel truncates it to bf16
+(o_store) before the bf16 gated RMS norm — the D1 bf16-truncation loss (avarok
+#248/#290). With o.dtype==float32 the host now selects a DIRECT-STORE variant:
+  * o_store_direct: predicated per-element reg→gmem fp32 stores using the
+    existing tOcO identity coords (StMatrix8x8x16bOp is 16-bit-only, so the
+    smem path cannot carry fp32);
+  * smem_o (16 KB), the o smem layout, the O TMA store atom, and the STORE_O
+    warp's CollectiveStoreTma are all elided under self.o_direct — this freed
+    16 KB is what lets the fp32 KK inverse patch fit under the ~99 KB sm_121a
+    smem cap;
+  * o_pipeline is still created but never used in direct mode (producer and
+    consumer sides are both const-guarded — nobody blocks);
+  * the state path is UNTOUCHED: carried-state bits must be identical between
+    the bf16 and f32 legs (gdn_export_f32.py asserts state max_abs == 0.0 for
+    this patch alone; the f32_inverse patch legitimately changes the state).
+Default behavior (o.dtype == q.dtype) is byte-identical to the unpatched
+kernel: every new code path is const-guarded on self.o_direct.
+
+Apply AFTER delta_rule_sm120_aot_export.patch + delta_rule_sm120_sm121a.patch
+(patch -p1 from /home/ms/flashinfer). Export with gdn_export_f32.py.
+
+--- a/flashinfer/gdn_kernels/delta_rule_dsl/delta_rule_sm120.py
++++ b/flashinfer/gdn_kernels/delta_rule_dsl/delta_rule_sm120.py
+@@ -116,6 +116,7 @@
+         needs_checkpointing: bool,
+         dtype: type[cutlass.Numeric] = cutlass.Float16,
+         acc_dtype: type[cutlass.Numeric] = cutlass.Float32,
++        o_dtype: type[cutlass.Numeric] | None = None,
+     ):
+         self.needs_alpha = needs_alpha
+         self.needs_beta = needs_beta
+@@ -123,6 +124,16 @@
+         self.needs_checkpointing = needs_checkpointing
+         self.dtype = dtype
+         self.acc_dtype = acc_dtype
++        # o_dtype: output tensor element type. Default (None) = same as q/k/v
++        # (fp16/bf16 via smem + TMA store). Float32 selects the DIRECT-STORE
++        # output path: the fp32 accumulator is written straight to gmem from
++        # registers (predicated, per-element), smem_o and the O TMA store are
++        # elided entirely (frees 16 KB smem), and the STORE_O warp idles.
++        # No other value is supported.
++        self.o_dtype = dtype if o_dtype is None else o_dtype
++        if self.o_dtype not in (dtype, cutlass.Float32):
++            raise ValueError(f"o_dtype must be {dtype} or Float32, got {self.o_dtype}")
++        self.o_direct = self.o_dtype == cutlass.Float32
+         self.inverse_dtype = cutlass.Float16
+         self.BLK_Q = 64
+         self.BLK_KV = 64
+@@ -443,6 +454,32 @@
+         cute.copy(o_tiled_copy_r2s, tOrO_cv, tOsO)
+         cute.arch.fence_view_async_shared()
+ 
++    # ─── o_store_direct (o_dtype == Float32) ─────────────────────────────────
++    # Predicated per-element register→gmem store of the fp32 accumulator.
++    # Replaces o_store + smem_o + the O TMA store when self.o_direct: the fp32
++    # acc never round-trips through bf16 (this is the F32-GDN-OUTPUT fix) and
++    # StMatrix8x8x16bOp cannot store 32-bit elements anyway. Uncoalesced but
++    # tiny vs the block's GEMMs (D*BLK_Q*4 B per block per head).
++
++    @cute.jit
++    def o_store_direct(
++        self,
++        tOrO: cute.Tensor,  # fp32 acc fragment, C-partition of o1_tiled_mma
++        tOcO: cute.Tensor,  # identity coords (d_idx, tok_q) for the fragment
++        gO_blk: cute.Tensor,  # (D, BLK_Q) fp32 gmem slice at this block
++        is_final_block: bool,
++        B: cutlass.Int32,  # valid token count in this block (tail masking)
++    ):
++        if cutlass.const_expr(is_final_block):
++            for i in cutlass.range_constexpr(cute.size(tOrO)):
++                d_idx, tok_q = tOcO[i]
++                if tok_q < B:
++                    gO_blk[d_idx, tok_q] = self.o_dtype(tOrO[i])
++        else:
++            for i in cutlass.range_constexpr(cute.size(tOrO)):
++                d_idx, tok_q = tOcO[i]
++                gO_blk[d_idx, tok_q] = self.o_dtype(tOrO[i])
++
+     # ─── TMA load helpers ────────────────────────────────────────────────────
+ 
+     @cute.jit
+@@ -706,6 +743,11 @@
+         scale: cutlass.Float32,
+         # WG role: MathWarpGroupRole.KK or MathWarpGroupRole.QK.
+         wg_idx: cutlass.Int32,
++        # Direct-store output (self.o_direct): per-head gmem slice (D, total)
++        # and this block's first-token offset. Unused (const-guarded) when the
++        # smem+TMA output path is active.
++        gO_head: cute.Tensor,
++        blk_tok: cutlass.Int32,
+     ):
+         tidx, _, _ = cute.arch.thread_idx()
+         thread_idx = tidx - cutlass.Int32(128)  # relative to compute threads
+@@ -850,13 +892,14 @@
+         tOrQK_cv = o2_thr_copy_B.retile(tOrQK)
+         tOsQK = o2_thr_copy_B.partition_S(sQK)
+ 
+-        # ── O store (R→S STSM) ────────────────────────────────────────────────
+-        o_stsm = cute.make_copy_atom(
+-            warp.StMatrix8x8x16bOp(transpose=True, num_matrices=4), self.dtype
+-        )
+-        o_tiled_copy_r2s = cute.make_tiled_copy_C(o_stsm, o1_tiled_mma)
+-        o_thr_copy_r2s = o_tiled_copy_r2s.get_slice(thread_idx)
+-        tOsO = o_thr_copy_r2s.partition_D(sO)
++        # ── O store (R→S STSM) — smem path only (o_direct stores from regs) ──
++        if cutlass.const_expr(not self.o_direct):
++            o_stsm = cute.make_copy_atom(
++                warp.StMatrix8x8x16bOp(transpose=True, num_matrices=4), self.dtype
++            )
++            o_tiled_copy_r2s = cute.make_tiled_copy_C(o_stsm, o1_tiled_mma)
++            o_thr_copy_r2s = o_tiled_copy_r2s.get_slice(thread_idx)
++            tOsO = o_thr_copy_r2s.partition_D(sO)
+ 
+         # ── Coordinate tensors for masking / alpha/beta indexing ──────────────
+         cMqk = cute.make_identity_tensor((blk_q, blk_kv))
+@@ -975,16 +1018,20 @@
+         cute.gemm(o2_tiled_mma, tOrO, tOrNewV, tOrQK, tOrO)
+         self._math_order_notify(wg_idx)
+ 
+-        # ── O store to smem ───────────────────────────────────────────────────
+-        o_pipeline.producer_acquire(o_producer_state)
+-        self.o_store(
+-            tOrO,
+-            tOsO[None, None, None, o_stage],
+-            o_tiled_copy_r2s,
+-            o_thr_copy_r2s,
+-        )
+-        o_pipeline.producer_commit(o_producer_state)
+-        o_producer_state.advance()
++        # ── O store: direct fp32 reg→gmem, or bf16 smem + TMA handoff ────────
++        if cutlass.const_expr(self.o_direct):
++            gO_blk = cute.domain_offset((cutlass.Int32(0), blk_tok), gO_head)
++            self.o_store_direct(tOrO, tOcO, gO_blk, is_final_block, B)
++        else:
++            o_pipeline.producer_acquire(o_producer_state)
++            self.o_store(
++                tOrO,
++                tOsO[None, None, None, o_stage],
++                o_tiled_copy_r2s,
++                o_thr_copy_r2s,
++            )
++            o_pipeline.producer_commit(o_producer_state)
++            o_producer_state.advance()
+ 
+         # ── KV state update ───────────────────────────────────────────────────
+         block_coeff = cutlass.Float32(1.0)
+@@ -1170,6 +1217,7 @@
+         g_init_state: cute.Tensor,
+         g_state_checkpoints: cute.Tensor,
+         checkpoint_cu_starts: cute.Tensor,
++        g_o_direct: cute.Tensor,  # (D, total, num_o_heads); stored to iff o_direct
+         work_desc: WorkDesc,
+         scale: cutlass.Float32,
+         wg_idx: cutlass.Int32,
+@@ -1217,6 +1265,9 @@
+             (self.D, self.D, num_sab_heads, num_seqs), order=(0, 1, 2, 3)
+         )
+         o_head_idx = work_desc.o_head_idx(num_q_heads, num_v_heads)
++        # Per-head output slice for the direct-store path (trace-time layout
++        # slicing only — no memory is touched unless o_direct stores to it).
++        gO_head = g_o_direct[None, None, o_head_idx]
+         mState = cute.make_tensor(g_state.iterator, state_layout)
+         gStateKV = mState[None, None, o_head_idx, work_desc.seq_idx]
+         if cutlass.const_expr(self.needs_init_state):
+@@ -1265,6 +1316,8 @@
+                 tKVrKV,
+                 scale,
+                 wg_idx,
++                gO_head,
++                work_desc.tok_offset,
+             )
+         else:
+             (
+@@ -1304,6 +1357,8 @@
+                 tKVrKV,
+                 scale,
+                 wg_idx,
++                gO_head,
++                work_desc.tok_offset,
+             )
+         self.maybe_store_checkpoint(
+             tKVrKV,
+@@ -1359,6 +1414,8 @@
+                 tKVrKV,
+                 scale,
+                 wg_idx,
++                gO_head,
++                work_desc.tok_offset + blk * cutlass.Int32(self.BLK_KV),
+             )
+             self.maybe_store_checkpoint(
+                 tKVrKV,
+@@ -1414,6 +1471,8 @@
+                 tKVrKV,
+                 scale,
+                 wg_idx,
++                gO_head,
++                work_desc.tok_offset + last_blk * cutlass.Int32(self.BLK_KV),
+             )
+             self.maybe_store_checkpoint(
+                 tKVrKV,
+@@ -1491,16 +1550,22 @@
+         v_storage_layout_ds = cute.select(v_storage_layout_sd, [1, 0, 2])
+         k_smem_layout = cute.slice_(k_storage_layout_ds, (None, None, 0))
+         v_smem_layout = cute.slice_(v_storage_layout_ds, (None, None, 0))
+-        o_smem_layout_atom = warpgroup.make_smem_layout_atom(
+-            warpgroup.SmemLayoutAtomKind.MN_SW32,
+-            self.dtype,
+-        )
+-        o_storage_layout = cute.tile_to_shape(
+-            o_smem_layout_atom,
+-            (self.D, self.BLK_Q, self.o_stage),
+-            order=(1, 0, 2),
+-        )
+-        o_smem_layout = cute.slice_(o_storage_layout, (None, None, 0))
++        if cutlass.const_expr(not self.o_direct):
++            o_smem_layout_atom = warpgroup.make_smem_layout_atom(
++                warpgroup.SmemLayoutAtomKind.MN_SW32,
++                self.dtype,
++            )
++            o_storage_layout = cute.tile_to_shape(
++                o_smem_layout_atom,
++                (self.D, self.BLK_Q, self.o_stage),
++                order=(1, 0, 2),
++            )
++            o_smem_layout = cute.slice_(o_storage_layout, (None, None, 0))
++            o_smem_cosize = cute.cosize(o_storage_layout)
++        else:
++            # Direct-store output: o never touches smem. Keep a token 8-element
++            # smem_o member so the SharedStorage struct shape stays uniform.
++            o_smem_cosize = 8
+ 
+         tma_load_op = cpasync.CopyBulkTensorTileG2SOp()
+         tma_atom_q, tma_tensor_q = cpasync.make_tiled_tma_atom(
+@@ -1513,10 +1578,15 @@
+             tma_load_op, g_v, v_smem_layout, (self.D, self.BLK_KV)
+         )
+ 
+-        tma_store_op = cpasync.CopyBulkTensorTileS2GOp()
+-        tma_atom_o, tma_tensor_o = cpasync.make_tiled_tma_atom(
+-            tma_store_op, g_o, o_smem_layout, (self.D, self.BLK_Q)
+-        )
++        if cutlass.const_expr(not self.o_direct):
++            tma_store_op = cpasync.CopyBulkTensorTileS2GOp()
++            tma_atom_o, tma_tensor_o = cpasync.make_tiled_tma_atom(
++                tma_store_op, g_o, o_smem_layout, (self.D, self.BLK_Q)
++            )
++        else:
++            # No O TMA in direct-store mode; all uses are const-guarded on
++            # self.o_direct (None-for-unused mirrors the g_alpha/g_beta pattern).
++            tma_atom_o, tma_tensor_o = None, None
+ 
+         dtype_bytes = self.dtype.width // 8
+         self.tma_load_q_bytes = cute.size(q_smem_layout) * dtype_bytes
+@@ -1571,7 +1641,7 @@
+                 16,
+             ]
+             smem_o: cute.struct.Align[
+-                cute.struct.MemRange[self.dtype, cute.cosize(o_storage_layout)],
++                cute.struct.MemRange[self.dtype, o_smem_cosize],
+                 128,
+             ]
+             smem_alpha: cute.struct.Align[
+@@ -1598,6 +1668,7 @@
+             tma_tensor_v,
+             tma_atom_o,
+             tma_tensor_o,
++            g_o,
+             g_state,
+             g_init_state,
+             g_state_checkpoints,
+@@ -1633,6 +1704,7 @@
+         tma_tensor_v: cute.Tensor,
+         tma_atom_o: cute.CopyAtom,
+         tma_tensor_o: cute.Tensor,
++        g_o_direct: cute.Tensor,
+         g_state: cute.Tensor,
+         g_init_state: cute.Tensor,
+         g_state_checkpoints: cute.Tensor,
+@@ -1676,7 +1748,8 @@
+             cpasync.prefetch_descriptor(tma_atom_q)
+             cpasync.prefetch_descriptor(tma_atom_k)
+             cpasync.prefetch_descriptor(tma_atom_v)
+-            cpasync.prefetch_descriptor(tma_atom_o)
++            if cutlass.const_expr(not self.o_direct):
++                cpasync.prefetch_descriptor(tma_atom_o)
+ 
+         work_desc = self.get_next_work(
+             cu_seqlens,
+@@ -1747,16 +1820,20 @@
+         kk_opd_ptr = cute.recast_ptr(storage.smem_kk.data_ptr(), dtype=self.dtype)
+         sKK_opd = cute.make_tensor(kk_opd_ptr, kk_layout)
+ 
+-        o_smem_layout_atom = warpgroup.make_smem_layout_atom(
+-            warpgroup.SmemLayoutAtomKind.MN_SW32,
+-            self.dtype,
+-        )
+-        o_layout = cute.tile_to_shape(
+-            o_smem_layout_atom,
+-            (self.D, self.BLK_Q, self.o_stage),
+-            order=(1, 0, 2),
+-        )
+-        sO = storage.smem_o.get_tensor(o_layout.outer, swizzle=o_layout.inner)
++        if cutlass.const_expr(not self.o_direct):
++            o_smem_layout_atom = warpgroup.make_smem_layout_atom(
++                warpgroup.SmemLayoutAtomKind.MN_SW32,
++                self.dtype,
++            )
++            o_layout = cute.tile_to_shape(
++                o_smem_layout_atom,
++                (self.D, self.BLK_Q, self.o_stage),
++                order=(1, 0, 2),
++            )
++            sO = storage.smem_o.get_tensor(o_layout.outer, swizzle=o_layout.inner)
++        else:
++            # Dummy stand-in: every sO use is const-guarded on not self.o_direct.
++            sO = sQK
+         alpha_layout = cute.make_layout(
+             (self.BLK_Q, AlphaProcessor.NUM_CHANNELS, self.alpha_beta_stage)
+         )
+@@ -1846,19 +1923,22 @@
+                     work_desc.v_head_idx(),
+                 )
+             elif ldst_warp_role == LoadStoreWarpRole.STORE_O:
+-                CollectiveStoreTma(self.BLK_Q, self.D).run(
+-                    sO,
+-                    tma_atom_o,
+-                    tma_tensor_o,
+-                    g_tensormaps,
+-                    o_pipeline,
+-                    num_blocks,
+-                    work_desc,
+-                    num_seqs,
+-                    self.o_stage,
+-                    num_q_heads,
+-                    num_v_heads,
+-                )
++                # Direct-store mode: math WGs write o straight to gmem and never
++                # touch o_pipeline — this warp must idle or it waits forever.
++                if cutlass.const_expr(not self.o_direct):
++                    CollectiveStoreTma(self.BLK_Q, self.D).run(
++                        sO,
++                        tma_atom_o,
++                        tma_tensor_o,
++                        g_tensormaps,
++                        o_pipeline,
++                        num_blocks,
++                        work_desc,
++                        num_seqs,
++                        self.o_stage,
++                        num_q_heads,
++                        num_v_heads,
++                    )
+             elif ldst_warp_role == LoadStoreWarpRole.LOAD_BETA:
+                 self.run_load_beta_role(
+                     sBeta,
+@@ -1906,6 +1986,7 @@
+                 g_init_state,
+                 g_state_checkpoints,
+                 checkpoint_cu_starts,
++                g_o_direct,
+                 work_desc,
+                 scale,
+                 wg_idx,
+@@ -1967,9 +2048,13 @@
+     if kernel_dtype is None:
+         raise RuntimeError(f"DSL kernel only supports fp16/bf16 inputs, got {q.dtype}")
+ 
+-    if k.dtype != q.dtype or v.dtype != q.dtype or o.dtype != q.dtype:
++    # o may be float32 (direct-store F32-output path: no bf16 truncation of the
++    # GDN output); otherwise it must match q/k/v (smem + TMA store path).
++    o_is_f32 = o.dtype == torch.float32
++    if k.dtype != q.dtype or v.dtype != q.dtype or (o.dtype != q.dtype and not o_is_f32):
+         raise RuntimeError(
+-            f"q/k/v/o dtypes must match, got {q.dtype}, {k.dtype}, {v.dtype}, {o.dtype}"
++            f"q/k/v dtypes must match and o must match or be float32, "
++            f"got {q.dtype}, {k.dtype}, {v.dtype}, {o.dtype}"
+         )
+     if alpha is not None and alpha.dtype != torch.float32:
+         raise RuntimeError(f"alpha must have dtype torch.float32, got {alpha.dtype}")
+@@ -2069,7 +2154,12 @@
+     cu_cute = from_dlpack(cu_seqlens, assumed_align=8).mark_layout_dynamic()
+ 
+     delta_rule_kernel = _FullyFusedDeltaRuleSm120(
+-        needs_alpha, needs_beta, needs_init_state, needs_checkpointing, kernel_dtype
++        needs_alpha,
++        needs_beta,
++        needs_init_state,
++        needs_checkpointing,
++        kernel_dtype,
++        o_dtype=cutlass.Float32 if o_is_f32 else None,
+     )
+ 
+     kernel_args = (

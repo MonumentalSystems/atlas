@@ -1103,6 +1103,93 @@ extern "C" __global__ void gated_rms_norm_prefill(
     }
 }
 
+// F32-input variant of gated_rms_norm_prefill: reads the GDN output in FP32
+// (FlashInfer F32-output path — the recurrence→gated-norm handoff skips the
+// BF16 truncation, avarok #248/#290). Same 2D (head, token) grid and argument
+// order as gated_rms_norm_prefill; only `input` changes type. Gate/weight stay
+// BF16, output stays BF16 (feeds the BF16 out_proj GEMM). `input_token_stride`
+// is in ELEMENTS and is shared by input (FP32) and output (BF16), exactly like
+// the BF16 kernel — both are [N, value_dim] row-major.
+//
+// Grid: (heads_per_token, num_actual_tokens, 1)
+// Block: (min(head_dim, 1024), 1, 1)
+extern "C" __global__ void gated_rms_norm_prefill_f32_input(
+    const float* __restrict__ input,           // F32 GDN output base
+    const __nv_bfloat16* __restrict__ gate,    // Z gate base
+    const __nv_bfloat16* __restrict__ weight,  // [head_dim]
+    __nv_bfloat16* __restrict__ output,         // normed output base (BF16)
+    unsigned int head_dim,
+    float eps,
+    unsigned int input_token_stride,            // elements between actual tokens in input/output
+    unsigned int gate_token_stride              // BF16 elements between actual tokens in gate
+) {
+    unsigned int head = blockIdx.x;
+    unsigned int token = blockIdx.y;
+    unsigned int tid = threadIdx.x;
+
+    const float* x = input + (unsigned long long)token * input_token_stride + head * head_dim;
+    const __nv_bfloat16* g = gate + (unsigned long long)token * gate_token_stride + head * head_dim;
+    __nv_bfloat16* out = output + (unsigned long long)token * input_token_stride + head * head_dim;
+
+    // Pass 1: sum of squares — direct FP32 reads.
+    float sum_sq = 0.0f;
+    for (unsigned int i = tid; i < head_dim; i += blockDim.x) {
+        float f = x[i];
+        sum_sq += f * f;
+    }
+
+    sum_sq = warp_reduce_sum(sum_sq);
+
+    __shared__ float warp_sums[32];
+    unsigned int warp_id = tid / 32;
+    unsigned int lane_id = tid % 32;
+
+    if (lane_id == 0) warp_sums[warp_id] = sum_sq;
+    __syncthreads();
+
+    if (warp_id == 0) {
+        float val = (lane_id < (blockDim.x + 31) / 32) ? warp_sums[lane_id] : 0.0f;
+        val = warp_reduce_sum(val);
+        if (lane_id == 0) warp_sums[0] = val;
+    }
+    __syncthreads();
+
+    float rms = rsqrtf(warp_sums[0] / (float)head_dim + eps);
+
+    // Pass 2: normalize + SiLU gate (re-read FP32 from L1), 4-wide gate/weight/out.
+    const unsigned long long* g64 = (const unsigned long long*)g;
+    const unsigned long long* w64 = (const unsigned long long*)weight;
+    unsigned long long* out64 = (unsigned long long*)out;
+
+    const unsigned int quad_size = head_dim / 4;
+    for (unsigned int i = tid; i < quad_size; i += blockDim.x) {
+        unsigned int base = i * 4;
+        float f0 = x[base];
+        float f1 = x[base + 1];
+        float f2 = x[base + 2];
+        float f3 = x[base + 3];
+
+        unsigned long long wv = w64[i];
+        float w0, w1, w2, w3;
+        unpack_bf16x2((unsigned int)wv, w0, w1);
+        unpack_bf16x2((unsigned int)(wv >> 32), w2, w3);
+
+        unsigned long long gv = g64[i];
+        float g0, g1, g2, g3;
+        unpack_bf16x2((unsigned int)gv, g0, g1);
+        unpack_bf16x2((unsigned int)(gv >> 32), g2, g3);
+
+        float s0 = g0 / (1.0f + expf(-g0));
+        float s1 = g1 / (1.0f + expf(-g1));
+        float s2 = g2 / (1.0f + expf(-g2));
+        float s3 = g3 / (1.0f + expf(-g3));
+
+        unsigned int lo = pack_bf16x2(f0 * rms * w0 * s0, f1 * rms * w1 * s1);
+        unsigned int hi = pack_bf16x2(f2 * rms * w2 * s2, f3 * rms * w3 * s3);
+        out64[i] = ((unsigned long long)hi << 32) | (unsigned long long)lo;
+    }
+}
+
 // L2 Normalization (in-place): x[i] = x[i] / sqrt(sum(x^2) + eps)
 //
 // Used for Q/K normalization in Gated Delta Net (GDN) attention.

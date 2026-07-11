@@ -1,0 +1,27 @@
+delta_rule_sm120_sm121a.patch — GB10 (sm_121a) arch retarget for the AOT export.
+
+Recreates the local gx10 edit the shipped libatlasgdn.so was built with (the
+.so's embedded compile line is "-arch sm_121a"; the .bak_sm121 noted in
+gdn_export_f32.py was reverted). ONE line: the explicit GPUArch compile option.
+custom_compile_cache.py needs NO change: with "sm_121a" the option no longer
+matches _needs_sm120a_tma_patch, so the sm_120a PTX TMA rewrite + forced
+CU_TARGET_COMPUTE_120A JIT loader are bypassed — the June-30 export ran the
+kernel bit-exactly on gx10 through exactly this clean path.
+
+Apply order (from /home/ms/flashinfer, pristine checkout):
+  1. patch flashinfer/gdn_kernels/delta_rule_dsl/delta_rule_sm120.py \
+       < delta_rule_sm120_aot_export.patch
+  2. patch -p1 < delta_rule_sm120_sm121a.patch     (this file)
+  3. patch -p1 < delta_rule_sm120_f32_out.patch    (variant A + B)
+  4. patch -p1 < delta_rule_sm120_f32_inverse.patch (variant B only)
+
+--- a/flashinfer/gdn_kernels/delta_rule_dsl/delta_rule_sm120.py
++++ b/flashinfer/gdn_kernels/delta_rule_dsl/delta_rule_sm120.py
+@@ -2099,6 +2099,6 @@
+     compiled_delta_rule_kernel = cached_compile(
+         delta_rule_kernel,
+         *kernel_args,
+-        compile_options=(cute.GPUArch("sm_120a"),),
++        compile_options=(cute.GPUArch("sm_121a"),),
+     )
+     compiled_delta_rule_kernel(*kernel_args)

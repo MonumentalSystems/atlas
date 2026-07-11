@@ -211,4 +211,41 @@ pub fn gated_rms_norm_prefill(
         .launch(stream)
 }
 
+/// F32-input batched gated RMS norm for prefill (FlashInfer F32 GDN-output
+/// path). Identical geometry/arguments to [`gated_rms_norm_prefill`]; `input`
+/// points to FP32 `[num_actual_tokens, value_dim]` (token stride is in
+/// elements, shared with the BF16 output — same as the BF16 kernel).
+///
+/// Grid: (heads_per_token, num_actual_tokens, 1)
+/// Block: (min(head_dim, 1024), 1, 1)
+#[allow(clippy::too_many_arguments)]
+pub fn gated_rms_norm_prefill_f32_input(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    input: DevicePtr,
+    gate: DevicePtr,
+    weight: &DenseWeight,
+    output: DevicePtr,
+    heads_per_token: u32,
+    head_dim: u32,
+    eps: f32,
+    num_actual_tokens: u32,
+    input_token_stride: u32,
+    gate_token_stride: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([heads_per_token, num_actual_tokens, 1])
+        .block([head_dim.min(1024), 1, 1])
+        .arg_ptr(input)
+        .arg_ptr(gate)
+        .arg_ptr(weight.weight)
+        .arg_ptr(output)
+        .arg_u32(head_dim)
+        .arg_f32(eps)
+        .arg_u32(input_token_stride)
+        .arg_u32(gate_token_stride)
+        .launch(stream)
+}
+
 // ── GEMM ───────────────────────────────────────────────────────────

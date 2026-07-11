@@ -107,6 +107,11 @@ impl Qwen3SsmLayer {
         // ops::gdn_flashinfer). FLA path below is the fallback when the flag/lib is absent.
         if !ctx.gdn_exact_replay && kd == 128 && vd == 128 && ops::gdn_flashinfer::available() {
             let scale = 1.0f32 / (kd as f32).sqrt();
+            // out_f32=false: gdn_bufs.output is the dedicated BF16 full-sequence
+            // buffer and phase3's gated norm reads it as BF16. The two-phase
+            // path only serves arena-fitting prompts (≤ max_batch_tokens), so
+            // the long-context F32-output lever (trait_prefill_recur.rs) does
+            // not apply here.
             return ops::gdn_flashinfer::flashinfer_gdn_prefill(
                 ctx.gpu,
                 gdn_bufs.qkv,
@@ -122,6 +127,7 @@ impl Qwen3SsmLayer {
                 conv_dim as u32,
                 gb_stride,
                 1,
+                false,
                 stream,
             );
         }
