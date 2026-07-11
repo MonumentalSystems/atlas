@@ -229,6 +229,27 @@ Requires reference-IO `.bin` files in the dir (raw little-endian): `ref_x_bf16.b
 
 ---
 
+## SESSION 2026-07-11 — Phases 0–5 DONE + de-risked on-ramp for 6–8
+
+Phases 0–5 executed & validated on dgx-00 GB10 (details in `3rdparty_patches/b12x_aot/STATUS.md`
+results log). Everything for phases 6–8 is now located/known:
+- **Env image**: `atlas-gb10:b12x-ready` (16.4GB) — snapshot of the export container with
+  cutlass-dsl 4.4.2 + all seds/patches/deps. The running container is `b12x-export`.
+- **spark binary**: `/atlas/target/release/spark` (release, built from #23; NO Rust changed this
+  session so it already carries the b12x FFI + gate). `spark serve [MODEL] [OPTS]` (HTTP server).
+- **Model**: `/tank/hf/hub/models--Hcompany--Holo-3.1-35B-A3B-NVFP4` (resident-experts NVFP4 —
+  what b12x requires). Mount `/tank` into the serve container.
+- **b12x .so**: `3rdparty_patches/b12x_aot/libatlasb12x.so`. Enable via
+  `ATLAS_HOLO_MOE_B12X=1 ATLAS_B12X_LIB=<abs path to libatlasb12x.so>` and put the cute runtime on
+  the loader path: `LD_LIBRARY_PATH=/usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl/lib:/usr/local/cuda-13.2/targets/sbsa-linux/lib:$LD_LIBRARY_PATH`.
+  On load you should see the `tracing::info` "FlashInfer b12x fused-MoE loaded … max_tokens=1024".
+- **Functional P0 (the SFB go/no-go)**: the FIRST serve with b12x enabled IS the functional P0 —
+  it exercises `b12x_weights.rs`'s repack for the first time. Coherent output ⇒ `ConcatReuse` holds;
+  garbage ⇒ switch `ATLAS_B12X_SFB_STRATEGY=rebuild` and implement the `RebuildFromRaw` swizzle.
+- **Capacity**: shim workspace is sized for `ATLAS_B12X_MAX_TOKENS` (default 1024). Prefills with
+  more routed tokens fall back to grouped (shim returns 2). Bump the env + re-export geometry if a
+  larger prefill chunk is wanted; `--max-prefill-tokens` bounds per-iteration prefill.
+
 ## PHASE 6 — Rebuild Atlas (P10)
 
 **DECISION POINT — build path:** Do NOT use host cargo — it drops CUTLASS + native-fp8 ⇒ wrong numerics (and fails on `-lnccl` unless `--no-default-features --features cuda`).
