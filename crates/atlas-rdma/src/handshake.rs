@@ -37,7 +37,23 @@ pub fn read_rw_server_params<R: Read>(
     peer: &str,
 ) -> Result<Vec<CacheServerParams>> {
     let mut b1 = [0u8; 1];
-    r.read_exact(&mut b1).context("read peer n_rails")?;
+    if let Err(e) = r.read_exact(&mut b1) {
+        // A clean EOF here is the peer REJECTING us, not a transport fault: it
+        // hangs up after logging its own reason (e.g. "paging blade cap") and
+        // the v2 wire has no error frame to carry that reason back. Bare
+        // `read_exact` context yields "failed to fill whole buffer", which
+        // sends operators hunting a network problem that does not exist.
+        if e.kind() == std::io::ErrorKind::UnexpectedEof {
+            bail!(
+                "{peer} closed the connection during the rail handshake without sending rail \
+                 params. The peer REJECTED this client — read ITS log for the reason. Most \
+                 common: the arena this client requested exceeds the peer's --max-blade-gb \
+                 cap (peer logs \"paging blade cap\"); also possible: a blob_bytes/kind \
+                 mismatch against an arena a prior client already fixed."
+            );
+        }
+        return Err(e).context("read peer n_rails");
+    }
     if b1[0] as usize != want {
         bail!("{peer} granted {} rails, wanted {want}", b1[0]);
     }
