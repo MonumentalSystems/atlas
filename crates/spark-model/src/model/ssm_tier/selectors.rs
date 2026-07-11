@@ -5,11 +5,11 @@
 
 use anyhow::{Result, bail};
 
-use super::fingerprint::ModelFingerprint;
-use super::unified::{build_unified_swap, unified_hot_slots};
+use super::fingerprint::{ModelFingerprint, resolve_decode_ns, resolve_swap_ns};
+use super::unified::{TransportSlotArena, build_unified_swap, unified_hot_slots};
 use super::{
-    ArenaSnapshotStore, FileSnapshotArena, MemBlobStore, SnapshotBlobStore, UnifiedSnapshotStore,
-    ssm_tier_unified,
+    ArenaSnapshotStore, FileSnapshotArena, MemBlobStore, PagingSnapshotStore, RdmaSnapshotStore,
+    SnapshotBlobStore, UnifiedSnapshotStore, ssm_tier_unified,
 };
 
 /// Whether the SSM spill tier is engaged (`ATLAS_SSM_TIER`). Default off ⇒
@@ -19,16 +19,108 @@ pub(crate) fn ssm_tier_enabled() -> bool {
 }
 
 /// Build the SSM spill-tier store (called only when `ssm_tier_enabled()`).
-/// Local backends: the unified host-RAM [`UnifiedSnapshotStore`] when
-/// `ATLAS_SSM_TIER_UNIFIED` is set (logging and falling back to host-RAM on a
-/// build error — the tier is optional, never a hard model-init error),
-/// otherwise `MemBlobStore::new(0)` — the byte-identical default. The RDMA arena
-/// (`ATLAS_SSM_RDMA_TIER` / `ATLAS_SSM_SWAP`) binding lands in a follow-up PR.
+/// `ATLAS_SSM_RDMA_TIER=host:port` selects the RDMA arena
+/// ([`RdmaSnapshotStore`] over a peer blade, `ATLAS_SSM_RDMA_ARENA_SLOTS` slots,
+/// default 512); otherwise the host-RAM [`MemBlobStore`]. A connect failure (or
+/// a build without RDMA verbs) LOGS and falls back to host-RAM — the tier is
+/// optional, never a hard model-init error. With `ATLAS_SSM_RDMA_TIER` unset the
+/// result is exactly `MemBlobStore::new(0)` as before ⇒ byte-identical.
+///
+/// `Err` is reserved for CONFIG errors (a bad `ATLAS_SSM_SWAP_NS` override —
+/// PCND fail-fast, resolved BEFORE any connect attempt); connectivity failures
+/// keep the non-fatal fallback chain paging → bounded RDMA → host-RAM.
 pub(crate) fn build_tier_store(
-    _fp: ModelFingerprint,
+    fp: ModelFingerprint,
     blob_bytes: usize,
 ) -> Result<std::sync::Arc<dyn SnapshotBlobStore>> {
     use std::sync::Arc;
+    if let Some(peer) = std::env::var("ATLAS_SSM_RDMA_TIER")
+        .ok()
+        .filter(|s| !s.is_empty())
+    {
+        let slots: usize = std::env::var("ATLAS_SSM_RDMA_ARENA_SLOTS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(512);
+        let arena_bytes = slots as u64 * blob_bytes as u64;
+        // WS-A: ATLAS_SSM_SWAP=1 selects PAGING mode — the peer (started with
+        // --swap-dir) owns residency and backs the RAM arena with an NVMe swap
+        // file, giving infinite depth (never drops) shared across clients. Falls
+        // through to the bounded RDMA store / host-RAM on any connect failure.
+        if std::env::var("ATLAS_SSM_SWAP").ok().as_deref() == Some("1") {
+            // Namespace = ATLAS_SSM_SWAP_NS (explicit u64 override, strict) or
+            // the config-derived model fingerprint, so different models sharing
+            // one peer can never collide. Resolved BEFORE the connect attempt:
+            // a bad override is a config error, not a connectivity error.
+            let namespace = resolve_swap_ns(fp)?;
+            match spark_storage::RdmaSnapshotArena::connect_paging(&peer, arena_bytes, blob_bytes) {
+                Ok(arena) => {
+                    tracing::info!(
+                        "SSM spill tier = RDMA PAGING peer {peer} ({slots}-slot shared RAM cache × \
+                         {blob_bytes} B + NVMe swap = infinite depth; ns={namespace:#x}, model \
+                         fingerprint {:#018x})",
+                        fp.get(),
+                    );
+                    return Ok(Arc::new(PagingSnapshotStore::new(
+                        Box::new(arena),
+                        blob_bytes,
+                        namespace,
+                    )));
+                }
+                Err(e) => tracing::warn!(
+                    "SSM RDMA paging connect to {peer} failed ({e:#}); trying bounded RDMA"
+                ),
+            }
+        }
+        // `connect` errors (and we fall back) both on a real connect failure and
+        // in a build without the RDMA verbs (the stub arena always errors).
+        match spark_storage::RdmaSnapshotArena::connect(&peer, arena_bytes, blob_bytes) {
+            Ok(arena) => {
+                if ssm_tier_unified() {
+                    // §4 fix (the LIVE bug arm): replace the drop-on-full
+                    // fixed-slot allocator with the peer's LRU/never-reject
+                    // Residency, client-side, over the same remote arena — an
+                    // arena-full PUT now LRU-spills the coldest blob to the
+                    // local swap tier instead of silently discarding the spill.
+                    let hot = Box::new(TransportSlotArena {
+                        transport: Box::new(arena),
+                        slot_bytes: blob_bytes,
+                        num_slots: slots,
+                    });
+                    let swap = build_unified_swap(blob_bytes, "marconi-rdma");
+                    match UnifiedSnapshotStore::new(hot, swap, blob_bytes) {
+                        Ok(s) => {
+                            tracing::info!(
+                                "SSM spill tier = UNIFIED residency over RDMA peer {peer} \
+                                 ({slots} hot slots × {blob_bytes} B, LRU spill, never rejects)"
+                            );
+                            return Ok(Arc::new(s));
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "SSM unified residency init failed ({e:#}); \
+                                 falling back to host-RAM"
+                            );
+                            return Ok(Arc::new(MemBlobStore::new(0)));
+                        }
+                    }
+                }
+                tracing::info!(
+                    "SSM spill tier = RDMA peer {peer} ({slots} slots × {blob_bytes} B = \
+                     {:.2} GiB arena)",
+                    arena_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+                );
+                return Ok(Arc::new(RdmaSnapshotStore::new(
+                    Box::new(arena),
+                    blob_bytes,
+                    slots,
+                )));
+            }
+            Err(e) => tracing::warn!(
+                "SSM RDMA tier connect to {peer} failed ({e:#}); falling back to host-RAM"
+            ),
+        }
+    }
     if ssm_tier_unified() {
         // §4 fix (host-RAM arm): one policy core instead of the FIFO
         // MemBlobStore — a bounded LRU hot arena that spills (never rejects)
@@ -64,11 +156,12 @@ pub(crate) fn build_tier_store(
 /// Selection (`ATLAS_SSM_DECODE_TIER`):
 ///   - `nvme` + `ATLAS_SSM_DECODE_NVME_DIR=<dir>` → [`FileSnapshotArena`] behind
 ///     [`ArenaSnapshotStore`], provably sized ≥ `min_slots`.
-///   - unset / anything else → unbounded host-RAM `MemBlobStore::new(0)`.
-///
-/// The `peer` (RDMA) decode tier binding lands in a follow-up PR.
+///   - `peer`  + `ATLAS_SSM_DECODE_RDMA_TIER=host:port` → the never-dropping
+///     [`PagingSnapshotStore`] (peer LRU-spills to its own NVMe), own
+///     `ATLAS_SSM_DECODE_NS` namespace fold.
+///   - unset / anything else → unbounded host-RAM [`MemBlobStore::new(0)`].
 pub(crate) fn build_decode_tier_store(
-    _fp: ModelFingerprint,
+    fp: ModelFingerprint,
     blob_bytes: usize,
     min_slots: usize,
 ) -> Result<std::sync::Arc<dyn SnapshotBlobStore>> {
@@ -124,6 +217,44 @@ pub(crate) fn build_decode_tier_store(
                 Box::new(arena),
                 blob_bytes,
                 slots,
+            )))
+        }
+        Some("peer") => {
+            let peer = std::env::var("ATLAS_SSM_DECODE_RDMA_TIER")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "ATLAS_SSM_DECODE_TIER=peer requires ATLAS_SSM_DECODE_RDMA_TIER=host:port"
+                    )
+                })?;
+            // Namespace = ATLAS_SSM_DECODE_NS (explicit u64 override, strict)
+            // or mix64(mix64(fingerprint, DECODE_DOMAIN), client_salt): the
+            // DOMAIN separator keeps decode spills off the same model's Marconi
+            // keys (both tiers share ONE peer residency whenever blob_bytes
+            // match), the fingerprint keeps them off OTHER models' decode
+            // spills, and the per-process client salt keeps them off other
+            // same-model CLIENTS' spills (cold keys are slot coordinates —
+            // identical across processes without it). NOTE the manager-side
+            // cold_key also folds DECODE_DOMAIN over (seq, logical) — that fold
+            // stays: removing it while this ns is overridden would re-collide
+            // decode with Marconi. Resolved BEFORE the (fatal) connect.
+            let namespace = resolve_decode_ns(fp)?;
+            // Arena RAM cache size is a hint; the peer pages to its own NVMe so
+            // the store never drops regardless of this slot count.
+            let slots = (min_slots + 1).max(512);
+            let arena_bytes = slots as u64 * blob_bytes as u64;
+            let arena =
+                spark_storage::RdmaSnapshotArena::connect_paging(&peer, arena_bytes, blob_bytes)?;
+            tracing::info!(
+                "SSM decode cold tier = RDMA PAGING peer {peer} (non-dropping, ns={namespace:#x}, \
+                 model fingerprint {:#018x})",
+                fp.get(),
+            );
+            Ok(Arc::new(PagingSnapshotStore::new(
+                Box::new(arena),
+                blob_bytes,
+                namespace,
             )))
         }
         // Unset = the documented default: unbounded, non-dropping host RAM.

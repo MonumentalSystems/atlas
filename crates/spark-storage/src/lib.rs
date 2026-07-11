@@ -38,6 +38,7 @@ pub mod group;
 pub mod model_dims;
 pub mod predictor_ref;
 pub mod projection;
+pub mod rdma_snapshot;
 
 // `ModelDims` is a plain POD struct (no GPU state) that
 // `spark-model`'s public surface threads through every layer's
@@ -77,6 +78,7 @@ pub use config::HighSpeedSwapConfig;
 pub use eviction::EvictionPolicy;
 #[cfg(feature = "cuda")]
 pub use high_speed_swap::{HighSpeedSwap, install_local, local_installed, with_local};
+pub use rdma_snapshot::RdmaSnapshotArena;
 
 // Non-cuda stub surface — same names as the real CUDA orchestrator
 // above so spark-model's call sites compile unchanged. `with_local`

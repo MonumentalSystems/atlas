@@ -7,7 +7,7 @@ use anyhow::Result;
 use parking_lot::Mutex;
 
 // ─────────────────────────────────────────────────────────────────────────
-// Phase 4b — RDMA snapshot spill tier (`RdmaSnapshotStore`)
+// RDMA snapshot spill tier (`RdmaSnapshotStore`)
 //
 // A second `SnapshotBlobStore` that ships the (already-contiguous) spill blob to
 // a remote RAM blade over RDMA instead of local host RAM. Scales warm-snapshot
@@ -21,7 +21,7 @@ use parking_lot::Mutex;
 // ─────────────────────────────────────────────────────────────────────────
 
 /// Transport seam for the RDMA snapshot tier: a flat remote byte arena addressed
-/// by absolute offset. The RDMA implementation (Phase 4b Inc 2, behind
+/// by absolute offset. The RDMA implementation (behind
 /// `atlas_rdma_verbs`) ships each contiguous spill blob to a peer RAM blade over
 /// CX7; `MockSnapshotTransport` is an in-process arena for unit tests. Snapshots
 /// must NOT reuse the KV `RdmaKvBackend` `GroupKey`/`group_stride` addressing
@@ -84,6 +84,35 @@ pub(crate) trait PagingTransport: Send + Sync {
     fn paging_get(&self, key: u64, out: &mut [u8]) -> Result<bool>;
     /// Drop `key` from the peer's residency (RAM and swap).
     fn paging_remove(&self, key: u64) -> Result<()>;
+}
+
+// Pure delegation to the arena's inherent paging ops (fully-qualified so the
+// inherent method — not this trait method — is what's called).
+// REVIEW CAREFULLY: a put/get transposition here would corrupt production
+// while every mock-backed test still passes.
+impl PagingTransport for spark_storage::RdmaSnapshotArena {
+    fn paging_put(&self, key: u64, bytes: &[u8]) -> Result<()> {
+        spark_storage::RdmaSnapshotArena::paging_put(self, key, bytes)
+    }
+    fn paging_get(&self, key: u64, out: &mut [u8]) -> Result<bool> {
+        spark_storage::RdmaSnapshotArena::paging_get(self, key, out)
+    }
+    fn paging_remove(&self, key: u64) -> Result<()> {
+        spark_storage::RdmaSnapshotArena::paging_remove(self, key)
+    }
+}
+
+// The real transport is spark-storage's offset-addressed
+// `RdmaSnapshotArena` (CX7 verbs + kv-peer blade; a `connect`-errors stub when
+// verbs aren't built). We own `SnapshotTransport` here, so implementing it for
+// the foreign type is allowed (no orphan rule).
+impl SnapshotTransport for spark_storage::RdmaSnapshotArena {
+    fn write_blob(&self, offset: u64, bytes: &[u8]) -> Result<()> {
+        self.write(offset, bytes)
+    }
+    fn read_blob(&self, offset: u64, out: &mut [u8]) -> Result<()> {
+        self.read(offset, out)
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────
