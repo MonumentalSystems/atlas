@@ -293,8 +293,10 @@ impl Qwen3SsmLayer {
         let v_ptr = conv_out_buf.offset(key_dim * 2 * bf16);
 
         // Recurrence kernel dispatch hoisted to trait_prefill_recur.rs to
-        // keep this file under the 500 LoC cap; behavior identical.
-        self.prefill_gdn_recurrence(
+        // keep this file under the 500 LoC cap; behavior identical. `true` =
+        // FlashInfer wrote the output in FP32 to ssm_conv_out_f32 instead of
+        // BF16 to gdn_out_buf (step 9 dispatches on this).
+        let gdn_out_f32 = self.prefill_gdn_recurrence(
             ssm_state.h_state,
             q_ptr,
             k_ptr,
@@ -313,17 +315,20 @@ impl Qwen3SsmLayer {
 
         // ATLAS_GDN_DUMP hook #3: post-GDN recurrence (pre-gnorm,
         // value-space). gdn_out_buf is [num_tokens, value_dim] bf16
-        // row-major; dump the last token's value_dim slice.
-        super::debug::maybe_dump_gdn_buf(
-            ctx.gpu,
-            gdn_out_buf,
-            (num_tokens - 1) * value_dim * bf16,
-            value_dim,
-            ssm_layer_idx,
-            "gdn",
-            &super::debug::DUMP_GDN,
-            stream,
-        )?;
+        // row-major; dump the last token's value_dim slice. Skipped on the
+        // F32-output path (gdn_out_buf is not written there).
+        if !gdn_out_f32 {
+            super::debug::maybe_dump_gdn_buf(
+                ctx.gpu,
+                gdn_out_buf,
+                (num_tokens - 1) * value_dim * bf16,
+                value_dim,
+                ssm_layer_idx,
+                "gdn",
+                &super::debug::DUMP_GDN,
+                stream,
+            )?;
+        }
         prof!("gdn_prefill", t0);
         t0 = if ctx.profile {
             ctx.gpu.synchronize(stream)?;
@@ -333,21 +338,21 @@ impl Qwen3SsmLayer {
         };
 
         // ── 9. Gated RMS norm (batched: all tokens × heads in one launch) ──
+        // Dispatch (BF16 vs F32-input kernel) hoisted to trait_prefill_recur.rs.
         let normed_out_buf = conv_out_buf;
         let z_base = deinterleaved.offset((key_dim * 2 + value_dim) * bf16);
-        ops::gated_rms_norm_prefill(
-            ctx.gpu,
-            self.gated_rms_norm_prefill_k,
+        self.prefill_gdn_gated_norm(
+            gdn_out_f32,
             gdn_out_buf,
             z_base,
-            &self.ssm.norm,
             normed_out_buf,
-            nv as u32,
-            vd as u32,
+            nv,
+            vd,
             eps,
             k,
-            value_dim as u32,
-            qkvz_size as u32,
+            value_dim,
+            qkvz_size,
+            ctx,
             stream,
         )?;
         // ATLAS_GDN_DUMP hook #4: post-gated-RMSNorm. Downstream

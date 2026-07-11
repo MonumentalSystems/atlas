@@ -1,0 +1,251 @@
+delta_rule_sm120_f32_inverse.patch — FP32 WY T-matrix inverse (variant B).
+
+THE primary long-context precision fix. The stock kernel computes the 64x64
+(I + tril(beta*K*K^T))^-1 in FP16: the fp32 KK accumulator is truncated to fp16
+smem, then CollectiveInverse runs fp16 HMMA at every blockwise level
+(8->16->32->64) with fp16 re-truncation between levels. That per-64-token-block
+error feeds the fp32-carried KV state and accumulates with CONTEXT DEPTH
+(~3128 blocks at 200K) — fine at 2-4K where the kernel was validated, degraded
+at 200K (the 7/8 needle miss), and chunk-count-invariant (both KV arms).
+
+NOTE the judge's "1-line inverse_dtype flip" is NOT mechanically possible:
+CollectiveInverse hardcodes fp16 fragments + HMMA MmaF16BF16Op + 16-bit
+LdMatrix/StMatrix atoms at every level, and StMatrix8x8x16bOp cannot store
+fp32. This patch therefore:
+  * adds collective_inverse_f32.py — CollectiveInverseF32, an all-fp32 SIMT
+    in-smem row-Gauss forward elimination (identical math to level 1 of the
+    fp16 collective, generalized to N=64; ~64^3/6 fp32 FMAs + 64 WG barriers
+    per block, overlapped with WG1's QK GEMM — noise vs the GEMMs);
+  * _kk_store_and_inv fp32 branch: coordinate-indexed UNTRUNCATED fp32 KK
+    store, fp32 inverse, then ONE conversion of the final beta*T operand to
+    bf16 (an extra KK_SYNC barrier guards the fp32-read / aliased-bf16-store
+    overlap that the fp16 path never had);
+  * inverse_dtype = Float32 ONLY when o_direct: the +8 KB fp32 KK smem fits
+    only because f32-out deleted smem_o (-16 KB). The bf16-out leg
+    (gdn_holo_0) keeps the fp16 inverse and stays bit-identical to the
+    shipped export — the packed harness regression check remains valid.
+
+EXPECTED after this patch: gdn_export_f32.py's state cross-check between the
+bf16 and f32 legs is NONZERO (the fp32 inverse changes — improves — the
+recurrence). Expect state cos ~ 1, max_abs small; o cos ~ 1.
+
+Apply AFTER delta_rule_sm120_f32_out.patch (patch -p1 from /home/ms/flashinfer).
+
+--- a/flashinfer/gdn_kernels/delta_rule_dsl/delta_rule_sm120.py
++++ b/flashinfer/gdn_kernels/delta_rule_dsl/delta_rule_sm120.py
+@@ -11,6 +11,7 @@
+ from .collective_store_tma import CollectiveStoreTma
+ from .custom_compile_cache import KeyedCompileMixin, cached_compile
+ from .collective_inverse_hmma import CollectiveInverse
++from .collective_inverse_f32 import CollectiveInverseF32
+ from .helpers import SM80, round_down
+ from .schedule import WorkDesc
+ 
+@@ -134,7 +135,13 @@
+         if self.o_dtype not in (dtype, cutlass.Float32):
+             raise ValueError(f"o_dtype must be {dtype} or Float32, got {self.o_dtype}")
+         self.o_direct = self.o_dtype == cutlass.Float32
+-        self.inverse_dtype = cutlass.Float16
++        # FP32 WY T-matrix inverse — the long-context precision fix: the fp16
++        # inverse's per-block error feeds the fp32-carried KV state and
++        # accumulates with context depth. fp32 KK smem is +8 KB; it fits ONLY
++        # because o_direct freed 16 KB (smem_o deleted), so the fp32 inverse is
++        # tied to the f32-output variant. The default-dtype (bf16-out) kernel
++        # keeps the fp16 inverse and stays bit-identical to the shipped export.
++        self.inverse_dtype = cutlass.Float32 if self.o_direct else cutlass.Float16
+         self.BLK_Q = 64
+         self.BLK_KV = 64
+         self.D = 128
+@@ -215,48 +222,90 @@
+         tKKcMkk: cute.Tensor,  # coordinate mapping for KK fragment
+     ):
+         """Store tKKrKK → sKK_inv, Inverse, optionally reload+beta."""
+-        stsm_atom = cute.make_copy_atom(
+-            warp.StMatrix8x8x16bOp(transpose=False, num_matrices=4), self.inverse_dtype
+-        )
+-        tiled_store = cute.make_tiled_copy_C(stsm_atom, kk_tiled_mma)
+-        thr_store = tiled_store.get_slice(kk_thread_idx)
+-        tKKsKK = thr_store.partition_D(sKK_inv)
+-        tKKrKK_inv = cute.make_fragment_like(tKKrKK, self.inverse_dtype)
+-        tKKrKK_cv = thr_store.retile(tKKrKK_inv)
+-        for i in cutlass.range_constexpr(cute.size(tKKrKK)):
+-            tKKrKK_inv[i] = self.inverse_dtype(tKKrKK[i])
+-        cute.copy(tiled_store, tKKrKK_cv, tKKsKK)
+-
+-        cute.arch.barrier(barrier_id=NamedBarrier.KK_SYNC, number_of_threads=128)
+-        CollectiveInverse().run(sKK_inv, NamedBarrier.KK_SYNC)
+-
+-        if cutlass.const_expr(self.needs_beta or self.dtype != self.inverse_dtype):
++        if cutlass.const_expr(self.inverse_dtype == cutlass.Float32):
++            # FP32 path: STSM/LDSM atoms are 16-bit-only, so the fp32 KK store
++            # and T reload go through per-element MMA-C coordinate indexing
++            # (tKKcMkk[i] is the (s, t) coordinate of fragment element i —
++            # the same pairing the tiled copies realize for 16-bit elements).
++            # The fp32 acc is stored UNTRUNCATED, inverted entirely in fp32,
++            # and only the final β·T operand is converted (once) to self.dtype.
++            for i in cutlass.range_constexpr(cute.size(tKKrKK)):
++                s, t = tKKcMkk[i]
++                sKK_inv[s, t] = tKKrKK[i]
++            cute.arch.barrier(barrier_id=NamedBarrier.KK_SYNC, number_of_threads=128)
++            CollectiveInverseF32().run(sKK_inv, NamedBarrier.KK_SYNC)
++            # run() ends with its own barrier arrival pattern; sync before the
++            # WG-wide reload reads rows written by other threads.
+             cute.arch.barrier(barrier_id=NamedBarrier.KK_SYNC, number_of_threads=128)
+-            ldsm_atom = cute.make_copy_atom(
+-                warp.LdMatrix8x8x16bOp(transpose=False, num_matrices=4),
+-                self.inverse_dtype,
+-            )
+-            tiled_load = cute.make_tiled_copy_C(ldsm_atom, kk_tiled_mma)
+-            thr_load = tiled_load.get_slice(kk_thread_idx)
+-            tKKrKK_cpy = cute.make_fragment_like(tKKrKK_inv)
+-            tKKrKK_cvt = cute.make_fragment_like(tKKrKK_inv, self.dtype)
+-            tKKrKK_cv2 = thr_load.retile(tKKrKK_cpy)
+-            cute.copy(tiled_load, thr_load.partition_S(sKK_inv), tKKrKK_cv2)
+-            tKKcMkk_cv = thr_load.retile(tKKcMkk)
+ 
+-            for i in cutlass.range_constexpr(cute.size(tKKrKK_cpy)):
++            # Reload T (fp32), scale by β column, convert once to the MMA
++            # operand dtype. sKK_opd ALIASES sKK_inv's storage (16-bit recast
++            # of the same smem), so a barrier must separate the fp32 reads
++            # from the overwriting 16-bit stores — unlike the fp16 path, the
++            # element addresses do not coincide thread-by-thread here.
++            tKKrKK_cvt = cute.make_fragment_like(tKKrKK, self.dtype)
++            for i in cutlass.range_constexpr(cute.size(tKKrKK)):
++                s, t = tKKcMkk[i]
++                val = cutlass.Float32(sKK_inv[s, t])
+                 if cutlass.const_expr(self.needs_beta):
+-                    _, t = tKKcMkk_cv[i]
+-                    tKKrKK_cvt[i] = self.dtype(
+-                        cutlass.Float32(tKKrKK_cpy[i])
+-                        * cutlass.Float32(sBeta[t, beta_pipe_idx])
+-                    )
+-                else:
+-                    tKKrKK_cvt[i] = self.dtype(tKKrKK_cpy[i])
++                    val = val * cutlass.Float32(sBeta[t, beta_pipe_idx])
++                tKKrKK_cvt[i] = self.dtype(val)
++            cute.arch.barrier(barrier_id=NamedBarrier.KK_SYNC, number_of_threads=128)
+ 
++            stsm_atom = cute.make_copy_atom(
++                warp.StMatrix8x8x16bOp(transpose=False, num_matrices=4), self.dtype
++            )
++            tiled_store = cute.make_tiled_copy_C(stsm_atom, kk_tiled_mma)
++            thr_store = tiled_store.get_slice(kk_thread_idx)
+             tKKsKK2 = thr_store.partition_D(sKK_opd)
+             tKKrKK_cv3 = thr_store.retile(tKKrKK_cvt)
+             cute.copy(tiled_store, tKKrKK_cv3, tKKsKK2)
++        else:
++            stsm_atom = cute.make_copy_atom(
++                warp.StMatrix8x8x16bOp(transpose=False, num_matrices=4),
++                self.inverse_dtype,
++            )
++            tiled_store = cute.make_tiled_copy_C(stsm_atom, kk_tiled_mma)
++            thr_store = tiled_store.get_slice(kk_thread_idx)
++            tKKsKK = thr_store.partition_D(sKK_inv)
++            tKKrKK_inv = cute.make_fragment_like(tKKrKK, self.inverse_dtype)
++            tKKrKK_cv = thr_store.retile(tKKrKK_inv)
++            for i in cutlass.range_constexpr(cute.size(tKKrKK)):
++                tKKrKK_inv[i] = self.inverse_dtype(tKKrKK[i])
++            cute.copy(tiled_store, tKKrKK_cv, tKKsKK)
++
++            cute.arch.barrier(barrier_id=NamedBarrier.KK_SYNC, number_of_threads=128)
++            CollectiveInverse().run(sKK_inv, NamedBarrier.KK_SYNC)
++
++            if cutlass.const_expr(self.needs_beta or self.dtype != self.inverse_dtype):
++                cute.arch.barrier(
++                    barrier_id=NamedBarrier.KK_SYNC, number_of_threads=128
++                )
++                ldsm_atom = cute.make_copy_atom(
++                    warp.LdMatrix8x8x16bOp(transpose=False, num_matrices=4),
++                    self.inverse_dtype,
++                )
++                tiled_load = cute.make_tiled_copy_C(ldsm_atom, kk_tiled_mma)
++                thr_load = tiled_load.get_slice(kk_thread_idx)
++                tKKrKK_cpy = cute.make_fragment_like(tKKrKK_inv)
++                tKKrKK_cvt = cute.make_fragment_like(tKKrKK_inv, self.dtype)
++                tKKrKK_cv2 = thr_load.retile(tKKrKK_cpy)
++                cute.copy(tiled_load, thr_load.partition_S(sKK_inv), tKKrKK_cv2)
++                tKKcMkk_cv = thr_load.retile(tKKcMkk)
++
++                for i in cutlass.range_constexpr(cute.size(tKKrKK_cpy)):
++                    if cutlass.const_expr(self.needs_beta):
++                        _, t = tKKcMkk_cv[i]
++                        tKKrKK_cvt[i] = self.dtype(
++                            cutlass.Float32(tKKrKK_cpy[i])
++                            * cutlass.Float32(sBeta[t, beta_pipe_idx])
++                        )
++                    else:
++                        tKKrKK_cvt[i] = self.dtype(tKKrKK_cpy[i])
++
++                tKKsKK2 = thr_store.partition_D(sKK_opd)
++                tKKrKK_cv3 = thr_store.retile(tKKrKK_cvt)
++                cute.copy(tiled_store, tKKrKK_cv3, tKKsKK2)
+ 
+     # ─── kk_epi ───────────────────────────────────────────────────────────────
+ 
+--- /dev/null
++++ b/flashinfer/gdn_kernels/delta_rule_dsl/collective_inverse_f32.py
+@@ -0,0 +1,64 @@
++import cutlass
++import cutlass.cute as cute
++
++
++# ─── CollectiveInverseF32 ────────────────────────────────────────────────────
++# Full-fp32 in-place inverse of the 64×64 unit-lower-triangular WY T-matrix
++# (I + strict_lower(sT)), replacing the fp16 HMMA blockwise CollectiveInverse
++# for the f32-inverse GDN variant. The fp16 collective truncates the KK
++# accumulator to fp16 before the inverse and re-truncates at every blockwise
++# level (8→16→32→64, HMMA fp16 operands); those per-64-token-block errors feed
++# the fp32-carried KV state and accumulate with CONTEXT DEPTH (~3128 blocks at
++# 200K) — the long-context coherence loss. This version is a classic row-Gauss
++# forward elimination computed entirely in fp32: no fp16 operand anywhere.
++#
++# Algorithm (identical math to CollectiveInverse level 1, N=64, smem-resident):
++#   row r>s at step s:  row_r[0..s-1] += (-row_r[s]) * row_s[0..s-1]
++#                       row_r[s]       = -row_r[s]
++# Row s is finalized before step s (its last update happens at step s-1), and
++# step s writes only rows r>s at columns <= s, so the in-place update is safe
++# with one WG-wide barrier per step.
++#
++# Contract (drop-in for CollectiveInverse().run in _kk_store_and_inv):
++#   * sT: (64, 64) smem tensor, fp32, logical (row, col) indexing. On entry the
++#     strict lower triangle holds the masked β·K·Kᵀ values, the diagonal holds
++#     garbage (raw k·k values — treated as 1, as garbage_filled_diagonal=True
++#     does), and the upper triangle is 0 (pre-masked by qk_or_kk_mask).
++#   * On exit: strict lower = the inverse's strict lower, diagonal = 1.0,
++#     upper triangle untouched (still 0) — same post-state the fp16 collective
++#     leaves for the β·T reload that builds the NewV operand.
++#   * Must be called by 128 threads (one warp group); barrier_id free for use.
++#     Rows are owned by threads 0..63; threads 64..127 only arrive at barriers.
++#   * The caller must barrier once more after run() before reading sT.
++#
++# Cost: ~64³/6 fp32 smem-FMAs + 64 WG barriers per 64-token block, CUDA-core
++# work on WG0 that overlaps WG1's QK GEMM — noise vs the block's tensor-core
++# GEMMs. (Headroom if it ever shows up in a profile: split each row across two
++# threads, or block the elimination 8-wide.)
++
++
++class CollectiveInverseF32:
++    @cute.jit
++    def run(self, sT: cute.Tensor, barrier_id: cutlass.Int32):
++        """Invert (I + strict_lower(sT)) in place, fp32 throughout."""
++        tidx, _, _ = cute.arch.thread_idx()
++        thread_idx = tidx % 128
++        n = cutlass.Int32(64)
++
++        for s in cutlass.range(cutlass.Int32(0), n - cutlass.Int32(1), cutlass.Int32(1), unroll=1):
++            # All 128 WG threads arrive; rows s+1.. then update in place.
++            cute.arch.barrier(barrier_id=barrier_id, number_of_threads=128)
++            r = thread_idx
++            if r > s and r < n:
++                row_scale = -cutlass.Float32(sT[r, s])
++                for j in cutlass.range(s, unroll=1):
++                    sT[r, j] = cutlass.Float32(sT[r, j]) + row_scale * cutlass.Float32(
++                        sT[s, j]
++                    )
++                sT[r, s] = row_scale
++
++        # Unit diagonal for the downstream β·T reload (the stored diagonal was
++        # garbage-filled; the elimination never read it).
++        cute.arch.barrier(barrier_id=barrier_id, number_of_threads=128)
++        if thread_idx < n:
++            sT[thread_idx, thread_idx] = cutlass.Float32(1.0)

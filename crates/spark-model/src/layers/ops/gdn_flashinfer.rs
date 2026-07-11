@@ -44,6 +44,10 @@ type PackedFn = unsafe extern "C" fn(
 
 struct Lib {
     prefill: PackedFn,
+    /// F32-output managed entry (`atlas_gdn_prefill_packed_managed_f32`) —
+    /// identical signature, `output` is FP32 `[total, value_dim]`. `None` when
+    /// the loaded lib predates the F32 export (bf16-output fallback).
+    prefill_f32: Option<PackedFn>,
 }
 // SAFETY: the resolved fn pointers are process-global and immutable after load.
 unsafe impl Send for Lib {}
@@ -68,9 +72,16 @@ fn lib() -> Option<&'static Lib> {
         }
         let load: LoadFn = std::mem::transmute(load);
         load(); // load the cubin module onto the device(s) once
-        tracing::info!("ATLAS_GDN_FLASHINFER: FlashInfer GDN kernel loaded (opt-in)");
+        // Optional F32-output entry (F32 GDN output export, avarok #248/#290).
+        let prefill_f32 = dlsym(h, c"atlas_gdn_prefill_packed_managed_f32".as_ptr());
+        tracing::info!(
+            "ATLAS_GDN_FLASHINFER: FlashInfer GDN kernel loaded (opt-in, f32_out={})",
+            !prefill_f32.is_null()
+        );
         Some(Lib {
             prefill: std::mem::transmute::<*mut c_void, PackedFn>(prefill),
+            prefill_f32: (!prefill_f32.is_null())
+                .then(|| std::mem::transmute::<*mut c_void, PackedFn>(prefill_f32)),
         })
     })
     .as_ref()
@@ -81,12 +92,30 @@ pub fn available() -> bool {
     std::env::var("ATLAS_GDN_FLASHINFER").as_deref() == Ok("1") && lib().is_some()
 }
 
+/// Pure gating for the F32-output path: capability (lib exports the F32 entry)
+/// AND not killed by `ATLAS_GDN_FI_F32_OUT=0` (default ON when capable).
+fn want_f32_output(has_f32_sym: bool, kill_switch: Option<&str>) -> bool {
+    has_f32_sym && kill_switch != Some("0")
+}
+
+/// True when the loaded lib exports the F32-output entry and the path is not
+/// disabled via `ATLAS_GDN_FI_F32_OUT=0`. Implies [`available`].
+pub fn f32_output_available() -> bool {
+    available()
+        && want_f32_output(
+            lib().is_some_and(|l| l.prefill_f32.is_some()),
+            std::env::var("ATLAS_GDN_FI_F32_OUT").ok().as_deref(),
+        )
+}
+
 /// Run one prefill GDN scan through the FlashInfer kernel on Atlas's native buffers.
 ///
 /// `qkv`: packed `[Q(key_dim)|K(key_dim)|V(value_dim)]` bf16, row stride `conv_dim`.
 /// `gate_beta`: interleaved `[gate(nv)|beta(nv)]` fp32, row stride `gb_stride`.
-/// `output`: contiguous `[total, value_dim]` bf16. `h_state`: `[nv,kd,vd]` fp32 (final state out).
-/// Single-stream only (`num_seqs == 1`); fresh prefill (zero init state).
+/// `output`: contiguous `[total, value_dim]` — bf16, or FP32 when `out_f32`
+/// (caller must gate on [`f32_output_available`] and hand an FP32 buffer).
+/// `h_state`: `[nv,kd,vd]` fp32 — carried state IN (zero on chunk 0), final state OUT.
+/// Single-stream only (`num_seqs == 1`).
 #[allow(clippy::too_many_arguments)]
 pub fn flashinfer_gdn_prefill(
     gpu: &dyn GpuBackend,
@@ -103,16 +132,23 @@ pub fn flashinfer_gdn_prefill(
     conv_dim: u32,
     gb_stride: u32,
     num_seqs: u32,
+    out_f32: bool,
     stream: u64,
 ) -> Result<()> {
     let l = lib().ok_or_else(|| anyhow!("FlashInfer GDN lib unavailable"))?;
     let _ = gpu; // scratch (tensormaps/init/cu) is now owned+cached inside the shim
+    let entry = if out_f32 {
+        l.prefill_f32
+            .ok_or_else(|| anyhow!("FlashInfer GDN F32-output entry not in lib"))?
+    } else {
+        l.prefill
+    };
 
     // Managed shim entry: caches scratch internally (no per-call alloc/free → no async
     // use-after-free, no per-call sync). Async on `stream`, ordered with the rest of
     // the layer like the FLA path it replaces.
     let ret = unsafe {
-        (l.prefill)(
+        (entry)(
             qkv.0 as *mut c_void,
             gate_beta.0 as *mut c_void,
             output.0 as *mut c_void,
@@ -131,7 +167,11 @@ pub fn flashinfer_gdn_prefill(
     };
 
     if ret != 0 {
-        bail!("atlas_gdn_prefill_packed_managed returned {ret}");
+        bail!("atlas_gdn_prefill_packed_managed{} returned {ret}", if out_f32 { "_f32" } else { "" });
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "gdn_flashinfer_tests.rs"]
+mod tests;

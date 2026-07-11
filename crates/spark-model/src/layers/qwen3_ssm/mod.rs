@@ -79,6 +79,8 @@ pub struct Qwen3SsmLayer {
     /// Dual-output (bf16 + f32) MoE-input norm for ATLAS_FP32_ROUTING. Zero if absent.
     residual_add_rms_norm_gatef32_k: KernelHandle,
     gated_rms_norm_prefill_k: KernelHandle,
+    /// F32-input prefill gated norm (FlashInfer F32 GDN-output path). Zero if absent.
+    gated_rms_norm_prefill_f32_k: KernelHandle,
     // Kernels — batched verification path (multi-token GEMM)
     w4a16_gemm_k: KernelHandle,
     w4a16_gemm_t_k: KernelHandle, // Transposed B layout [K/2, N] — K_STEP_T=32

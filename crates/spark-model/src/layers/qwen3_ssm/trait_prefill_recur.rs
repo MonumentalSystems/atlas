@@ -15,6 +15,11 @@ impl Qwen3SsmLayer {
     /// Dispatch: FLA chunked prefill (baked default, 128-dim linear heads) →
     /// WY4-persistent (4 tokens/iter, H in shared memory) → single-token persistent
     /// (256..=4096) → split4 for unsupported configurations.
+    ///
+    /// Returns `true` when the GDN output was written in FP32 to
+    /// `ctx.buffers.ssm_conv_out_f32()` (FlashInfer F32-output path) instead of
+    /// BF16 to `gdn_out_buf` — the caller must then use the F32-input gated
+    /// norm ([`Self::prefill_gdn_gated_norm`] dispatches on this flag).
     #[allow(clippy::too_many_arguments)]
     pub(super) fn prefill_gdn_recurrence(
         &self,
@@ -32,7 +37,7 @@ impl Qwen3SsmLayer {
         conv_dim: usize,
         ctx: &ForwardContext,
         stream: u64,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let fp32 = 4usize;
         let gb_stride = (nv * 2) as u32;
 
@@ -44,7 +49,7 @@ impl Qwen3SsmLayer {
         // paths (and a future C=32 FLA variant) are Blackwell-only. NVIDIA
         // (cfg unset) takes the full FLA/WY ladder below unchanged.
         if cfg!(atlas_scale) {
-            return ops::gdn_prefill_split4(
+            ops::gdn_prefill_split4(
                 ctx.gpu,
                 self.gdn_prefill_split4_k,
                 h_state,
@@ -64,7 +69,8 @@ impl Qwen3SsmLayer {
                 conv_dim as u32,
                 gb_stride,
                 stream,
-            );
+            )?;
+            return Ok(false);
         }
 
         // FlashInfer GDN (opt-in, ATLAS_GDN_FLASHINFER=1): tensor-core chunked delta-rule
@@ -74,11 +80,26 @@ impl Qwen3SsmLayer {
         // shim (ops::gdn_flashinfer). FLA ladder below is the fallback when flag/lib absent.
         if !ctx.gdn_exact_replay && kd == 128 && vd == 128 && ops::gdn_flashinfer::available() {
             let scale = 1.0f32 / (kd as f32).sqrt();
-            return ops::gdn_flashinfer::flashinfer_gdn_prefill(
+            // F32 GDN output (avarok #248/#290): when the lib exports the F32
+            // entry AND the F32-input prefill norm kernel is loaded, write the
+            // recurrence output in FP32 to ssm_conv_out_f32 (idle during the
+            // GDN step; m*qkvz_size*4 B ≥ the m*value_dim*4 B needed) so the
+            // recurrence→gated-norm handoff skips the BF16 truncation — the
+            // long-context (200K needle) coherence lever for the FlashInfer
+            // path. Kill switch: ATLAS_GDN_FI_F32_OUT=0.
+            let f32_out = ops::gdn_flashinfer::f32_output_available()
+                && self.gated_rms_norm_prefill_f32_k.0 != 0
+                && ctx.buffers.ssm_conv_out_f32().0 != 0;
+            let out = if f32_out {
+                ctx.buffers.ssm_conv_out_f32()
+            } else {
+                gdn_out_buf
+            };
+            ops::gdn_flashinfer::flashinfer_gdn_prefill(
                 ctx.gpu,
                 q_ptr,
                 gates_buf,
-                gdn_out_buf,
+                out,
                 h_state,
                 scale,
                 k,
@@ -89,8 +110,10 @@ impl Qwen3SsmLayer {
                 conv_dim as u32,
                 gb_stride,
                 1,
+                f32_out,
                 stream,
-            );
+            )?;
+            return Ok(f32_out);
         }
 
         // 2026-06-06: removed the concluded GDN-prefill experiment env flags
@@ -283,6 +306,62 @@ impl Qwen3SsmLayer {
                 stream,
             )?;
         }
-        Ok(())
+        Ok(false)
+    }
+
+    /// Step-9 gated RMS norm dispatch for the monolithic prefill: reads the GDN
+    /// output from the FP32 scratch via the F32-input kernel when
+    /// [`Self::prefill_gdn_recurrence`] returned `true`, else the BF16 buffer
+    /// via the baked BF16 kernel. Hoisted here to keep `trait_prefill.rs` under
+    /// the 500-LoC cap.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn prefill_gdn_gated_norm(
+        &self,
+        gdn_out_f32: bool,
+        gdn_out_buf: DevicePtr,
+        z_base: DevicePtr,
+        normed_out_buf: DevicePtr,
+        nv: usize,
+        vd: usize,
+        eps: f32,
+        k: u32,
+        value_dim: usize,
+        qkvz_size: usize,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        if gdn_out_f32 {
+            ops::gated_rms_norm_prefill_f32_input(
+                ctx.gpu,
+                self.gated_rms_norm_prefill_f32_k,
+                ctx.buffers.ssm_conv_out_f32(),
+                z_base,
+                &self.ssm.norm,
+                normed_out_buf,
+                nv as u32,
+                vd as u32,
+                eps,
+                k,
+                value_dim as u32,
+                qkvz_size as u32,
+                stream,
+            )
+        } else {
+            ops::gated_rms_norm_prefill(
+                ctx.gpu,
+                self.gated_rms_norm_prefill_k,
+                gdn_out_buf,
+                z_base,
+                &self.ssm.norm,
+                normed_out_buf,
+                nv as u32,
+                vd as u32,
+                eps,
+                k,
+                value_dim as u32,
+                qkvz_size as u32,
+                stream,
+            )
+        }
     }
 }
