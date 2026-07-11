@@ -32,6 +32,7 @@ pub use cuda_module::{CudaEvent, CudaModule, launch_kernel};
 
 // Pure CPU-side modules — types, configs, references. Always compiled.
 pub mod attention_ref;
+pub mod cascade_policy;
 pub mod config;
 pub mod eviction;
 pub mod group;
