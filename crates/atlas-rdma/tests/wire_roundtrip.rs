@@ -1,25 +1,25 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-// Codec round-trip / validation tests, extracted WITH the codecs from the
-// RDMA peer daemons (RailSet extraction). These cover reader/writer agreement,
-// the exact byte layouts (see also `tests/transcript_golden.rs`), the frozen
-// interop constant values (`frozen_wire_constants`), and the validation bails.
-// Un-gated: pure `std::io`, runs on the ATLAS_SKIP_BUILD path.
+// Codec round-trip / validation tests for the RDMA peer daemons' shared wire
+// codecs. These cover reader/writer agreement, the exact byte layouts (see
+// also `tests/transcript_golden.rs`), the frozen interop constant values
+// (`frozen_wire_constants`), and the validation bails. Un-gated: pure
+// `std::io`, runs on the ATLAS_SKIP_BUILD path.
 
 use atlas_rdma::wire::{
     CacheServerParams, MODE_TCP, MODE_VERBS, STATUS_ERR, STATUS_OK, VerbsClientParams,
     VerbsServerParams, read_server_rails, write_server_rails,
 };
 
-/// The interop bytes the live gx10 peer speaks are frozen — a value flip here
-/// is a silent wire break, so pin them explicitly (the goldens only exercise
+/// These interop bytes are a frozen external contract — a value flip here is a
+/// silent wire break, so pin them explicitly (the goldens only exercise
 /// STATUS_OK/MODE bytes indirectly).
 #[test]
 fn frozen_wire_constants() {
-    assert_eq!(STATUS_OK, 0, "STATUS_OK is frozen vs the live peer");
-    assert_eq!(STATUS_ERR, 1, "STATUS_ERR is frozen vs the live peer");
-    assert_eq!(MODE_TCP, 0, "MODE_TCP is frozen vs the live peer");
-    assert_eq!(MODE_VERBS, 1, "MODE_VERBS is frozen vs the live peer");
+    assert_eq!(STATUS_OK, 0, "STATUS_OK is a frozen wire constant");
+    assert_eq!(STATUS_ERR, 1, "STATUS_ERR is a frozen wire constant");
+    assert_eq!(MODE_TCP, 0, "MODE_TCP is a frozen wire constant");
+    assert_eq!(MODE_VERBS, 1, "MODE_VERBS is a frozen wire constant");
 }
 
 #[test]

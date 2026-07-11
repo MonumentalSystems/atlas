@@ -6,10 +6,10 @@
 // registers its store here, the client tier (cuda) registers its pinned arena.
 //
 // One `Verbs` == one RC QP + its device context. The QP-identity exchange
-// (qpn/psn/gid) rides the existing TCP control channel in `expert_peer.rs`;
-// `connect` drives INIT->RTR->RTS. The client posts `IBV_WR_RDMA_READ`s with
-// `post_read` and reaps them with `poll` (blocking busy-poll); the server QP
-// only reaches RTS to respond, its CPU idle — the Phase B win.
+// (qpn/psn/gid) rides the TCP control channel; `connect` drives INIT->RTR->RTS.
+// The client posts `IBV_WR_RDMA_READ`s with `post_read` and reaps them with
+// `poll` (blocking busy-poll); the server QP only reaches RTS to respond, its
+// CPU idle (the point of one-sided reads).
 
 use anyhow::{Result, bail};
 use std::ffi::CString;

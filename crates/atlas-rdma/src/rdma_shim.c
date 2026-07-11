@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
 // Minimal one-sided RDMA READ shim over libibverbs (RoCEv2), for the expert
-// weight tier (streaming-experts WS2, Phase B).
+// weight tier.
 //
 // `ibv_post_send` / `ibv_poll_cq` are `static inline` in <infiniband/verbs.h>,
 // so they cannot be FFI'd directly from Rust — they must be called from a C
 // translation unit. This shim is that unit: it wraps the whole RC-QP lifecycle
 // (create -> INIT -> RTR -> RTS), MR registration, one-sided READ posting, and
-// completion polling behind a tiny C ABI the Rust side (`rdma_verbs.rs`) binds.
+// completion polling behind a tiny C ABI the Rust side (`verbs.rs`) binds.
 //
 // Design: one `rs_conn` == one device context + PD + CQ + RC QP, plus a small
 // fixed table of registered MRs. Both peer (server, registers its store with
@@ -15,7 +15,7 @@
 // one. QP identity (qpn/psn/gid) is exchanged out-of-band over the existing TCP
 // control channel; `rs_connect` drives the state machine with the remote params.
 // One-sided: the client is the requester (posts READs); the server QP only has
-// to reach RTS to respond, its CPU stays idle — the intended Phase B win.
+// to reach RTS to respond, its CPU stays idle (the point of one-sided reads).
 
 #include <infiniband/verbs.h>
 #include <stdint.h>

@@ -1,12 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
-// The RDMA handshake wire codecs, shared by every Atlas RDMA client AND the
-// peer daemons. Extracted from the RDMA peer codecs; the peer daemons
-// re-export these at their old paths (a follow-up PR) so the servers stay
-// zero-diff.
+// The RDMA handshake wire codecs, shared by every Atlas RDMA client and the
+// peer daemons (the daemons re-export these, so client and server speak one
+// codec).
 //
-// ** GOLDEN WIRE FORMAT ** — the live gx10 peer runs an OLDER binary, so
-// every byte layout here is frozen. All integers little-endian. The byte
+// ** GOLDEN WIRE FORMAT ** — every byte layout here is a frozen external
+// contract (already-deployed peers depend on it). All integers little-endian. The byte
 // vectors are pinned by `tests/wire_roundtrip.rs` and `tests/transcript_golden.rs`,
 // and the frozen constant values by `frozen_wire_constants` (wire_roundtrip.rs).
 //
@@ -18,10 +17,10 @@ use anyhow::{Context, Result, bail};
 // ── Shared status / transport-mode bytes ──
 pub const STATUS_OK: u8 = 0;
 pub const STATUS_ERR: u8 = 1;
-/// Two-sided TCP record streaming (the Stage-4 Phase-A expert path).
+/// Two-sided TCP record streaming (the expert record path).
 pub const MODE_TCP: u8 = 0;
-/// One-sided RDMA READ over verbs (WS2 Phase B): the server publishes its
-/// store's MRs and the client READs records directly into its arena.
+/// One-sided RDMA READ over verbs: the server publishes its store's MRs and
+/// the client READs records directly into its arena.
 pub const MODE_VERBS: u8 = 1;
 
 /// The server's half of the verbs handshake (RO dialect: expert / weight /

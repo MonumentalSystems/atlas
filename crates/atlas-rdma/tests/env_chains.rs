@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-// Pins the TWO distinct env-fallback semantics the RDMA tiers deploy with
-// (RailSet extraction, Step B): `first_set` (an exported-but-EMPTY var counts
-// as set — KV/expert/snapshot reads and the LoRA DEV chain) vs
+// Pins the TWO distinct env-fallback semantics the RDMA tiers deploy with:
+// `first_set` (an exported-but-EMPTY var counts as set — KV/expert/snapshot
+// reads and the LoRA DEV chain) vs
 // `first_nonempty` (empty is SKIPPED — the weight tier), plus the
 // parse-or-fall-through `first_set_u32`. A unified helper that flipped either
 // behavior would silently change deployed configs (e.g. make

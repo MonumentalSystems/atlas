@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-// Build script for atlas-rdma — moved wholesale from spark-storage/build.rs
-// (`compile_rdma_shim`) in the tiered-cache consolidation. It compiles the
-// one-sided RDMA verbs C shim and decides `cfg(atlas_rdma_verbs)` for the
-// whole workspace:
+// Build script for atlas-rdma. It compiles the one-sided RDMA verbs C shim
+// and decides `cfg(atlas_rdma_verbs)` for the whole workspace:
 //
 //   * cfg ON  ⇔ target_os != macos AND !skip_build()   (unchanged semantics)
 //   * skip_build() honours ATLAS_SKIP_BUILD / SKIP_ATLAS_BUILD ∈ {1,true,TRUE}

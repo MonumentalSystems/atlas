@@ -12,7 +12,7 @@
 //     [n_rails] → server params → [n_rails]+client params → ack interleaving);
 //   * the parsed server params, against hand-written reply bytes (pins the
 //     reader field order independent of the writer).
-// The live gx10 peer runs an older binary: these transcripts are frozen.
+// These transcripts are frozen: a stable external wire contract.
 
 use std::io::{Read, Write};
 

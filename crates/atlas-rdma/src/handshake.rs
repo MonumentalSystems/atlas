@@ -7,7 +7,7 @@
 // the client's complete emitted byte sequence (`tests/transcript_golden.rs`),
 // which is the only test class that catches a write REORDER.
 //
-// Wire order per dialect (all little-endian, frozen vs the live gx10 peer):
+// Wire order per dialect (all little-endian, a frozen external contract):
 //   client: [u8 n_rails]                                   (`write_n_rails`)
 //   server: RO  → [u8 n]{VerbsServerParams}×n              (`wire::read_server_rails`)
 //           RW  → [u8 n echo]{CacheServerParams}×n         (`read_rw_server_params`)

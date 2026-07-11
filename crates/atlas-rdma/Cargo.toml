@@ -11,16 +11,15 @@ description = "Atlas: one-sided RDMA verbs primitive (C shim + safe Rust wrapper
 # build script publish `cargo:has_verbs=1`, which direct dependents' build
 # scripts read as `DEP_ATLAS_RDMA_SHIM_HAS_VERBS` to re-emit
 # `cfg(atlas_rdma_verbs)` for THEIR own gated code (rustc-cfg never crosses
-# crate boundaries). See spark-storage/build.rs.
+# crate boundaries).
 links = "atlas_rdma_shim"
 
-# HARD CONSTRAINT (tiered-cache consolidation, atlas-rdma chunk): this crate is
-# the CUDA-free verbs transport the peer daemons AND the cuda client tiers both
-# build on. Its dependency budget is `anyhow` (+ `cc` at build time) — adding a
-# GPU dependency or any workspace crate here destroys the `atlas-expert-pack`
-# default-features = false property that keeps the peers CUDA-free (the same
-# rule crates/atlas-tier documents), and depending on spark-storage would be a
-# cycle.
+# HARD CONSTRAINT: this crate is the CUDA-free verbs transport the peer daemons
+# AND the CUDA client tiers both build on. Its dependency budget is `anyhow`
+# (+ `cc` at build time) — adding a GPU dependency or any workspace crate here
+# breaks the property that keeps the peer daemons CUDA-free (the same rule
+# crates/atlas-tier documents), and depending on a consumer crate would be a
+# dependency cycle.
 [dependencies]
 anyhow = { workspace = true }
 
