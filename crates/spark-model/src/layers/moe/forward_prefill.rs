@@ -279,107 +279,127 @@ impl MoeLayer {
         super::dump::dump_expert_ids(ctx.gpu, stream, indices_dev, weights_dev, n, top_k)?;
         prof_step!("topk");
 
-        // 3. Sort tokens by expert → L2-optimized ordering.
-        let te = total_expanded as usize;
-        let ne = num_experts as usize;
-        let sorted_token_ids = gate_logits;
-        let sorted_expert_ids = gate_logits.offset(te * 4);
-        let expert_offsets = gate_logits.offset(te * 4 * 2);
-        let token_to_perm = gate_logits.offset(te * 4 * 2 + (ne + 1) * 4);
-        ops::moe_sort_by_expert(
-            ctx.gpu,
-            self.moe_sort_by_expert,
+        // ── b12x fused MoE (opt-in, ATLAS_HOLO_MOE_B12X) ──
+        // Replaces the routed sort→grouped-GEMM→unpermute block below with ONE resident
+        // FlashInfer launch that writes the routed result straight into `output`. The
+        // shared-expert blend + EP all-reduce tail below still runs. `try_b12x_prefill`
+        // returns false (grouped path, byte-identical to today) unless every eligibility
+        // gate passes. See forward_prefill_b12x.rs.
+        let output = ctx.buffers.moe_output();
+        let used_b12x = self.try_b12x_prefill(
+            input,
             indices_dev,
-            sorted_token_ids,
-            sorted_expert_ids,
-            expert_offsets,
-            token_to_perm,
-            total_expanded,
-            num_experts,
-            top_k,
-            stream,
-        )?;
-        prof_step!("sort");
-
-        // 3.5. Pre-expert norm: norm the input for expert dispatch (Gemma-4 26B).
-        // Router already used the raw input for routing; now norm for experts.
-        // IMPORTANT: write to scratch (ssm_deinterleaved), NOT in-place — `input` is
-        // the residual and must be preserved for the subsequent residual add.
-        let expert_input = if let Some(ref norm_w) = self.pre_expert_norm {
-            let normed_buf = ctx.buffers.ssm_deinterleaved();
-            let n_tokens = num_tokens as u32;
-            let eps = ctx.config.rms_norm_eps as f32;
-            ops::rms_norm(
-                ctx.gpu,
-                self.pre_expert_norm_k,
-                input,
-                norm_w,
-                normed_buf,
-                n_tokens,
-                h,
-                eps,
-                stream,
-            )?;
-            normed_buf
-        } else {
-            input
-        };
-        prof_step!("pre_expert_norm");
-
-        // Streaming Experts: patch the transposed pointer tables to point at
-        // the arena-resident records for this layer's local experts (no-op
-        // unless --stream-experts). Blocking fetch (Stage 2), before the GEMM
-        // reads the tables. Outside the profiled body; no sync on the fast path.
-        //
-        // REACTIVE (expert-granular) mode for small M (decode-via-prefill runs
-        // M=1): read back the active expert set (count>0) that `moe_sort_by_expert`
-        // just produced and fetch/patch ONLY those experts (~top_k of num_experts
-        // instead of all). `None` → the dense layer-ahead path, byte-identical to
-        // pre-reactive behavior. The readback is legal here (graphs off).
-        let reactive_active =
-            self.compute_reactive_active(ctx, expert_offsets, ne, num_tokens, stream)?;
-        self.install_streamed_tables(ctx, stream, reactive_active.as_deref())?;
-
-        // 4-6. Routed grouped-GEMM phase (grid sizing → grouped gate+up
-        // GEMM → SiLU → grouped down GEMM). Hoisted to forward_prefill_routed.rs
-        // to keep this file under the 500 LoC cap; behavior identical.
-        self.run_routed_grouped_gemm(
-            expert_input,
-            expert_offsets,
-            sorted_token_ids,
+            weights_dev,
+            output,
             n,
-            h,
-            inter,
-            num_experts,
-            top_k,
             num_tokens,
-            ne,
-            &mut t0,
             ctx,
             stream,
         )?;
+        if used_b12x {
+            prof_step!("b12x_moe");
+        } else {
+            // 3. Sort tokens by expert → L2-optimized ordering.
+            let te = total_expanded as usize;
+            let ne = num_experts as usize;
+            let sorted_token_ids = gate_logits;
+            let sorted_expert_ids = gate_logits.offset(te * 4);
+            let expert_offsets = gate_logits.offset(te * 4 * 2);
+            let token_to_perm = gate_logits.offset(te * 4 * 2 + (ne + 1) * 4);
+            ops::moe_sort_by_expert(
+                ctx.gpu,
+                self.moe_sort_by_expert,
+                indices_dev,
+                sorted_token_ids,
+                sorted_expert_ids,
+                expert_offsets,
+                token_to_perm,
+                total_expanded,
+                num_experts,
+                top_k,
+                stream,
+            )?;
+            prof_step!("sort");
 
-        // Streaming Experts: record this layer's slab as consumed and (dense
-        // path only) prefetch the next MoE layer's experts so its I/O overlaps
-        // upcoming compute (no-op unless --stream-experts). After the GEMM on
-        // `stream`. Reactive mode skips the layer-ahead prefetch.
-        self.after_streamed_layer(ctx, stream, reactive_active.is_some())?;
-        let expert_down_out = ctx.buffers.expert_down_out();
+            // 3.5. Pre-expert norm: norm the input for expert dispatch (Gemma-4 26B).
+            // Router already used the raw input for routing; now norm for experts.
+            // IMPORTANT: write to scratch (ssm_deinterleaved), NOT in-place — `input` is
+            // the residual and must be preserved for the subsequent residual add.
+            let expert_input = if let Some(ref norm_w) = self.pre_expert_norm {
+                let normed_buf = ctx.buffers.ssm_deinterleaved();
+                let n_tokens = num_tokens as u32;
+                let eps = ctx.config.rms_norm_eps as f32;
+                ops::rms_norm(
+                    ctx.gpu,
+                    self.pre_expert_norm_k,
+                    input,
+                    norm_w,
+                    normed_buf,
+                    n_tokens,
+                    h,
+                    eps,
+                    stream,
+                )?;
+                normed_buf
+            } else {
+                input
+            };
+            prof_step!("pre_expert_norm");
 
-        // 7. Unpermute + weighted reduce: scatter sorted outputs to token order
-        let output = ctx.buffers.moe_output();
-        ops::moe_unpermute_reduce_indexed(
-            ctx.gpu,
-            self.moe_unpermute_reduce,
-            expert_down_out,
-            output,
-            token_to_perm,
-            weights_dev,
-            h,
-            n,
-            top_k,
-            stream,
-        )?;
+            // Streaming Experts: patch the transposed pointer tables to point at
+            // the arena-resident records for this layer's local experts (no-op
+            // unless --stream-experts). Blocking fetch (Stage 2), before the GEMM
+            // reads the tables. Outside the profiled body; no sync on the fast path.
+            //
+            // REACTIVE (expert-granular) mode for small M (decode-via-prefill runs
+            // M=1): read back the active expert set (count>0) that `moe_sort_by_expert`
+            // just produced and fetch/patch ONLY those experts (~top_k of num_experts
+            // instead of all). `None` → the dense layer-ahead path, byte-identical to
+            // pre-reactive behavior. The readback is legal here (graphs off).
+            let reactive_active =
+                self.compute_reactive_active(ctx, expert_offsets, ne, num_tokens, stream)?;
+            self.install_streamed_tables(ctx, stream, reactive_active.as_deref())?;
+
+            // 4-6. Routed grouped-GEMM phase (grid sizing → grouped gate+up
+            // GEMM → SiLU → grouped down GEMM). Hoisted to forward_prefill_routed.rs
+            // to keep this file under the 500 LoC cap; behavior identical.
+            self.run_routed_grouped_gemm(
+                expert_input,
+                expert_offsets,
+                sorted_token_ids,
+                n,
+                h,
+                inter,
+                num_experts,
+                top_k,
+                num_tokens,
+                ne,
+                &mut t0,
+                ctx,
+                stream,
+            )?;
+
+            // Streaming Experts: record this layer's slab as consumed and (dense
+            // path only) prefetch the next MoE layer's experts so its I/O overlaps
+            // upcoming compute (no-op unless --stream-experts). After the GEMM on
+            // `stream`. Reactive mode skips the layer-ahead prefetch.
+            self.after_streamed_layer(ctx, stream, reactive_active.is_some())?;
+            let expert_down_out = ctx.buffers.expert_down_out();
+
+            // 7. Unpermute + weighted reduce: scatter sorted outputs to token order
+            ops::moe_unpermute_reduce_indexed(
+                ctx.gpu,
+                self.moe_unpermute_reduce,
+                expert_down_out,
+                output,
+                token_to_perm,
+                weights_dev,
+                h,
+                n,
+                top_k,
+                stream,
+            )?;
+        } // end else (grouped routed path)
 
         // 8. Blend shared expert: output += sigmoid(dot(input, gate)) * shared
         // Skip when has_shared == false (no shared expert in this model config).
