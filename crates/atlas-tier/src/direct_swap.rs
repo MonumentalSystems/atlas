@@ -13,9 +13,8 @@ use anyhow::{Result, bail};
 use crate::traits::SwapStore;
 
 /// `O_DIRECT` is a Linux-only open flag (macOS has no equivalent — `F_NOCACHE`
-/// is an `fcntl`, not an open flag). The type itself must still compile on every
-/// unix because `spark_storage::snapshot_swap` re-exports it unconditionally and
-/// the workspace has a macOS/metal CI job; off Linux it simply opens buffered.
+/// is an `fcntl`, not an open flag). The type must still compile on every unix
+/// (the workspace has a macOS/metal CI job); off Linux it simply opens buffered.
 /// That is harmless: the NVMe cold tier only ever runs on the Linux fleet.
 #[cfg(target_os = "linux")]
 const DIRECT_FLAGS: i32 = libc::O_DIRECT;

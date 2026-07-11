@@ -3,7 +3,7 @@
 #![deny(clippy::all)]
 
 //! The generic tiered-cache core: the CUDA-free, verbs-free paging foundation
-//! that the streaming-weights peer daemons build on.
+//! that the peer daemons build on.
 //!
 //! One mechanism, three seams:
 //!   * [`SlotArena`]  — the bounded HOT tier: `num_slots` fixed-size byte slots
@@ -21,8 +21,7 @@
 //! fully unit-testable without RDMA or a GPU and lets the downstream peer
 //! daemons build CUDA-free. The peer wire protocol (paging loops, client
 //! codec) and the concrete RDMA/HBM tier implementations deliberately do NOT
-//! live here — they arrive in the consumer crates (cache-peer, the
-//! `spark-storage` re-export) in follow-up PRs of the streaming-weights work.
+//! live here — they belong to the consumer crates that build on this core.
 
 mod direct_swap;
 mod mem;
