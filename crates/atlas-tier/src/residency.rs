@@ -51,7 +51,7 @@ pub struct Residency<A: SlotArena, S: SwapStore> {
     scratch: Vec<u8>,
     /// Read-pins: `key → active reader count`. A GET hands the client an arena
     /// offset it then one-sided-RDMA-READs; the peer drops the residency lock
-    /// before that read, so a concurrent ALLOC on another connection could pick
+    /// before that read, so a concurrent allocation on another connection could pick
     /// the slot as an eviction victim and reuse it mid-read (torn restore). A
     /// pinned key is held OUT of `lru` (like a `Reserved` slot) so
     /// `evict_coldest_to_disk` can never choose it. Ref-counted for concurrent
@@ -260,7 +260,7 @@ impl<A: SlotArena, S: SwapStore> Residency<A, S> {
     /// Read-pin `key` so its resident slot cannot be chosen as an eviction
     /// victim while a client's one-sided RDMA READ of it is in flight (the
     /// GET→RDMA-read race: the peer replies with the offset and drops the lock
-    /// before the client reads, so a concurrent ALLOC could otherwise
+    /// before the client reads, so a concurrent allocation could otherwise
     /// spill+reuse the slot). Ref-counted for concurrent readers; the first pin
     /// removes the key from `lru` (like a `Reserved` slot). No-op unless the key
     /// is currently `Resident`.

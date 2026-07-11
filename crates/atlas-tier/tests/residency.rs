@@ -94,7 +94,7 @@ fn infinite_depth_spill_and_fault_byte_identical() {
 
 /// THE eviction-pin guarantee (WS-A GET→RDMA-read race): a read-pinned key
 /// is never chosen as an eviction victim, even when it is the LRU-coldest —
-/// a concurrent ALLOC spills the next-coldest UNPINNED key instead, so the
+/// a concurrent allocation spills the next-coldest unpinned key instead, so the
 /// client's in-flight one-sided RDMA READ is never torn by slot reuse.
 #[test]
 fn read_pin_survives_concurrent_eviction() {
@@ -107,7 +107,7 @@ fn read_pin_survives_concurrent_eviction() {
     assert_eq!(r.read_pin_count(0), 1);
     let faults_before = r.stats().faults_from_disk;
 
-    // Client B ALLOCs a new key → arena full → must evict. Key 0 is coldest
+    // Client B allocates a new key → arena full → must evict. Key 0 is coldest
     // but pinned, so key 1 is spilled instead.
     put(&mut r, 2, 2);
     assert_eq!(r.stats().spills_to_disk, 1, "exactly one eviction");
