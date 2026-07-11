@@ -17,10 +17,23 @@ fn o_direct_file(record_bytes: usize, tag: &str) -> Option<(DirectSwapFile, std:
     match DirectSwapFile::create(&path, record_bytes) {
         Ok(f) => Some((f, path)),
         Err(e) => {
+            // Opt-in enforcement: CI on a real disk sets this so a silent skip
+            // can't green-light a run that never touched the O_DIRECT path.
+            if std::env::var_os("ATLAS_TIER_REQUIRE_O_DIRECT").is_some() {
+                panic!("ATLAS_TIER_REQUIRE_O_DIRECT set but O_DIRECT unavailable: {e:#}");
+            }
             eprintln!("skipping O_DIRECT test (filesystem refused O_DIRECT): {e:#}");
             None
         }
     }
+}
+
+/// A page-aligned (4 KiB) mutable sub-slice of `storage`, which must be
+/// over-allocated by at least 4096 bytes past `len`. Lets a test deterministically
+/// hit the O_DIRECT *aligned fast-path* (plain `Vec`s almost never are).
+fn page_aligned(storage: &mut [u8], len: usize) -> &mut [u8] {
+    let pad = (4096 - (storage.as_ptr() as usize & 0xfff)) & 0xfff;
+    &mut storage[pad..pad + len]
 }
 
 #[test]
@@ -90,6 +103,43 @@ fn residency_over_o_direct_swap_byte_identical() {
             vec![k as u8; rb],
             "key {k} byte-identical through O_DIRECT"
         );
+    }
+    let _ = std::fs::remove_file(path);
+}
+
+/// Deterministically exercise the O_DIRECT *aligned fast-path* (the direct
+/// pwrite/pread, not the bounce staging): pass page-aligned buffers so
+/// `write_record`/`read_record` take the `is_aligned()` branch. The existing
+/// `Vec`-based tests almost always hit the bounce instead, so this is the only
+/// coverage of the zero-copy path the peer's mmap'd arena actually uses.
+#[test]
+fn direct_swap_aligned_fast_path_roundtrips() {
+    let rb = 4096usize;
+    let Some((mut f, path)) = o_direct_file(rb, "aligned") else {
+        return;
+    };
+    let mut wstore = vec![0u8; rb + 4096];
+    let w = page_aligned(&mut wstore, rb);
+    assert_eq!(
+        w.as_ptr() as usize & 0xfff,
+        0,
+        "write buffer is page-aligned → fast-path"
+    );
+    for (i, b) in w.iter_mut().enumerate() {
+        *b = (i % 251) as u8;
+    }
+    f.write_record(7, w).unwrap(); // aligned src → direct pwrite
+
+    let mut rstore = vec![0u8; rb + 4096];
+    let rbuf = page_aligned(&mut rstore, rb);
+    assert_eq!(
+        rbuf.as_ptr() as usize & 0xfff,
+        0,
+        "read buffer is page-aligned → fast-path"
+    );
+    f.read_record(7, rbuf).unwrap(); // aligned dst → direct pread
+    for (i, b) in rbuf.iter().enumerate() {
+        assert_eq!(*b, (i % 251) as u8, "aligned fast-path byte {i}");
     }
     let _ = std::fs::remove_file(path);
 }
