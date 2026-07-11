@@ -350,9 +350,15 @@ pub struct MoeLayer {
     /// This layer's dense MoE-layer index (skips dense-attention layers), used
     /// to pick its arena ring slab. 0 unless streaming.
     stream_dense_idx: u32,
+    /// b12x fused-MoE repacked weights (`ATLAS_HOLO_MOE_B12X`). `None` = not
+    /// built / ineligible (grouped-CUTLASS path runs). Only `Some` when every
+    /// expert is resident (no EP shard, no streamer, no null experts).
+    pub(crate) b12x: Option<b12x_weights::B12xMoeWeights>,
 }
 
 // ── Sub-files (split for ≤500 LoC) ────────────────────────────────────────
+mod b12x_scales;
+mod b12x_weights;
 mod dump;
 mod forward;
 mod forward_atomic_c4;
@@ -362,6 +368,7 @@ mod forward_k2;
 mod forward_k3;
 mod forward_phase;
 mod forward_prefill;
+mod forward_prefill_b12x;
 mod forward_prefill_bf16;
 mod forward_prefill_fp8;
 mod forward_prefill_phase;
@@ -374,127 +381,11 @@ mod helpers_stream;
 mod init;
 #[cfg(test)]
 mod mod_tests;
+mod ptr_tables;
 mod streamer;
 
+pub(crate) use b12x_weights::B12xMoeWeights;
+pub(crate) use ptr_tables::{
+    build_bf16_ptr_table, build_fp8_ptr_table, build_ptr_table, build_ptr_table_from_qw,
+};
 pub(crate) use streamer::ExpertStreamerShared;
-
-/// Build a device-side pointer table from pre-transposed QuantizedWeight vec.
-fn build_ptr_table_from_qw(
-    weights: &[QuantizedWeight],
-    gpu: &dyn GpuBackend,
-) -> Result<ExpertPtrTable> {
-    let n = weights.len();
-    let packed_bytes: Vec<u8> = weights
-        .iter()
-        .flat_map(|w| w.weight.0.to_le_bytes())
-        .collect();
-    let scale_bytes: Vec<u8> = weights
-        .iter()
-        .flat_map(|w| w.weight_scale.0.to_le_bytes())
-        .collect();
-    let scale2_bytes: Vec<u8> = weights
-        .iter()
-        .flat_map(|w| w.weight_scale_2.to_le_bytes())
-        .collect();
-
-    let packed_ptrs = gpu.alloc(n * 8)?;
-    gpu.copy_h2d(&packed_bytes, packed_ptrs)?;
-    let scale_ptrs = gpu.alloc(n * 8)?;
-    gpu.copy_h2d(&scale_bytes, scale_ptrs)?;
-    let scale2_vals = gpu.alloc(n * 4)?;
-    gpu.copy_h2d(&scale2_bytes, scale2_vals)?;
-
-    Ok(ExpertPtrTable {
-        packed_ptrs,
-        scale_ptrs,
-        scale2_vals,
-    })
-}
-
-/// Build a device-side pointer table for one projection across all experts.
-fn build_ptr_table(
-    experts: &[ExpertWeight],
-    proj: impl Fn(&ExpertWeight) -> &crate::weight_map::QuantizedWeight,
-    gpu: &dyn GpuBackend,
-) -> Result<ExpertPtrTable> {
-    let n = experts.len();
-
-    // Build host-side arrays
-    let packed_bytes: Vec<u8> = experts
-        .iter()
-        .flat_map(|e| proj(e).weight.0.to_le_bytes())
-        .collect();
-    let scale_bytes: Vec<u8> = experts
-        .iter()
-        .flat_map(|e| proj(e).weight_scale.0.to_le_bytes())
-        .collect();
-    let scale2_bytes: Vec<u8> = experts
-        .iter()
-        .flat_map(|e| proj(e).weight_scale_2.to_le_bytes())
-        .collect();
-
-    // Upload to device
-    let packed_ptrs = gpu.alloc(n * 8)?;
-    gpu.copy_h2d(&packed_bytes, packed_ptrs)?;
-
-    let scale_ptrs = gpu.alloc(n * 8)?;
-    gpu.copy_h2d(&scale_bytes, scale_ptrs)?;
-
-    let scale2_vals = gpu.alloc(n * 4)?;
-    gpu.copy_h2d(&scale2_bytes, scale2_vals)?;
-
-    Ok(ExpertPtrTable {
-        packed_ptrs,
-        scale_ptrs,
-        scale2_vals,
-    })
-}
-
-/// Build a device-side FP8 pointer table for one projection across all experts.
-///
-/// FP8 experts store 2 arrays (weight + block_scale) per projection,
-/// vs NVFP4's 3 (packed + scale + scale2).
-/// Build a device-side BF16 pointer table for one projection across all
-/// experts. Used by the FP8-dequant-to-BF16 MoE path; one device pointer
-/// per expert pointing at that expert's `[N, K]` BF16 weight buffer.
-pub(crate) fn build_bf16_ptr_table(
-    experts: &[DenseWeight],
-    gpu: &dyn GpuBackend,
-) -> Result<DevicePtr> {
-    let n = experts.len();
-    let weight_bytes: Vec<u8> = experts
-        .iter()
-        .flat_map(|e| e.weight.0.to_le_bytes())
-        .collect();
-    let ptrs = gpu.alloc(n * 8)?;
-    gpu.copy_h2d(&weight_bytes, ptrs)?;
-    Ok(ptrs)
-}
-
-fn build_fp8_ptr_table(
-    experts: &[Fp8ExpertWeight],
-    proj: impl Fn(&Fp8ExpertWeight) -> &Fp8Weight,
-    gpu: &dyn GpuBackend,
-) -> Result<Fp8ExpertPtrTable> {
-    let n = experts.len();
-
-    let weight_bytes: Vec<u8> = experts
-        .iter()
-        .flat_map(|e| proj(e).weight.0.to_le_bytes())
-        .collect();
-    let scale_bytes: Vec<u8> = experts
-        .iter()
-        .flat_map(|e| proj(e).row_scale.0.to_le_bytes())
-        .collect();
-
-    let weight_ptrs = gpu.alloc(n * 8)?;
-    gpu.copy_h2d(&weight_bytes, weight_ptrs)?;
-
-    let scale_ptrs = gpu.alloc(n * 8)?;
-    gpu.copy_h2d(&scale_bytes, scale_ptrs)?;
-
-    Ok(Fp8ExpertPtrTable {
-        weight_ptrs,
-        scale_ptrs,
-    })
-}

@@ -379,6 +379,13 @@ pub(super) fn load_layers(
             moe_layer.build_cutlass_grouped_sfb(gpu, config, stream)?;
         }
 
+        // b12x fused-MoE opt-in repack (ATLAS_HOLO_MOE_B12X). Hard-errors on the
+        // --stream-experts combo; EP/null-expert/no-lib configs leave b12x=None (grouped
+        // path). Logic lives in b12x_weights.rs (this file is at the allow-listed cap).
+        if std::env::var("ATLAS_HOLO_MOE_B12X").as_deref() == Ok("1") {
+            moe_layer.build_b12x_weights(gpu, config, stream)?;
+        }
+
         // Streaming Experts: attach the shared streamer + this layer's dense MoE
         // index (the transposed tables now exist and will be patched per prefill).
         // qwen3.5 has a MoE MLP in every layer, so the dense MoE index == i; a
