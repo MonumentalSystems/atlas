@@ -81,7 +81,8 @@ impl TransformerModel {
         let prefix_match = if self.tokens_have_vision_pad(tokens) {
             spark_runtime::prefix_cache::PrefixMatch::empty()
         } else {
-            self.prefix_cache.lookup(tokens, bs, seq.session_hash)
+            self.prefix_cache
+                .lookup(tokens, bs, seq.session_hash, seq.adapter_id)
         };
         let mut kv_write_start = prefix_match.matched_tokens;
         seq.cached_prefix_tokens = prefix_match.matched_tokens;
