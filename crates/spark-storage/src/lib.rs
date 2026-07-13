@@ -41,6 +41,11 @@ pub mod group;
 pub mod model_dims;
 pub mod predictor_ref;
 pub mod projection;
+// The one-sided RDMA KV transport backend — a `StorageBackend` impl that
+// offloads/restores KV groups to a `cache_peer` blade over verbs. cuda (for the
+// pinned-host bounce + copy_h2d) + the verbs shim.
+#[cfg(all(feature = "cuda", atlas_rdma_verbs))]
+pub mod rdma_kv_backend;
 pub mod rdma_snapshot;
 pub mod snapshot_swap;
 
@@ -113,6 +118,8 @@ pub use expert_tier::{
 pub use expert_tier_rdma::RdmaTier;
 #[cfg(feature = "cuda")]
 pub use high_speed_swap::{HighSpeedSwap, install_local, local_installed, with_local};
+#[cfg(all(feature = "cuda", atlas_rdma_verbs))]
+pub use rdma_kv_backend::RdmaKvBackend;
 pub use rdma_snapshot::RdmaSnapshotArena;
 
 /// `true` iff `atlas_rdma_verbs` was re-emitted for this crate by build.rs (the
