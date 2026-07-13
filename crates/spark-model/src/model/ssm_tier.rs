@@ -1,14 +1,31 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! Model-safety contract for the SSM snapshot tiers: the stable, model-agnostic
+//! The SSM snapshot spill tier: the model-safety contract (the model-agnostic
 //! durable-key [`ModelFingerprint`] and the [`ensure_ssm_tier_capability`]
-//! gate. Both are pure `ModelConfig`-derived leaves — no HBM, RDMA, or paging
-//! machinery — so a caching tier can key entries so they never collide across
-//! models and can refuse a model that has no recurrent state. The paging/spill
-//! machinery that consumes these lands separately.
+//! gate) plus the byte-store substrate an evicted snapshot spills into.
+//!
+//! * [`SnapshotBlobStore`] — the seam: a keyed fixed-size blob store. Backends
+//!   are hardware-free and in-process here ([`MemBlobStore`] host-RAM;
+//!   [`ArenaSnapshotStore`]/[`PagingSnapshotStore`] over a [`SnapshotTransport`]/
+//!   [`PagingTransport`], proven on [`MockSnapshotTransport`]/[`FileSnapshotArena`]).
+//!   The env-driven store selection ([`build_tier_store`] / [`build_decode_tier_store`],
+//!   gated by `ATLAS_SSM_TIER`) picks a local backend here; the RDMA transport
+//!   binding and its peer arms land in a follow-up PR.
 
+mod arena_store;
 mod capability;
 mod fingerprint;
+mod selectors;
+mod store;
+mod transport;
+mod unified;
 
+pub(crate) use arena_store::{ArenaSnapshotStore, PagingSnapshotStore, RdmaSnapshotStore};
 pub(crate) use capability::ensure_ssm_tier_capability;
 pub(crate) use fingerprint::ModelFingerprint;
+pub(crate) use selectors::{build_decode_tier_store, build_tier_store, ssm_tier_enabled};
+pub(crate) use store::{BlobStoreStats, MemBlobStore, SnapshotBlobStore};
+pub(crate) use transport::{
+    FileSnapshotArena, MockSnapshotTransport, PagingTransport, SnapshotTransport,
+};
+pub(crate) use unified::{UnifiedSnapshotStore, ssm_tier_unified};
