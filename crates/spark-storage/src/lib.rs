@@ -77,6 +77,12 @@ pub mod backend;
 #[cfg(feature = "cuda")]
 pub mod bench;
 #[cfg(feature = "cuda")]
+pub mod expert_arena;
+#[cfg(feature = "cuda")]
+pub mod expert_tier;
+#[cfg(feature = "cuda")]
+pub mod expert_tier_rdma;
+#[cfg(feature = "cuda")]
 pub mod high_speed_swap;
 #[cfg(feature = "cuda")]
 pub mod predictor;
@@ -94,9 +100,17 @@ pub use eviction::EvictionPolicy;
 pub use expert::{
     ExpertKey, ExpertLayout, ExpertRecordHeader, ExpertRecordId, ExpertRecordSpec, Proj, ProjBytes,
 };
+#[cfg(feature = "cuda")]
+pub use expert_arena::ExpertArena;
 #[cfg(unix)]
 pub use expert_pack::{ExpertFileReader, ExpertFileWriter};
 pub use expert_pack::{ExpertIndex, ProjData, ProjView, pack_record, unpack_record};
+#[cfg(feature = "cuda")]
+pub use expert_tier::{
+    ArenaSlot, ExpertResidency, ExpertTier, PosixTier, TierKind, UmaArenaTier, open_tier,
+};
+#[cfg(feature = "cuda")]
+pub use expert_tier_rdma::RdmaTier;
 #[cfg(feature = "cuda")]
 pub use high_speed_swap::{HighSpeedSwap, install_local, local_installed, with_local};
 pub use rdma_snapshot::RdmaSnapshotArena;
