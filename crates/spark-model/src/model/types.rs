@@ -41,6 +41,18 @@ pub struct TransformerModel {
     pub(super) lm_head_fp8: Option<Fp8DenseWeight>,
     pub(super) layers: Vec<Box<dyn TransformerLayer>>,
     pub(super) buffers: BufferArena,
+    /// Startup-static LoRA adapter (pool + per-layer pairs + M2 pointer
+    /// tables). `None` = no adapter. Installed post-construction via
+    /// `set_lora_weights`, which also copies the per-layer pairs into the
+    /// layer structs; kept here as the owner of the pool/tables and for
+    /// status introspection.
+    pub(super) lora: Option<crate::lora::LoraWeights>,
+    /// True when runtime adapter rotation is ARMED: `ATLAS_LORA_ROTATE=1`, or
+    /// `$ATLAS_LORA_PEER` set. Armed ⇒ decode runs eager (no CUDA-graph
+    /// capture) so a `set_active_lora` re-point is immediately live
+    /// (eager-on-rotate). `false` (single startup adapter, no rotation env)
+    /// keeps the decode-graph path byte-identical to today.
+    pub(super) lora_rotatable: bool,
     pub(super) kv_cache: Mutex<PagedKvCache>,
     pub(super) gpu: Box<dyn GpuBackend>,
     pub(super) rms_norm_kernel: KernelHandle,

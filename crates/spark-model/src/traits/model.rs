@@ -204,6 +204,65 @@ pub trait Model: Send + Sync {
     /// Vocab size (for sampler allocation).
     fn vocab_size(&self) -> usize;
 
+    /// Runtime LoRA adapter rotation: select the resident adapter named `name`
+    /// as active (re-points the delta pool pointers). MUST be called at a
+    /// scheduler quiescent point (no in-flight decode). Graph-safety is via the
+    /// eager-on-rotate gate. Default: unsupported (non-LoRA or non-rotatable).
+    fn set_active_lora(&mut self, _name: &str) -> Result<()> {
+        bail!("this model does not support LoRA adapter rotation")
+    }
+
+    /// Task #24: stable adapter_id (KV/prefix-cache identity) for a per-request
+    /// pool-slot selector. `slot` follows `SequenceState.adapter_slot`: `>= 0`
+    /// picks that resident slot, `-1` defers to the installed active adapter.
+    /// The default (no LoRA) returns the base sentinel `0`, keeping the prefix
+    /// cache byte-identical to the pre-LoRA path.
+    fn adapter_id_for(&self, _slot: i32) -> u64 {
+        0
+    }
+
+    /// Task #25: acquire a per-slot ref when a sequence begins using its adapter
+    /// (at prefill), resolving `-1 -> active` like [`Self::adapter_id_for`].
+    /// Returns the RESOLVED pool index the ref was taken on (store it, release
+    /// EXACTLY that index at terminal free — immune to a rotate changing active).
+    /// Default (no LoRA) returns `-1` "nothing acquired" so the release guard
+    /// skips and the base path is byte-identical.
+    fn acquire_adapter_slot(&self, _slot: i32) -> i32 {
+        -1
+    }
+
+    /// Task #25: release a per-slot ref acquired by [`Self::acquire_adapter_slot`],
+    /// by the RESOLVED index it returned. `-1` is a no-op. Default: no-op.
+    fn release_adapter_slot(&self, _resolved: i32) {}
+
+    /// Runtime LoRA adapter dynamic-load: load the adapter at `dir` INTO pool
+    /// `slot` and make it resident there (pool-size-1 per-request weight change).
+    /// MUST be called at a scheduler quiescent point; needs rotation armed.
+    /// Default: unsupported (non-LoRA or non-rotatable).
+    fn swap_lora_from_disk(
+        &mut self,
+        _dir: &std::path::Path,
+        _name: &str,
+        _slot: usize,
+    ) -> Result<()> {
+        bail!("this model does not support LoRA disk swap")
+    }
+
+    /// Task #27 (demand-driven promotion): RDMA-promote the adapter `name`
+    /// (staged on `peer_addr` at `adapter_id`) from the peer into a cache pool
+    /// slot and make it active, returning `(slot, evicted_name)`. Runs at a
+    /// scheduler quiescent point. `peft` supplies the r/alpha/scaling the peer
+    /// manifest does not carry. Default: unsupported (non-LoRA / non-cuda).
+    fn promote_lora_from_peer(
+        &mut self,
+        _peer_addr: &str,
+        _adapter_id: &str,
+        _name: &str,
+        _peft: atlas_core::config::PeftAdapterConfig,
+    ) -> Result<(usize, Option<String>)> {
+        bail!("this model does not support LoRA peer promotion")
+    }
+
     /// Dims for the `--high-speed-swap` orchestrator (installed thread-local
     /// after `bind_gpu_to_thread`). `None` for legacy/non-attention models.
     fn high_speed_swap_dims(&self) -> Option<spark_storage::ModelDims> {

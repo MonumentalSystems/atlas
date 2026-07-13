@@ -181,6 +181,24 @@ pub struct SequenceState {
     /// i in [0, prompt_len-1) scoring tokens[i+1]. The final prompt
     /// position (whose target is the first GENERATED token) is excluded.
     pub prompt_logprobs: Vec<PromptTokenLogprob>,
+    /// M2 per-request LoRA routing: the adapter POOL SLOT this sequence's
+    /// requests select (NOT `slot_idx`, which is the KV/SSM pool slot). `-1`
+    /// (the default for every existing path) means "defer to the installed
+    /// active adapter" — so an unset request is byte-identical to today. Set
+    /// once from `InferenceRequest::adapter_slot()` at prefill; read by
+    /// `decode_batch` to build the per-step device `seq_slot[N]` buffer the
+    /// batched bgmv routes on.
+    pub adapter_slot: i32,
+    /// Task #25 (slot ref_count): the RESOLVED LoRA pool slot this sequence holds
+    /// a ref on (`-1` = none / not acquired — the default and every non-LoRA
+    /// path). Set at the prefill acquire (and re-acquire on swap-in resume) to
+    /// the index `Model::acquire_adapter_slot` returned; the terminal free
+    /// releases EXACTLY this index (not a re-resolved `adapter_slot`, which would
+    /// mis-decrement if `active` rotated between prefill and finish) and zeroes
+    /// it back to `-1` so release fires exactly once per acquire. Stored resolved
+    /// (not raw) so it also guards the non-scheduler alloc paths (which never
+    /// acquire) from an underflow.
+    pub acquired_adapter_slot: i32,
 }
 
 impl SequenceState {

@@ -193,6 +193,8 @@ impl TransformerModel {
         let num_attn_layers = self.config.num_attention_layers();
         Ok(SequenceState {
             adapter_id: 0,
+            adapter_slot: -1,          // default: defer to installed active adapter
+            acquired_adapter_slot: -1, // Task #25: no ref held until prefill acquires
             tokens: Vec::new(),
             block_table: Vec::new(),
             seq_len: 0,

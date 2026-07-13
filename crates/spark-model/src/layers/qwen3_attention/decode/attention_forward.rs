@@ -226,6 +226,86 @@ impl Qwen3AttentionLayer {
 
         self.attention_forward_kv(normed, k_out, v_out, nkv, hd, h, ctx, stream)?;
 
+        // ── LoRA deltas on K/V (v0; Q excluded — gated [Q|gate] interleave).
+        // MUST run BEFORE the q/k RMS-norm, RoPE, and write_kv_cache below:
+        // HF computes k_norm(k_proj(x) + Δ), and the KV cache must store the
+        // ADAPTED k/v. Placed here rather than inside attention_forward_kv
+        // because that helper has three return points (MLA / FP8 / tail).
+        if let Some(ref lw) = self.lora {
+            // Request-scoped routing: when this step carries a per-seq slot
+            // buffer (`seq_slot != 0`) and the module has a routing table, fold
+            // the delta for THIS request's adapter via the fused bgmv (n=1 row,
+            // byte-identical to a single `apply_lora_delta(m=1)` at that slot).
+            // Otherwise (no pool / no route) take the installed-active-pair path
+            // — byte-identical to pre-M2.
+            let seq_slot = ctx
+                .attn_metadata
+                .map(|m| m.seq_slot)
+                .unwrap_or(DevicePtr(0));
+            if let Some(ref pair) = lw.k {
+                if seq_slot.0 != 0
+                    && let Some(ref route) = lw.k_route
+                {
+                    ops::lora_delta::apply_lora_bgmv(
+                        ctx.gpu,
+                        &lw.kernels,
+                        route,
+                        normed,
+                        k_out,
+                        seq_slot,
+                        1,
+                        pair.k_in,
+                        pair.n_out,
+                        ctx.buffers.lora_xa(),
+                        stream,
+                    )?;
+                } else {
+                    ops::lora_delta::apply_lora_delta(
+                        ctx.gpu,
+                        &lw.kernels,
+                        pair,
+                        normed,
+                        k_out,
+                        1,
+                        ctx.buffers.lora_xa(),
+                        ctx.buffers.lora_delta(),
+                        stream,
+                    )?;
+                }
+            }
+            if let Some(ref pair) = lw.v {
+                if seq_slot.0 != 0
+                    && let Some(ref route) = lw.v_route
+                {
+                    ops::lora_delta::apply_lora_bgmv(
+                        ctx.gpu,
+                        &lw.kernels,
+                        route,
+                        normed,
+                        v_out,
+                        seq_slot,
+                        1,
+                        pair.k_in,
+                        pair.n_out,
+                        ctx.buffers.lora_xa(),
+                        stream,
+                    )?;
+                } else {
+                    ops::lora_delta::apply_lora_delta(
+                        ctx.gpu,
+                        &lw.kernels,
+                        pair,
+                        normed,
+                        v_out,
+                        1,
+                        ctx.buffers.lora_xa(),
+                        ctx.buffers.lora_delta(),
+                        stream,
+                    )?;
+                }
+            }
+        }
+
         // Q/K RMS norms — three mutually-exclusive paths:
         //  1. MiniMax M2 style: RMSNorm over full projected hidden
         //     `[nq*hd]` per token, single learned weight of that shape.

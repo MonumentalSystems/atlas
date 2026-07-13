@@ -32,6 +32,8 @@ pub(crate) mod impl_a3;
 pub(crate) mod impl_b1;
 pub(crate) mod impl_b2;
 pub(crate) mod impl_b3;
+pub(crate) mod impl_lora;
+pub(crate) mod impl_lora_swap;
 pub(crate) mod ssm_pool;
 pub(crate) mod ssm_snapshot;
 pub(crate) mod ssm_snapshot_spill;
