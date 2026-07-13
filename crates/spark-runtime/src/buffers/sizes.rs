@@ -108,6 +108,23 @@ pub struct BufferSizes {
     pub fp8_act: usize,
     /// Per-128-block FP32 scales paired with `fp8_act` (one f32 per 128 elems).
     pub fp8_act_scale: usize,
+    /// LoRA shrink output `xa = x@Aᵀ`: [m, adapter_max_rank] BF16.
+    /// 0 (→ NULL alloc) when no adapter is configured (adapter_max_rank == 0).
+    pub lora_xa: usize,
+    /// LoRA expand output `delta = xa@Bᵀ`: [m, max target n_out] BF16, where
+    /// max n_out = max(hidden, intermediate) — covers k/v/o/gate/up/down in
+    /// v0 (q_proj is excluded). 0 (→ NULL) when no adapter.
+    pub lora_delta: usize,
+    /// LoRA hidden-activation scratch [m, intermediate_size] BF16 for the
+    /// runtime delta path on FFN projections. 0 (→ NULL) when no adapter.
+    pub lora_hact: usize,
+    /// LoRA per-request routing slots `[m]` i32 — one adapter SLOT index per
+    /// prefilling token (all equal for a single-request prefill; resolves
+    /// `-1`→active before upload). Dedicated buffer (not a packed meta offset)
+    /// so the m-element prefill slot array never collides with the per-path
+    /// positions/slots/block_table region. 0 (→ NULL) when no adapter
+    /// (adapter_max_rank == 0).
+    pub lora_seq_slot: usize,
 }
 
 impl BufferSizes {
@@ -240,6 +257,21 @@ impl BufferSizes {
         let max_proj_k = h.max(q_heads * hd);
         let fp8_act = m * max_proj_k;
         let fp8_act_scale = m * max_proj_k.div_ceil(128) * 4;
+        // LoRA scratch — only when an adapter is configured (adapter_max_rank
+        // set programmatically pre-build). Widest v0 target n_out =
+        // max(hidden, intermediate): covers k/v, o/down (hidden) and gate/up
+        // (intermediate); q_proj (2*q_heads*head_dim) is excluded in v0.
+        let (lora_xa, lora_delta, lora_hact, lora_seq_slot) = if config.adapter_max_rank > 0 {
+            let max_n = h.max(config.intermediate_size);
+            (
+                m * config.adapter_max_rank * bf16,
+                m * max_n * bf16,
+                m * config.intermediate_size * bf16,
+                m * 4, // [m] i32 per-request routing slots (prefill path)
+            )
+        } else {
+            (0, 0, 0, 0)
+        };
 
         // GDN FLA chunked-prefill scratch — ONE buffer holding W|U|S|uc back-to-back,
         // sized for the chunked-prefill arena (nt = ceil(max_batch_tokens / CHUNK)).
@@ -401,6 +433,10 @@ impl BufferSizes {
             ffn_act_scale,
             fp8_act,
             fp8_act_scale,
+            lora_xa,
+            lora_delta,
+            lora_hact,
+            lora_seq_slot,
         }
     }
 
@@ -436,5 +472,9 @@ impl BufferSizes {
             + self.ffn_act_scale
             + self.fp8_act
             + self.fp8_act_scale
+            + self.lora_xa
+            + self.lora_delta
+            + self.lora_hact
+            + self.lora_seq_slot
     }
 }
