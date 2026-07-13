@@ -78,9 +78,6 @@ pub(crate) fn ssm_tier_unified() -> bool {
 /// the [`atlas_tier::SlotArena`] hot-tier seam: slot `i` lives at offset
 /// `i × slot_bytes` — the same fixed-slot geometry [`super::RdmaSnapshotStore`]
 /// uses, so the peer arena layout is unchanged under the flag.
-// Constructed only through the RDMA transport binding (a follow-up PR) and the
-// unit tests; the local-only selector arms in this PR don't build one yet.
-#[allow(dead_code)]
 pub(super) struct TransportSlotArena {
     pub(super) transport: Box<dyn SnapshotTransport>,
     pub(super) slot_bytes: usize,

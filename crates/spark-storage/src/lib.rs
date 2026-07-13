@@ -38,6 +38,8 @@ pub mod group;
 pub mod model_dims;
 pub mod predictor_ref;
 pub mod projection;
+pub mod rdma_snapshot;
+pub mod snapshot_swap;
 
 // `ModelDims` is a plain POD struct (no GPU state) that
 // `spark-model`'s public surface threads through every layer's
@@ -77,6 +79,20 @@ pub use config::HighSpeedSwapConfig;
 pub use eviction::EvictionPolicy;
 #[cfg(feature = "cuda")]
 pub use high_speed_swap::{HighSpeedSwap, install_local, local_installed, with_local};
+pub use rdma_snapshot::RdmaSnapshotArena;
+
+/// `true` iff `atlas_rdma_verbs` was re-emitted for this crate by build.rs (the
+/// one-sided verbs shim lives in the CUDA-free `atlas-rdma` crate; `rustc-cfg`
+/// doesn't cross crates, so build.rs re-emits it off atlas-rdma's `links`
+/// metadata). `rdma_verbs_probe_tests` asserts it, so a silent cfg evaporation
+/// fails `cargo test -p spark-storage --lib` on verbs hosts instead of
+/// green-building with the gated modules compiled out.
+pub const fn rdma_verbs_enabled() -> bool {
+    cfg!(atlas_rdma_verbs)
+}
+
+#[cfg(test)]
+mod rdma_verbs_probe_tests;
 
 // Non-cuda stub surface — same names as the real CUDA orchestrator
 // above so spark-model's call sites compile unchanged. `with_local`
