@@ -220,12 +220,8 @@ impl RdmaLoraLoader {
             .context("alloc pinned RDMA landing bounce")?;
         // LOCAL_WRITE-only landing MR (`remote_read == false`, invariant).
         // SAFETY: `bounce` backs `bounce_len` pinned bytes that outlive the MR.
-        let keys = unsafe {
-            rs.rails[0]
-                .verbs
-                .reg_mr(bounce as *mut c_void, bounce_len, false)
-        }
-        .context("register RDMA landing bounce")?;
+        let keys = unsafe { rs.rails[0].verbs.reg_mr(bounce as *mut c_void, bounce_len, false) }
+            .context("register RDMA landing bounce")?;
 
         // Validate the shard table BEFORE replying (bail = no client params).
         let server = rs
