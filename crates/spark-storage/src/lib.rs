@@ -41,6 +41,17 @@ pub mod projection;
 pub mod rdma_snapshot;
 pub mod snapshot_swap;
 
+// KV overflow blade (cache-peer): a passive remote-RAM RW tier for the
+// high-speed-swap KV cache, served over one-sided RDMA. `cache_peer` is the
+// server; `blade_cap` is the process-global commit ledger it (and the
+// weight/expert peers) reserve against — CUDA-free arithmetic, so it's
+// `#[allow(dead_code)]` on verbs-OFF builds where the handshake that consumes
+// it is compiled out.
+#[cfg(unix)]
+#[allow(dead_code)]
+pub(crate) mod blade_cap;
+pub mod cache_peer;
+
 // `ModelDims` is a plain POD struct (no GPU state) that
 // `spark-model`'s public surface threads through every layer's
 // forward signature; it must stay reachable on metal builds even
