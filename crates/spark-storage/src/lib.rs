@@ -38,6 +38,7 @@ pub mod expert;
 pub mod expert_pack;
 pub mod expert_peer;
 pub mod group;
+pub mod kv_paging;
 pub mod model_dims;
 pub mod predictor_ref;
 pub mod projection;
@@ -118,6 +119,8 @@ pub use expert_tier::{
 pub use expert_tier_rdma::RdmaTier;
 #[cfg(feature = "cuda")]
 pub use high_speed_swap::{HighSpeedSwap, install_local, local_installed, with_local};
+#[cfg(all(feature = "cuda", atlas_rdma_verbs))]
+pub use kv_paging::KvPagingBackend;
 #[cfg(all(feature = "cuda", atlas_rdma_verbs))]
 pub use rdma_kv_backend::RdmaKvBackend;
 pub use rdma_snapshot::RdmaSnapshotArena;
