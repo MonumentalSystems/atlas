@@ -228,6 +228,29 @@ impl TransformerModel {
                 );
             }
         }
+        // verify_kgamma_graph + fused_graph are keyed by (slot, K). They now
+        // capture the LoRA bgmv-vs-installed-pair branch and read the per-seq
+        // seq_slot buffer, so a freed slot's entries MUST be destroyed — else a
+        // reused slot replays a stale adapter index (multi-adapter + DFlash
+        // spec-decode output corruption). Drop every K for this slot.
+        for graph_map in [&self.verify_kgamma_graph, &self.fused_graph] {
+            let mut cache = graph_map.lock();
+            let keys: Vec<(usize, usize)> = cache
+                .keys()
+                .filter(|k| k.0 == seq.slot_idx)
+                .copied()
+                .collect();
+            for k in keys {
+                if let Some(graph) = cache.remove(&k)
+                    && let Err(e) = self.gpu.destroy_graph(graph)
+                {
+                    tracing::error!(
+                        "free_sequence: destroy_graph(kgamma/fused[{},{}]): {e:#}",
+                        k.0, k.1
+                    );
+                }
+            }
+        }
 
         // Free proposer state (KV cache blocks + per-seq device buffers).
         if let Some(ref proposer) = self.proposer
