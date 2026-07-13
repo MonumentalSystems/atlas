@@ -50,6 +50,10 @@ pub mod projection;
 pub mod rdma_kv_backend;
 pub mod rdma_snapshot;
 pub mod snapshot_swap;
+// RDMA weight-staging peer (RO): serves a model's safetensors shards to the
+// weight loader over one-sided READ for fast model swaps. `manifest`/`wire` are
+// un-gated; `serve`/`shard` are `cfg(unix)` internally.
+pub mod weight_peer;
 
 // KV overflow blade (cache-peer): a passive remote-RAM RW tier for the
 // high-speed-swap KV cache, served over one-sided RDMA. `cache_peer` is the
@@ -158,3 +162,4 @@ pub use probe::{Backend, ProbeConfig, ProbeResult, run_probe};
 pub use projection::{PredictorShape, build_projection};
 #[cfg(feature = "cuda")]
 pub use tiled_attention::{TiledAttention, TiledAttentionDims};
+pub use weight_peer::{WeightManifest, WeightTensorRecord};
