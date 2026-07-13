@@ -30,6 +30,16 @@ fn main() {
     println!("cargo:rerun-if-env-changed=SKIP_ATLAS_BUILD");
     println!("cargo:rerun-if-changed=src/rdma_shim.c");
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-env-changed=ATLAS_NO_RDMA");
+
+    // RDMA-only opt-out: gate off the verbs shim (no libibverbs, no C compile)
+    // WITHOUT the nvcc/CUDA side effects that ATLAS_SKIP_BUILD carries in
+    // spark-storage. Downstream RDMA code compiles to its `not(atlas_rdma_verbs)`
+    // stubs; the NVMe/host tiers are unaffected. (Proves the "NVMe-only, no RDMA"
+    // build profile; candidate for a proper `rdma` cargo feature upstream.)
+    if std::env::var("ATLAS_NO_RDMA").as_deref() == Ok("1") {
+        return;
+    }
 
     // Apple Silicon hosts have no rdma-core; the verbs module compiles out.
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
