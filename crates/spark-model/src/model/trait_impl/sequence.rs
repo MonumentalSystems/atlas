@@ -130,6 +130,17 @@ impl TransformerModel {
             self.ssm_pool.release_slot(slot);
         }
 
+        // Task #25: release this sequence's LoRA slot ref (the single terminal
+        // chokepoint every stamped seq routes through — normal stop/EOS/length,
+        // error/abort, prefill-error frees, and swap-out spill). Guarded by the
+        // RESOLVED `acquired_adapter_slot` (`-1` = never acquired: the non-
+        // scheduler alloc paths and the base no-LoRA path skip this) and zeroed
+        // so it fires exactly once per acquire, idempotent against a double free.
+        if seq.acquired_adapter_slot >= 0 {
+            self.release_adapter_slot(seq.acquired_adapter_slot);
+            seq.acquired_adapter_slot = -1;
+        }
+
         // Release prefix cache refs before freeing blocks.
         // (i.e., blocks not shared with the prefix cache).
         self.prefix_cache.release(
