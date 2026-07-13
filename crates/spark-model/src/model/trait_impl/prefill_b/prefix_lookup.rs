@@ -119,8 +119,13 @@ impl TransformerModel {
             // layer_kv_write_start floor (forward_layers.rs) skips writes below
             // cached_prefix_tokens, so the shared prefix-cache blocks keep the
             // original values (a non-bit-equal rewrite would poison them).
-            let mut skip = if let Some(snap_id) = prefix_match.ssm_snapshot {
-                let snap_tok = prefix_match.ssm_snapshot_tokens;
+            // Phase 1b spill-tier fault-in: fold a resident hit with a
+            // faulted-back spilled anchor; see `ssm_fault_in::eff_ssm_snapshot`.
+            let (eff_snapshot, eff_snapshot_tokens) =
+                self.eff_ssm_snapshot(&prefix_match, seq.session_hash, stream);
+
+            let mut skip = if let Some(snap_id) = eff_snapshot {
+                let snap_tok = eff_snapshot_tokens;
                 // Exact full-prompt hit on a hiddenless snapshot (finish
                 // leaves never stash a hidden): the exact-snap fixup cannot
                 // produce the first token's logits, so fall through to the
@@ -252,7 +257,18 @@ impl TransformerModel {
             // already-cached values).
             //
             // For pure attention (MLA/GQA): use matched tokens directly.
-            let snap_tok = prefix_match.ssm_snapshot_tokens;
+            //
+            // CRITICAL (tier fault-in skip fix): use the EFFECTIVE snapshot
+            // depth, not the resident-only `ssm_snapshot_tokens`. When the
+            // anchor was SPILLED and faulted back in above, the resident field
+            // is 0 and the real depth lives in `ssm_snapshot_tier_tokens` (both
+            // folded into `eff_snapshot_tokens`). Using the raw field here would
+            // make `snap_tok = 0 → skip_tokens = 0` for every tier restore, so
+            // the suffix prefill re-runs the SSM over the ENTIRE prefix — the
+            // restore completes but skips nothing, making a warm fault-in slower
+            // than a plain recompute. `eff_snapshot_tokens` makes the skip point
+            // equal the restored state depth.
+            let snap_tok = eff_snapshot_tokens;
             let skip_tokens = if skip && !has_ssm {
                 matched
             } else if skip && matched == total && snap_tok == matched {
