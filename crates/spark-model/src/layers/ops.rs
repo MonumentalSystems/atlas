@@ -43,6 +43,8 @@ mod kv_cache;
 mod kv_cache_fp8k;
 #[path = "ops/kv_cache_turbok.rs"]
 mod kv_cache_turbok;
+#[path = "ops/lora_delta.rs"]
+pub mod lora_delta;
 #[path = "ops/moe_atomic_c4.rs"]
 mod moe_atomic_c4;
 #[path = "ops/moe_expert.rs"]
