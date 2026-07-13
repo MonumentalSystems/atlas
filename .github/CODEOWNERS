@@ -29,6 +29,7 @@ crates/spark-server/                         @tbraun96 @azeezish @rsafier @SeedS
 
 # Multi-rank communication (NCCL / RDMA).
 crates/spark-comm/                           @tbraun96 @azeezish @rsafier @SeedSource
+crates/atlas-rdma/                           @tbraun96 @azeezish @rsafier @SeedSource
 
 # Storage / NVMe-backed swap.
 crates/spark-storage/                        @tbraun96 @azeezish @rsafier @SeedSource
