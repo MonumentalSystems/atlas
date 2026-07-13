@@ -339,6 +339,32 @@ pub(crate) async fn serve(mut args: cli::ServeArgs) -> Result<()> {
         }
     }
     let dflash_drafter_state = serve_phases::load_dflash_drafter(&args, &ptx_set, gpu.as_ref())?;
+    // LoRA adapters: resolve + load BEFORE `gpu` is moved into build_model.
+    // `lora_states` must outlive build_model (lora_args borrows &l.store) and
+    // stays alive until after AppState construction (adapter name clones).
+    let lora_states = serve_phases::load_lora_adapters(&args, gpu.as_ref())?;
+    if !lora_states.is_empty() && world_size > 1 {
+        anyhow::bail!(
+            "--lora-adapter requires world_size=1 in v0 (got {world_size}); \
+             TP adapter sharding is M3"
+        );
+    }
+    let lora_args = if lora_states.is_empty() {
+        None
+    } else {
+        Some(spark_model::factory::LoraBuildArgs {
+            adapters: lora_states
+                .iter()
+                .map(|l| spark_model::lora::LoraAdapterInput {
+                    name: l.name.clone(),
+                    store: &l.store,
+                    peft: l.peft_config.clone(),
+                })
+                .collect(),
+            max_lora_rank: args.max_lora_rank,
+            max_loras: args.max_loras,
+        })
+    };
     let dflash_args =
         dflash_drafter_state
             .as_ref()
@@ -365,6 +391,7 @@ pub(crate) async fn serve(mut args: cli::ServeArgs) -> Result<()> {
         prefix_cache,
         comm,
         dflash_args,
+        lora_args,
     )?;
 
     // Kernel load audit: print the table of every kernel resolved during model
@@ -459,6 +486,9 @@ pub(crate) async fn serve(mut args: cli::ServeArgs) -> Result<()> {
 
     // 7. Create scheduler channel + spawn scheduler
     let (request_tx, request_rx) = mpsc::channel::<InferenceRequest>(args.max_num_seqs);
+    // LoRA adapter-rotation control channel (POST /v1/lora/active). Small: it
+    // carries only control messages, applied one-at-a-time at quiescence.
+    let (rotation_tx, rotation_rx) = mpsc::channel::<scheduler::LoraRotation>(8);
 
     let model_name = serve_phases::resolve_model_name(&args, &config_json, &model_dir);
 
@@ -582,6 +612,7 @@ pub(crate) async fn serve(mut args: cli::ServeArgs) -> Result<()> {
         scheduler::run(
             scheduler_model,
             request_rx,
+            rotation_rx,
             scheduler_eos,
             max_batch_size,
             use_speculative,
@@ -622,11 +653,79 @@ pub(crate) async fn serve(mut args: cli::ServeArgs) -> Result<()> {
     if let Some(max_pixels) = vision_max_pixels {
         tracing::info!("Vision max_pixels cap enabled: {}", max_pixels);
     }
+    // #27: build the STAGEABLE registry (name -> {peer_stage_id, peft}). The peer
+    // WeightManifest carries no r/alpha, so the peft scaling is parsed from each
+    // adapter's local CONFIG_DIR/adapter_config.json HERE (fail-fast at startup —
+    // a wrong/absent scale must never be discovered mid-serve).
+    let lora_peer_addr = spark_model::lora::lora_peer_env();
+    let mut lora_stageable = std::collections::HashMap::new();
+    for (name, peer_id, dir) in &args.lora_stageable {
+        let cfg_path = std::path::Path::new(dir).join("adapter_config.json");
+        let raw = std::fs::read_to_string(&cfg_path).with_context(|| {
+            format!(
+                "--lora-stageable '{name}': read peft config {}",
+                cfg_path.display()
+            )
+        })?;
+        let peft = atlas_core::config::parse_peft_adapter_config(&raw)
+            .with_context(|| format!("--lora-stageable '{name}': parse {}", cfg_path.display()))?;
+        lora_stageable.insert(
+            name.clone(),
+            crate::main_modules::promotion::StageableAdapter {
+                peer_stage_id: peer_id.clone(),
+                peft,
+            },
+        );
+    }
+    if !lora_stageable.is_empty() && lora_peer_addr.is_none() {
+        anyhow::bail!(
+            "--lora-stageable given ({} adapter(s)) but $ATLAS_LORA_PEER is unset; \
+             demand promotion needs a weight peer to RDMA-stage from",
+            lora_stageable.len()
+        );
+    }
+    if !lora_stageable.is_empty() && lora_states.is_empty() {
+        anyhow::bail!(
+            "--lora-stageable needs a resident pool to promote INTO; start with at \
+             least one --lora-adapter (and --max-loras > that count for cache headroom)"
+        );
+    }
+    // Promotion is armed only when the registry is non-empty, a peer is set, AND
+    // a rotation channel exists (a LoRA pool is resident). Otherwise every field
+    // is inert and a miss 404s byte-identically to today.
+    let promotion =
+        if !lora_stageable.is_empty() && lora_peer_addr.is_some() && !lora_states.is_empty() {
+            Some(Arc::new(
+                crate::main_modules::promotion::PromotionManager::default(),
+            ))
+        } else {
+            None
+        };
+    if promotion.is_some() {
+        tracing::info!(
+            "LoRA #27: {} stageable adapter(s) armed for demand promotion \
+             (peer={:?}, cache headroom={} slots)",
+            lora_stageable.len(),
+            lora_peer_addr,
+            args.max_loras.saturating_sub(lora_states.len()),
+        );
+    }
+
     let state = Arc::new(AppState {
         tokenizer,
         model_name,
+        adapter_name: lora_states.first().map(|l| l.name.clone()),
+        adapter_names: lora_states.iter().map(|l| l.name.clone()).collect(),
+        active_adapter: std::sync::Arc::new(std::sync::Mutex::new(
+            lora_states.first().map(|l| l.name.clone()),
+        )),
         max_seq_len: args.max_seq_len,
         request_tx,
+        rotation_tx: if lora_states.is_empty() {
+            None
+        } else {
+            Some(rotation_tx)
+        },
         vision_config: config.vision.clone(),
         vision_max_pixels,
         default_temperature,
@@ -666,6 +765,10 @@ pub(crate) async fn serve(mut args: cli::ServeArgs) -> Result<()> {
         conversation_store,
         dump_writer,
         auth,
+        lora_stageable,
+        lora_peer_addr,
+        promotion,
+        promoted_slots: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
     });
 
     serve_phases::log_behavior_audit(&args, &ptx_set);

@@ -201,6 +201,16 @@ impl InferenceRequest {
         }
     }
 
+    /// M2 per-request LoRA routing: the adapter pool slot this request selects
+    /// (`-1` = defer to installed active). Copied onto `SequenceState.adapter_slot`
+    /// by the scheduler at prefill; the batched decode routes the bgmv on it.
+    pub fn adapter_slot(&self) -> i32 {
+        match self {
+            InferenceRequest::Blocking { adapter_slot, .. } => *adapter_slot,
+            InferenceRequest::Streaming { adapter_slot, .. } => *adapter_slot,
+        }
+    }
+
     /// Whether thinking mode is enabled for this request.
     pub fn enable_thinking(&self) -> bool {
         match self {

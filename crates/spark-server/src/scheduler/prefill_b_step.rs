@@ -44,6 +44,7 @@ pub fn prefill_request(
     let logit_bias = req.logit_bias().to_vec();
     let req_min_tokens = req.min_tokens();
     let req_session_hash = req.session_hash();
+    let req_adapter_slot = req.adapter_slot(); // M2 per-request LoRA routing
     let req_enable_thinking = req.enable_thinking();
     let req_thinking_budget = req.thinking_budget();
     let req_repetition_detection = req.repetition_detection();
@@ -111,6 +112,15 @@ pub fn prefill_request(
         }
     };
     seq.session_hash = req_session_hash;
+    seq.adapter_slot = req_adapter_slot;
+    // Task #24: resolve the STABLE adapter_id NOW (model owns the authoritative
+    // active slot for the `-1 = defer to active` case). Keys the KV/prefix cache
+    // so this request reuses only same-adapter blocks.
+    seq.adapter_id = model.adapter_id_for(req_adapter_slot);
+    // Task #25: acquire a ref on the resolved LoRA slot so a swap into it is
+    // refused while this seq is in-flight; released symmetrically in
+    // free_sequence (normal finish + the error guard below both route there).
+    seq.acquired_adapter_slot = model.acquire_adapter_slot(req_adapter_slot);
 
     // Guard: free SSM slot on any error after allocation (Bug #16).
     let prefill_result = (|| -> Result<u32> {

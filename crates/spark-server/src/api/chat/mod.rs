@@ -154,6 +154,20 @@ pub(crate) async fn chat_completions_inner(
         req.repetition_penalty,
     );
 
+    // M2 per-request LoRA routing: resolve the optional `adapter` name to a
+    // pool slot ONCE here (both dispatch paths inherit it). Unset defers to the
+    // installed active adapter (`-1`, byte-identical to today); an unknown name
+    // is a hard 400, a STAGEABLE name triggers the #27 on-miss RDMA promotion.
+    let adapter_slot = match super::lora_control::resolve_request_adapter_slot(
+        &state,
+        req.adapter.as_deref(),
+    )
+    .await
+    {
+        Ok(slot) => slot,
+        Err(resp) => return resp,
+    };
+
     // ── Phase 1: build MsgEntry vec + image preprocess + cwd ────
     let msg_entry::BuildOut {
         messages,
@@ -263,6 +277,7 @@ pub(crate) async fn chat_completions_inner(
             dump_seq,
             prompt_tokens,
             session_hash,
+            adapter_slot,
             image_pixels,
             max_tokens,
             temperature,
@@ -299,6 +314,7 @@ pub(crate) async fn chat_completions_inner(
         dump_seq,
         prompt_tokens,
         session_hash,
+        adapter_slot,
         image_pixels,
         max_tokens,
         temperature,

@@ -26,6 +26,8 @@ pub(super) async fn dispatch_streaming(
     dump_seq: Option<u64>,
     prompt_tokens: Vec<u32>,
     session_hash: u64,
+    // M2 per-request LoRA routing: resolved adapter slot (-1 = defer to active).
+    adapter_slot: i32,
     image_pixels: Vec<(Vec<f32>, usize, usize)>,
     max_tokens: usize,
     temperature: f32,
@@ -76,6 +78,7 @@ pub(super) async fn dispatch_streaming(
         state,
         prompt_tokens,
         session_hash,
+        adapter_slot,
         image_pixels,
         max_tokens,
         req.min_tokens,

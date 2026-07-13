@@ -39,7 +39,9 @@ pub mod completions_logprobs;
 pub mod conversations;
 pub mod inference_impl;
 pub mod inference_types;
+pub mod lora_control;
 pub mod misc_handlers;
+pub mod models;
 pub mod responses;
 pub mod responses_stream;
 pub mod responses_stream_finalize;
@@ -62,13 +64,15 @@ pub use chat::chat_completions;
 pub(crate) use chat::chat_completions_inner;
 #[allow(unused_imports)]
 pub use compact::compact_messages;
-pub use completions::{completions, embeddings_stub, get_model, list_models};
+pub use completions::completions;
+pub use models::{embeddings_stub, get_model, list_models};
 #[allow(unused_imports)]
 pub use conversations::{
     AddItemsRequest, CreateConversationRequest, UpdateConversationRequest, add_conversation_items,
     create_conversation, delete_conversation, delete_conversation_item, get_conversation,
     get_conversation_item, list_conversation_items, update_conversation,
 };
+pub use lora_control::{load_lora_into_slot, set_active_lora};
 pub use inference_types::{
     GrammarSpec, InferenceRequest, InferenceResponse, StreamEvent, TokenLogprobs,
 };

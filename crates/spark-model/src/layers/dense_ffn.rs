@@ -471,7 +471,7 @@ impl DenseFfnLayer {
         let mut freed = 0usize;
         for wt in [&mut self.weights.gate_proj_t, &mut self.weights.up_proj_t]
             .into_iter()
-            .chain(down_t.take().into_iter())
+            .chain(down_t.take())
         {
             if let Some(w) = wt.as_ref()
                 && !w.weight.is_null()

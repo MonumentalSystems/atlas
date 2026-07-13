@@ -37,6 +37,9 @@ pub(super) struct CompletionParams {
     /// Clamped `logprobs` (OpenAI integer form). Drives generated-token
     /// logprobs always, and prompt logprobs when `echo` is set.
     pub logprobs_k: Option<u8>,
+    /// M2 per-request LoRA routing: resolved adapter slot (`-1` = defer to
+    /// the installed active adapter).
+    pub adapter_slot: i32,
 }
 
 /// Run every (prompt × n) choice sequentially and assemble the response.
@@ -66,6 +69,7 @@ pub(super) async fn run_blocking(
             let request = InferenceRequest::Blocking {
                 prompt_tokens: Arc::new(prompt_tokens.clone()),
                 session_hash,
+                adapter_slot: p.adapter_slot,
                 image_pixels: Vec::new(),
                 max_tokens: req.max_tokens,
                 min_tokens: 0,

@@ -9,6 +9,12 @@ use super::*;
 #[allow(dead_code)]
 pub struct ChatCompletionRequest {
     pub model: String,
+    /// M2 per-request LoRA routing: optional resident adapter NAME to apply to
+    /// THIS request's sequence (independent of `model`, which routes advertise
+    /// only). Unset = defer to the installed active adapter (byte-identical to
+    /// today). Unknown name = 400. Resolved to a pool slot at request time.
+    #[serde(default)]
+    pub adapter: Option<String>,
     pub messages: Vec<IncomingMessage>,
     #[serde(default = "default_max_tokens", alias = "max_completion_tokens")]
     pub max_tokens: usize,

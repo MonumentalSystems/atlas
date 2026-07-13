@@ -199,6 +199,20 @@ pub async fn completions(
     // OpenAI clamps chat top_logprobs to 20; same bound here (spec says
     // 5 for legacy — being more permissive, never less).
     let logprobs_k = req.logprobs.map(|k| k.min(20));
+
+    // M2 per-request LoRA routing: resolve the optional `adapter` name to a
+    // pool slot (`-1` = defer to installed active; unknown = 400), with the #27
+    // on-miss RDMA promotion for stageable adapters.
+    let adapter_slot = match super::lora_control::resolve_request_adapter_slot(
+        &state,
+        req.adapter.as_deref(),
+    )
+    .await
+    {
+        Ok(slot) => slot,
+        Err(resp) => return resp,
+    };
+
     let params = super::completions_exec::CompletionParams {
         temperature,
         top_k,
@@ -212,6 +226,7 @@ pub async fn completions(
         stop_tokens,
         repetition_detection: req.repetition_detection,
         logprobs_k,
+        adapter_slot,
     };
 
     if req.stream {
@@ -268,6 +283,7 @@ pub(super) async fn completions_stream(
     let request = InferenceRequest::Streaming {
         prompt_tokens: std::sync::Arc::new(prompt_tokens),
         session_hash,
+        adapter_slot: p.adapter_slot,
         image_pixels: Vec::new(),
         max_tokens: req.max_tokens,
         min_tokens: 0,
@@ -443,48 +459,6 @@ pub(super) async fn completions_stream(
     Ok(Sse::new(full_stream)
         .keep_alive(KeepAlive::default())
         .into_response())
-}
-
-/// GET /v1/models
-pub async fn list_models(State(state): State<Arc<AppState>>) -> Json<ModelListResponse> {
-    Json(ModelListResponse {
-        object: "list".to_string(),
-        data: vec![ModelInfo {
-            id: state.model_name.clone(),
-            object: "model".to_string(),
-            created: crate::openai::unix_timestamp(),
-            owned_by: "atlas-spark".to_string(),
-        }],
-    })
-}
-
-/// GET /v1/models/{model_id} — retrieve a single model (OpenAI SDK `client.models.retrieve()`).
-pub async fn get_model(
-    State(state): State<Arc<AppState>>,
-    axum::extract::Path(model_id): axum::extract::Path<String>,
-) -> Response {
-    if model_id == state.model_name {
-        Json(serde_json::json!({
-            "id": state.model_name,
-            "object": "model",
-            "created": crate::openai::unix_timestamp(),
-            "owned_by": "atlas-spark",
-        }))
-        .into_response()
-    } else {
-        openai_error_response(
-            StatusCode::NOT_FOUND,
-            format!("The model '{model_id}' does not exist"),
-        )
-    }
-}
-
-/// POST /v1/embeddings — stub for clients that probe this endpoint during auto-detection.
-pub async fn embeddings_stub() -> Response {
-    openai_error_response(
-        StatusCode::NOT_IMPLEMENTED,
-        "Embeddings are not supported by this model. Atlas serves generative (chat/completion) models only.".into(),
-    )
 }
 
 /// Generic 501 "not supported" response used by the auto-probe stubs

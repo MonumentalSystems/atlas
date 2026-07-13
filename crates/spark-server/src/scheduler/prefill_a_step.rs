@@ -57,6 +57,7 @@ pub fn start_chunked_prefill(
     let logit_bias = req.logit_bias().to_vec();
     let req_min_tokens = req.min_tokens();
     let req_session_hash = req.session_hash();
+    let req_adapter_slot = req.adapter_slot(); // M2 per-request LoRA routing
     let req_enable_thinking = req.enable_thinking();
     let req_thinking_budget = req.thinking_budget();
     let req_repetition_detection = req.repetition_detection();
@@ -131,6 +132,16 @@ pub fn start_chunked_prefill(
         }
     };
     seq.session_hash = req_session_hash;
+    seq.adapter_slot = req_adapter_slot;
+    // Task #24: resolve the STABLE adapter_id NOW (model owns the authoritative
+    // active slot for the `-1 = defer to active` case). Keys the KV/prefix cache
+    // so this request reuses only same-adapter blocks.
+    seq.adapter_id = model.adapter_id_for(req_adapter_slot);
+    // Task #25: acquire a ref on the resolved LoRA slot so a swap into it is
+    // refused while this seq is in-flight. Before the `defer` branch so both the
+    // InProgress co-dispatch and the inline path (and all error frees below,
+    // which route through free_sequence) hold + release the ref symmetrically.
+    seq.acquired_adapter_slot = model.acquire_adapter_slot(req_adapter_slot);
     seq.collect_prompt_logprobs = req_prompt_logprobs;
 
     // Deferred co-dispatch: setup + EP broadcast, then return InProgress at

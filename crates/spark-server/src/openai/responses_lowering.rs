@@ -149,6 +149,7 @@ pub fn lower_responses_to_chat(
     };
     Ok(ChatCompletionRequest {
         model: r.model,
+        adapter: None,
         messages,
         max_tokens: r.max_output_tokens.unwrap_or_else(default_max_tokens),
         temperature: r.temperature,
