@@ -2200,6 +2200,7 @@ dependencies = [
  "rand_distr",
  "serde",
  "serde_json",
+ "spark-runtime",
  "tracing",
  "tracing-subscriber",
 ]
