@@ -107,6 +107,7 @@ impl ModelConfig {
             mtp_transformer_layers: 0,
             rotary_dim: 0,
             dflash_capture_layers: Vec::new(),
+            adapter_max_rank: 0,
         }
     }
 }
