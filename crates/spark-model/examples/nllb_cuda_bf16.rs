@@ -1,12 +1,14 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! Milestone-4 GPU PoC: NLLB-200 / M2M-100 translation on CUDA with a **bf16
-//! tensor-core** pipeline. The heavy projections/FFN/lm_head run on Atlas's
-//! shared `dense_gemm_bf16_pipelined` (mma.sync + cp.async) tensor-core kernel;
-//! LayerNorm / attention / elementwise use bf16 variants in the `nllb_encoder`
-//! module (bf16 storage, f32 accumulation). Greedy argmax runs on-device
-//! (`argmax`) — no per-token 1 MB logits copy. Device KV cache + beam as in
-//! milestone 3.
+//! Milestone-4/5 GPU PoC: NLLB-200 / M2M-100 translation on CUDA with a **bf16
+//! tensor-core** pipeline. The ENCODER's batched projections/FFN/lm_head run on
+//! Atlas's shared `dense_gemm_bf16_pipelined` (mma.sync + cp.async) tensor-core
+//! kernel; single-token DECODE uses a right-sized `nllb_gemv_bf16` (warp-per-row
+//! GEMV, fused bias) since the pipelined GEMM wastes 127/128 of its M-tile on
+//! M=1. LayerNorm / attention / elementwise use bf16 variants in the
+//! `nllb_encoder` module (bf16 storage, f32 accumulation). Greedy argmax runs
+//! on-device (`argmax`) — no per-token 1 MB logits copy. Device KV cache + beam
+//! as in milestone 3.
 //!
 //! Loads the bf16 checkpoint (default `/tank/hf/nllb-200-3.3B-bf16`). bf16
 //! introduces small numeric drift vs the fp32 reference, so greedy is
@@ -50,6 +52,7 @@ struct Kernels {
     bias: KernelHandle,
     attn: KernelHandle,
     gemm: KernelHandle,
+    gemv: KernelHandle,
     argmax: KernelHandle,
 }
 
@@ -100,6 +103,7 @@ fn main() -> Result<()> {
         bias: gpu.kernel("nllb_encoder", "nllb_bias_bf16")?,
         attn: gpu.kernel("nllb_encoder", "nllb_attn_kv_bf16")?,
         gemm: gpu.kernel("gemm", "dense_gemm_bf16_pipelined")?,
+        gemv: gpu.kernel("nllb_encoder", "nllb_gemv_bf16")?,
         argmax: gpu.kernel("argmax", "argmax_bf16")?,
     };
     let embed_table = store.get("model.shared.weight")?.ptr;
@@ -288,6 +292,48 @@ impl Ctx<'_> {
             .arg_u32(rows as u32)
             .arg_u32(n_out as u32)
             .launch(self.stream)
+    }
+
+    /// Single-token GEMV: y[N] = W[N,K] @ x[K] + bias (bias may be NULL).
+    /// Fuses the bias-add; right-sized for M=1 decode.
+    fn gemv(
+        &self,
+        x: DevicePtr,
+        wt: DevicePtr,
+        bias: DevicePtr,
+        y: DevicePtr,
+        n: usize,
+        kdim: usize,
+    ) -> Result<()> {
+        KernelLaunch::new(self.gpu, self.k.gemv)
+            .grid([div_ceil(n as u32, 8), 1, 1])
+            .block([256, 1, 1])
+            .arg_ptr(x)
+            .arg_ptr(wt)
+            .arg_ptr(bias)
+            .arg_ptr(y)
+            .arg_u32(n as u32)
+            .arg_u32(kdim as u32)
+            .launch(self.stream)
+    }
+
+    /// M=1 biased linear via GEMV (weight/bias named `{prefix}.{weight,bias}`).
+    fn linear1(
+        &self,
+        prefix: &str,
+        x: DevicePtr,
+        y: DevicePtr,
+        n_out: usize,
+        k_in: usize,
+    ) -> Result<()> {
+        self.gemv(
+            x,
+            self.w(&format!("{prefix}.weight"))?,
+            self.w(&format!("{prefix}.bias"))?,
+            y,
+            n_out,
+            k_in,
+        )
     }
 
     fn attention(
@@ -525,32 +571,30 @@ impl<'a> DecCtx<'a> {
             c.gpu.copy_d2d(s.dh, s.residual, d * 2)?;
             c.gpu.copy_d2d(s.dh, s.normed, d * 2)?;
             c.layer_norm(&format!("{p}.self_attn_layer_norm"), s.normed, 1)?;
-            c.linear(&format!("{p}.self_attn.q_proj"), s.normed, s.q, 1, d, d)?;
-            c.linear(
+            c.linear1(&format!("{p}.self_attn.q_proj"), s.normed, s.q, d, d)?;
+            c.linear1(
                 &format!("{p}.self_attn.k_proj"),
                 s.normed,
                 cache.k[l].offset(off),
-                1,
                 d,
                 d,
             )?;
-            c.linear(
+            c.linear1(
                 &format!("{p}.self_attn.v_proj"),
                 s.normed,
                 cache.v[l].offset(off),
-                1,
                 d,
                 d,
             )?;
             c.attention(s.q, cache.k[l], cache.v[l], s.attn, 1, tk, false)?;
-            c.linear(&format!("{p}.self_attn.out_proj"), s.attn, s.proj, 1, d, d)?;
+            c.linear1(&format!("{p}.self_attn.out_proj"), s.attn, s.proj, d, d)?;
             c.add(s.proj, s.residual, d)?;
             c.gpu.copy_d2d(s.proj, s.dh, d * 2)?;
             // cross-attention
             c.gpu.copy_d2d(s.dh, s.residual, d * 2)?;
             c.gpu.copy_d2d(s.dh, s.normed, d * 2)?;
             c.layer_norm(&format!("{p}.encoder_attn_layer_norm"), s.normed, 1)?;
-            c.linear(&format!("{p}.encoder_attn.q_proj"), s.normed, s.q, 1, d, d)?;
+            c.linear1(&format!("{p}.encoder_attn.q_proj"), s.normed, s.q, d, d)?;
             c.attention(
                 s.q,
                 self.cross_k[l],
@@ -560,33 +604,26 @@ impl<'a> DecCtx<'a> {
                 c.enc_len,
                 false,
             )?;
-            c.linear(
-                &format!("{p}.encoder_attn.out_proj"),
-                s.attn,
-                s.proj,
-                1,
-                d,
-                d,
-            )?;
+            c.linear1(&format!("{p}.encoder_attn.out_proj"), s.attn, s.proj, d, d)?;
             c.add(s.proj, s.residual, d)?;
             c.gpu.copy_d2d(s.proj, s.dh, d * 2)?;
             // FFN
             c.gpu.copy_d2d(s.dh, s.residual, d * 2)?;
             c.gpu.copy_d2d(s.dh, s.normed, d * 2)?;
             c.layer_norm(&format!("{p}.final_layer_norm"), s.normed, 1)?;
-            c.linear(&format!("{p}.fc1"), s.normed, s.ff, 1, c.ffn, d)?;
+            c.linear1(&format!("{p}.fc1"), s.normed, s.ff, c.ffn, d)?;
             KernelLaunch::new(c.gpu, c.k.relu)
                 .grid([div_ceil(c.ffn as u32, 256), 1, 1])
                 .block([256, 1, 1])
                 .arg_ptr(s.ff)
                 .arg_u32(c.ffn as u32)
                 .launch(c.stream)?;
-            c.linear(&format!("{p}.fc2"), s.ff, s.proj, 1, d, c.ffn)?;
+            c.linear1(&format!("{p}.fc2"), s.ff, s.proj, d, c.ffn)?;
             c.add(s.proj, s.residual, d)?;
             c.gpu.copy_d2d(s.proj, s.dh, d * 2)?;
         }
         c.layer_norm("model.decoder.layer_norm", s.dh, 1)?;
-        c.gemm(s.dh, c.embed_table, s.logits, 1, c.vocab, d)?; // tied lm_head, no bias
+        c.gemv(s.dh, c.embed_table, DevicePtr(0), s.logits, c.vocab, d)?; // tied lm_head, no bias
         Ok(())
     }
 

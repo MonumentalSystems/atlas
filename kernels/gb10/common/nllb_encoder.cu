@@ -312,3 +312,26 @@ extern "C" __global__ void nllb_attn_kv_bf16(
         acc += scores[j] * __bfloat162float(v[(unsigned long long)j * dmodel + (unsigned long long)head * D + tid]);
     out[bq + tid] = __float2bfloat16(acc);
 }
+
+// bf16 GEMV for single-token decode: y[N] = W[N,K] @ x[K] + bias[N] (bias may
+// be null). One warp per output row; f32 accumulation → bit-compatible with the
+// tensor-core GEMM's f32 accumulate. Right-sized for M=1 (the pipelined GEMM
+// wastes 127/128 of its 128-row M-tile on a single token) and fuses the bias.
+extern "C" __global__ void nllb_gemv_bf16(
+    const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ W,
+    const __nv_bfloat16* __restrict__ bias, __nv_bfloat16* __restrict__ y,
+    unsigned int N, unsigned int K) {
+    unsigned int warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    unsigned int lane = threadIdx.x & 31u;
+    if (warp >= N) return;
+    const __nv_bfloat16* wrow = W + (unsigned long long)warp * K;
+    float acc = 0.0f;
+    for (unsigned int k = lane; k < K; k += 32u)
+        acc += __bfloat162float(x[k]) * __bfloat162float(wrow[k]);
+    for (int o = 16; o > 0; o >>= 1)
+        acc += __shfl_down_sync(0xffffffffu, acc, o);
+    if (lane == 0) {
+        if (bias) acc += __bfloat162float(bias[warp]);
+        y[warp] = __float2bfloat16(acc);
+    }
+}
