@@ -41,4 +41,8 @@ pub(crate) mod ssm_tier;
 pub(crate) mod trait_impl;
 pub(crate) mod types;
 
+// Served NLLB-200 / M2M-100 encoder-decoder model (CUDA/GB10 serving path).
+#[cfg(feature = "cuda")]
+pub mod nllb;
+
 pub use types::TransformerModel;

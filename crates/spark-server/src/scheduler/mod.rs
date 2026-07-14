@@ -13,6 +13,7 @@
 
 // ── Submodules (split for ≤500 LoC files) ──────────────────────────────────
 mod adaptive_spec;
+mod beam_prefill;
 mod confidence;
 mod decode_logits_content;
 mod decode_logits_seq;
@@ -47,6 +48,7 @@ mod verify_k3_step;
 mod verify_k4_step;
 mod verify_pipeline_helper;
 
+use beam_prefill::resolve_beam_hyp;
 use confidence::*;
 use decode_logits_content::*;
 use decode_logits_seq::*;

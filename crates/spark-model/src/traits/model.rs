@@ -36,7 +36,40 @@ use spark_runtime::gpu::DevicePtr;
 
 use super::{MixedBatchResult, MixedForwardResult, PrefillSlice, SequenceState};
 
+/// One beam-search request for a translation model (NLLB). Carries the resolved
+/// per-request parameters the scheduler stamps onto the sequence; the model runs
+/// the whole beam search to completion and returns the winning hypothesis.
+#[derive(Debug, Clone)]
+pub struct BeamReq {
+    /// Raw source subword ids (the model adds `[src_lang] … </s>` itself).
+    pub prompt_tokens: Vec<u32>,
+    /// Per-request source/target language token ids (`0` = deployment default).
+    pub src_lang_id: u32,
+    pub tgt_lang_id: u32,
+    /// Per-request LoRA slot (`>=0` apply, `-1` base).
+    pub adapter_slot: i32,
+    pub num_beams: usize,
+    pub max_new: usize,
+    pub length_penalty: f32,
+    pub early_stopping: bool,
+}
+
 pub trait Model: Send + Sync {
+    /// True when this model implements run-to-completion beam search
+    /// ([`Self::generate_beam_batch`]). Default `false` — only encoder-decoder
+    /// translation models (NLLB) override it.
+    fn supports_beam(&self) -> bool {
+        false
+    }
+
+    /// Run beam search to completion for each request, returning each one's
+    /// winning hypothesis token ids (EOS-terminated). Called from the prefill
+    /// path for `num_beams > 1` requests, bypassing the token-by-token decode
+    /// loop. Default: unsupported.
+    fn generate_beam_batch(&self, _reqs: &[BeamReq]) -> Result<Vec<Vec<u32>>> {
+        bail!("this model does not support beam search")
+    }
+
     /// Run prefill: process all prompt tokens through the model.
     ///
     /// Returns logits DevicePtr for the last token position.

@@ -2125,6 +2125,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "spark-nllb"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "half",
+ "memmap2",
+ "rayon",
+ "safetensors",
+ "serde",
+ "serde_json",
+ "tokenizers",
+]
+
+[[package]]
 name = "spark-runtime"
 version = "0.1.0"
 dependencies = [

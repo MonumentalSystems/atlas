@@ -169,6 +169,42 @@ pub(crate) async fn chat_completions_inner(
         Err(resp) => return resp,
     };
 
+    // Resolve optional per-request source/target language token NAMES to token
+    // ids via the server tokenizer. Absent = deployment default (0); an unknown
+    // token is a hard 400 (mirrors the adapter-name resolution convention).
+    let resolve_lang = |name: &Option<String>| -> Result<u32, Response> {
+        match name {
+            None => Ok(0),
+            Some(s) => state.tokenizer.inner().token_to_id(s).ok_or_else(|| {
+                openai_error_response(
+                    StatusCode::BAD_REQUEST,
+                    format!("unknown language token '{s}'"),
+                )
+            }),
+        }
+    };
+    let src_lang_id = match resolve_lang(&req.src_lang) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    let tgt_lang_id = match resolve_lang(&req.tgt_lang) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+
+    // NLLB beam search params (mirrors src/tgt lang resolution). Streaming +
+    // beam is unsupported (the beam path emits a single completed hypothesis,
+    // not an incremental token stream) — reject up front like n>1.
+    let num_beams = req.num_beams.unwrap_or(1);
+    let length_penalty = req.length_penalty.unwrap_or(1.0);
+    let early_stopping = req.early_stopping.unwrap_or(false);
+    if num_beams > 1 && req.stream {
+        return openai_error_response(
+            StatusCode::BAD_REQUEST,
+            "num_beams > 1 is not supported in streaming mode".to_string(),
+        );
+    }
+
     // ── Phase 1: build MsgEntry vec + image preprocess + cwd ────
     let msg_entry::BuildOut {
         messages,
@@ -279,6 +315,11 @@ pub(crate) async fn chat_completions_inner(
             prompt_tokens,
             session_hash,
             adapter_slot,
+            src_lang_id,
+            tgt_lang_id,
+            num_beams,
+            length_penalty,
+            early_stopping,
             image_pixels,
             max_tokens,
             temperature,
@@ -316,6 +357,11 @@ pub(crate) async fn chat_completions_inner(
         prompt_tokens,
         session_hash,
         adapter_slot,
+        src_lang_id,
+        tgt_lang_id,
+        num_beams,
+        length_penalty,
+        early_stopping,
         image_pixels,
         max_tokens,
         temperature,

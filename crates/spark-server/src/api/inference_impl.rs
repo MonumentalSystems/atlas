@@ -211,6 +211,70 @@ impl InferenceRequest {
         }
     }
 
+    /// Per-request source-language token id (0 = deployment default). Copied
+    /// onto `SequenceState.src_lang_id` by the scheduler at prefill.
+    pub fn src_lang_id(&self) -> u32 {
+        match self {
+            InferenceRequest::Blocking { src_lang_id, .. } => *src_lang_id,
+            InferenceRequest::Streaming { src_lang_id, .. } => *src_lang_id,
+        }
+    }
+
+    /// Per-request target-language token id (0 = deployment default). Copied
+    /// onto `SequenceState.tgt_lang_id` by the scheduler at prefill.
+    pub fn tgt_lang_id(&self) -> u32 {
+        match self {
+            InferenceRequest::Blocking { tgt_lang_id, .. } => *tgt_lang_id,
+            InferenceRequest::Streaming { tgt_lang_id, .. } => *tgt_lang_id,
+        }
+    }
+
+    /// NLLB beam search: beams per request (1 = greedy). Copied onto
+    /// `SequenceState.num_beams` by the scheduler at prefill.
+    pub fn num_beams(&self) -> u32 {
+        match self {
+            InferenceRequest::Blocking { num_beams, .. } => *num_beams,
+            InferenceRequest::Streaming { num_beams, .. } => *num_beams,
+        }
+    }
+
+    /// NLLB beam search: length penalty. Copied onto
+    /// `SequenceState.length_penalty` by the scheduler at prefill.
+    pub fn length_penalty(&self) -> f32 {
+        match self {
+            InferenceRequest::Blocking { length_penalty, .. } => *length_penalty,
+            InferenceRequest::Streaming { length_penalty, .. } => *length_penalty,
+        }
+    }
+
+    /// NLLB beam search: early stopping. Copied onto
+    /// `SequenceState.early_stopping` by the scheduler at prefill.
+    pub fn early_stopping(&self) -> bool {
+        match self {
+            InferenceRequest::Blocking { early_stopping, .. } => *early_stopping,
+            InferenceRequest::Streaming { early_stopping, .. } => *early_stopping,
+        }
+    }
+
+    /// Max new tokens for this request. Read (non-consuming) by the beam
+    /// co-dispatch pre-pass to build a `BeamReq` before the admit loop consumes
+    /// the request.
+    pub fn max_tokens(&self) -> usize {
+        match self {
+            InferenceRequest::Blocking { max_tokens, .. } => *max_tokens,
+            InferenceRequest::Streaming { max_tokens, .. } => *max_tokens,
+        }
+    }
+
+    /// Clone the prompt-token `Arc` (cheap) — used by the beam co-dispatch
+    /// pre-pass to build a `BeamReq` without consuming the request.
+    pub fn prompt_tokens_arc(&self) -> std::sync::Arc<Vec<u32>> {
+        match self {
+            InferenceRequest::Blocking { prompt_tokens, .. } => prompt_tokens.clone(),
+            InferenceRequest::Streaming { prompt_tokens, .. } => prompt_tokens.clone(),
+        }
+    }
+
     /// Whether thinking mode is enabled for this request.
     pub fn enable_thinking(&self) -> bool {
         match self {

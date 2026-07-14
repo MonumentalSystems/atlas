@@ -513,6 +513,18 @@ pub struct ServeArgs {
     #[arg(long, value_name = "NAME=PATH_OR_HF_ID", value_parser = parse_lora_adapter_spec)]
     pub lora_adapter: Vec<(String, String)>,
 
+    /// NLLB/M2M-100 ONLY: source-language token for translation (e.g.
+    /// `eng_Latn`). Prepended to the encoder input. Required when serving an
+    /// `m2m_100`/`nllb` checkpoint; ignored otherwise.
+    #[arg(long)]
+    pub src_lang: Option<String>,
+
+    /// NLLB/M2M-100 ONLY: target-language token (`forced_bos`, e.g. `fra_Latn`,
+    /// `gvn_Latn`). Forced as the first decoded token. Required when serving an
+    /// `m2m_100`/`nllb` checkpoint; ignored otherwise.
+    #[arg(long)]
+    pub tgt_lang: Option<String>,
+
     /// Maximum LoRA adapter rank. The A/B slot pool and delta scratch buffers
     /// are allocated rank-padded to this value at startup (frozen v1 layout
     /// contract); an adapter whose `r` exceeds it is rejected at load.

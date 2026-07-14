@@ -16,6 +16,25 @@ pub struct CompletionRequest {
     /// (byte-identical to today); unknown = 400. See `ChatCompletionRequest`.
     #[serde(default)]
     pub adapter: Option<String>,
+    /// Optional source-language token name. Resolved to a token id via the
+    /// server tokenizer at request time. Unset = deployment default (0);
+    /// unknown token = 400.
+    #[serde(default)]
+    pub src_lang: Option<String>,
+    /// Optional target-language token name. Resolved to a token id via the
+    /// server tokenizer at request time. Unset = deployment default (0);
+    /// unknown token = 400.
+    #[serde(default)]
+    pub tgt_lang: Option<String>,
+    /// NLLB beam search: beams per request (None/1 = greedy).
+    #[serde(default)]
+    pub num_beams: Option<u32>,
+    /// NLLB beam search: length penalty (None = 1.0).
+    #[serde(default)]
+    pub length_penalty: Option<f32>,
+    /// NLLB beam search: early-stop when enough hypotheses finish (None = false).
+    #[serde(default)]
+    pub early_stopping: Option<bool>,
     /// OpenAI-compatible `prompt`: a string, an array of strings, an array
     /// of integer token IDs, or an array of token-ID arrays (batch). The
     /// token-ID forms bypass tokenization and feed the scheduler verbatim

@@ -342,7 +342,14 @@ pub(crate) async fn serve(mut args: cli::ServeArgs) -> Result<()> {
     // LoRA adapters: resolve + load BEFORE `gpu` is moved into build_model.
     // `lora_states` must outlive build_model (lora_args borrows &l.store) and
     // stays alive until after AppState construction (adapter name clones).
-    let lora_states = serve_phases::load_lora_adapters(&args, gpu.as_ref())?;
+    // NLLB uses its own encoder-decoder LoRA path (resolved below), not the
+    // decoder-only pool loader — skip the latter to avoid a family rejection.
+    let is_nllb = matches!(config.model_type.as_str(), "m2m_100" | "nllb");
+    let lora_states = if is_nllb {
+        Vec::new()
+    } else {
+        serve_phases::load_lora_adapters(&args, gpu.as_ref())?
+    };
     if !lora_states.is_empty() && world_size > 1 {
         anyhow::bail!(
             "--lora-adapter requires world_size=1 in v0 (got {world_size}); \
@@ -378,6 +385,51 @@ pub(crate) async fn serve(mut args: cli::ServeArgs) -> Result<()> {
                     None
                 },
             });
+    // NLLB / M2M-100: resolve the translation language pair to token ids from
+    // the checkpoint tokenizer (the ChatTokenizer isn't built until after the
+    // model). Only for encoder-decoder checkpoints; other models pass `None`.
+    let nllb_lang: Option<(u32, u32)> = if matches!(config.model_type.as_str(), "m2m_100" | "nllb")
+    {
+        let src = args.src_lang.as_deref().ok_or_else(|| {
+            anyhow::anyhow!("serving an NLLB/M2M-100 checkpoint requires --src-lang")
+        })?;
+        let tgt = args.tgt_lang.as_deref().ok_or_else(|| {
+            anyhow::anyhow!("serving an NLLB/M2M-100 checkpoint requires --tgt-lang")
+        })?;
+        let tk = tokenizers::Tokenizer::from_file(model_dir.join("tokenizer.json"))
+            .map_err(|e| anyhow::anyhow!("nllb: load tokenizer for lang resolve: {e}"))?;
+        let src_id = tk
+            .token_to_id(src)
+            .ok_or_else(|| anyhow::anyhow!("unknown --src-lang token '{src}'"))?;
+        let tgt_id = tk
+            .token_to_id(tgt)
+            .ok_or_else(|| anyhow::anyhow!("unknown --tgt-lang token '{tgt}'"))?;
+        tracing::info!("NLLB translation: {src}({src_id}) -> {tgt}({tgt_id})");
+        Some((src_id, tgt_id))
+    } else {
+        None
+    };
+    // NLLB PEFT adapter: resolve the first `--lora-adapter NAME=DIR` to a dir;
+    // NllbGpuModel loads it via its own encoder-decoder LoRA apply.
+    let nllb_lora_dir: Option<std::path::PathBuf> = if is_nllb {
+        match args.lora_adapter.first() {
+            Some((_name, spec)) => Some(
+                crate::model_resolver::resolve_adapter_dir(spec, args.cache_dir.as_deref())
+                    .context("resolving NLLB --lora-adapter")?,
+            ),
+            None => None,
+        }
+    } else {
+        None
+    };
+    // Advertise the NLLB adapter name so a request's `adapter` field validates
+    // (present → apply LoRA per-request, absent → base). Kept distinct from the
+    // model name so base routing falls through to slot -1.
+    let nllb_adapter_name: Option<String> = if nllb_lora_dir.is_some() {
+        args.lora_adapter.first().map(|(n, _)| n.clone())
+    } else {
+        None
+    };
     let model = serve_phases::build_model(
         &args,
         &config,
@@ -392,6 +444,8 @@ pub(crate) async fn serve(mut args: cli::ServeArgs) -> Result<()> {
         comm,
         dflash_args,
         lora_args,
+        nllb_lang,
+        nllb_lora_dir,
     )?;
 
     // Kernel load audit: print the table of every kernel resolved during model
@@ -773,8 +827,14 @@ pub(crate) async fn serve(mut args: cli::ServeArgs) -> Result<()> {
     let state = Arc::new(AppState {
         tokenizer,
         model_name,
-        adapter_name: lora_states.first().map(|l| l.name.clone()),
-        adapter_names: lora_states.iter().map(|l| l.name.clone()).collect(),
+        adapter_name: nllb_adapter_name
+            .clone()
+            .or_else(|| lora_states.first().map(|l| l.name.clone())),
+        adapter_names: if let Some(ref n) = nllb_adapter_name {
+            vec![n.clone()]
+        } else {
+            lora_states.iter().map(|l| l.name.clone()).collect()
+        },
         active_adapter: std::sync::Arc::new(std::sync::Mutex::new(
             lora_states.first().map(|l| l.name.clone()),
         )),

@@ -199,6 +199,22 @@ pub struct SequenceState {
     /// (not raw) so it also guards the non-scheduler alloc paths (which never
     /// acquire) from an underflow.
     pub acquired_adapter_slot: i32,
+    /// NLLB / M2M-100 per-request translation source-language token id (the
+    /// encoder-input prefix). `0` = use the deployment default (`--src-lang`).
+    /// Unused by every other model type.
+    pub src_lang_id: u32,
+    /// NLLB / M2M-100 per-request target-language token id (`forced_bos`).
+    /// `0` = use the deployment default (`--tgt-lang`). Unused by other models.
+    pub tgt_lang_id: u32,
+    /// NLLB beam search: number of beams for this request (`1` = greedy,
+    /// disables the beam path). Unused by every other model type.
+    pub num_beams: u32,
+    /// NLLB beam search: length penalty applied to hypothesis scores
+    /// (`1.0` = neutral). Unused by other models.
+    pub length_penalty: f32,
+    /// NLLB beam search: stop as soon as `num_beams` finished hypotheses
+    /// exist (`false` = exhaust `max_new`). Unused by other models.
+    pub early_stopping: bool,
 }
 
 impl SequenceState {
@@ -253,4 +269,4 @@ impl SequenceState {
 mod logprobs;
 mod model;
 pub use logprobs::*;
-pub use model::Model;
+pub use model::{BeamReq, Model};

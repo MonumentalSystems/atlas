@@ -37,22 +37,9 @@ use super::strip::strip_thinking_tags;
 use super::inference_types::*;
 use super::sanitizer::*;
 
-/// Resolve an OpenAI-compatible `prompt` field into the concrete prompt
-/// token sequence consumed by the scheduler.
-///
-/// Text forms (`Text` / `TextArray`) are tokenized via the same
-/// `tokenizer.encode` path used historically — `encode` calls the HF
-/// tokenizer with `add_special_tokens=false` (see
-/// `tokenizer/chat_impl.rs:74`), so **no BOS / special token is
-/// prepended**. The token-ID forms (`TokenIds` / `TokenIdBatch`) are fed
-/// to the scheduler verbatim and likewise prepend nothing — the caller
-/// supplies the exact IDs. Both paths therefore converge on the same
-/// `Vec<u32>` with identical framing, which is required for exact
-/// cross-engine cosine comparison (any spurious BOS would corrupt it).
-///
-/// Token-ID inputs are range-checked against the tokenizer vocabulary;
-/// an out-of-range ID fails fast with a 400 rather than indexing out of
-/// bounds into the embedding table.
+/// Resolve an OpenAI `prompt` field into the scheduler's prompt tokens. Text
+/// tokenizes with `add_special_tokens=false` (no BOS); token-ID forms are used
+/// verbatim, range-checked against the vocab (out-of-range → 400).
 fn resolve_prompts(
     state: &AppState,
     prompt: &PromptInput,
@@ -214,6 +201,34 @@ pub async fn completions(
         Err(resp) => return resp,
     };
 
+    // Resolve optional per-request source/target language token NAMES to token
+    // ids via the server tokenizer. Absent = deployment default (0); an unknown
+    // token is a hard 400 (mirrors the adapter-name resolution convention).
+    let resolve_lang = |name: &Option<String>| -> Result<u32, Response> {
+        match name {
+            None => Ok(0),
+            Some(s) => state.tokenizer.inner().token_to_id(s).ok_or_else(|| {
+                openai_error_response(
+                    StatusCode::BAD_REQUEST,
+                    format!("unknown language token '{s}'"),
+                )
+            }),
+        }
+    };
+    let src_lang_id = match resolve_lang(&req.src_lang) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    let tgt_lang_id = match resolve_lang(&req.tgt_lang) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+
+    // NLLB beam search params (mirrors src/tgt lang resolution).
+    let num_beams = req.num_beams.unwrap_or(1);
+    let length_penalty = req.length_penalty.unwrap_or(1.0);
+    let early_stopping = req.early_stopping.unwrap_or(false);
+
     let params = super::completions_exec::CompletionParams {
         temperature,
         top_k,
@@ -228,6 +243,11 @@ pub async fn completions(
         repetition_detection: req.repetition_detection,
         logprobs_k,
         adapter_slot,
+        src_lang_id,
+        tgt_lang_id,
+        num_beams,
+        length_penalty,
+        early_stopping,
     };
 
     if req.stream {
@@ -235,6 +255,12 @@ pub async fn completions(
             return openai_error_response(
                 StatusCode::BAD_REQUEST,
                 "stream=true supports a single prompt with n=1".to_string(),
+            );
+        }
+        if num_beams > 1 {
+            return openai_error_response(
+                StatusCode::BAD_REQUEST,
+                "num_beams > 1 is not supported in streaming mode".to_string(),
             );
         }
         let prompt_tokens = prompts.into_iter().next().expect("checked non-empty");
@@ -247,12 +273,9 @@ pub async fn completions(
     super::completions_exec::run_blocking(state, &req, prompts, params).await
 }
 
-/// SSE streaming path for legacy completions. Single prompt, n=1
-/// (guarded by the handler). Echo semantics: the prompt text (plus its
-/// logprobs when `logprobs` is set) is emitted as the FIRST chunk,
-/// before any generated-token chunk. With `stream_options.include_usage`
-/// the finish chunk carries no usage; a `choices: []` usage chunk
-/// precedes `[DONE]` (chat parity).
+/// SSE streaming path for legacy completions (single prompt, n=1, handler-
+/// guarded). Echo: prompt text (+ logprobs when set) is the FIRST chunk; with
+/// `stream_options.include_usage` a `choices: []` usage chunk precedes `[DONE]`.
 pub(super) async fn completions_stream(
     state: Arc<AppState>,
     prompt_tokens: Vec<u32>,
@@ -285,6 +308,11 @@ pub(super) async fn completions_stream(
         prompt_tokens: std::sync::Arc::new(prompt_tokens),
         session_hash,
         adapter_slot: p.adapter_slot,
+        src_lang_id: p.src_lang_id,
+        tgt_lang_id: p.tgt_lang_id,
+        num_beams: p.num_beams,
+        length_penalty: p.length_penalty,
+        early_stopping: p.early_stopping,
         image_pixels: Vec::new(),
         max_tokens: req.max_tokens,
         min_tokens: 0,
