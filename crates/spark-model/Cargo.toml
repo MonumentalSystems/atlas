@@ -90,6 +90,10 @@ name = "nllb_cuda_encoder"
 required-features = ["cuda", "gpu-examples"]
 
 [[example]]
+name = "nllb_cuda_translate"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
 name = "gdn_cdh_vblock_microtest"
 required-features = ["cuda", "gpu-examples"]
 

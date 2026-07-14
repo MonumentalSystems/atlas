@@ -98,6 +98,56 @@ extern "C" __global__ void nllb_linear(
     c[(unsigned long long)m * N + n] = acc;
 }
 
+// General multi-head SDPA with separate query/key lengths and optional causal
+// masking. q:[tq, H*D], k/v:[tk, H*D], out:[tq, H*D] (heads interleaved on the
+// feature axis). One block per (query, head); blockDim.x == D (power of two).
+// causal!=0 → query i attends keys 0..=i (decoder self-attn); causal==0 →
+// query attends all tk keys (encoder self-attn / decoder cross-attn).
+// shared mem = (tk + D) floats.
+extern "C" __global__ void nllb_attn_kv(
+    const float* __restrict__ q, const float* __restrict__ k, const float* __restrict__ v,
+    float* __restrict__ out, unsigned int tq, unsigned int tk, unsigned int H, unsigned int D,
+    float scale, unsigned int causal) {
+    unsigned int qh = blockIdx.x;
+    unsigned int query = qh / H;
+    unsigned int head = qh % H;
+    unsigned int tid = threadIdx.x;
+    extern __shared__ float sh2[];
+    float* scores = sh2;
+    float* red = sh2 + tk;
+    unsigned int dmodel = H * D;
+    unsigned long long bq = (unsigned long long)query * dmodel + (unsigned long long)head * D;
+    unsigned int kmax = causal ? (query + 1) : tk;
+
+    for (unsigned int j = 0; j < kmax; j++) {
+        unsigned long long bk = (unsigned long long)j * dmodel + (unsigned long long)head * D;
+        red[tid] = q[bq + tid] * k[bk + tid];
+        __syncthreads();
+        for (unsigned int s = D / 2; s > 0; s >>= 1) {
+            if (tid < s) red[tid] += red[tid + s];
+            __syncthreads();
+        }
+        if (tid == 0) scores[j] = red[0] * scale;
+        __syncthreads();
+    }
+    if (tid == 0) {
+        float m = -1e30f;
+        for (unsigned int j = 0; j < kmax; j++) m = fmaxf(m, scores[j]);
+        float su = 0.0f;
+        for (unsigned int j = 0; j < kmax; j++) {
+            scores[j] = expf(scores[j] - m);
+            su += scores[j];
+        }
+        for (unsigned int j = 0; j < kmax; j++) scores[j] /= su;
+    }
+    __syncthreads();
+    float acc = 0.0f;
+    for (unsigned int j = 0; j < kmax; j++) {
+        acc += scores[j] * v[(unsigned long long)j * dmodel + (unsigned long long)head * D + tid];
+    }
+    out[bq + tid] = acc;
+}
+
 // Dense non-causal multi-head SDPA. q/k/v/out are [seq, H*D] row-major
 // (heads interleaved on the feature axis). One block per (query, head);
 // blockDim.x == D (power of two). scale applied to the logits.
