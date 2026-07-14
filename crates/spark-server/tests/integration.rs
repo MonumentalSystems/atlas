@@ -120,6 +120,8 @@ fn setup_model(
         None,               // hss_cache_blocks_per_seq
         None,               // dflash_args (no speculative-decoding pairing)
         None,               // lora_args (no LoRA adapter)
+        None,               // nllb_lang (not an NLLB translation model)
+        None,               // nllb_lora_dir
     )?;
 
     Ok((model, config))
