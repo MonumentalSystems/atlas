@@ -22,10 +22,13 @@
 //! defaults to group-128 (the shipped Ternary-Bonsai layout); set
 //! `ATLAS_GGUF_Q2_GROUP=64` for the fork-master group-64 layout.
 
+mod config;
 mod container;
 mod dequant_cpu;
 mod dequant_gpu;
 mod names;
+
+pub use config::config_from_gguf_dir;
 
 use anyhow::{Context, Result, bail};
 use std::collections::HashMap;

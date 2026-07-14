@@ -14,7 +14,12 @@ use anyhow::{Context, Result, bail};
 /// 2. Otherwise, treat it as a HuggingFace model ID and look up the local cache.
 pub fn resolve_model_dir(model: &str, cache_dir: Option<&Path>) -> Result<PathBuf> {
     let as_path = Path::new(model);
-    if as_path.is_dir() && as_path.join("config.json").exists() {
+    // Accept a local dir that has a config.json OR a bare .gguf (served via the
+    // GGUF loader + config-from-metadata path).
+    if as_path.is_dir()
+        && (as_path.join("config.json").exists()
+            || spark_runtime::weights::find_gguf(as_path).is_some())
+    {
         tracing::info!("Model path: {} (local directory)", as_path.display());
         return Ok(as_path.to_path_buf());
     }

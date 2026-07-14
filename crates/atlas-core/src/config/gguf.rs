@@ -203,7 +203,12 @@ pub fn config_from_gguf(inputs: &GgufConfigInputs) -> Result<ModelConfig> {
 
     config.model_type = model_type.to_string();
     config.attn_gated = attn_gated;
-    config.weight_prefix = String::new(); // → layer_prefix() == "model.layers.N"
+    // The GGUF name map emits HF names under the `model.` prefix
+    // (`model.embed_tokens.weight`, `model.layers.N.*`, `model.norm.weight`).
+    // `layer_prefix()` yields `model.layers.N` for both "" and "model", but the
+    // embed/norm/lm_head lookups use the raw prefix — so it must be "model", not
+    // "" (else they resolve to `.embed_tokens.weight` and fail).
+    config.weight_prefix = "model".to_string();
 
     // Gemma-specific post-parse fixups.
     if model_type == "gemma4" {
@@ -304,7 +309,7 @@ mod tests {
         assert!((c.rms_norm_eps - 1e-5).abs() < 1e-12);
         assert!(!c.attn_gated);
         assert!(!c.tie_word_embeddings); // has_output_weight = true
-        assert!(c.weight_prefix.is_empty());
+        assert_eq!(c.weight_prefix, "model"); // HF-name prefix the GGUF loader emits
         assert_eq!(c.num_experts, 0);
     }
 

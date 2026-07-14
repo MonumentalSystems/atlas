@@ -258,7 +258,7 @@ pub fn parse_expert_index(name: &str) -> Option<usize> {
 mod gguf;
 mod loader;
 pub mod mlx_int8;
-pub use gguf::{GgufLoader, find_gguf};
+pub use gguf::{GgufLoader, config_from_gguf_dir, find_gguf};
 pub(crate) use loader::{check_oom_guard, estimate_has_fp8, estimate_load_bytes};
 
 #[cfg(test)]

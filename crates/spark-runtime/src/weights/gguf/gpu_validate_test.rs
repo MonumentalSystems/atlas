@@ -46,6 +46,7 @@ fn bf16_bytes_to_f32(bytes: &[u8]) -> Vec<f32> {
 }
 
 /// Run one type through CPU + GPU and assert BF16 outputs match exactly.
+#[allow(clippy::too_many_arguments)]
 fn check_type(
     gpu: &AtlasCudaBackend,
     label: &str,
