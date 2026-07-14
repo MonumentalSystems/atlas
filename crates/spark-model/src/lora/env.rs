@@ -66,16 +66,10 @@ pub fn validate_peft_config(peft: &PeftAdapterConfig, max_lora_rank: usize) -> R
     }
     for t in &peft.target_modules {
         let last = t.rsplit('.').next().unwrap_or(t);
-        if last == "q_proj" {
-            bail!(
-                "REJECT[gated-q-proj]: target_modules includes q_proj — \
-                 excluded in v0 (attn_output_gate interleaved [Q|gate])"
-            );
-        }
         if !LoraModule::ALL.iter().any(|m| m.peft_name() == last) {
             bail!(
                 "REJECT[unsupported-target]: target_modules entry '{t}' \
-                 (allowed: k_proj v_proj o_proj gate_proj up_proj down_proj)"
+                 (allowed: q_proj k_proj v_proj o_proj gate_proj up_proj down_proj)"
             );
         }
     }

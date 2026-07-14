@@ -85,13 +85,7 @@ pub fn classify_key(key: &str, cfg: &ModelConfig) -> Result<(usize, LoraModule, 
         );
     }
     let module = match tail {
-        "self_attn.q_proj" => bail!(
-            "REJECT[gated-q-proj]: '{key}' — q_proj is excluded in v0: \
-             attn_output_gate=true makes q_proj emit interleaved [Q|gate] \
-             (out = 2·q_heads·head_dim = {}); a PEFT q_proj delta maps only to \
-             the Q half and needs segment-offset expand support (M3+)",
-            2 * cfg.num_attention_heads * cfg.head_dim
-        ),
+        "self_attn.q_proj" => LoraModule::QProj,
         "self_attn.k_proj" => LoraModule::KProj,
         "self_attn.v_proj" => LoraModule::VProj,
         "self_attn.o_proj" => LoraModule::OProj,

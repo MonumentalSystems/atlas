@@ -18,6 +18,7 @@ use crate::layers::ops::lora_delta::LoraPair;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum LoraModule {
+    QProj,
     KProj,
     VProj,
     OProj,
@@ -27,7 +28,8 @@ pub enum LoraModule {
 }
 
 impl LoraModule {
-    pub const ALL: [LoraModule; 6] = [
+    pub const ALL: [LoraModule; 7] = [
+        Self::QProj,
         Self::KProj,
         Self::VProj,
         Self::OProj,
@@ -39,6 +41,7 @@ impl LoraModule {
     /// PEFT suffix name (target_modules vocabulary).
     pub fn peft_name(&self) -> &'static str {
         match self {
+            Self::QProj => "q_proj",
             Self::KProj => "k_proj",
             Self::VProj => "v_proj",
             Self::OProj => "o_proj",
@@ -51,9 +54,18 @@ impl LoraModule {
     /// (out_dim, in_dim) of the base projection. Holo-3.1-0.8B (verified
     /// against the checkpoint header): k/v `[512,1024]`, o `[1024,2048]`,
     /// gate/up `[3584,1024]`, down `[1024,3584]`.
+    ///
+    /// q_proj: on a gated-attention model (`attn_gated`) the raw projection
+    /// emits the interleaved `[Q|gate]` at width `2·q_heads·head_dim` (the
+    /// FULL width the PEFT `lora_B` was trained against — verified `[8192,16]`
+    /// on holo-3.1-35b); ungated q is `q_heads·head_dim`.
     pub fn dims(&self, cfg: &atlas_core::config::ModelConfig) -> (usize, usize) {
         let h = cfg.hidden_size;
         match self {
+            Self::QProj => (
+                (if cfg.attn_gated { 2 } else { 1 }) * cfg.num_attention_heads * cfg.head_dim,
+                h,
+            ),
             Self::KProj | Self::VProj => (cfg.num_key_value_heads * cfg.head_dim, h),
             Self::OProj => (h, cfg.num_attention_heads * cfg.head_dim),
             Self::GateProj | Self::UpProj => (cfg.intermediate_size, h),
@@ -77,6 +89,7 @@ pub enum AdapterAb {
 #[derive(Clone)]
 pub struct LoraLayerWeights {
     pub layer_idx: usize,
+    pub q_proj: Option<LoraPair>,
     pub k_proj: Option<LoraPair>,
     pub v_proj: Option<LoraPair>,
     pub o_proj: Option<LoraPair>,
@@ -205,6 +218,7 @@ impl LoraLayerWeights {
     /// shared by [`select_routed_pair`] and [`LoraWeights::refresh_slot_tables`].
     pub fn module_pair(&self, module: LoraModule) -> Option<&LoraPair> {
         match module {
+            LoraModule::QProj => self.q_proj.as_ref(),
             LoraModule::KProj => self.k_proj.as_ref(),
             LoraModule::VProj => self.v_proj.as_ref(),
             LoraModule::OProj => self.o_proj.as_ref(),
@@ -333,6 +347,7 @@ impl LoraWeights {
                 .get(*layer)
                 .and_then(|o| o.as_ref())
                 .and_then(|lw| match module {
+                    LoraModule::QProj => lw.q_proj.as_ref(),
                     LoraModule::KProj => lw.k_proj.as_ref(),
                     LoraModule::VProj => lw.v_proj.as_ref(),
                     LoraModule::OProj => lw.o_proj.as_ref(),

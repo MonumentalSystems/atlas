@@ -151,10 +151,12 @@ impl TransformerModel {
                 // #30: the global layer index (from `self.layers.enumerate()`) —
                 // the key the request slot's GLOBAL-layer-indexed pairs use.
                 layer_idx: idx,
+                q: layer_weights.q_proj,
                 k: layer_weights.k_proj,
                 v: layer_weights.v_proj,
                 o: layer_weights.o_proj,
                 kernels,
+                q_route: mk_route(idx, LoraModule::QProj, &layer_weights.q_proj),
                 k_route: mk_route(idx, LoraModule::KProj, &layer_weights.k_proj),
                 v_route: mk_route(idx, LoraModule::VProj, &layer_weights.v_proj),
                 o_route: mk_route(idx, LoraModule::OProj, &layer_weights.o_proj),

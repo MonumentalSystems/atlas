@@ -106,6 +106,7 @@ pub fn rebuild_slot_layers(
     for rec_layer in super::full_attention_layers(cfg) {
         let mut lw = LoraLayerWeights {
             layer_idx: rec_layer,
+            q_proj: None,
             k_proj: None,
             v_proj: None,
             o_proj: None,
@@ -142,6 +143,7 @@ pub fn rebuild_slot_layers(
                 };
                 let _ = b; // b geometry equals a's rank; both audited upstream
                 match module {
+                    LoraModule::QProj => lw.q_proj = Some(pair),
                     LoraModule::KProj => lw.k_proj = Some(pair),
                     LoraModule::VProj => lw.v_proj = Some(pair),
                     LoraModule::OProj => lw.o_proj = Some(pair),

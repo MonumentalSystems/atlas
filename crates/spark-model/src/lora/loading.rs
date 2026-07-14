@@ -148,6 +148,7 @@ fn pack_slot(
     for layer_idx in full_attention_layers(cfg) {
         let mut lw = LoraLayerWeights {
             layer_idx,
+            q_proj: None,
             k_proj: None,
             v_proj: None,
             o_proj: None,
@@ -207,6 +208,7 @@ fn pack_slot(
                     max_lora_rank
                 );
                 match module {
+                    LoraModule::QProj => lw.q_proj = Some(pair),
                     LoraModule::KProj => lw.k_proj = Some(pair),
                     LoraModule::VProj => lw.v_proj = Some(pair),
                     LoraModule::OProj => lw.o_proj = Some(pair),

@@ -85,9 +85,11 @@ pub struct LoraPair {
 /// Per-layer attention-side LoRA weights, installed by copy onto
 /// `Qwen3AttentionLayer`.
 ///
-/// v0: NO q field — q_proj is rejected at load (attn_output_gate makes the
-/// projection 2x q_dim Q+gate interleaved; a PEFT q delta maps only to the
-/// Q half). The named rejection lives in the loader (`crate::lora`).
+/// The `q` pair folds the delta into the RAW q_proj output at offset 0, full
+/// width = q_proj_dim (on a gated model the interleaved `[Q|gate]`, width
+/// `2·q_heads·head_dim`), BEFORE the `deinterleave_qg` split — the PEFT
+/// `lora_B` was trained against exactly that interleaved basis, so the delta
+/// applies like k/v/o, just wider.
 #[derive(Clone, Copy)]
 pub struct LoraAttnWeights {
     /// #30: the TRUE global layer index (`0..num_hidden_layers`), stamped at
@@ -96,6 +98,7 @@ pub struct LoraAttnWeights {
     /// an attention-only counter that diverges from the global index on hybrid
     /// GDN/attention models).
     pub layer_idx: usize,
+    pub q: Option<LoraPair>,
     pub k: Option<LoraPair>,
     pub v: Option<LoraPair>,
     pub o: Option<LoraPair>,
@@ -104,6 +107,7 @@ pub struct LoraAttnWeights {
     /// adapter with no routing (the n==1 path uses the pair above and stays
     /// byte-identical). `Some` when a multi-adapter pool is resident; the
     /// batched decode path reads these + the per-seq `seq_slot` via the bgmv.
+    pub q_route: Option<LoraRoute>,
     pub k_route: Option<LoraRoute>,
     pub v_route: Option<LoraRoute>,
     pub o_route: Option<LoraRoute>,
