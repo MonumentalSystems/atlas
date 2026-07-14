@@ -28,6 +28,9 @@ const INPUT_IDS: &[u32] = &[
 const FORCED_BOS: u32 = 256057; // fra_Latn
 const PAD_ID: u32 = 1;
 const MAX_NEW: usize = 96;
+// Decoder cache / position-table rows: MAX_NEW generated tokens + the 2 seed
+// tokens (decoder_start, forced_bos) the beam loop writes before iterating.
+const CACHE_ROWS: usize = MAX_NEW + 2;
 const EXPECTED_GREEDY: &[u32] = &[
     256057, 17994, 141190, 248079, 25358, 123732, 248105, 30213, 248079, 1724, 25601, 385, 2,
 ];
@@ -135,8 +138,8 @@ fn main() -> Result<()> {
     }
 
     // Precomputed decoder position sinusoids (posid = index + 2), rows 0..MAX_NEW.
-    let pos_table = ctx.f32b(MAX_NEW * d)?;
-    let pos_host = decoder_pos_table(MAX_NEW, d);
+    let pos_table = ctx.f32b(CACHE_ROWS * d)?;
+    let pos_host = decoder_pos_table(CACHE_ROWS, d);
     gpu.copy_h2d(f32_bytes(&pos_host), pos_table)?;
 
     let dctx = DecCtx {
@@ -450,8 +453,8 @@ impl<'a> DecCtx<'a> {
         let mut k = Vec::with_capacity(c.dec_layers);
         let mut v = Vec::with_capacity(c.dec_layers);
         for _ in 0..c.dec_layers {
-            k.push(c.f32b(MAX_NEW * c.d)?);
-            v.push(c.f32b(MAX_NEW * c.d)?);
+            k.push(c.f32b(CACHE_ROWS * c.d)?);
+            v.push(c.f32b(CACHE_ROWS * c.d)?);
         }
         Ok(KvCache { k, v })
     }
