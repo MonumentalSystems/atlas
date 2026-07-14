@@ -41,6 +41,26 @@ cargo run -p spark-nllb --release --bin nllb-translate -- \
 `spa_Latn`, `deu_Latn`, …). `--beams N` sets the beam width (default `5`, the
 NLLB default; `--beams 1` is greedy).
 
+### GGUF weights
+
+Weights can instead be read from an NLLB **GGUF** file (architecture `nllb`,
+F16/F32 — e.g. `acceldium/nllb-200-3.3B-GGUF`) with `--gguf`:
+
+```bash
+nllb-translate --model /path/to/nllb-200-3.3B-st \
+    --gguf /path/to/nllb-3.3B.gguf \
+    --src eng_Latn --tgt fra_Latn "Hello, how are you?"
+# -> Bonjour, comment allez vous ?   (byte-identical to the safetensors path)
+```
+
+`--model` still supplies `config.json` + `tokenizer.json` (the GGUF does not
+carry the HF tokenizer this runtime needs). The GGUF is parsed by a small
+self-contained reader (`src/gguf.rs`, F16→f32 / F32 only, no K-quant path); its
+`enc/dec.blk.N.*` tensor names are remapped to the HuggingFace M2M-100 keys by
+`weights::map_gguf_name`. The learned `position_embd.weight` is skipped — the
+model regenerates sinusoidal positions. Because the shipped GGUF is F16, outputs
+match the fp32 safetensors path (verified identical on the test sentences).
+
 ## Validation
 
 ```bash
