@@ -153,6 +153,7 @@ fn load_kernels(gpu: &dyn GpuBackend) -> Result<Kernels> {
         lin_no_bias: gpu.kernel("nllb_encoder", "nllb_linear_no_bias_bf16")?,
         gemv: gpu.kernel("nllb_encoder", "nllb_gemv_bf16")?,
         gemv_no_bias: gpu.kernel("nllb_encoder", "nllb_gemv_bf16_no_bias")?,
+        gemv_batched: gpu.kernel("nllb_encoder", "nllb_gemv_batched_bf16")?,
         attn: gpu.kernel("nllb_encoder", "nllb_attn_kv_bf16")?,
         add_row: gpu.kernel("nllb_encoder", "nllb_add_row_bf16")?,
         scatter: gpu.kernel("nllb_encoder", "nllb_scatter_batched")?,

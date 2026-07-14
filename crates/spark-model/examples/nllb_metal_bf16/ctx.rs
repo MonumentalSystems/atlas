@@ -19,6 +19,7 @@ pub struct Kernels {
     pub lin_no_bias: KernelHandle,
     pub gemv: KernelHandle,
     pub gemv_no_bias: KernelHandle,
+    pub gemv_batched: KernelHandle,
     pub attn: KernelHandle,
     pub add_row: KernelHandle,
     pub scatter: KernelHandle,
@@ -107,6 +108,29 @@ impl Ctx<'_> {
             .arg_ptr(self.w(&format!("{prefix}.weight"))?)
             .arg_ptr(self.w(&format!("{prefix}.bias"))?)
             .arg_ptr(y)
+            .arg_u32(n_out as u32)
+            .arg_u32(k_in as u32)
+            .launch(self.stream)
+    }
+
+    #[allow(dead_code)]
+    pub fn linear_batch_gemv(
+        &self,
+        prefix: &str,
+        a: DevicePtr,
+        c: DevicePtr,
+        rows: usize,
+        n_out: usize,
+        k_in: usize,
+    ) -> Result<()> {
+        KernelLaunch::new(self.gpu, self.k.gemv_batched)
+            .grid([n_out as u32, rows as u32, 1])
+            .block([256, 1, 1])
+            .arg_ptr(a)
+            .arg_ptr(self.w(&format!("{prefix}.weight"))?)
+            .arg_ptr(self.w(&format!("{prefix}.bias"))?)
+            .arg_ptr(c)
+            .arg_u32(rows as u32)
             .arg_u32(n_out as u32)
             .arg_u32(k_in as u32)
             .launch(self.stream)

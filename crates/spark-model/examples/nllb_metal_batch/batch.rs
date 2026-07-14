@@ -192,13 +192,13 @@ impl Ctx<'_> {
         self.gpu.copy_d2d(dh, residual, b * d * 2)?;
         self.gpu.copy_d2d(dh, normed, b * d * 2)?;
         self.layer_norm(&format!("{layer}.self_attn_layer_norm"), normed, b)?;
-        self.linear(&format!("{layer}.self_attn.q_proj"), normed, q, b, d, d)?;
-        self.linear(&format!("{layer}.self_attn.k_proj"), normed, knew, b, d, d)?;
-        self.linear(&format!("{layer}.self_attn.v_proj"), normed, vnew, b, d, d)?;
+        self.linear_batch_gemv(&format!("{layer}.self_attn.q_proj"), normed, q, b, d, d)?;
+        self.linear_batch_gemv(&format!("{layer}.self_attn.k_proj"), normed, knew, b, d, d)?;
+        self.linear_batch_gemv(&format!("{layer}.self_attn.v_proj"), normed, vnew, b, d, d)?;
         self.scatter(knew, self_k, step, b, MAX_NEW, d)?;
         self.scatter(vnew, self_v, step, b, MAX_NEW, d)?;
         self.attn_decode(q, self_k, self_v, attn, b, MAX_NEW, tk_dev)?;
-        self.linear(&format!("{layer}.self_attn.out_proj"), attn, proj, b, d, d)?;
+        self.linear_batch_gemv(&format!("{layer}.self_attn.out_proj"), attn, proj, b, d, d)?;
         self.add(proj, residual, b * d)?;
         self.gpu.copy_d2d(proj, dh, b * d * 2)
     }
@@ -223,9 +223,9 @@ impl Ctx<'_> {
         self.gpu.copy_d2d(dh, residual, b * d * 2)?;
         self.gpu.copy_d2d(dh, normed, b * d * 2)?;
         self.layer_norm(&format!("{layer}.encoder_attn_layer_norm"), normed, b)?;
-        self.linear(&format!("{layer}.encoder_attn.q_proj"), normed, q, b, d, d)?;
+        self.linear_batch_gemv(&format!("{layer}.encoder_attn.q_proj"), normed, q, b, d, d)?;
         self.attn_decode(q, cross_k, cross_v, attn, b, max_enc, tk_dev)?;
-        self.linear(
+        self.linear_batch_gemv(
             &format!("{layer}.encoder_attn.out_proj"),
             attn,
             proj,
@@ -250,9 +250,9 @@ impl Ctx<'_> {
         self.gpu.copy_d2d(dh, residual, b * self.d * 2)?;
         self.gpu.copy_d2d(dh, normed, b * self.d * 2)?;
         self.layer_norm(&format!("{layer}.final_layer_norm"), normed, b)?;
-        self.linear(&format!("{layer}.fc1"), normed, ff, b, self.ffn, self.d)?;
+        self.linear_batch_gemv(&format!("{layer}.fc1"), normed, ff, b, self.ffn, self.d)?;
         self.relu(ff, b * self.ffn)?;
-        self.linear(&format!("{layer}.fc2"), ff, proj, b, self.d, self.ffn)?;
+        self.linear_batch_gemv(&format!("{layer}.fc2"), ff, proj, b, self.d, self.ffn)?;
         self.add(proj, residual, b * self.d)?;
         self.gpu.copy_d2d(proj, dh, b * self.d * 2)
     }

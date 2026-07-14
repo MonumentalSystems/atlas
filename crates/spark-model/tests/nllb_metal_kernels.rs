@@ -121,7 +121,36 @@ fn run_attention_smoke(gpu: &dyn GpuBackend, stream: u64) -> Result<()> {
 fn run_bf16_batch_smoke(gpu: &dyn GpuBackend, stream: u64) -> Result<()> {
     let scatter = gpu.kernel("nllb_encoder", "nllb_scatter_batched")?;
     let gather = gpu.kernel("nllb_encoder", "nllb_gather_batched")?;
+    let gemv_batched = gpu.kernel("nllb_encoder", "nllb_gemv_batched_bf16")?;
     let topk = gpu.kernel("nllb_encoder", "nllb_topk_lse_bf16")?;
+
+    let x = upload_bf16(gpu, &[1.0, 2.0, 3.0, 4.0, 4.0, 3.0, 2.0, 1.0])?;
+    let w = upload_bf16(
+        gpu,
+        &[
+            1.0, 0.0, 0.0, 0.0, //
+            0.0, 1.0, 1.0, 0.0, //
+            1.0, 1.0, 1.0, 1.0,
+        ],
+    )?;
+    let bias = upload_bf16(gpu, &[10.0, 20.0, 30.0])?;
+    let out = gpu.alloc(2 * 3 * 2)?;
+    KernelLaunch::new(gpu, gemv_batched)
+        .grid([3, 2, 1])
+        .block([256, 1, 1])
+        .arg_ptr(x)
+        .arg_ptr(w)
+        .arg_ptr(bias)
+        .arg_ptr(out)
+        .arg_u32(2)
+        .arg_u32(3)
+        .arg_u32(4)
+        .launch(stream)?;
+    gpu.synchronize(stream)?;
+    assert_close(
+        &download_bf16(gpu, out, 6)?,
+        &[11.0, 25.0, 40.0, 14.0, 25.0, 40.0],
+    );
 
     let src = upload_bf16(gpu, &[1.0, 2.0, 3.0, 4.0])?;
     let cache = gpu.alloc(2 * 2 * 2 * 2)?;

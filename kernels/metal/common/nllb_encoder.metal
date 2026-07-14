@@ -594,6 +594,50 @@ kernel void nllb_gemv_bf16_no_bias(
     }
 }
 
+kernel void nllb_gemv_batched_bf16(
+    device const bfloat *x [[buffer(0)]],
+    device const bfloat *w [[buffer(1)]],
+    device const bfloat *bias [[buffer(2)]],
+    device bfloat *y [[buffer(3)]],
+    constant uint &M [[buffer(4)]],
+    constant uint &N [[buffer(5)]],
+    constant uint &K [[buffer(6)]],
+    uint3 group [[threadgroup_position_in_grid]],
+    uint3 tid3 [[thread_position_in_threadgroup]],
+    uint3 tg_size3 [[threads_per_threadgroup]],
+    uint simd_lane_id [[thread_index_in_simdgroup]],
+    uint simd_group_id [[simdgroup_index_in_threadgroup]])
+{
+    uint n = group.x;
+    uint m = group.y;
+    if (m >= M || n >= N) {
+        return;
+    }
+    threadgroup float partial[32];
+    uint tid = tid3.x;
+    uint tg_size = tg_size3.x;
+    device const bfloat *xrow = x + (ulong)m * K;
+    device const bfloat *wrow = w + (ulong)n * K;
+    float acc = 0.0f;
+    for (uint k = tid; k < K; k += tg_size) {
+        acc += float(xrow[k]) * float(wrow[k]);
+    }
+    float simd_acc = simd_sum(acc);
+    if (simd_lane_id == 0) {
+        partial[simd_group_id] = simd_acc;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint num_simds = (tg_size + 31u) / 32u;
+    if (simd_group_id == 0) {
+        float v = (tid < num_simds) ? partial[tid] : 0.0f;
+        v = simd_sum(v);
+        if (tid == 0) {
+            y[(ulong)m * N + n] = bfloat(v + float(bias[n]));
+        }
+    }
+}
+
 kernel void nllb_attn_kv_bf16(
     device const bfloat *q [[buffer(0)]],
     device const bfloat *k [[buffer(1)]],
