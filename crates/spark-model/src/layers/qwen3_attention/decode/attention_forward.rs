@@ -108,6 +108,8 @@ impl Qwen3AttentionLayer {
                     h,
                     stream,
                 )?;
+                // q_proj LoRA on the RAW interleaved [Q|gate] (BEFORE deinterleave).
+                self.apply_q_lora(ctx, normed, q_out, stream)?;
                 ops::deinterleave_qg(
                     ctx.gpu,
                     self.deinterleave_qg_k,
@@ -119,18 +121,45 @@ impl Qwen3AttentionLayer {
                     stream,
                 )?;
             } else if let Some(nvfp4) = self.q_weight.as_ref().and_then(|w| w.as_nvfp4()) {
-                ops::w4a16_gemv_qg(
-                    ctx.gpu,
-                    self.w4a16_gemv_qg_k,
-                    normed,
-                    nvfp4,
-                    q_out,
-                    q_proj_dim,
-                    h,
-                    nq,
-                    hd,
-                    stream,
-                )?;
+                if self.lora.as_ref().and_then(|lw| lw.q.as_ref()).is_some() {
+                    // q adapter resident: split the FUSED gemv+deinterleave into
+                    // raw interleaved gemv → q LoRA fold → deinterleave, so the
+                    // delta lands in the interleaved basis PEFT trained against.
+                    ops::w4a16_gemv(
+                        ctx.gpu,
+                        self.w4a16_gemv_k,
+                        normed,
+                        nvfp4,
+                        q_out,
+                        q_proj_dim,
+                        h,
+                        stream,
+                    )?;
+                    self.apply_q_lora(ctx, normed, q_out, stream)?;
+                    ops::deinterleave_qg(
+                        ctx.gpu,
+                        self.deinterleave_qg_k,
+                        q_out,
+                        1,
+                        nq,
+                        hd,
+                        nq * hd * 2,
+                        stream,
+                    )?;
+                } else {
+                    ops::w4a16_gemv_qg(
+                        ctx.gpu,
+                        self.w4a16_gemv_qg_k,
+                        normed,
+                        nvfp4,
+                        q_out,
+                        q_proj_dim,
+                        h,
+                        nq,
+                        hd,
+                        stream,
+                    )?;
+                }
             } else {
                 ops::dense_gemv(
                     ctx.gpu,
@@ -142,6 +171,8 @@ impl Qwen3AttentionLayer {
                     h,
                     stream,
                 )?;
+                // q_proj LoRA on the RAW interleaved [Q|gate] (BEFORE deinterleave).
+                self.apply_q_lora(ctx, normed, q_out, stream)?;
                 ops::deinterleave_qg(
                     ctx.gpu,
                     self.deinterleave_qg_k,
@@ -190,6 +221,8 @@ impl Qwen3AttentionLayer {
                     stream,
                 )?;
             }
+            // Ungated q_proj LoRA: no deinterleave — fold onto the final q_out.
+            self.apply_q_lora(ctx, normed, q_out, stream)?;
         }
 
         // DIAG: dump normed input and Q output for L0
@@ -647,5 +680,60 @@ impl Qwen3AttentionLayer {
         let o_out = self.attention_forward_oproj(attn_out, nq, hd, h, ctx, stream)?;
 
         Ok(o_out)
+    }
+
+    /// Fold the q_proj LoRA delta into the RAW q_proj output at `q_out`
+    /// (offset 0; on a gated model the interleaved `[Q|gate]`, width
+    /// `q_proj_dim`), BEFORE `deinterleave_qg`. Mirrors the K/V block: the
+    /// routed bgmv (per-request slot) when this step carries a `seq_slot` +
+    /// the module has a route, else the installed-active-pair dense path.
+    /// No-op when no q adapter is resident (byte-identical base).
+    fn apply_q_lora(
+        &self,
+        ctx: &ForwardContext,
+        normed: DevicePtr,
+        q_out: DevicePtr,
+        stream: u64,
+    ) -> Result<()> {
+        let Some(ref lw) = self.lora else {
+            return Ok(());
+        };
+        let Some(ref pair) = lw.q else {
+            return Ok(());
+        };
+        let seq_slot = ctx
+            .attn_metadata
+            .map(|m| m.seq_slot)
+            .unwrap_or(DevicePtr(0));
+        if seq_slot.0 != 0
+            && let Some(ref route) = lw.q_route
+        {
+            ops::lora_delta::apply_lora_bgmv(
+                ctx.gpu,
+                &lw.kernels,
+                route,
+                normed,
+                q_out,
+                seq_slot,
+                1,
+                pair.k_in,
+                pair.n_out,
+                ctx.buffers.lora_xa(),
+                stream,
+            )?;
+        } else {
+            ops::lora_delta::apply_lora_delta(
+                ctx.gpu,
+                &lw.kernels,
+                pair,
+                normed,
+                q_out,
+                1,
+                ctx.buffers.lora_xa(),
+                ctx.buffers.lora_delta(),
+                stream,
+            )?;
+        }
+        Ok(())
     }
 }

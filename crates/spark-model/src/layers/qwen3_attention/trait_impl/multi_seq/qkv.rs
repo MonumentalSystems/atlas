@@ -69,14 +69,52 @@ impl Qwen3AttentionLayer {
             }
         }
 
-        // ── Per-request K/V LoRA delta (batched bgmv), pre-norm. No-op when no
+        // ── Per-request Q/K/V LoRA delta (batched bgmv), pre-norm. No-op when no
         // routing table is installed or `seq_slot` is null (base model / n==1).
+        // For gated Q this folds onto the RAW interleaved [Q|gate] segment; the
+        // deferred deinterleave below then splits it (the projection branches
+        // skipped their inline deinterleave when a q adapter is resident).
         self.ms_qkv_apply_lora(c)?;
+        self.ms_qkv_deinterleave_q(c)?;
 
         // ── Shared q/k RMS-norm pass (all projection branches). HF computes
         // k_norm(k_proj(x) + Δ), so norms run AFTER the pre-norm LoRA delta.
         let _ = eps; // consumed by ms_qkv_norms via `c`
         self.ms_qkv_norms(c)?;
+        Ok(())
+    }
+
+    /// `true` when a q_proj adapter is resident on the ACTIVE slot — the
+    /// load-fixed (graph-stable) branch that makes the gated projection
+    /// branches emit RAW interleaved `[Q|gate]` (deferring `deinterleave_qg`
+    /// past the q LoRA fold) instead of the fused gemv+deinterleave fast path.
+    fn q_lora_active(&self) -> bool {
+        self.lora.as_ref().and_then(|lw| lw.q.as_ref()).is_some()
+    }
+
+    /// Deferred Q deinterleave over the per-seq `qkv_buf` Q segments. Runs ONLY
+    /// when a q adapter is resident on a gated model: the projection wrote RAW
+    /// interleaved `[Q|gate]` and the q LoRA fold in [`Self::ms_qkv_apply_lora`]
+    /// has since landed on that raw basis, so the split happens here (in place,
+    /// per token) — identical to the inline `deinterleave_qg` the no-adapter
+    /// fast path runs during projection.
+    fn ms_qkv_deinterleave_q(&self, c: &MultiSeqCtx<'_>) -> Result<()> {
+        if !self.gated || !self.q_lora_active() {
+            return Ok(());
+        }
+        for i in 0..c.n {
+            let q_out_i = c.qkv_buf.offset(i * c.per_seq_qkv);
+            ops::deinterleave_qg(
+                c.fwd.gpu,
+                self.deinterleave_qg_k,
+                q_out_i,
+                1,
+                c.nq,
+                c.hd,
+                c.q_proj_dim,
+                c.stream,
+            )?;
+        }
         Ok(())
     }
 
@@ -95,6 +133,26 @@ impl Qwen3AttentionLayer {
         let out_row_stride = (c.per_seq_qkv / bf16) as u32; // strided [Q|K|V] layout
         let x_row_stride = c.h as u32; // normed rows are contiguous [n, h]
         let kv_bytes = (c.nkv * c.hd) as usize * bf16;
+        // Q delta: base_out = the RAW interleaved [Q|gate] segment at qkv_buf
+        // offset 0 (width q_proj_dim). Folded BEFORE the deferred deinterleave
+        // (`ms_qkv_deinterleave_q`), matching the interleaved basis PEFT
+        // trained against. Route is present iff a q adapter is resident.
+        if let Some(ref route) = lw.q_route {
+            let q_out0 = c.qkv_buf; // Q segment starts at offset 0
+            ops::lora_delta::apply_lora_bgmv(
+                c.fwd.gpu,
+                &lw.kernels,
+                route,
+                c.normed,
+                q_out0,
+                c.seq_slot,
+                c.n as u32,
+                x_row_stride,
+                out_row_stride,
+                c.fwd.buffers.lora_xa(),
+                c.stream,
+            )?;
+        }
         // K delta: base_out = k_out region (after Q), fold in place.
         if let Some(ref route) = lw.k_route {
             let k_out0 = c.qkv_buf.offset(c.q_proj_bytes);
@@ -205,7 +263,7 @@ impl Qwen3AttentionLayer {
         let v_nvfp4 = self.v_weight.as_ref().and_then(|w| w.as_nvfp4()).unwrap();
 
         let q_scratch = fwd.buffers.ssm_qkvz();
-        if self.gated {
+        if self.gated && !self.q_lora_active() {
             ops::w4a16_gemv_qg_batch3(
                 fwd.gpu,
                 self.w4a16_gemv_qg_batch3_k,
@@ -219,6 +277,9 @@ impl Qwen3AttentionLayer {
                 stream,
             )?;
         } else {
+            // Ungated, OR gated with a q adapter: emit RAW interleaved [Q|gate]
+            // (the fused deinterleave is deferred to `ms_qkv_deinterleave_q` so
+            // the q LoRA fold lands on the interleaved basis).
             ops::w4a16_gemv_batch3(
                 fwd.gpu,
                 self.w4a16_gemv_batch3_k,
@@ -293,7 +354,7 @@ impl Qwen3AttentionLayer {
         let v_nvfp4 = self.v_weight.as_ref().and_then(|w| w.as_nvfp4()).unwrap();
 
         let q_scratch = fwd.buffers.ssm_qkvz();
-        if self.gated {
+        if self.gated && !self.q_lora_active() {
             ops::w4a16_gemv_qg_batch2(
                 fwd.gpu,
                 self.w4a16_gemv_qg_batch2_k,
@@ -307,6 +368,8 @@ impl Qwen3AttentionLayer {
                 stream,
             )?;
         } else {
+            // Ungated, OR gated with a q adapter: RAW interleaved [Q|gate]
+            // (deinterleave deferred past the q LoRA fold).
             ops::w4a16_gemv_batch2(
                 fwd.gpu,
                 self.w4a16_gemv_batch2_k,
@@ -499,9 +562,11 @@ impl Qwen3AttentionLayer {
             q_proj_dim,
             h as u32,
         )?;
-        if self.gated {
+        if self.gated && !self.q_lora_active() {
             // Split interleaved [Q|Gate] → deinterleaved, in place, all n rows
             // (grid is per-token). Matches what w4a16_gemv_qg_batch3 does inline.
+            // Deferred to `ms_qkv_deinterleave_q` (post-fold) when a q adapter is
+            // resident, so the delta folds on the raw interleaved basis first.
             ops::deinterleave_qg(
                 fwd.gpu,
                 self.deinterleave_qg_k,
@@ -590,29 +655,48 @@ impl Qwen3AttentionLayer {
                     h as u32,
                     stream,
                 )?;
-                ops::deinterleave_qg(
-                    fwd.gpu,
-                    self.deinterleave_qg_k,
-                    q_out_i,
-                    1,
-                    nq,
-                    hd,
-                    q_proj_dim,
-                    stream,
-                )?;
+                // Deinterleave deferred past the q LoRA fold when a q adapter is
+                // resident (see `ms_qkv_deinterleave_q`).
+                if !self.q_lora_active() {
+                    ops::deinterleave_qg(
+                        fwd.gpu,
+                        self.deinterleave_qg_k,
+                        q_out_i,
+                        1,
+                        nq,
+                        hd,
+                        q_proj_dim,
+                        stream,
+                    )?;
+                }
             } else if let Some(nvfp4) = self.q_weight.as_ref().and_then(|w| w.as_nvfp4()) {
-                ops::w4a16_gemv_qg(
-                    fwd.gpu,
-                    self.w4a16_gemv_qg_k,
-                    normed_i,
-                    nvfp4,
-                    q_out_i,
-                    q_proj_dim,
-                    h as u32,
-                    nq,
-                    hd,
-                    stream,
-                )?;
+                if self.q_lora_active() {
+                    // Split the FUSED gemv+deinterleave into a raw interleaved
+                    // gemv; the deinterleave is deferred past the q LoRA fold.
+                    ops::w4a16_gemv(
+                        fwd.gpu,
+                        self.w4a16_gemv_k,
+                        normed_i,
+                        nvfp4,
+                        q_out_i,
+                        q_proj_dim,
+                        h as u32,
+                        stream,
+                    )?;
+                } else {
+                    ops::w4a16_gemv_qg(
+                        fwd.gpu,
+                        self.w4a16_gemv_qg_k,
+                        normed_i,
+                        nvfp4,
+                        q_out_i,
+                        q_proj_dim,
+                        h as u32,
+                        nq,
+                        hd,
+                        stream,
+                    )?;
+                }
             } else {
                 ops::dense_gemv(
                     fwd.gpu,
@@ -624,16 +708,18 @@ impl Qwen3AttentionLayer {
                     h as u32,
                     stream,
                 )?;
-                ops::deinterleave_qg(
-                    fwd.gpu,
-                    self.deinterleave_qg_k,
-                    q_out_i,
-                    1,
-                    nq,
-                    hd,
-                    q_proj_dim,
-                    stream,
-                )?;
+                if !self.q_lora_active() {
+                    ops::deinterleave_qg(
+                        fwd.gpu,
+                        self.deinterleave_qg_k,
+                        q_out_i,
+                        1,
+                        nq,
+                        hd,
+                        q_proj_dim,
+                        stream,
+                    )?;
+                }
             }
         } else if let Some(fp8) = self.q_weight.as_ref().and_then(|w| w.as_fp8()) {
             ops::w8a16_gemv(

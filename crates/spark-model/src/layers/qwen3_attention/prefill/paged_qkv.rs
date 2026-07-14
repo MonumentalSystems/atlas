@@ -311,15 +311,20 @@ impl Qwen3AttentionLayer {
                 )?;
             }
         }
-        // ── LoRA runtime delta: out += scale·(normed@Aᵀ)@Bᵀ (v0: K/V only;
-        // q_proj is rejected at adapter load — gated [Q|gate] interleave).
+        // ── LoRA runtime delta: out += scale·(normed@Aᵀ)@Bᵀ (Q/K/V).
+        // For gated Q this folds into the RAW interleaved `[Q|gate]` `out`
+        // (out_dim = q_proj_dim) BEFORE the caller's `deinterleave_qg_split`
+        // (paged.rs / cache_skip.rs) — the PEFT `lora_B` was trained against
+        // exactly that interleaved basis, so Q folds like K/V, just wider.
         // Runs before the caller's ATLAS_OP_DUMP, so dumps show ADAPTED
         // outputs (what an HF+PEFT forward hook shows).
         if let Some(ref lw) = self.lora {
-            // Q has neither a pair nor a route (rejected at load) — keep it None
-            // for ALL THREE so a route/module deref can never fire on Q.
             let (pair, route, module) = match proj {
-                Proj::Q => (None, None, None),
+                Proj::Q => (
+                    lw.q.as_ref(),
+                    lw.q_route.as_ref(),
+                    Some(crate::lora::LoraModule::QProj),
+                ),
                 Proj::K => (
                     lw.k.as_ref(),
                     lw.k_route.as_ref(),
