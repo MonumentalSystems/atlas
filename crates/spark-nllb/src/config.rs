@@ -33,8 +33,21 @@ pub struct NllbConfig {
     pub scale_embedding: bool,
     #[serde(default = "default_activation")]
     pub activation_function: String,
-    #[serde(default = "default_max_length")]
+    // HF configs frequently ship `"max_length": null`; `serde(default)` only
+    // fires on an ABSENT key, so tolerate an explicit null too.
+    #[serde(
+        default = "default_max_length",
+        deserialize_with = "null_or_default_len"
+    )]
     pub max_length: usize,
+}
+
+/// Deserialize `usize`, mapping an explicit JSON `null` to the default length.
+fn null_or_default_len<'de, D>(de: D) -> Result<usize, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<usize>::deserialize(de)?.unwrap_or_else(default_max_length))
 }
 
 fn default_pad() -> u32 {
@@ -49,6 +62,10 @@ fn default_true() -> bool {
 fn default_activation() -> String {
     "relu".to_string()
 }
+#[cfg(test)]
+#[path = "config_tests.rs"]
+mod tests;
+
 fn default_max_length() -> usize {
     200
 }
