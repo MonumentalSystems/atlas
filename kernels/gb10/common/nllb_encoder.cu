@@ -11,6 +11,7 @@
 // consumed transposed (C[m,n] = bias[n] + Σ_k A[m,k]·W[n,k]).
 
 #include <cuda_runtime.h>
+#include <cuda_bf16.h>
 #include <math.h>
 
 // out[tok, :] = table[ids[tok], :]   (embedding gather, fp32)
@@ -191,4 +192,123 @@ extern "C" __global__ void nllb_attention(
         acc += scores[j] * v[(unsigned long long)j * dmodel + (unsigned long long)head * D + tid];
     }
     out[bq + tid] = acc;
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// bf16 variants (milestone-4 tensor-core pipeline). Activations + weights are
+// bf16; the heavy GEMMs use the shared tensor-core `gemm` module
+// (dense_gemm_bf16_pipelined). These ops store bf16 but accumulate in f32.
+// ─────────────────────────────────────────────────────────────────────────
+
+extern "C" __global__ void nllb_embed_bf16(
+    const unsigned int* __restrict__ ids, const __nv_bfloat16* __restrict__ table,
+    __nv_bfloat16* __restrict__ out, unsigned int d) {
+    unsigned int tok = blockIdx.x;
+    unsigned long long id = ids[tok];
+    for (unsigned int i = threadIdx.x; i < d; i += blockDim.x)
+        out[(unsigned long long)tok * d + i] = table[id * d + i];
+}
+
+extern "C" __global__ void nllb_scale_bf16(__nv_bfloat16* __restrict__ x, unsigned int n, float s) {
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) x[i] = __float2bfloat16(__bfloat162float(x[i]) * s);
+}
+
+extern "C" __global__ void nllb_add_bf16(
+    __nv_bfloat16* __restrict__ dst, const __nv_bfloat16* __restrict__ src, unsigned int n) {
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) dst[i] = __float2bfloat16(__bfloat162float(dst[i]) + __bfloat162float(src[i]));
+}
+
+// c[m,n] += bias[n]  (row-broadcast, after a bias-less GEMM)
+extern "C" __global__ void nllb_bias_bf16(
+    __nv_bfloat16* __restrict__ c, const __nv_bfloat16* __restrict__ bias,
+    unsigned int M, unsigned int N) {
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= M * N) return;
+    unsigned int n = idx % N;
+    c[idx] = __float2bfloat16(__bfloat162float(c[idx]) + __bfloat162float(bias[n]));
+}
+
+extern "C" __global__ void nllb_relu_bf16(__nv_bfloat16* __restrict__ x, unsigned int n) {
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) x[i] = __float2bfloat16(fmaxf(__bfloat162float(x[i]), 0.0f));
+}
+
+extern "C" __global__ void nllb_layernorm_bf16(
+    __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ w,
+    const __nv_bfloat16* __restrict__ b, unsigned int rows, unsigned int dim, float eps) {
+    unsigned int row = blockIdx.x;
+    if (row >= rows) return;
+    extern __shared__ float sm[];
+    unsigned int tid = threadIdx.x;
+    __nv_bfloat16* rowp = x + (unsigned long long)row * dim;
+    float local = 0.0f;
+    for (unsigned int i = tid; i < dim; i += blockDim.x) local += __bfloat162float(rowp[i]);
+    sm[tid] = local;
+    __syncthreads();
+    for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) sm[tid] += sm[tid + s];
+        __syncthreads();
+    }
+    float mean = sm[0] / dim;
+    __syncthreads();
+    local = 0.0f;
+    for (unsigned int i = tid; i < dim; i += blockDim.x) {
+        float dv = __bfloat162float(rowp[i]) - mean;
+        local += dv * dv;
+    }
+    sm[tid] = local;
+    __syncthreads();
+    for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) sm[tid] += sm[tid + s];
+        __syncthreads();
+    }
+    float inv = rsqrtf(sm[0] / dim + eps);
+    for (unsigned int i = tid; i < dim; i += blockDim.x) {
+        float v = (__bfloat162float(rowp[i]) - mean) * inv * __bfloat162float(w[i]) + __bfloat162float(b[i]);
+        rowp[i] = __float2bfloat16(v);
+    }
+}
+
+extern "C" __global__ void nllb_attn_kv_bf16(
+    const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ k,
+    const __nv_bfloat16* __restrict__ v, __nv_bfloat16* __restrict__ out,
+    unsigned int tq, unsigned int tk, unsigned int H, unsigned int D, float scale, unsigned int causal) {
+    unsigned int qh = blockIdx.x;
+    unsigned int query = qh / H;
+    unsigned int head = qh % H;
+    unsigned int tid = threadIdx.x;
+    extern __shared__ float sh2b[];
+    float* scores = sh2b;
+    float* red = sh2b + tk;
+    unsigned int dmodel = H * D;
+    unsigned long long bq = (unsigned long long)query * dmodel + (unsigned long long)head * D;
+    unsigned int kmax = causal ? (query + 1) : tk;
+    for (unsigned int j = 0; j < kmax; j++) {
+        unsigned long long bk = (unsigned long long)j * dmodel + (unsigned long long)head * D;
+        red[tid] = __bfloat162float(q[bq + tid]) * __bfloat162float(k[bk + tid]);
+        __syncthreads();
+        for (unsigned int s = D / 2; s > 0; s >>= 1) {
+            if (tid < s) red[tid] += red[tid + s];
+            __syncthreads();
+        }
+        if (tid == 0) scores[j] = red[0] * scale;
+        __syncthreads();
+    }
+    if (tid == 0) {
+        float m = -1e30f;
+        for (unsigned int j = 0; j < kmax; j++) m = fmaxf(m, scores[j]);
+        float su = 0.0f;
+        for (unsigned int j = 0; j < kmax; j++) {
+            scores[j] = expf(scores[j] - m);
+            su += scores[j];
+        }
+        for (unsigned int j = 0; j < kmax; j++) scores[j] /= su;
+    }
+    __syncthreads();
+    float acc = 0.0f;
+    for (unsigned int j = 0; j < kmax; j++)
+        acc += scores[j] * __bfloat162float(v[(unsigned long long)j * dmodel + (unsigned long long)head * D + tid]);
+    out[bq + tid] = __float2bfloat16(acc);
 }

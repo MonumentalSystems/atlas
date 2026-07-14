@@ -98,6 +98,10 @@ name = "nllb_cuda_gen"
 required-features = ["cuda", "gpu-examples"]
 
 [[example]]
+name = "nllb_cuda_bf16"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
 name = "gdn_cdh_vblock_microtest"
 required-features = ["cuda", "gpu-examples"]
 
