@@ -143,7 +143,7 @@ fn snapshot_has_weights(dir: &Path) -> bool {
     read.filter_map(|e| e.ok()).any(|e| {
         e.file_name()
             .to_str()
-            .is_some_and(|n| n.ends_with(".safetensors"))
+            .is_some_and(|n| n.ends_with(".safetensors") || n.ends_with(".gguf"))
     })
 }
 

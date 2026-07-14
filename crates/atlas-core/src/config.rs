@@ -478,12 +478,14 @@ pub(crate) fn default_conv_kernel() -> usize {
 
 mod dispatch;
 mod factory;
+mod gguf;
 mod methods;
 mod parsers;
 #[cfg(test)]
 mod tests;
 
 pub use dispatch::parse_config;
+pub use gguf::{GgufConfigInputs, GgufMeta, config_from_gguf};
 pub(crate) use parsers::{
     parse_deepseek_v4, parse_gemma4_params, parse_minimax_m2, parse_step3p7, parse_vision_config,
 };
