@@ -622,3 +622,41 @@ fn test_qwen36_35b_with_mtp_is_not_holo() {
     // text-only serving keeps H/W position IDs at zero.
     assert!(cfg.vision.is_some());
 }
+
+#[test]
+fn test_parse_nllb_m2m100_config() {
+    let json = r#"{
+        "activation_function": "relu",
+        "architectures": ["M2M100ForConditionalGeneration"],
+        "bos_token_id": 0,
+        "d_model": 2048,
+        "decoder_attention_heads": 16,
+        "decoder_ffn_dim": 8192,
+        "decoder_layers": 24,
+        "encoder_attention_heads": 16,
+        "encoder_ffn_dim": 8192,
+        "encoder_layers": 24,
+        "eos_token_id": 2,
+        "is_encoder_decoder": true,
+        "max_position_embeddings": 1024,
+        "model_type": "m2m_100",
+        "num_hidden_layers": 24,
+        "pad_token_id": 1,
+        "scale_embedding": true,
+        "use_cache": true,
+        "vocab_size": 256206
+    }"#;
+
+    let cfg = parse_config(json).unwrap();
+    assert_eq!(cfg.model_type, "m2m_100");
+    assert_eq!(cfg.hidden_size, 2048);
+    assert_eq!(cfg.num_hidden_layers, 24);
+    assert_eq!(cfg.intermediate_size, 8192);
+    assert_eq!(cfg.num_attention_heads, 16);
+    assert_eq!(cfg.num_key_value_heads, 16);
+    assert_eq!(cfg.head_dim, 128);
+    assert_eq!(cfg.max_position_embeddings, 1024);
+    assert_eq!(cfg.vocab_size, 256206);
+    assert_eq!(cfg.weight_prefix, "model.decoder");
+    assert!(!cfg.attn_gated);
+}

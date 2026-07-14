@@ -19,6 +19,7 @@ pub mod dflash_loader;
 mod gemma4;
 mod minimax;
 mod nemotron;
+mod nllb;
 mod qwen3;
 mod qwen35;
 mod qwen35_dense;
@@ -33,6 +34,7 @@ pub use dflash_loader::{
 pub use gemma4::Gemma4WeightLoader;
 pub use minimax::MinimaxM2WeightLoader;
 pub use nemotron::NemotronHWeightLoader;
+pub use nllb::NllbWeightLoader;
 pub use qwen3::Qwen3WeightLoader;
 pub use qwen3_vl::Qwen3VLWeightLoader;
 pub use qwen35::Qwen35WeightLoader;

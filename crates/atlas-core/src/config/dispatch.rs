@@ -177,6 +177,66 @@ pub fn parse_config(json: &str) -> Result<ModelConfig> {
             Ok(config)
         }
         "gemma4" => parse_gemma4_params(&raw),
+        "m2m_100" | "nllb" => {
+            let mut config = ModelConfig::qwen3_next_80b_nvfp4();
+            config.model_type = "m2m_100".to_string();
+            config.hidden_size = raw
+                .get("d_model")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0) as usize;
+            config.num_hidden_layers = raw
+                .get("decoder_layers")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0) as usize;
+            config.intermediate_size = raw
+                .get("decoder_ffn_dim")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0) as usize;
+            config.vocab_size = raw
+                .get("vocab_size")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0) as usize;
+            config.num_attention_heads = raw
+                .get("decoder_attention_heads")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0) as usize;
+            config.num_key_value_heads = config.num_attention_heads;
+            config.head_dim = if config.num_attention_heads > 0 {
+                config.hidden_size / config.num_attention_heads
+            } else {
+                0
+            };
+            config.max_position_embeddings = raw
+                .get("max_position_embeddings")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0) as usize;
+            config.bos_token_id = raw
+                .get("bos_token_id")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0) as u32;
+            config.eos_token_id = raw
+                .get("eos_token_id")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0) as u32;
+            config.tie_word_embeddings = true;
+            config.attn_gated = false;
+            config.weight_prefix = "model.decoder".to_string();
+            config.num_experts = 0;
+            config.num_experts_per_tok = 1;
+            config.moe_intermediate_size = 0;
+            config.shared_expert_intermediate_size = 0;
+            config.layer_types.clear();
+            config.full_attention_interval = 1;
+            config.linear_num_key_heads = 0;
+            config.linear_key_head_dim = 0;
+            config.linear_num_value_heads = 0;
+            config.linear_value_head_dim = 0;
+            config.mtp_num_hidden_layers = 0;
+            config.vision = None;
+            config.quantization_config = parse_quantization_config(&raw);
+            validate_config(&config)?;
+            Ok(config)
+        }
         "minimax_m2" => parse_minimax_m2(&raw),
         "step3p7" => parse_step3p7(&raw),
         "deepseek_v4" => parse_deepseek_v4(json),
