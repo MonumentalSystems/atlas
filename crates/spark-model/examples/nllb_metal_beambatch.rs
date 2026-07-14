@@ -1,31 +1,30 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! Metal NLLB-200 / M2M-100 decode validation with BF16 safetensors, device KV
-//! cache, greedy decode, and beam search.
+//! Metal BF16 beam batching for NLLB-200 / M2M-100 translation.
 
 use anyhow::{Context, Result, bail};
-use spark_runtime::gpu::GpuBackend;
+use spark_runtime::gpu::{DevicePtr, GpuBackend};
 use spark_runtime::metal_backend::MetalGpuBackend;
 use spark_runtime::weights::{SafetensorsLoader, WeightDtype, WeightLoader, WeightStore};
 use std::path::Path;
 
+#[path = "nllb_metal_batch/batch.rs"]
+#[allow(dead_code)]
+mod batch;
+#[path = "nllb_metal_beambatch/beam.rs"]
+mod beam;
+#[allow(dead_code)]
 #[path = "nllb_metal_bf16/ctx.rs"]
 mod ctx;
-#[path = "nllb_metal_bf16/decode.rs"]
-mod decode;
 
-use ctx::{Ctx, Kernels, Scratch, bf16_bytes, decoder_pos_table_bf16};
-use decode::{DecCtx, DecScratch};
+use ctx::{Ctx, Kernels, Scratch};
 
 const INPUT_IDS: &[u32] = &[
     256047, 94124, 248079, 15697, 248075, 13374, 2442, 1259, 30435, 248130, 2,
 ];
 const FORCED_BOS: u32 = 256057;
+const NUM_BEAMS: usize = 5;
 pub const MAX_NEW: usize = 96;
-pub const CACHE_ROWS: usize = MAX_NEW + 2;
-const EXPECTED_GREEDY: &[u32] = &[
-    256057, 17994, 141190, 248079, 25358, 123732, 248105, 30213, 385, 2,
-];
 const EXPECTED_BEAM5: &[u32] = &[
     256057, 17994, 141190, 248079, 25358, 4255, 956, 34821, 248105, 30213, 102506, 248116, 15510,
     385, 2,
@@ -63,18 +62,14 @@ fn main() -> Result<()> {
         1.0
     };
     let attn_scale = (head_dim as f32).powf(-0.5);
-    println!(
-        "[nllb-metal-bf16] d={d} heads={heads} ffn={ffn} enc={enc_layers} dec={dec_layers} vocab={vocab}"
-    );
 
-    println!("[nllb-metal-bf16] loading BF16 weights to Metal ...");
+    println!("[nllb-metal-beambatch] loading BF16 weights to Metal ...");
     let store: WeightStore = SafetensorsLoader::new().load(Path::new(&dir), gpu, 0)?;
     anyhow::ensure!(
         store.get("model.shared.weight")?.dtype == WeightDtype::BF16,
         "expected a BF16 safetensors checkpoint at {dir}"
     );
     let kernels = load_kernels(gpu)?;
-    let embed_table = store.get("model.shared.weight")?.ptr;
     let ctx = Ctx {
         gpu,
         k: &kernels,
@@ -88,67 +83,61 @@ fn main() -> Result<()> {
         enc_len: INPUT_IDS.len(),
         attn_scale,
         embed_scale,
-        embed_table,
+        embed_table: store.get("model.shared.weight")?.ptr,
         dec_start,
         eos,
         stream,
     };
 
-    let enc_out = ctx.bf16b(ctx.enc_len * d)?;
-    let escr = Scratch::new(&ctx, ctx.enc_len)?;
+    let enc_len = INPUT_IDS.len();
+    let enc_out = ctx.bf16b(enc_len * d)?;
+    let escr = Scratch::new(&ctx, enc_len)?;
     ctx.embed_seq(INPUT_IDS, enc_out)?;
     for l in 0..enc_layers {
         let p = format!("model.encoder.layers.{l}");
-        ctx.enc_self_attn(&p, enc_out, ctx.enc_len, &escr)?;
-        ctx.ffn_block(&p, enc_out, ctx.enc_len, &escr)?;
+        ctx.enc_self_attn(&p, enc_out, enc_len, &escr)?;
+        ctx.ffn_block(&p, enc_out, enc_len, &escr)?;
     }
-    ctx.layer_norm("model.encoder.layer_norm", enc_out, ctx.enc_len)?;
+    ctx.layer_norm("model.encoder.layer_norm", enc_out, enc_len)?;
 
-    let mut cross_k = Vec::with_capacity(dec_layers);
-    let mut cross_v = Vec::with_capacity(dec_layers);
+    let b = NUM_BEAMS;
+    let cross_k: Vec<DevicePtr> = (0..dec_layers)
+        .map(|_| ctx.bf16b(b * enc_len * d))
+        .collect::<Result<_>>()?;
+    let cross_v: Vec<DevicePtr> = (0..dec_layers)
+        .map(|_| ctx.bf16b(b * enc_len * d))
+        .collect::<Result<_>>()?;
+    let tmp = ctx.bf16b(enc_len * d)?;
     for l in 0..dec_layers {
         let p = format!("model.decoder.layers.{l}.encoder_attn");
-        let ck = ctx.bf16b(ctx.enc_len * d)?;
-        let cv = ctx.bf16b(ctx.enc_len * d)?;
-        ctx.linear(&format!("{p}.k_proj"), enc_out, ck, ctx.enc_len, d, d)?;
-        ctx.linear(&format!("{p}.v_proj"), enc_out, cv, ctx.enc_len, d, d)?;
-        cross_k.push(ck);
-        cross_v.push(cv);
+        ctx.linear(&format!("{p}.k_proj"), enc_out, tmp, enc_len, d, d)?;
+        for bi in 0..b {
+            ctx.gpu.copy_d2d(
+                tmp,
+                cross_k[l].offset(bi * enc_len * d * 2),
+                enc_len * d * 2,
+            )?;
+        }
+        ctx.linear(&format!("{p}.v_proj"), enc_out, tmp, enc_len, d, d)?;
+        for bi in 0..b {
+            ctx.gpu.copy_d2d(
+                tmp,
+                cross_v[l].offset(bi * enc_len * d * 2),
+                enc_len * d * 2,
+            )?;
+        }
     }
 
-    let pos_table = ctx.bf16b(CACHE_ROWS * d)?;
-    gpu.copy_h2d(
-        bf16_bytes(&decoder_pos_table_bf16(CACHE_ROWS, d)),
-        pos_table,
-    )?;
-    let dctx = DecCtx {
-        ctx: &ctx,
-        cross_k: &cross_k,
-        cross_v: &cross_v,
-        pos_table,
-    };
-    let dscr = DecScratch::new(&ctx)?;
-
     let t0 = std::time::Instant::now();
-    let greedy = dctx.greedy(&dscr, FORCED_BOS)?;
-    println!("[nllb-metal-bf16] greedy ids = {greedy:?}");
-    anyhow::ensure!(greedy == EXPECTED_GREEDY, "BF16 greedy diverged");
+    let out = ctx.beam_batched(b, &cross_k, &cross_v, FORCED_BOS, 1.0)?;
+    let dt = t0.elapsed().as_secs_f64();
+    println!("[nllb-metal-beambatch] beam={b} ids = {out:?}");
+    anyhow::ensure!(out == EXPECTED_BEAM5, "beam-batched output diverged");
     println!(
-        "[nllb-metal-bf16] greedy PASS in {:.3}s",
-        t0.elapsed().as_secs_f64()
-    );
-
-    let t1 = std::time::Instant::now();
-    let beam = dctx.beam(&dscr, FORCED_BOS, 5, 1.0)?;
-    println!("[nllb-metal-bf16] beam=5 ids = {beam:?}");
-    println!(
-        "[nllb-metal-bf16] beam=5 {} in {:.3}s",
-        if beam == EXPECTED_BEAM5 {
-            "matches HF"
-        } else {
-            "differs from HF"
-        },
-        t1.elapsed().as_secs_f64()
+        "[nllb-metal-beambatch] PASS - {} tok in {:.3}s = {:.1} tok/s",
+        out.len(),
+        dt,
+        out.len() as f64 / dt
     );
     Ok(())
 }

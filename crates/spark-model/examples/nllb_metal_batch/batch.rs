@@ -151,7 +151,7 @@ impl Ctx<'_> {
         Ok(outs)
     }
 
-    fn embed_batch(&self, cur: &[u32], id_dev: DevicePtr, out: DevicePtr) -> Result<()> {
+    pub(crate) fn embed_batch(&self, cur: &[u32], id_dev: DevicePtr, out: DevicePtr) -> Result<()> {
         self.gpu.copy_h2d(u32_bytes(cur), id_dev)?;
         KernelLaunch::new(self.gpu, self.k.embed)
             .grid([cur.len() as u32, 1, 1])
@@ -171,7 +171,7 @@ impl Ctx<'_> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn self_attn_batch(
+    pub(crate) fn self_attn_batch(
         &self,
         layer: &str,
         dh: DevicePtr,
@@ -204,7 +204,7 @@ impl Ctx<'_> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn cross_attn_batch(
+    pub(crate) fn cross_attn_batch(
         &self,
         layer: &str,
         dh: DevicePtr,
@@ -237,7 +237,7 @@ impl Ctx<'_> {
         self.gpu.copy_d2d(proj, dh, b * d * 2)
     }
 
-    fn ffn_batch(
+    pub(crate) fn ffn_batch(
         &self,
         layer: &str,
         dh: DevicePtr,
@@ -257,7 +257,7 @@ impl Ctx<'_> {
         self.gpu.copy_d2d(proj, dh, b * self.d * 2)
     }
 
-    fn add_row(&self, dst: DevicePtr, row: DevicePtr, n: usize, d: usize) -> Result<()> {
+    pub(crate) fn add_row(&self, dst: DevicePtr, row: DevicePtr, n: usize, d: usize) -> Result<()> {
         KernelLaunch::new(self.gpu, self.k.add_row)
             .grid([div_ceil(n as u32, 256), 1, 1])
             .block([256, 1, 1])
@@ -268,7 +268,7 @@ impl Ctx<'_> {
             .launch(self.stream)
     }
 
-    fn scatter(
+    pub(crate) fn scatter(
         &self,
         src: DevicePtr,
         dst: DevicePtr,
@@ -289,7 +289,7 @@ impl Ctx<'_> {
             .launch(self.stream)
     }
 
-    fn attn_decode(
+    pub(crate) fn attn_decode(
         &self,
         q: DevicePtr,
         kc: DevicePtr,
@@ -315,7 +315,7 @@ impl Ctx<'_> {
             .launch(self.stream)
     }
 
-    fn lm_head_batch(&self, a: DevicePtr, c: DevicePtr, b: usize) -> Result<()> {
+    pub(crate) fn lm_head_batch(&self, a: DevicePtr, c: DevicePtr, b: usize) -> Result<()> {
         KernelLaunch::new(self.gpu, self.k.lin_no_bias)
             .grid([div_ceil(self.vocab as u32, 16), div_ceil(b as u32, 16), 1])
             .block([16, 16, 1])
@@ -328,7 +328,7 @@ impl Ctx<'_> {
             .launch(self.stream)
     }
 
-    fn argmax_batch(&self, logits: DevicePtr, out: DevicePtr, b: usize) -> Result<()> {
+    pub(crate) fn argmax_batch(&self, logits: DevicePtr, out: DevicePtr, b: usize) -> Result<()> {
         KernelLaunch::new(self.gpu, self.k.argmax_batched)
             .grid([b as u32, 1, 1])
             .block([256, 1, 1])

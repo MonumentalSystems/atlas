@@ -22,8 +22,10 @@ pub struct Kernels {
     pub attn: KernelHandle,
     pub add_row: KernelHandle,
     pub scatter: KernelHandle,
+    pub gather: KernelHandle,
     pub attn_decode: KernelHandle,
     pub argmax_batched: KernelHandle,
+    pub topk_lse: KernelHandle,
     pub argmax: KernelHandle,
 }
 

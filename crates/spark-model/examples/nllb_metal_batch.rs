@@ -227,8 +227,10 @@ fn load_kernels(gpu: &dyn GpuBackend) -> Result<Kernels> {
         attn: gpu.kernel("nllb_encoder", "nllb_attn_kv_bf16")?,
         add_row: gpu.kernel("nllb_encoder", "nllb_add_row_bf16")?,
         scatter: gpu.kernel("nllb_encoder", "nllb_scatter_batched")?,
+        gather: gpu.kernel("nllb_encoder", "nllb_gather_batched")?,
         attn_decode: gpu.kernel("nllb_encoder", "nllb_attn_bdecode")?,
         argmax_batched: gpu.kernel("nllb_encoder", "nllb_argmax_batched")?,
+        topk_lse: gpu.kernel("nllb_encoder", "nllb_topk_lse_bf16")?,
         argmax: gpu.kernel("argmax_bf16", "argmax_bf16")?,
     })
 }

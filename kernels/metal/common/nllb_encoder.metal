@@ -500,6 +500,27 @@ kernel void nllb_scatter_batched(
     dst[((ulong)b * stride + pos) * d + i] = src[gid];
 }
 
+kernel void nllb_gather_batched(
+    device const bfloat *src [[buffer(0)]],
+    device bfloat *dst [[buffer(1)]],
+    device const uint *perm [[buffer(2)]],
+    constant uint &B [[buffer(3)]],
+    constant uint &used [[buffer(4)]],
+    constant uint &stride [[buffer(5)]],
+    constant uint &d [[buffer(6)]],
+    uint gid [[thread_position_in_grid]])
+{
+    ulong total = (ulong)B * used * d;
+    if (gid >= total) {
+        return;
+    }
+    uint i = gid % d;
+    uint t = (gid / d) % used;
+    uint b = gid / (used * d);
+    uint parent = perm[b];
+    dst[((ulong)b * stride + t) * d + i] = src[((ulong)parent * stride + t) * d + i];
+}
+
 kernel void nllb_gemv_bf16(
     device const bfloat *x [[buffer(0)]],
     device const bfloat *w [[buffer(1)]],
@@ -821,6 +842,108 @@ kernel void nllb_argmax_batched(
         if (tid == 0) {
             out[b] = i;
         }
+    }
+}
+
+kernel void nllb_topk_lse_bf16(
+    device const bfloat *logits [[buffer(0)]],
+    device float *top_vals [[buffer(1)]],
+    device uint *top_ids [[buffer(2)]],
+    device float *lse_out [[buffer(3)]],
+    constant uint &B [[buffer(4)]],
+    constant uint &vocab [[buffer(5)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tg_size [[threads_per_threadgroup]])
+{
+    constexpr uint K = 10;
+    if (row >= B) {
+        return;
+    }
+    threadgroup float partial_max[256];
+    threadgroup float partial_sum[256];
+    threadgroup float local_vals[2560];
+    threadgroup uint local_ids[2560];
+    device const bfloat *base = logits + (ulong)row * vocab;
+
+    float vals[K];
+    uint ids[K];
+    for (uint j = 0; j < K; j++) {
+        vals[j] = -INFINITY;
+        ids[j] = 0;
+    }
+    float local_max = -INFINITY;
+    for (uint i = tid; i < vocab; i += tg_size) {
+        float v = float(base[i]);
+        local_max = fmax(local_max, v);
+        if (v > vals[K - 1]) {
+            vals[K - 1] = v;
+            ids[K - 1] = i;
+            for (uint j = K - 1; j > 0 && vals[j] > vals[j - 1]; j--) {
+                float tv = vals[j - 1];
+                uint ti = ids[j - 1];
+                vals[j - 1] = vals[j];
+                ids[j - 1] = ids[j];
+                vals[j] = tv;
+                ids[j] = ti;
+            }
+        }
+    }
+    partial_max[tid] = local_max;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = tg_size >> 1; s > 0; s >>= 1) {
+        if (tid < s) {
+            partial_max[tid] = fmax(partial_max[tid], partial_max[tid + s]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float m = partial_max[0];
+    float local_sum = 0.0f;
+    for (uint i = tid; i < vocab; i += tg_size) {
+        local_sum += exp(float(base[i]) - m);
+    }
+    partial_sum[tid] = local_sum;
+    for (uint j = 0; j < K; j++) {
+        local_vals[tid * K + j] = vals[j];
+        local_ids[tid * K + j] = ids[j];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = tg_size >> 1; s > 0; s >>= 1) {
+        if (tid < s) {
+            partial_sum[tid] += partial_sum[tid + s];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0) {
+        float best_vals[K];
+        uint best_ids[K];
+        for (uint j = 0; j < K; j++) {
+            best_vals[j] = -INFINITY;
+            best_ids[j] = 0;
+        }
+        for (uint t = 0; t < tg_size; t++) {
+            for (uint j = 0; j < K; j++) {
+                float v = local_vals[t * K + j];
+                uint id = local_ids[t * K + j];
+                if (v > best_vals[K - 1]) {
+                    best_vals[K - 1] = v;
+                    best_ids[K - 1] = id;
+                    for (uint p = K - 1; p > 0 && best_vals[p] > best_vals[p - 1]; p--) {
+                        float tv = best_vals[p - 1];
+                        uint ti = best_ids[p - 1];
+                        best_vals[p - 1] = best_vals[p];
+                        best_ids[p - 1] = best_ids[p];
+                        best_vals[p] = tv;
+                        best_ids[p] = ti;
+                    }
+                }
+            }
+        }
+        for (uint j = 0; j < K; j++) {
+            top_vals[row * K + j] = best_vals[j];
+            top_ids[row * K + j] = best_ids[j];
+        }
+        lse_out[row] = m + log(partial_sum[0]);
     }
 }
 
