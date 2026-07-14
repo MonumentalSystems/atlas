@@ -191,6 +191,13 @@ impl Model for TransformerModel {
             anyhow::bail!("LoRA peer promotion requires the cuda feature")
         }
     }
+    fn promote_lora_from_disk(
+        &mut self,
+        dir: &std::path::Path,
+        name: &str,
+    ) -> Result<(usize, Option<String>)> {
+        self.promote_lora_slot_from_disk(dir, name)
+    }
     fn high_speed_swap_dims(&self) -> Option<spark_storage::ModelDims> {
         self.high_speed_swap_dims_dispatch()
     }

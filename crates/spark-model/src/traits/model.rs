@@ -263,6 +263,20 @@ pub trait Model: Send + Sync {
         bail!("this model does not support LoRA peer promotion")
     }
 
+    /// Demand-driven DISK promotion (no RDMA/peer): load the adapter `name` from
+    /// `adapter_dir` into a cache pool slot (LRU victim) and make it active,
+    /// returning `(slot, evicted_name)`. Local-disk sibling of
+    /// [`Self::promote_lora_from_peer`]; the swap re-parses the dir's
+    /// `adapter_config.json`, so no `peft` arg. Runs at a scheduler quiescent
+    /// point; needs rotation armed. Default: unsupported.
+    fn promote_lora_from_disk(
+        &mut self,
+        _adapter_dir: &std::path::Path,
+        _name: &str,
+    ) -> Result<(usize, Option<String>)> {
+        bail!("this model does not support LoRA disk promotion")
+    }
+
     /// Dims for the `--high-speed-swap` orchestrator (installed thread-local
     /// after `bind_gpu_to_thread`). `None` for legacy/non-attention models.
     fn high_speed_swap_dims(&self) -> Option<spark_storage::ModelDims> {

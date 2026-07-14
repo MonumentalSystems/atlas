@@ -202,6 +202,82 @@ impl TransformerModel {
         Ok((slot, evicted))
     }
 
+    /// Demand-driven DISK promotion (no RDMA/peer): load the adapter at
+    /// `adapter_dir` (named `name`) into a CACHE-region pool slot (LRU victim)
+    /// and make it ACTIVE, returning `(slot, evicted_name)`. Local-disk analog
+    /// of [`Self::promote_lora_slot_from_peer`] — same victim policy (pure
+    /// [`select_victim_slot`]: never-filled placeholder first, else the LRU idle
+    /// (`ref_count == 0`) cache slot, else `POOL_FULL`, retryable — a busy slot
+    /// is NEVER evicted) and the same make-active control plane, but the inner
+    /// swap reads the adapter from disk instead of the peer.
+    /// [`Self::swap_lora_slot_from_disk`] re-parses the dir's
+    /// `adapter_config.json` (so no `peft` arg), re-checks `ref_count>0` as a
+    /// backstop, and bumps the slot generation so #24 KV stays correct. Runs on
+    /// the scheduler thread at a QUIESCENT point; requires rotation armed
+    /// (`ATLAS_LORA_ROTATE=1`) — the inner swap enforces it.
+    pub fn promote_lora_slot_from_disk(
+        &mut self,
+        adapter_dir: &std::path::Path,
+        name: &str,
+    ) -> Result<(usize, Option<String>)> {
+        // 1) Snapshot the cache region + pick a victim (pure policy).
+        let (slot, evicted) = {
+            let lw = self
+                .lora
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("LoRA disk promote: no adapter pool loaded"))?;
+            let views = lw.cache_slot_views();
+            let slot = crate::lora::select_victim_slot(&views).map_err(|e| match e {
+                crate::lora::VictimError::PoolFull => anyhow::anyhow!(
+                    "POOL_FULL: all {} cache slot(s) are busy (ref_count>0); retry",
+                    views.len()
+                ),
+            })?;
+            // The name being replaced (if the victim already held an adapter) so
+            // the caller can drop the stale name->slot overlay entry.
+            let evicted = lw
+                .slots
+                .get(slot)
+                .map(|s| s.name.clone())
+                .filter(|n| !n.is_empty());
+            (slot, evicted)
+        };
+
+        // 2) Disk-load into the victim slot (re-checks ref_count>0, bumps gen).
+        self.swap_lora_slot_from_disk(adapter_dir, name, slot)?;
+
+        // 3) Make the promoted slot ACTIVE so its delta applies (batch-1 honest).
+        //    `swap_lora_slot_from_disk` already re-installed if the victim WAS the
+        //    active slot; otherwise re-point the installed pairs onto it here.
+        let already_active = self.lora.as_ref().unwrap().active == slot;
+        if !already_active {
+            let (layers, tables, scale_table) = {
+                let lw = self.lora.as_mut().unwrap();
+                lw.active = slot;
+                lw.name = lw.slots[slot].name.clone();
+                lw.adapter_config = lw.slots[slot].adapter_config.clone();
+                (
+                    lw.slots[slot].layers.clone(),
+                    lw.tables.clone(),
+                    lw.scale_table,
+                )
+            };
+            let kernels = ops::lora_delta::LoraKernels::new(self.gpu.as_ref())?;
+            self.install_lora_layers(&layers, kernels, &tables, scale_table)?;
+            self.destroy_lora_decode_graphs();
+        }
+        // Stamp the freshly-promoted slot as most-recently-used so a back-to-back
+        // promote of a DIFFERENT cold adapter picks an older victim, not this one,
+        // before the request that triggered this promote has acquired its ref.
+        self.lora.as_ref().unwrap().touch_slot(slot);
+        tracing::info!(
+            "LoRA disk-promote: '{name}' hot in cache slot {slot} \
+             (evicted={:?}), now active",
+            evicted
+        );
+        Ok((slot, evicted))
+    }
+
     /// Disk-swap the adapter at `adapter_dir` INTO pool `slot`, in place, then
     /// make it that slot's resident adapter (re-installing onto the layer structs
     /// if the slot is currently active). The local-disk analog of
