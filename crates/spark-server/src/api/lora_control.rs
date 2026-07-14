@@ -28,16 +28,28 @@ use crate::api::compact::openai_error_response;
 pub async fn resolve_request_adapter_slot(
     state: &AppState,
     adapter: Option<&str>,
+    model: &str,
 ) -> Result<i32, Response> {
+    // Selection precedence: the explicit `adapter` field wins; otherwise the
+    // OpenAI `model` field routes when it names a RESIDENT adapter (so a plain
+    // `{"model":"demo"}` selects the `demo` pool slot — the standard OpenAI way
+    // to pick a served LoRA). A `model` that is the base model (or any name not
+    // a resident adapter) falls through to `None` → installed active (`-1`),
+    // never an unknown-adapter 400.
+    let selector = match adapter {
+        Some(a) => Some(a),
+        None if state.adapter_names.iter().any(|n| n == model) => Some(model),
+        None => None,
+    };
     if let Some(slot) =
-        crate::main_modules::app_state::resolve_adapter_slot(&state.adapter_names, adapter)
+        crate::main_modules::app_state::resolve_adapter_slot(&state.adapter_names, selector)
     {
         return Ok(slot);
     }
     // #27: a non-resident name may be STAGEABLE — try an on-miss RDMA
     // promotion into a cache slot. Only 400 when it isn't stageable
     // (byte-identical to today) or the promote fails.
-    let name = adapter.unwrap_or("");
+    let name = selector.unwrap_or("");
     match state.ensure_adapter_hot_opt(name).await {
         Ok(Some(slot)) => Ok(slot),
         Ok(None) => Err(openai_error_response(

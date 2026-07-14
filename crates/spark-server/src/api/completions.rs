@@ -206,6 +206,7 @@ pub async fn completions(
     let adapter_slot = match super::lora_control::resolve_request_adapter_slot(
         &state,
         req.adapter.as_deref(),
+        &req.model,
     )
     .await
     {
