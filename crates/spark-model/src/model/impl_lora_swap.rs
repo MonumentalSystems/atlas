@@ -128,7 +128,7 @@ impl TransformerModel {
     /// (staged on `peer_addr` at `adapter_id`) from the peer into a CACHE-region
     /// pool slot and make it ACTIVE, returning `(slot, evicted_name)`. Runs on
     /// the scheduler thread at a QUIESCENT point (the only place per-slot
-    /// `ref_count` is authoritative). Victim policy (pure [`select_victim_slot`]):
+    /// `ref_count` is authoritative). Victim policy (pure `select_victim_slot`):
     /// a never-filled placeholder first, else the LRU idle (`ref_count == 0`)
     /// cache slot, else `POOL_FULL` (retryable — a busy slot is NEVER evicted).
     /// The underlying [`Self::swap_lora_slot_from_peer`] re-checks `ref_count>0`
@@ -206,7 +206,7 @@ impl TransformerModel {
     /// `adapter_dir` (named `name`) into a CACHE-region pool slot (LRU victim)
     /// and make it ACTIVE, returning `(slot, evicted_name)`. Local-disk analog
     /// of [`Self::promote_lora_slot_from_peer`] — same victim policy (pure
-    /// [`select_victim_slot`]: never-filled placeholder first, else the LRU idle
+    /// `select_victim_slot`: never-filled placeholder first, else the LRU idle
     /// (`ref_count == 0`) cache slot, else `POOL_FULL`, retryable — a busy slot
     /// is NEVER evicted) and the same make-active control plane, but the inner
     /// swap reads the adapter from disk instead of the peer.

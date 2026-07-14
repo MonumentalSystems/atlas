@@ -193,7 +193,7 @@ pub struct LoraWeights {
 
 /// Task #27: a per-slot snapshot for the pure victim-selection policy. Taken on
 /// the model thread at a scheduler-quiescent point (the only place `ref_count`
-/// is authoritative), then handed to [`select_victim_slot`].
+/// is authoritative), then handed to `select_victim_slot`.
 #[derive(Clone, Copy, Debug)]
 pub struct SlotView {
     /// `true` if this slot currently holds a (non-placeholder) adapter.
@@ -330,7 +330,7 @@ impl LoraWeights {
     /// the per-slot scale table from `layers` (the just-staged adapter's actual
     /// per-module coverage). A re-staged adapter whose module coverage DIFFERS
     /// from the evicted one would otherwise keep a STALE table entry: the
-    /// bgmv-routed path would SKIP a module the new adapter adds (a_table[slot]
+    /// bgmv-routed path would SKIP a module the new adapter adds (`a_table[slot]`
     /// stale-NULL → missed delta), keep applying an evicted module (stale non-NULL
     /// → wrong delta), or use the wrong per-slot scale. Shared by BOTH the disk
     /// swap (`pack_store_into_slot`) and the RDMA swap (`swap_lora_slot_from_peer`).
@@ -369,7 +369,7 @@ impl LoraWeights {
     }
 
     /// Task #27: snapshot the CACHE region `[pinned, max_loras)` as
-    /// `(slot_index, SlotView)` for [`select_victim_slot`]. `filled` = the slot
+    /// `(slot_index, SlotView)` for `select_victim_slot`. `filled` = the slot
     /// holds a non-placeholder adapter (non-empty name). Read on the model
     /// thread at a quiescent point.
     pub fn cache_slot_views(&self) -> Vec<(usize, SlotView)> {

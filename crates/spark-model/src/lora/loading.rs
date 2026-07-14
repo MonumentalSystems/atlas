@@ -391,7 +391,7 @@ pub fn load_lora_adapters_multi(
 /// Runtime disk swap: audit + pack an already-loaded adapter `store` into an
 /// EXISTING pool `slot` of `lw`, in place, and stamp that slot's
 /// name/config/layers. Byte-identical to a startup pack of the same adapter into
-/// that slot — same audit, A-contiguous copy, and B row-repack via [`pack_slot`].
+/// that slot — same audit, A-contiguous copy, and B row-repack via `pack_slot`.
 /// The slot sub-region is re-zeroed first (a reused slot still holds the prior
 /// adapter's bytes, and pad rows/cols must stay 0 for padded-K correctness).
 /// Returns the rebuilt per-layer pairs so the caller can re-install them if the

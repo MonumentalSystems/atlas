@@ -241,7 +241,7 @@ pub fn apply_lora_delta(
 /// `route.a_table`/`route.b_table`/`route.scale_table` (`[max_loras]` device
 /// arrays, NULL/0 = base-only slot) at the load-time-fixed pool addresses.
 ///
-/// out[i, :] += scale_s * (x[i, :] @ A_s^T) @ B_s^T   where s = seq_slot[i].
+/// `out[i, :] += scale_s * (x[i, :] @ A_s^T) @ B_s^T`   where `s = seq_slot[i]`.
 ///
 /// BYTE-IDENTICAL to `n` sequential `apply_lora_delta(m=1)` calls for the same
 /// `(x_i, s_i)` (the on-hardware oracle): kernel 1 is `dense_gemv_bf16` with a

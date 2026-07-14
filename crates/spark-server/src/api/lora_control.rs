@@ -42,7 +42,9 @@ pub async fn resolve_request_adapter_slot(
     // `model=<peer-stageable>` routing (previously only reachable via `adapter`).
     let selector = match adapter {
         Some(a) => Some(a),
-        None if state.adapter_names.iter().any(|n| n == model) || state.is_stageable_name(model) => {
+        None if state.adapter_names.iter().any(|n| n == model)
+            || state.is_stageable_name(model) =>
+        {
             Some(model)
         }
         None => None,

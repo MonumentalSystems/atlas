@@ -246,7 +246,8 @@ impl TransformerModel {
                 {
                     tracing::error!(
                         "free_sequence: destroy_graph(kgamma/fused[{},{}]): {e:#}",
-                        k.0, k.1
+                        k.0,
+                        k.1
                     );
                 }
             }

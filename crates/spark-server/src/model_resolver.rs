@@ -209,7 +209,6 @@ fn validate_adapter_dir(dir: PathBuf, spec: &str) -> Result<PathBuf> {
     );
 }
 
-
 /// True when the directory contains at least one weight file Atlas's
 /// safetensors loader can pick up. Mirrors the heuristic in
 /// `spark-runtime::weights::SafetensorsLoader::load`.

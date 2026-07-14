@@ -31,6 +31,11 @@ pub use loading::*;
 pub use slot_math::*;
 pub use types::*;
 
+// RDMA LoRA staging pulls `spark_storage::{LoraAbKind, LoraLandTarget}`, which
+// spark-storage only exports under `cuda`; its sole caller
+// (`swap_lora_slot_from_peer`) is already `cfg(feature = "cuda")`. Gate the
+// module so the non-cuda (metal) build doesn't try to resolve those imports.
+#[cfg(feature = "cuda")]
 pub mod rdma_stage;
 
 #[cfg(test)]

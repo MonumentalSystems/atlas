@@ -65,21 +65,21 @@ pub(crate) use chat::chat_completions_inner;
 #[allow(unused_imports)]
 pub use compact::compact_messages;
 pub use completions::completions;
-pub use models::{embeddings_stub, get_model, list_models};
 #[allow(unused_imports)]
 pub use conversations::{
     AddItemsRequest, CreateConversationRequest, UpdateConversationRequest, add_conversation_items,
     create_conversation, delete_conversation, delete_conversation_item, get_conversation,
     get_conversation_item, list_conversation_items, update_conversation,
 };
-pub use lora_control::{load_lora_into_slot, set_active_lora};
 pub use inference_types::{
     GrammarSpec, InferenceRequest, InferenceResponse, StreamEvent, TokenLogprobs,
 };
+pub use lora_control::{load_lora_into_slot, set_active_lora};
 #[allow(unused_imports)]
 pub use misc_handlers::{
     DetokenizeRequest, cancel_response, detokenize, health, health_live, metrics_handler, tokenize,
 };
+pub use models::{embeddings_stub, get_model, list_models};
 pub use responses::responses_endpoint;
 pub use stored::{
     delete_stored_response, get_stored_completion, get_stored_response, list_response_input_items,
