@@ -73,6 +73,26 @@ name = "metal_qwen35_inference"
 path = "examples/metal_qwen35_inference/main.rs"
 required-features = ["metal-example"]
 
+[[example]]
+name = "nllb_metal_encoder"
+required-features = ["metal"]
+
+[[example]]
+name = "nllb_metal_translate"
+required-features = ["metal"]
+
+[[example]]
+name = "nllb_metal_gen"
+required-features = ["metal"]
+
+[[example]]
+name = "nllb_metal_bf16"
+required-features = ["metal"]
+
+[[example]]
+name = "nllb_metal_batch"
+required-features = ["metal"]
+
 [dev-dependencies]
 # `default-features = false` so a metal-feature build of spark-model doesn't
 # inadvertently pull cudarc back in via the dev-dep chain.

@@ -660,3 +660,23 @@ fn test_parse_nllb_m2m100_config() {
     assert_eq!(cfg.weight_prefix, "model.decoder");
     assert!(!cfg.attn_gated);
 }
+
+#[test]
+fn test_parse_nllb_rejects_missing_required_dimension() {
+    let json = r#"{
+        "bos_token_id": 0,
+        "d_model": 2048,
+        "decoder_ffn_dim": 8192,
+        "decoder_layers": 24,
+        "eos_token_id": 2,
+        "max_position_embeddings": 1024,
+        "model_type": "nllb",
+        "vocab_size": 256206
+    }"#;
+
+    let err = parse_config(json).unwrap_err().to_string();
+    assert!(
+        err.contains("nllb config missing required field `decoder_attention_heads`"),
+        "{err}"
+    );
+}

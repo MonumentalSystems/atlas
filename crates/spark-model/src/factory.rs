@@ -166,4 +166,21 @@ mod tests {
         config.model_type = "unsupported_model".to_string();
         assert!(loader_for_config(&config).is_err());
     }
+
+    #[test]
+    fn test_nllb_loader_fails_fast_until_encoder_decoder_runtime_exists() {
+        let mut config = ModelConfig::qwen3_next_80b_nvfp4();
+        config.model_type = "nllb".to_string();
+        let loader = loader_for_config(&config).unwrap();
+        let store = WeightStore::empty();
+        let gpu = spark_runtime::gpu::mock::MockGpuBackend::new();
+
+        let err = loader.load_embedding(&store, &config, &gpu).unwrap_err();
+        assert!(
+            err.to_string().contains(
+                "Atlas does not yet implement the encoder-decoder runtime required by facebook/nllb-200-3.3B"
+            ),
+            "{err}"
+        );
+    }
 }

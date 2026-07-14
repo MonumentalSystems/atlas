@@ -15,6 +15,29 @@ use super::{
     validate_config,
 };
 
+fn required_u64(raw: &serde_json::Value, key: &str, model_type: &str) -> Result<u64> {
+    let value = raw
+        .get(key)
+        .with_context(|| format!("{model_type} config missing required field `{key}`"))?;
+    value
+        .as_u64()
+        .with_context(|| format!("{model_type} config field `{key}` must be an unsigned integer"))
+}
+
+fn required_nonzero_usize(raw: &serde_json::Value, key: &str, model_type: &str) -> Result<usize> {
+    let value = required_u64(raw, key, model_type)? as usize;
+    if value == 0 {
+        anyhow::bail!("{model_type} config field `{key}` must be greater than zero");
+    }
+    Ok(value)
+}
+
+fn required_u32(raw: &serde_json::Value, key: &str, model_type: &str) -> Result<u32> {
+    let value = required_u64(raw, key, model_type)?;
+    u32::try_from(value)
+        .with_context(|| format!("{model_type} config field `{key}` does not fit in u32"))
+}
+
 pub fn parse_config(json: &str) -> Result<ModelConfig> {
     // First, probe the top-level model_type.
     let raw: serde_json::Value =
@@ -180,44 +203,31 @@ pub fn parse_config(json: &str) -> Result<ModelConfig> {
         "m2m_100" | "nllb" => {
             let mut config = ModelConfig::qwen3_next_80b_nvfp4();
             config.model_type = "m2m_100".to_string();
-            config.hidden_size = raw
-                .get("d_model")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(0) as usize;
-            config.num_hidden_layers = raw
-                .get("decoder_layers")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(0) as usize;
-            config.intermediate_size = raw
-                .get("decoder_ffn_dim")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(0) as usize;
-            config.vocab_size = raw
-                .get("vocab_size")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(0) as usize;
-            config.num_attention_heads = raw
-                .get("decoder_attention_heads")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(0) as usize;
+            config.hidden_size = required_nonzero_usize(&raw, "d_model", top_model_type)?;
+            config.num_hidden_layers =
+                required_nonzero_usize(&raw, "decoder_layers", top_model_type)?;
+            config.intermediate_size =
+                required_nonzero_usize(&raw, "decoder_ffn_dim", top_model_type)?;
+            config.vocab_size = required_nonzero_usize(&raw, "vocab_size", top_model_type)?;
+            config.num_attention_heads =
+                required_nonzero_usize(&raw, "decoder_attention_heads", top_model_type)?;
             config.num_key_value_heads = config.num_attention_heads;
-            config.head_dim = if config.num_attention_heads > 0 {
-                config.hidden_size / config.num_attention_heads
-            } else {
-                0
-            };
-            config.max_position_embeddings = raw
-                .get("max_position_embeddings")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(0) as usize;
-            config.bos_token_id = raw
-                .get("bos_token_id")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(0) as u32;
-            config.eos_token_id = raw
-                .get("eos_token_id")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(0) as u32;
+            if !config
+                .hidden_size
+                .is_multiple_of(config.num_attention_heads)
+            {
+                anyhow::bail!(
+                    "{} config has d_model ({}) not divisible by decoder_attention_heads ({})",
+                    top_model_type,
+                    config.hidden_size,
+                    config.num_attention_heads,
+                );
+            }
+            config.head_dim = config.hidden_size / config.num_attention_heads;
+            config.max_position_embeddings =
+                required_nonzero_usize(&raw, "max_position_embeddings", top_model_type)?;
+            config.bos_token_id = required_u32(&raw, "bos_token_id", top_model_type)?;
+            config.eos_token_id = required_u32(&raw, "eos_token_id", top_model_type)?;
             config.tie_word_embeddings = true;
             config.attn_gated = false;
             config.weight_prefix = "model.decoder".to_string();
