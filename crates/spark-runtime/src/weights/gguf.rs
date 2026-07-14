@@ -333,6 +333,9 @@ impl super::WeightLoader for GgufLoader {
 #[cfg(test)]
 mod real_file_test;
 
+#[cfg(all(test, feature = "cuda"))]
+mod gpu_validate_test;
+
 #[cfg(test)]
 mod tests {
     use super::*;
