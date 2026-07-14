@@ -109,6 +109,30 @@ impl NllbGpuModel {
             .launch(self.stream())
     }
 
+    /// Out-of-place layer norm: normalize `src` into `dst` (must be distinct
+    /// buffers). Bit-identical arithmetic to `layer_norm`; used by the beam
+    /// decode to fold the pre-LN `dh->normed` copy into the LN launch itself.
+    pub(super) fn layer_norm_to(
+        &self,
+        prefix: &str,
+        src: DevicePtr,
+        dst: DevicePtr,
+        rows: usize,
+    ) -> Result<()> {
+        KernelLaunch::new(self.gpu.as_ref(), self.kernels.ln_oop)
+            .grid([rows as u32, 1, 1])
+            .block([256, 1, 1])
+            .shared_mem(256 * 4)
+            .arg_ptr(src)
+            .arg_ptr(dst)
+            .arg_ptr(self.w(&format!("{prefix}.weight")))
+            .arg_ptr(self.w(&format!("{prefix}.bias")))
+            .arg_u32(rows as u32)
+            .arg_u32(self.d as u32)
+            .arg_f32(1e-5)
+            .launch(self.stream())
+    }
+
     /// Tensor-core GEMM `C[m,n] = A[m,k] @ W[n,k]^T` (bf16, no bias).
     pub(super) fn gemm(
         &self,

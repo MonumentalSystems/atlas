@@ -2,9 +2,10 @@
 
 //! Cross-request (C×B) batched beam co-dispatch (Phase c). Runs the C requests'
 //! encoders sequentially into per-request cross-KV, then decodes ALL Σ beams as
-//! one M=(Σ beams) batch per step — every projection / self-attention / FFN /
-//! lm_head is a single tensor-core GEMM, and only cross-attention loops per
-//! request (each reading its own encoder output, [`super::beam::CrossGroup`]).
+//! one M=(Σ beams) batch per step — every projection / self-attention / cross-
+//! attention / FFN / lm_head is a SINGLE launch. Cross-attention reads a padded
+//! `[C, max_enc, d]` cross-KV ([`super::beam::CrossBatch`]) with a per-request
+//! group divisor, so its cost is dec_layers launches/step, not C·dec_layers.
 //! Per-request candidate pruning, hypothesis pools, per-request `max_new`, and
 //! staggered completion run on the host, so each request's winner is token-exact
 //! versus running it alone. All fused requests must share one LoRA adapter (the
@@ -14,7 +15,7 @@
 use anyhow::{Context, Result};
 
 use super::NllbGpuModel;
-use super::beam::{BeamHyps, CrossGroup, DecBuf, NLLB_TOPK_KMAX, logsumexp, top_k};
+use super::beam::{BeamHyps, CrossBatch, DecBuf, NLLB_TOPK_KMAX, logsumexp, top_k};
 use super::kv::NllbSeqKv;
 use super::util::u32_bytes;
 use crate::traits::BeamReq;
@@ -50,6 +51,18 @@ struct Pending {
     best_running: f32,
 }
 
+/// Per-phase wall-clock accumulator for the beam decode loop (opt-in via
+/// `ATLAS_NLLB_BEAM_PROFILE=1`). GPU phases are bracketed by a `sync()` so the
+/// timing reflects real device work, not just launch-enqueue.
+#[derive(Default)]
+struct BeamProf {
+    steps: usize,
+    prune: std::time::Duration, // host candidate expansion / sort / BeamHyps
+    gather: std::time::Duration, // self-KV reorder (perm h2d + gather + swap)
+    forward: std::time::Duration, // one batched decode forward
+    cands: std::time::Duration, // top-k reduction + D2H (device or host)
+}
+
 impl NllbGpuModel {
     /// Co-dispatch beam search for several requests as one fused batch. Returns
     /// one winning hypothesis per request, in request order (decoder-start
@@ -65,9 +78,20 @@ impl NllbGpuModel {
         if reqs.iter().any(|r| r.adapter_slot != slot0) {
             return reqs.iter().map(|r| self.generate_beam_one(r)).collect();
         }
+        // Grouped cross-attn maps row -> request via `row / num_beams`, which only
+        // holds when every fused request shares num_beams (so row_off == r*B).
+        // Mixed-B batches fall back to serial (exact) before any allocation.
+        let bp = reqs[0].num_beams.max(1);
+        if reqs.iter().any(|r| r.num_beams.max(1) != bp) {
+            return reqs.iter().map(|r| self.generate_beam_one(r)).collect();
+        }
         self.set_lora_active(slot0);
 
         let gpu = self.gpu.as_ref();
+        let prof = std::env::var("ATLAS_NLLB_BEAM_PROFILE")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        let t_enc = prof.then(std::time::Instant::now);
         // 1) Run each encoder into its own cross-KV (kept alive across decode).
         let mut kvs: Vec<NllbSeqKv> = Vec::with_capacity(reqs.len());
         let mut states: Vec<ReqState> = Vec::with_capacity(reqs.len());
@@ -105,6 +129,14 @@ impl NllbGpuModel {
             row_off += b;
         }
         let rows = row_off; // Σ beams over all requests
+        if let Some(t) = t_enc {
+            self.sync()?;
+            tracing::info!(
+                "nllb beam profile: {} encoders (sequential) = {:.1}ms",
+                reqs.len(),
+                t.elapsed().as_secs_f64() * 1e3,
+            );
+        }
 
         // 2) Batch scratch sized for `rows`; per-row cross length = its enc_len.
         let mut crosstk_host = vec![0u32; rows];
@@ -124,21 +156,38 @@ impl NllbGpuModel {
         let mut sk2 = alloc_set(self.dec_layers)?;
         let mut sv2 = alloc_set(self.dec_layers)?;
         let perm_dev = gpu.alloc(rows * 4)?;
-        let cross: Vec<CrossGroup> = states
-            .iter()
-            .zip(&kvs)
-            .map(|(st, kv)| CrossGroup {
-                k: &kv.cross_k,
-                v: &kv.cross_v,
-                enc_len: st.enc_len,
-                row_off: st.row_off,
-                n_rows: st.b,
-            })
-            .collect();
+
+        // Padded per-layer cross-KV `[C, max_enc, d]`: gather each request's
+        // `[enc_len_r, d]` cross-KV into its slab `r*max_enc` ONCE (amortized over
+        // all decode steps). Rows enc_len_r..max_enc stay uninitialized but are
+        // never read — `crosstk` bounds each row's key loop to its own enc_len.
+        let cc = states.len();
+        let max_enc = states.iter().map(|s| s.enc_len).max().unwrap_or(1);
+        let slab = max_enc * self.d * 2;
+        let alloc_pad = |n: usize| {
+            (0..n)
+                .map(|_| gpu.alloc(cc * slab))
+                .collect::<Result<Vec<_>>>()
+        };
+        let padk = alloc_pad(self.dec_layers)?;
+        let padv = alloc_pad(self.dec_layers)?;
+        for (r, kv) in kvs.iter().enumerate() {
+            let bytes = states[r].enc_len * self.d * 2;
+            for l in 0..self.dec_layers {
+                gpu.copy_d2d(kv.cross_k[l], padk[l].offset(r * slab), bytes)?;
+                gpu.copy_d2d(kv.cross_v[l], padv[l].offset(r * slab), bytes)?;
+            }
+        }
+        let xb = CrossBatch {
+            kpad: &padk,
+            vpad: &padv,
+            group: bp,
+            max_enc,
+        };
 
         let res = self.beam_multi_loop(
             &mut states,
-            &cross,
+            &xb,
             rows,
             max_new,
             &buf,
@@ -149,8 +198,14 @@ impl NllbGpuModel {
             perm_dev,
         );
 
-        drop(cross);
-        for p in sk.into_iter().chain(sv).chain(sk2).chain(sv2) {
+        for p in sk
+            .into_iter()
+            .chain(sv)
+            .chain(sk2)
+            .chain(sv2)
+            .chain(padk)
+            .chain(padv)
+        {
             gpu.free(p)?;
         }
         gpu.free(perm_dev)?;
@@ -165,7 +220,7 @@ impl NllbGpuModel {
     fn beam_multi_loop(
         &self,
         states: &mut [ReqState],
-        cross: &[CrossGroup],
+        xb: &CrossBatch,
         rows: usize,
         max_new: usize,
         buf: &DecBuf,
@@ -197,14 +252,14 @@ impl NllbGpuModel {
         let use_device = k <= NLLB_TOPK_KMAX && rows >= min_rows && !host_forced;
 
         // Seed: step 0 = decoder_start (all rows), step 1 = per-request forced_bos.
-        self.beam_forward_step(&vec![dec_start; rows], 0, rows, sk, sv, cross, buf)?;
+        self.beam_forward_step(&vec![dec_start; rows], 0, rows, sk, sv, xb, buf)?;
         let mut seed1 = vec![eos; rows];
         for st in states.iter() {
             for i in 0..st.b {
                 seed1[st.row_off + i] = st.forced_bos;
             }
         }
-        self.beam_forward_step(&seed1, 1, rows, sk, sv, cross, buf)?;
+        self.beam_forward_step(&seed1, 1, rows, sk, sv, xb, buf)?;
         let init = self.beam_cands(buf, rows, k, use_device)?;
         for st in states.iter_mut() {
             st.beams = (0..st.b)
@@ -217,6 +272,12 @@ impl NllbGpuModel {
                 .collect();
         }
 
+        let prof = std::env::var("ATLAS_NLLB_BEAM_PROFILE")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        let mut pf = BeamProf::default();
+        super::beam_compute::LMHEAD_NS.with(|c| c.set(0));
+
         let mut cur_len = 2usize; // shared beam length of active requests
         for step in 1..max_new {
             // Freeze any request that has reached its own generation cap.
@@ -225,6 +286,8 @@ impl NllbGpuModel {
                     st.active = false;
                 }
             }
+            pf.steps += 1;
+            let tprune = prof.then(std::time::Instant::now);
             let mut cur = vec![eos; rows];
             let mut perm: Vec<u32> = (0..rows as u32).collect();
             let mut staged: Vec<Option<Pending>> = (0..states.len()).map(|_| None).collect();
@@ -279,8 +342,15 @@ impl NllbGpuModel {
             if !any_active {
                 break;
             }
+            if let Some(t) = tprune {
+                pf.prune += t.elapsed();
+            }
 
             // Reorder every row's self-KV by the global parent map, then forward.
+            if prof {
+                self.sync()?;
+            }
+            let tgather = prof.then(std::time::Instant::now);
             self.gpu.copy_h2d(u32_bytes(&perm), perm_dev)?;
             for l in 0..self.dec_layers {
                 self.gather(sk[l], sk2[l], perm_dev, rows, cur_len, buf.cache_rows)?;
@@ -288,9 +358,22 @@ impl NllbGpuModel {
             }
             std::mem::swap(sk, sk2);
             std::mem::swap(sv, sv2);
+            if let Some(t) = tgather {
+                self.sync()?;
+                pf.gather += t.elapsed();
+            }
 
-            self.beam_forward_step(&cur, cur_len, rows, sk, sv, cross, buf)?;
+            let tfwd = prof.then(std::time::Instant::now);
+            self.beam_forward_step(&cur, cur_len, rows, sk, sv, xb, buf)?;
+            if let Some(t) = tfwd {
+                self.sync()?;
+                pf.forward += t.elapsed();
+            }
+            let tcands = prof.then(std::time::Instant::now);
             let lh = self.beam_cands(buf, rows, k, use_device)?;
+            if let Some(t) = tcands {
+                pf.cands += t.elapsed();
+            }
 
             for (ri, st) in states.iter_mut().enumerate() {
                 let Some(p) = staged[ri].take() else {
@@ -309,6 +392,27 @@ impl NllbGpuModel {
                 }
             }
             cur_len += 1;
+        }
+        if prof {
+            let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
+            let total = pf.prune + pf.gather + pf.forward + pf.cands;
+            let lmhead_ms = super::beam_compute::LMHEAD_NS.with(|c| c.get()) as f64 / 1e6;
+            tracing::info!(
+                "nllb beam profile C={} rows={} steps={} device_topk={}: \
+                 prune={:.1} gather={:.1} forward={:.1} (lm_head={:.1}) cands={:.1} | \
+                 total={:.1}ms ({:.2}ms/step)",
+                states.len(),
+                rows,
+                pf.steps,
+                use_device,
+                ms(pf.prune),
+                ms(pf.gather),
+                ms(pf.forward),
+                lmhead_ms,
+                ms(pf.cands),
+                ms(total),
+                ms(total) / pf.steps.max(1) as f64,
+            );
         }
 
         // Collect each request's winner (remaining finite beams count as hyps).

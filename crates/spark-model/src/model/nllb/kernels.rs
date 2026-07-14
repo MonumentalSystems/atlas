@@ -15,6 +15,9 @@ pub(super) struct NllbKernels {
     pub add: KernelHandle,
     pub relu: KernelHandle,
     pub ln: KernelHandle,
+    /// Out-of-place layer norm (reads `in`, writes `out`) — lets the beam decode
+    /// fuse the pre-LN `dh->normed` copy away.
+    pub ln_oop: KernelHandle,
     pub bias: KernelHandle,
     pub attn: KernelHandle,
     /// Tensor-core pipelined GEMM (`gemm` module) for the multi-row encoder.
@@ -46,6 +49,7 @@ impl NllbKernels {
             add: gpu.kernel("nllb_encoder", "nllb_add_bf16")?,
             relu: gpu.kernel("nllb_encoder", "nllb_relu_bf16")?,
             ln: gpu.kernel("nllb_encoder", "nllb_layernorm_bf16")?,
+            ln_oop: gpu.kernel("nllb_encoder", "nllb_layernorm_oop_bf16")?,
             bias: gpu.kernel("nllb_encoder", "nllb_bias_bf16")?,
             attn: gpu.kernel("nllb_encoder", "nllb_attn_kv_bf16")?,
             gemm: gpu.kernel("gemm", "dense_gemm_bf16_pipelined")?,

@@ -14,16 +14,17 @@ use super::kv::NllbSeqKv;
 use super::util::{bf16_bytes, decoder_pos_table_bf16, u32_bytes};
 use crate::traits::BeamReq;
 
-/// A request's cross-KV within a fused C×B batch: `k`/`v` are per-decoder-layer
-/// `[enc_len,d]` buffers shared across this request's `n_rows` beams (stride 0),
-/// occupying rows `row_off..row_off+n_rows` of the batch. The cross-attn step
-/// loops these groups; every other projection stays one M=(Σn_rows) GEMM.
-pub(super) struct CrossGroup<'a> {
-    pub k: &'a [DevicePtr],
-    pub v: &'a [DevicePtr],
-    pub enc_len: usize,
-    pub row_off: usize,
-    pub n_rows: usize,
+/// The fused batch's cross-KV for grouped single-launch cross-attention: `kpad`/
+/// `vpad` are per-decoder-layer padded `[C, max_enc, d]` buffers (one slab per
+/// request). Cross-attn issues ONE launch/layer; row `i` reads slab `i / group`
+/// (its request) bounded to its own enc_len by the per-row `crosstk`. For a
+/// single request (C=1) the un-padded `[enc_len,d]` buffers are passed directly
+/// with `group = num_beams` (so `i / group == 0` for every beam — no padding).
+pub(super) struct CrossBatch<'a> {
+    pub kpad: &'a [DevicePtr],
+    pub vpad: &'a [DevicePtr],
+    pub group: usize,
+    pub max_enc: usize,
 }
 
 /// Max K (= 2·num_beams) the on-device beam top-k kernel supports; sizes the
@@ -33,7 +34,6 @@ pub(super) const NLLB_TOPK_KMAX: usize = 32;
 /// Batched decode scratch for B beams (bf16, except the u32 id/length buffers).
 pub(super) struct DecBuf {
     pub dh: DevicePtr,
-    pub residual: DevicePtr,
     pub normed: DevicePtr,
     pub q: DevicePtr,
     pub knew: DevicePtr,
@@ -74,7 +74,6 @@ impl DecBuf {
         )?;
         Ok(Self {
             dh: gpu.alloc(b * d * 2)?,
-            residual: gpu.alloc(b * d * 2)?,
             normed: gpu.alloc(b * d * 2)?,
             q: gpu.alloc(b * d * 2)?,
             knew: gpu.alloc(b * d * 2)?,
@@ -96,7 +95,6 @@ impl DecBuf {
     pub(super) fn free(self, gpu: &dyn spark_runtime::gpu::GpuBackend) -> Result<()> {
         for p in [
             self.dh,
-            self.residual,
             self.normed,
             self.q,
             self.knew,
@@ -255,16 +253,16 @@ impl NllbGpuModel {
         let mut sv2 = alloc_set(self.dec_layers)?;
         let perm_dev = gpu.alloc(b * 4)?;
 
-        let cross = [CrossGroup {
-            k: cross_k,
-            v: cross_v,
-            enc_len,
-            row_off: 0,
-            n_rows: b,
-        }];
+        // Single request (C=1): pass the un-padded [enc_len,d] cross-KV directly
+        // with group = num_beams, so every beam's `row / group == 0` reads it.
+        let xb = CrossBatch {
+            kpad: cross_k,
+            vpad: cross_v,
+            group: b.max(1),
+            max_enc: enc_len,
+        };
         let res = self.beam_loop(
-            req, b, max_new, forced_bos, &cross, &buf, &mut sk, &mut sv, &mut sk2, &mut sv2,
-            perm_dev,
+            req, b, max_new, forced_bos, &xb, &buf, &mut sk, &mut sv, &mut sk2, &mut sv2, perm_dev,
         );
 
         for p in sk.into_iter().chain(sv).chain(sk2).chain(sv2) {
@@ -282,7 +280,7 @@ impl NllbGpuModel {
         b: usize,
         max_new: usize,
         forced_bos: u32,
-        cross: &[CrossGroup],
+        xb: &CrossBatch,
         buf: &DecBuf,
         sk: &mut Vec<DevicePtr>,
         sv: &mut Vec<DevicePtr>,
@@ -292,8 +290,8 @@ impl NllbGpuModel {
     ) -> Result<Vec<u32>> {
         let (dec_start, eos) = (self.lang.decoder_start_id, self.lang.eos_id);
         // Seed all beams with [dec_start, forced_bos] into their slots.
-        self.beam_forward_step(&vec![dec_start; b], 0, b, sk, sv, cross, buf)?;
-        self.beam_forward_step(&vec![forced_bos; b], 1, b, sk, sv, cross, buf)?;
+        self.beam_forward_step(&vec![dec_start; b], 0, b, sk, sv, xb, buf)?;
+        self.beam_forward_step(&vec![forced_bos; b], 1, b, sk, sv, xb, buf)?;
         let init = self.beam_logits_host(buf, b)?;
         let mut beams: Vec<Beam> = (0..b)
             .map(|bi| Beam {
@@ -349,7 +347,7 @@ impl NllbGpuModel {
             std::mem::swap(sk, sk2);
             std::mem::swap(sv, sv2);
 
-            self.beam_forward_step(&cur, cur_len, b, sk, sv, cross, buf)?;
+            self.beam_forward_step(&cur, cur_len, b, sk, sv, xb, buf)?;
             let lh = self.beam_logits_host(buf, b)?;
             beams = (0..cur.len())
                 .map(|i| Beam {

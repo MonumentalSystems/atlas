@@ -12,8 +12,14 @@ use spark_runtime::gpu::DevicePtr;
 use spark_runtime::kernel_args::{KernelLaunch, div_ceil};
 
 use super::NllbGpuModel;
-use super::beam::{CrossGroup, DecBuf};
+use super::beam::{CrossBatch, DecBuf};
 use super::util::u32_bytes;
+
+thread_local! {
+    /// Accumulated lm_head (tied-embedding projection) device time, ns — split
+    /// out of `beam_forward_step` when `ATLAS_NLLB_BEAM_PROFILE=1`.
+    pub(super) static LMHEAD_NS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
 
 impl NllbGpuModel {
     /// Write `src[B,d]` into batch-major cache `[B,stride,d]` at row `pos`.
@@ -37,8 +43,10 @@ impl NllbGpuModel {
             .launch(self.stream())
     }
 
-    /// Batched attention over B beams; `tk` holds each beam's key length. When
-    /// `stride == 0` all beams read the SAME `kc`/`vc` (shared cross-KV).
+    /// Batched attention over `b` rows; `tk` holds each row's key length. Row `i`
+    /// reads K/V cache slab `i / group`: self-attn passes `group=1` (per-row
+    /// cache), grouped cross-attn passes `group=B_per_request` so all beams of a
+    /// request share its one padded cross slab.
     #[allow(clippy::too_many_arguments)]
     fn attn_batched(
         &self,
@@ -48,9 +56,11 @@ impl NllbGpuModel {
         out: DevicePtr,
         b: usize,
         stride: usize,
+        group: usize,
         tk: DevicePtr,
         sh: u32,
     ) -> Result<()> {
+        debug_assert!(group >= 1);
         KernelLaunch::new(self.gpu.as_ref(), self.kernels.attn_bdecode)
             .grid([(b * self.heads) as u32, 1, 1])
             .block([self.head_dim as u32, 1, 1])
@@ -61,6 +71,7 @@ impl NllbGpuModel {
             .arg_ptr(out)
             .arg_u32(b as u32)
             .arg_u32(stride as u32)
+            .arg_u32(group as u32)
             .arg_ptr(tk)
             .arg_u32(self.heads as u32)
             .arg_u32(self.head_dim as u32)
@@ -94,9 +105,9 @@ impl NllbGpuModel {
 
     /// One batched decode step over `b` rows (Σ beams of all fused requests):
     /// fill self-KV row `pos` for every row and write `logits[b, vocab]` (bf16).
-    /// `cur` = one token per row. Self-attention / projections / FFN / lm_head are
-    /// single M=b GEMMs; cross-attention loops the per-request `cross` groups, each
-    /// reading its own `[enc_len,d]` buffer shared across its beams (stride 0).
+    /// `cur` = one token per row. Every projection / self-attention / cross-
+    /// attention / FFN / lm_head is a SINGLE M=b launch: cross-attention reads the
+    /// padded per-layer cross-KV (`xb`) with a per-request group divisor.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn beam_forward_step(
         &self,
@@ -105,7 +116,7 @@ impl NllbGpuModel {
         b: usize,
         sk: &[DevicePtr],
         sv: &[DevicePtr],
-        cross: &[CrossGroup],
+        xb: &CrossBatch,
         buf: &DecBuf,
     ) -> Result<()> {
         let (d, ffn) = (self.d, self.ffn);
@@ -127,10 +138,11 @@ impl NllbGpuModel {
 
         for l in 0..self.dec_layers {
             let p = format!("model.decoder.layers.{l}");
-            // causal self-attention (batched, per-beam length via selftk)
-            self.gpu.copy_d2d(buf.dh, buf.residual, b * d * 2)?;
-            self.gpu.copy_d2d(buf.dh, buf.normed, b * d * 2)?;
-            self.layer_norm(&format!("{p}.self_attn_layer_norm"), buf.normed, b)?;
+            // Causal self-attention. `dh` carries the running residual IN PLACE
+            // across all three blocks — nothing writes it between a block's start
+            // and its post-block add — so no separate residual copy is needed;
+            // `normed` is the layer-norm scratch (dh normalized out-of-place).
+            self.layer_norm_to(&format!("{p}.self_attn_layer_norm"), buf.dh, buf.normed, b)?;
             self.linear(&format!("{p}.self_attn.q_proj"), buf.normed, buf.q, b, d, d)?;
             self.linear(
                 &format!("{p}.self_attn.k_proj"),
@@ -157,6 +169,7 @@ impl NllbGpuModel {
                 buf.attn,
                 b,
                 buf.cache_rows,
+                1, // self-attn: per-row cache (slab = row)
                 buf.selftk,
                 sh,
             )?;
@@ -168,12 +181,14 @@ impl NllbGpuModel {
                 d,
                 d,
             )?;
-            self.add(buf.proj, buf.residual, b * d)?;
-            self.gpu.copy_d2d(buf.proj, buf.dh, b * d * 2)?;
+            self.add(buf.dh, buf.proj, b * d)?; // dh += proj (residual add, in place)
             // cross-attention (shared cross-KV, stride 0)
-            self.gpu.copy_d2d(buf.dh, buf.residual, b * d * 2)?;
-            self.gpu.copy_d2d(buf.dh, buf.normed, b * d * 2)?;
-            self.layer_norm(&format!("{p}.encoder_attn_layer_norm"), buf.normed, b)?;
+            self.layer_norm_to(
+                &format!("{p}.encoder_attn_layer_norm"),
+                buf.dh,
+                buf.normed,
+                b,
+            )?;
             self.linear(
                 &format!("{p}.encoder_attn.q_proj"),
                 buf.normed,
@@ -182,21 +197,21 @@ impl NllbGpuModel {
                 d,
                 d,
             )?;
-            // Per-request cross-attention: each group reads its own [enc_len,d]
-            // cross-KV, shared across its beams (stride 0), into its batch rows.
-            for g in cross {
-                let sh_cross = ((self.head_dim + g.enc_len) * 4) as u32;
-                self.attn_batched(
-                    buf.q.offset(g.row_off * d * 2),
-                    g.k[l],
-                    g.v[l],
-                    buf.attn.offset(g.row_off * d * 2),
-                    g.n_rows,
-                    0,
-                    buf.crosstk.offset(g.row_off * 4),
-                    sh_cross,
-                )?;
-            }
+            // Grouped cross-attention: ONE launch over all rows against the padded
+            // [C, max_enc, d] cross-KV. Row `i` reads slab `i / group` (its
+            // request), bounded to its own enc_len by the per-row `crosstk`.
+            let sh_cross = ((self.head_dim + xb.max_enc) * 4) as u32;
+            self.attn_batched(
+                buf.q,
+                xb.kpad[l],
+                xb.vpad[l],
+                buf.attn,
+                b,
+                xb.max_enc,
+                xb.group,
+                buf.crosstk,
+                sh_cross,
+            )?;
             self.linear(
                 &format!("{p}.encoder_attn.out_proj"),
                 buf.attn,
@@ -205,20 +220,24 @@ impl NllbGpuModel {
                 d,
                 d,
             )?;
-            self.add(buf.proj, buf.residual, b * d)?;
-            self.gpu.copy_d2d(buf.proj, buf.dh, b * d * 2)?;
+            self.add(buf.dh, buf.proj, b * d)?; // dh += proj (residual add, in place)
             // FFN
-            self.gpu.copy_d2d(buf.dh, buf.residual, b * d * 2)?;
-            self.gpu.copy_d2d(buf.dh, buf.normed, b * d * 2)?;
-            self.layer_norm(&format!("{p}.final_layer_norm"), buf.normed, b)?;
+            self.layer_norm_to(&format!("{p}.final_layer_norm"), buf.dh, buf.normed, b)?;
             self.linear(&format!("{p}.fc1"), buf.normed, buf.ff, b, ffn, d)?;
             self.relu(buf.ff, b * ffn)?;
             self.linear(&format!("{p}.fc2"), buf.ff, buf.proj, b, d, ffn)?;
-            self.add(buf.proj, buf.residual, b * d)?;
-            self.gpu.copy_d2d(buf.proj, buf.dh, b * d * 2)?;
+            self.add(buf.dh, buf.proj, b * d)?; // dh += proj (residual add, in place)
         }
         self.layer_norm("model.decoder.layer_norm", buf.dh, b)?;
+        let t_lm = std::env::var("ATLAS_NLLB_BEAM_PROFILE")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+            .then(std::time::Instant::now);
         self.gemm(buf.dh, self.embed_table, buf.logits, b, self.vocab, d)?; // tied lm_head
+        if let Some(t) = t_lm {
+            self.gpu.synchronize(self.stream())?;
+            LMHEAD_NS.with(|c| c.set(c.get() + t.elapsed().as_nanos() as u64));
+        }
         Ok(())
     }
 

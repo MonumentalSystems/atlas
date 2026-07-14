@@ -271,6 +271,49 @@ extern "C" __global__ void nllb_layernorm_bf16(
     }
 }
 
+// Out-of-place layer norm: identical arithmetic to nllb_layernorm_bf16 (same
+// tree reduction, mean, rsqrt, and per-element transform) but reads `in` and
+// writes `out`. Lets the beam decode fuse the pre-LN `dh->normed` copy away by
+// normalizing dh directly into the LN scratch. Requires in != out (callers only
+// ever pass distinct buffers).
+extern "C" __global__ void nllb_layernorm_oop_bf16(
+    const __nv_bfloat16* __restrict__ in, __nv_bfloat16* __restrict__ out,
+    const __nv_bfloat16* __restrict__ w, const __nv_bfloat16* __restrict__ b,
+    unsigned int rows, unsigned int dim, float eps) {
+    unsigned int row = blockIdx.x;
+    if (row >= rows) return;
+    extern __shared__ float sm[];
+    unsigned int tid = threadIdx.x;
+    const __nv_bfloat16* inp = in + (unsigned long long)row * dim;
+    __nv_bfloat16* outp = out + (unsigned long long)row * dim;
+    float local = 0.0f;
+    for (unsigned int i = tid; i < dim; i += blockDim.x) local += __bfloat162float(inp[i]);
+    sm[tid] = local;
+    __syncthreads();
+    for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) sm[tid] += sm[tid + s];
+        __syncthreads();
+    }
+    float mean = sm[0] / dim;
+    __syncthreads();
+    local = 0.0f;
+    for (unsigned int i = tid; i < dim; i += blockDim.x) {
+        float dv = __bfloat162float(inp[i]) - mean;
+        local += dv * dv;
+    }
+    sm[tid] = local;
+    __syncthreads();
+    for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) sm[tid] += sm[tid + s];
+        __syncthreads();
+    }
+    float inv = rsqrtf(sm[0] / dim + eps);
+    for (unsigned int i = tid; i < dim; i += blockDim.x) {
+        float v = (__bfloat162float(inp[i]) - mean) * inv * __bfloat162float(w[i]) + __bfloat162float(b[i]);
+        outp[i] = __float2bfloat16(v);
+    }
+}
+
 extern "C" __global__ void nllb_attn_kv_bf16(
     const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ k,
     const __nv_bfloat16* __restrict__ v, __nv_bfloat16* __restrict__ out,
@@ -350,8 +393,8 @@ extern "C" __global__ void nllb_gemv_bf16(
 extern "C" __global__ void nllb_attn_bdecode(
     const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ kc,
     const __nv_bfloat16* __restrict__ vc, __nv_bfloat16* __restrict__ out,
-    unsigned int B, unsigned int stride, const unsigned int* __restrict__ tk,
-    unsigned int H, unsigned int D, float scale) {
+    unsigned int B, unsigned int stride, unsigned int group,
+    const unsigned int* __restrict__ tk, unsigned int H, unsigned int D, float scale) {
     unsigned int bh = blockIdx.x;
     unsigned int b = bh / H;
     unsigned int head = bh % H;
@@ -362,8 +405,12 @@ extern "C" __global__ void nllb_attn_bdecode(
     extern __shared__ float shd[];
     float* red = shd;
     float* scores = shd + D;
+    // `group` maps rows to the K/V cache slab: self-attn passes group=1 (slab=b,
+    // per-row cache); grouped cross-attn passes group=B_per_request so rows of the
+    // same request (b/group) share one padded [C,max_enc,d] cross slab.
     unsigned long long qbase = (unsigned long long)b * dmodel + (unsigned long long)head * D;
-    unsigned long long cbase = (unsigned long long)b * stride * dmodel + (unsigned long long)head * D;
+    unsigned long long cbase =
+        (unsigned long long)(b / group) * stride * dmodel + (unsigned long long)head * D;
     for (unsigned int j = 0; j < t; j++) {
         red[tid] = __bfloat162float(q[qbase + tid]) *
                    __bfloat162float(kc[cbase + (unsigned long long)j * dmodel + tid]);
