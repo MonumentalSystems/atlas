@@ -335,3 +335,112 @@ extern "C" __global__ void nllb_gemv_bf16(
         y[warp] = __float2bfloat16(acc);
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// Batched decode kernels (milestone-6: request-batching / beam-batching).
+// Batch B sequences decode in lockstep; each has its own [B, stride, H*D]
+// batch-major K/V cache. Elementwise/LayerNorm/embed kernels already batch
+// (per-row / flat), and projections use the M=B tensor-core GEMM — only
+// attention, argmax, cache-scatter and the broadcast pos-add are new.
+// ─────────────────────────────────────────────────────────────────────────
+
+// Batched single-query decode attention. q:[B,H*D], kc/vc:[B,stride,H*D]
+// (batch-major), out:[B,H*D]. Batch element b attends its rows 0..tk[b]-1.
+// grid=[B*H], block=[D]. shared = (D + max_tk) floats (red[D] then scores).
+extern "C" __global__ void nllb_attn_bdecode(
+    const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ kc,
+    const __nv_bfloat16* __restrict__ vc, __nv_bfloat16* __restrict__ out,
+    unsigned int B, unsigned int stride, const unsigned int* __restrict__ tk,
+    unsigned int H, unsigned int D, float scale) {
+    unsigned int bh = blockIdx.x;
+    unsigned int b = bh / H;
+    unsigned int head = bh % H;
+    unsigned int tid = threadIdx.x;
+    if (b >= B) return;
+    unsigned int t = tk[b];
+    unsigned int dmodel = H * D;
+    extern __shared__ float shd[];
+    float* red = shd;
+    float* scores = shd + D;
+    unsigned long long qbase = (unsigned long long)b * dmodel + (unsigned long long)head * D;
+    unsigned long long cbase = (unsigned long long)b * stride * dmodel + (unsigned long long)head * D;
+    for (unsigned int j = 0; j < t; j++) {
+        red[tid] = __bfloat162float(q[qbase + tid]) *
+                   __bfloat162float(kc[cbase + (unsigned long long)j * dmodel + tid]);
+        __syncthreads();
+        for (unsigned int s = D / 2; s > 0; s >>= 1) {
+            if (tid < s) red[tid] += red[tid + s];
+            __syncthreads();
+        }
+        if (tid == 0) scores[j] = red[0] * scale;
+        __syncthreads();
+    }
+    if (tid == 0) {
+        float m = -1e30f;
+        for (unsigned int j = 0; j < t; j++) m = fmaxf(m, scores[j]);
+        float su = 0.0f;
+        for (unsigned int j = 0; j < t; j++) {
+            scores[j] = expf(scores[j] - m);
+            su += scores[j];
+        }
+        for (unsigned int j = 0; j < t; j++) scores[j] /= su;
+    }
+    __syncthreads();
+    float acc = 0.0f;
+    for (unsigned int j = 0; j < t; j++)
+        acc += scores[j] * __bfloat162float(vc[cbase + (unsigned long long)j * dmodel + tid]);
+    out[qbase + tid] = __float2bfloat16(acc);
+}
+
+// Write src[B,d] into a batch-major cache [B,stride,d] at row `pos`.
+extern "C" __global__ void nllb_scatter_batched(
+    const __nv_bfloat16* __restrict__ src, __nv_bfloat16* __restrict__ dst,
+    unsigned int pos, unsigned int B, unsigned int stride, unsigned int d) {
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= B * d) return;
+    unsigned int b = idx / d;
+    unsigned int i = idx % d;
+    dst[(unsigned long long)b * stride * d + (unsigned long long)pos * d + i] = src[idx];
+}
+
+// dst[B*d] += row[d] broadcast to every one of the B rows (positional add).
+extern "C" __global__ void nllb_add_row_bf16(
+    __nv_bfloat16* __restrict__ dst, const __nv_bfloat16* __restrict__ row,
+    unsigned int n, unsigned int d) {
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n)
+        dst[idx] = __float2bfloat16(__bfloat162float(dst[idx]) + __bfloat162float(row[idx % d]));
+}
+
+// Batched argmax: out[b] = argmax_v logits[b, v]. grid=[B], block=[256],
+// shared = block*(4+4) bytes.
+extern "C" __global__ void nllb_argmax_batched(
+    const __nv_bfloat16* __restrict__ logits, unsigned int* __restrict__ out,
+    unsigned int B, unsigned int vocab) {
+    unsigned int b = blockIdx.x;
+    unsigned int tid = threadIdx.x;
+    extern __shared__ char smem[];
+    float* sval = (float*)smem;
+    unsigned int* sidx = (unsigned int*)(sval + blockDim.x);
+    const __nv_bfloat16* row = logits + (unsigned long long)b * vocab;
+    float best = -1e30f;
+    unsigned int bi = 0;
+    for (unsigned int v = tid; v < vocab; v += blockDim.x) {
+        float x = __bfloat162float(row[v]);
+        if (x > best) {
+            best = x;
+            bi = v;
+        }
+    }
+    sval[tid] = best;
+    sidx[tid] = bi;
+    __syncthreads();
+    for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s && sval[tid + s] > sval[tid]) {
+            sval[tid] = sval[tid + s];
+            sidx[tid] = sidx[tid + s];
+        }
+        __syncthreads();
+    }
+    if (tid == 0) out[b] = sidx[0];
+}
