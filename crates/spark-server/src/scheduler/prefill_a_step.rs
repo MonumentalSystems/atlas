@@ -29,6 +29,10 @@ pub fn start_chunked_prefill(
     // encode and instead set the per-stream slice base around the chunk-0 splice.
     // None ⇒ legacy self-encode. Only ever Some for single-chunk-fit image prompts.
     vision_slice: Option<VisionSlice>,
+    // Beam co-dispatch: Some ⇒ this beam request's winning hypothesis was already
+    // computed (fused with other requests into one batched search by the pre-pass);
+    // the beam branch uses it directly. None ⇒ run the search here per-request.
+    precomputed_beam_hyp: Option<Vec<u32>>,
 ) -> Result<StartPrefillResult> {
     // Merge user-supplied stop tokens with model EOS tokens.
     let stop_tokens = req.take_stop_tokens();
@@ -159,18 +163,14 @@ pub fn start_chunked_prefill(
     // the co-dispatch defer path and the chunked prefill/decode loop. Only
     // reachable for blocking requests (streaming + beam is rejected upstream).
     if model.supports_beam() && seq.num_beams > 1 {
-        let beam_req = spark_model::traits::BeamReq {
-            prompt_tokens: prompt_tokens.to_vec(),
-            src_lang_id: seq.src_lang_id,
-            tgt_lang_id: seq.tgt_lang_id,
-            adapter_slot: seq.adapter_slot,
-            num_beams: seq.num_beams as usize,
-            max_new: max_tokens,
-            length_penalty: seq.length_penalty,
-            early_stopping: seq.early_stopping,
-        };
-        let hyp = match model.generate_beam_batch(std::slice::from_ref(&beam_req)) {
-            Ok(mut v) => v.pop().unwrap_or_default(),
+        let hyp = match resolve_beam_hyp(
+            model,
+            precomputed_beam_hyp,
+            &seq,
+            &prompt_tokens,
+            max_tokens,
+        ) {
+            Ok(h) => h,
             Err(e) => {
                 send_error_to_sink(&mut sink, &format!("beam search failed: {e:#}"));
                 let _ = model.free_sequence(&mut seq);

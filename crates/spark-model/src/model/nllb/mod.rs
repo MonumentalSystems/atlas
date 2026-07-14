@@ -27,6 +27,7 @@ use spark_runtime::weights::{WeightDtype, WeightStore};
 
 mod beam;
 mod beam_compute;
+mod beam_multi;
 mod compute;
 mod kernels;
 mod kv;

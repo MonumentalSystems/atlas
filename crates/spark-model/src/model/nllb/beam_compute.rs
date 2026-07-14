@@ -12,7 +12,7 @@ use spark_runtime::gpu::DevicePtr;
 use spark_runtime::kernel_args::{KernelLaunch, div_ceil};
 
 use super::NllbGpuModel;
-use super::beam::DecBuf;
+use super::beam::{CrossGroup, DecBuf};
 use super::util::u32_bytes;
 
 impl NllbGpuModel {
@@ -92,9 +92,11 @@ impl NllbGpuModel {
             .launch(self.stream())
     }
 
-    /// One batched decode step: fill self-KV row `pos` for all B beams and write
-    /// `logits[B, vocab]` (bf16). `cur` = one token per beam. `cross_k`/`cross_v`
-    /// are single `[enc_len,d]` buffers shared across beams (stride 0).
+    /// One batched decode step over `b` rows (Σ beams of all fused requests):
+    /// fill self-KV row `pos` for every row and write `logits[b, vocab]` (bf16).
+    /// `cur` = one token per row. Self-attention / projections / FFN / lm_head are
+    /// single M=b GEMMs; cross-attention loops the per-request `cross` groups, each
+    /// reading its own `[enc_len,d]` buffer shared across its beams (stride 0).
     #[allow(clippy::too_many_arguments)]
     pub(super) fn beam_forward_step(
         &self,
@@ -103,8 +105,7 @@ impl NllbGpuModel {
         b: usize,
         sk: &[DevicePtr],
         sv: &[DevicePtr],
-        cross_k: &[DevicePtr],
-        cross_v: &[DevicePtr],
+        cross: &[CrossGroup],
         buf: &DecBuf,
     ) -> Result<()> {
         let (d, ffn) = (self.d, self.ffn);
@@ -181,16 +182,21 @@ impl NllbGpuModel {
                 d,
                 d,
             )?;
-            self.attn_batched(
-                buf.q,
-                cross_k[l],
-                cross_v[l],
-                buf.attn,
-                b,
-                0,
-                buf.crosstk,
-                sh,
-            )?;
+            // Per-request cross-attention: each group reads its own [enc_len,d]
+            // cross-KV, shared across its beams (stride 0), into its batch rows.
+            for g in cross {
+                let sh_cross = ((self.head_dim + g.enc_len) * 4) as u32;
+                self.attn_batched(
+                    buf.q.offset(g.row_off * d * 2),
+                    g.k[l],
+                    g.v[l],
+                    buf.attn.offset(g.row_off * d * 2),
+                    g.n_rows,
+                    0,
+                    buf.crosstk.offset(g.row_off * 4),
+                    sh_cross,
+                )?;
+            }
             self.linear(
                 &format!("{p}.encoder_attn.out_proj"),
                 buf.attn,
@@ -214,6 +220,55 @@ impl NllbGpuModel {
         self.layer_norm("model.decoder.layer_norm", buf.dh, b)?;
         self.gemm(buf.dh, self.embed_table, buf.logits, b, self.vocab, d)?; // tied lm_head
         Ok(())
+    }
+
+    /// Phase-d on-device candidate reduction: for each of `rows` logit rows,
+    /// return its log-sum-exp over the full vocab and its top-`k` `(value, token)`
+    /// pairs (descending, ties by lower id) — the same expansion inputs the host
+    /// path derives from a full-vocab D2H, but the D2H shrinks from
+    /// `rows*vocab*2` to `rows*k*8` bytes. `k` must be ≤ `NLLB_TOPK_KMAX`.
+    pub(super) fn beam_cands_device(
+        &self,
+        buf: &DecBuf,
+        rows: usize,
+        k: usize,
+    ) -> Result<Vec<(f32, Vec<(f32, u32)>)>> {
+        let sh = (128 * k * 8) as u32; // 128 threads · k · (f32 val + u32 id)
+        KernelLaunch::new(self.gpu.as_ref(), self.kernels.beam_topk)
+            .grid([rows as u32, 1, 1])
+            .block([128, 1, 1])
+            .shared_mem(sh)
+            .arg_ptr(buf.logits)
+            .arg_ptr(buf.topk_lse)
+            .arg_ptr(buf.topk_val)
+            .arg_ptr(buf.topk_idx)
+            .arg_u32(rows as u32)
+            .arg_u32(self.vocab as u32)
+            .arg_u32(k as u32)
+            .launch(self.stream())?;
+        self.gpu.synchronize(self.stream())?;
+        // The kernel packs outputs as [rows, k] (stride k), so the first
+        // rows*k elements are contiguous.
+        let (mut lse, mut val, mut idx) = (
+            vec![0u8; rows * 4],
+            vec![0u8; rows * k * 4],
+            vec![0u8; rows * k * 4],
+        );
+        self.gpu.copy_d2h(buf.topk_lse, &mut lse)?;
+        self.gpu.copy_d2h(buf.topk_val, &mut val)?;
+        self.gpu.copy_d2h(buf.topk_idx, &mut idx)?;
+        let f32_at =
+            |b: &[u8], i: usize| f32::from_le_bytes(b[i * 4..i * 4 + 4].try_into().unwrap());
+        let u32_at =
+            |b: &[u8], i: usize| u32::from_le_bytes(b[i * 4..i * 4 + 4].try_into().unwrap());
+        Ok((0..rows)
+            .map(|r| {
+                let top = (0..k)
+                    .map(|j| (f32_at(&val, r * k + j), u32_at(&idx, r * k + j)))
+                    .collect();
+                (f32_at(&lse, r), top)
+            })
+            .collect())
     }
 
     /// Copy the device `[B,vocab]` bf16 logits to host as per-beam `f32` rows.

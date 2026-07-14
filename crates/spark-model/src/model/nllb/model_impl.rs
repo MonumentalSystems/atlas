@@ -145,9 +145,10 @@ impl Model for NllbGpuModel {
     }
 
     fn generate_beam_batch(&self, reqs: &[crate::traits::BeamReq]) -> Result<Vec<Vec<u32>>> {
-        // Phase a/b: each request's B beams batch as one M=B forward; requests
-        // run sequentially (cross-request C×B batching is a later phase).
-        reqs.iter().map(|r| self.generate_beam_one(r)).collect()
+        // Phase c: the C requests' Σ beams decode as ONE M=(Σ beams) batch per
+        // step (cross-request co-dispatch). Single-adapter batches fuse; mixed
+        // adapters fall back to serial inside `beam_batched_multi`.
+        self.beam_batched_multi(reqs)
     }
 
     fn bind_gpu_to_thread(&self) -> Result<()> {

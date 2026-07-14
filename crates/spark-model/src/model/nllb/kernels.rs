@@ -32,6 +32,10 @@ pub(super) struct NllbKernels {
     pub gather: KernelHandle,
     /// Broadcast-add one position row across a `[B,d]` batch.
     pub add_row: KernelHandle,
+    /// Phase-d on-device beam candidate reduction: per row, log-sum-exp over the
+    /// full vocab + the top-K `(value, token)` pairs (shrinks the per-step D2H
+    /// from `B*vocab` to `B*K`).
+    pub beam_topk: KernelHandle,
 }
 
 impl NllbKernels {
@@ -51,6 +55,7 @@ impl NllbKernels {
             scatter: gpu.kernel("nllb_encoder", "nllb_scatter_batched")?,
             gather: gpu.kernel("nllb_encoder", "nllb_gather_batched")?,
             add_row: gpu.kernel("nllb_encoder", "nllb_add_row_bf16")?,
+            beam_topk: gpu.kernel("nllb_encoder", "nllb_beam_topk")?,
         })
     }
 }

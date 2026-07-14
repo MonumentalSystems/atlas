@@ -256,6 +256,25 @@ impl InferenceRequest {
         }
     }
 
+    /// Max new tokens for this request. Read (non-consuming) by the beam
+    /// co-dispatch pre-pass to build a `BeamReq` before the admit loop consumes
+    /// the request.
+    pub fn max_tokens(&self) -> usize {
+        match self {
+            InferenceRequest::Blocking { max_tokens, .. } => *max_tokens,
+            InferenceRequest::Streaming { max_tokens, .. } => *max_tokens,
+        }
+    }
+
+    /// Clone the prompt-token `Arc` (cheap) — used by the beam co-dispatch
+    /// pre-pass to build a `BeamReq` without consuming the request.
+    pub fn prompt_tokens_arc(&self) -> std::sync::Arc<Vec<u32>> {
+        match self {
+            InferenceRequest::Blocking { prompt_tokens, .. } => prompt_tokens.clone(),
+            InferenceRequest::Streaming { prompt_tokens, .. } => prompt_tokens.clone(),
+        }
+    }
+
     /// Whether thinking mode is enabled for this request.
     pub fn enable_thinking(&self) -> bool {
         match self {

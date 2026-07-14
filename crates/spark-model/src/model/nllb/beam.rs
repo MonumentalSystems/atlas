@@ -14,6 +14,22 @@ use super::kv::NllbSeqKv;
 use super::util::{bf16_bytes, decoder_pos_table_bf16, u32_bytes};
 use crate::traits::BeamReq;
 
+/// A request's cross-KV within a fused C×B batch: `k`/`v` are per-decoder-layer
+/// `[enc_len,d]` buffers shared across this request's `n_rows` beams (stride 0),
+/// occupying rows `row_off..row_off+n_rows` of the batch. The cross-attn step
+/// loops these groups; every other projection stays one M=(Σn_rows) GEMM.
+pub(super) struct CrossGroup<'a> {
+    pub k: &'a [DevicePtr],
+    pub v: &'a [DevicePtr],
+    pub enc_len: usize,
+    pub row_off: usize,
+    pub n_rows: usize,
+}
+
+/// Max K (= 2·num_beams) the on-device beam top-k kernel supports; sizes the
+/// `topk_*` scratch and caps the fused-beam count (num_beams ≤ 16).
+pub(super) const NLLB_TOPK_KMAX: usize = 32;
+
 /// Batched decode scratch for B beams (bf16, except the u32 id/length buffers).
 pub(super) struct DecBuf {
     pub dh: DevicePtr,
@@ -31,13 +47,26 @@ pub(super) struct DecBuf {
     pub crosstk: DevicePtr,
     pub pos_table: DevicePtr,
     pub cache_rows: usize,
+    /// Phase-d on-device top-k outputs: per row `lse` (f32), and `K` `(val,tok)`
+    /// pairs in `topk_val`/`topk_idx` (`[rows, NLLB_TOPK_KMAX]`).
+    pub topk_lse: DevicePtr,
+    pub topk_val: DevicePtr,
+    pub topk_idx: DevicePtr,
 }
 
 impl DecBuf {
-    fn new(m: &NllbGpuModel, b: usize, enc_len: usize, cache_rows: usize) -> Result<Self> {
+    /// `crosstk_host[row]` is that row's cross key length (its request's
+    /// `enc_len`); `b` is the total row count (Σ beams over all fused requests).
+    pub(super) fn new(
+        m: &NllbGpuModel,
+        b: usize,
+        crosstk_host: &[u32],
+        cache_rows: usize,
+    ) -> Result<Self> {
         let (d, gpu) = (m.d, m.gpu.as_ref());
+        debug_assert_eq!(crosstk_host.len(), b);
         let crosstk = gpu.alloc(b * 4)?;
-        gpu.copy_h2d(u32_bytes(&vec![enc_len as u32; b]), crosstk)?;
+        gpu.copy_h2d(u32_bytes(crosstk_host), crosstk)?;
         let pos_table = gpu.alloc(cache_rows * d * 2)?;
         gpu.copy_h2d(
             bf16_bytes(&decoder_pos_table_bf16(cache_rows, d)),
@@ -59,9 +88,12 @@ impl DecBuf {
             crosstk,
             pos_table,
             cache_rows,
+            topk_lse: gpu.alloc(b * 4)?,
+            topk_val: gpu.alloc(b * NLLB_TOPK_KMAX * 4)?,
+            topk_idx: gpu.alloc(b * NLLB_TOPK_KMAX * 4)?,
         })
     }
-    fn free(self, gpu: &dyn spark_runtime::gpu::GpuBackend) -> Result<()> {
+    pub(super) fn free(self, gpu: &dyn spark_runtime::gpu::GpuBackend) -> Result<()> {
         for p in [
             self.dh,
             self.residual,
@@ -77,6 +109,9 @@ impl DecBuf {
             self.selftk,
             self.crosstk,
             self.pos_table,
+            self.topk_lse,
+            self.topk_val,
+            self.topk_idx,
         ] {
             gpu.free(p)?;
         }
@@ -84,21 +119,21 @@ impl DecBuf {
     }
 }
 
-struct Beam {
-    tokens: Vec<u32>,
-    score: f32,
-    logits: Vec<f32>,
+pub(super) struct Beam {
+    pub tokens: Vec<u32>,
+    pub score: f32,
+    pub logits: Vec<f32>,
 }
 
 /// Finished-hypothesis pool (length-penalty scored), HF `BeamHypotheses`.
-struct BeamHyps {
+pub(super) struct BeamHyps {
     num_beams: usize,
     lp: f32,
     beams: Vec<(Vec<u32>, f32)>,
 }
 
 impl BeamHyps {
-    fn new(num_beams: usize, lp: f32) -> Self {
+    pub(super) fn new(num_beams: usize, lp: f32) -> Self {
         Self {
             num_beams,
             lp,
@@ -111,7 +146,7 @@ impl BeamHyps {
             .map(|(_, s)| *s)
             .fold(f32::INFINITY, f32::min)
     }
-    fn add(&mut self, tokens: Vec<u32>, sum_logprob: f32) {
+    pub(super) fn add(&mut self, tokens: Vec<u32>, sum_logprob: f32) {
         let score = sum_logprob / (tokens.len() as f32).powf(self.lp);
         if self.beams.len() < self.num_beams || score > self.worst() {
             self.beams.push((tokens, score));
@@ -126,7 +161,7 @@ impl BeamHyps {
             }
         }
     }
-    fn is_done(&self, best_running: f32, cur_len: usize, early_stopping: bool) -> bool {
+    pub(super) fn is_done(&self, best_running: f32, cur_len: usize, early_stopping: bool) -> bool {
         if self.beams.len() < self.num_beams {
             return false;
         }
@@ -135,7 +170,7 @@ impl BeamHyps {
         }
         self.worst() >= best_running / (cur_len as f32).powf(self.lp)
     }
-    fn best(&self) -> Option<Vec<u32>> {
+    pub(super) fn best(&self) -> Option<Vec<u32>> {
         self.beams
             .iter()
             .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
@@ -143,12 +178,12 @@ impl BeamHyps {
     }
 }
 
-fn logsumexp(x: &[f32]) -> f32 {
+pub(super) fn logsumexp(x: &[f32]) -> f32 {
     let m = x.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     m + x.iter().map(|&v| (v - m).exp()).sum::<f32>().ln()
 }
 
-fn top_k(x: &[f32], k: usize) -> Vec<(f32, usize)> {
+pub(super) fn top_k(x: &[f32], k: usize) -> Vec<(f32, usize)> {
     let mut best: Vec<(f32, usize)> = Vec::with_capacity(k + 1);
     for (i, &v) in x.iter().enumerate() {
         if best.len() < k {
@@ -208,7 +243,7 @@ impl NllbGpuModel {
         let b = req.num_beams.max(1);
         let max_new = req.max_new.max(2).min(self.cache_rows);
         let gpu = self.gpu.as_ref();
-        let buf = DecBuf::new(self, b, enc_len, max_new)?;
+        let buf = DecBuf::new(self, b, &vec![enc_len as u32; b], max_new)?;
         let alloc_set = |n: usize| {
             (0..n)
                 .map(|_| gpu.alloc(b * max_new * self.d * 2))
@@ -220,9 +255,16 @@ impl NllbGpuModel {
         let mut sv2 = alloc_set(self.dec_layers)?;
         let perm_dev = gpu.alloc(b * 4)?;
 
+        let cross = [CrossGroup {
+            k: cross_k,
+            v: cross_v,
+            enc_len,
+            row_off: 0,
+            n_rows: b,
+        }];
         let res = self.beam_loop(
-            req, b, max_new, forced_bos, cross_k, cross_v, &buf, &mut sk, &mut sv, &mut sk2,
-            &mut sv2, perm_dev,
+            req, b, max_new, forced_bos, &cross, &buf, &mut sk, &mut sv, &mut sk2, &mut sv2,
+            perm_dev,
         );
 
         for p in sk.into_iter().chain(sv).chain(sk2).chain(sv2) {
@@ -240,8 +282,7 @@ impl NllbGpuModel {
         b: usize,
         max_new: usize,
         forced_bos: u32,
-        cross_k: &[DevicePtr],
-        cross_v: &[DevicePtr],
+        cross: &[CrossGroup],
         buf: &DecBuf,
         sk: &mut Vec<DevicePtr>,
         sv: &mut Vec<DevicePtr>,
@@ -251,8 +292,8 @@ impl NllbGpuModel {
     ) -> Result<Vec<u32>> {
         let (dec_start, eos) = (self.lang.decoder_start_id, self.lang.eos_id);
         // Seed all beams with [dec_start, forced_bos] into their slots.
-        self.beam_forward_step(&vec![dec_start; b], 0, b, sk, sv, cross_k, cross_v, buf)?;
-        self.beam_forward_step(&vec![forced_bos; b], 1, b, sk, sv, cross_k, cross_v, buf)?;
+        self.beam_forward_step(&vec![dec_start; b], 0, b, sk, sv, cross, buf)?;
+        self.beam_forward_step(&vec![forced_bos; b], 1, b, sk, sv, cross, buf)?;
         let init = self.beam_logits_host(buf, b)?;
         let mut beams: Vec<Beam> = (0..b)
             .map(|bi| Beam {
@@ -308,7 +349,7 @@ impl NllbGpuModel {
             std::mem::swap(sk, sk2);
             std::mem::swap(sv, sv2);
 
-            self.beam_forward_step(&cur, cur_len, b, sk, sv, cross_k, cross_v, buf)?;
+            self.beam_forward_step(&cur, cur_len, b, sk, sv, cross, buf)?;
             let lh = self.beam_logits_host(buf, b)?;
             beams = (0..cur.len())
                 .map(|i| Beam {

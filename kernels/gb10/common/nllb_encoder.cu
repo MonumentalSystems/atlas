@@ -461,3 +461,91 @@ extern "C" __global__ void nllb_gather_batched(
     dst[(unsigned long long)i * stride * d + rem] =
         src[(unsigned long long)src_b * stride * d + rem];
 }
+
+// Batched beam top-k + logsumexp (Phase-d on-device candidate reduction). For
+// each row b of the [B,vocab] bf16 logits, compute the log-sum-exp over the FULL
+// vocab (lse_out[b]) and the K = 2*num_beams largest (value, token) pairs
+// (val_out[b*K+j], idx_out[b*K+j], descending; ties broken by lower token id to
+// match the host `top_k`). Replaces the per-step full-[B,vocab] D2H + host
+// logsumexp/top_k in the beam decode loop: the D2H shrinks from B*vocab*2 bytes
+// to B*K*(4+4) bytes. grid=[B], block=[128], dynamic shared = 128*K*(4+4).
+#define NLLB_TOPK_MAX 32
+extern "C" __global__ void nllb_beam_topk(
+    const __nv_bfloat16* __restrict__ logits, float* __restrict__ lse_out,
+    float* __restrict__ val_out, unsigned int* __restrict__ idx_out,
+    unsigned int B, unsigned int vocab, unsigned int K) {
+    unsigned int b = blockIdx.x;
+    unsigned int tid = threadIdx.x;
+    unsigned int nt = blockDim.x; // == 128
+    const __nv_bfloat16* row = logits + (unsigned long long)b * vocab;
+
+    // Per-thread local top-K (descending) + streaming logsumexp state (m, s).
+    float lv[NLLB_TOPK_MAX];
+    unsigned int li[NLLB_TOPK_MAX];
+    for (unsigned int j = 0; j < K; ++j) {
+        lv[j] = -1e30f;
+        li[j] = 0u;
+    }
+    float m = -1e30f, s = 0.0f;
+    for (unsigned int v = tid; v < vocab; v += nt) {
+        float x = __bfloat162float(row[v]);
+        if (x > m) {
+            s = s * __expf(m - x) + 1.0f;
+            m = x;
+        } else {
+            s += __expf(x - m);
+        }
+        // Insert into the local top-K (strict >, so equal values keep the
+        // lower token id already held; scan is ascending in v within a thread).
+        if (x > lv[K - 1]) {
+            int j = (int)K - 1;
+            while (j > 0 && lv[j - 1] < x) {
+                lv[j] = lv[j - 1];
+                li[j] = li[j - 1];
+                --j;
+            }
+            lv[j] = x;
+            li[j] = v;
+        }
+    }
+
+    extern __shared__ char smem[];
+    float* cval = (float*)smem;                          // nt*K candidate values
+    unsigned int* cidx = (unsigned int*)(cval + nt * K); // nt*K candidate ids
+    for (unsigned int j = 0; j < K; ++j) {
+        cval[tid * K + j] = lv[j];
+        cidx[tid * K + j] = li[j];
+    }
+    __shared__ float sm[128];
+    __shared__ float ss[128];
+    sm[tid] = m;
+    ss[tid] = s;
+    __syncthreads();
+
+    if (tid == 0) {
+        // Combine per-thread logsumexp partials: lse = M + log(Σ s_t·exp(m_t−M)).
+        float M = -1e30f;
+        for (unsigned int t = 0; t < nt; ++t)
+            if (sm[t] > M) M = sm[t];
+        float S = 0.0f;
+        for (unsigned int t = 0; t < nt; ++t) S += ss[t] * __expf(sm[t] - M);
+        lse_out[b] = M + logf(S);
+        // Extract the global top-K from the nt*K candidate pool (small, serial).
+        unsigned int cand = nt * K;
+        for (unsigned int r = 0; r < K; ++r) {
+            float best = -1e30f;
+            unsigned int bpos = 0, bid = 0xFFFFFFFFu;
+            for (unsigned int c = 0; c < cand; ++c) {
+                float cv = cval[c];
+                if (cv > best || (cv == best && cidx[c] < bid)) {
+                    best = cv;
+                    bid = cidx[c];
+                    bpos = c;
+                }
+            }
+            val_out[b * K + r] = best;
+            idx_out[b * K + r] = cidx[bpos];
+            cval[bpos] = -1e30f; // mask the extracted candidate
+        }
+    }
+}
