@@ -536,6 +536,16 @@ pub struct ServeArgs {
     /// behaviour, byte-identical.
     #[arg(long, value_name = "NAME=PEER_ID=DIR", value_parser = parse_lora_stageable_spec)]
     pub lora_stageable: Vec<(String, String, String)>,
+
+    /// A DISK-stageable (promotable-but-not-resident, NO peer) LoRA adapter, as
+    /// `NAME=PATH_OR_HF_ID` (repeatable). A request naming NAME triggers an
+    /// on-miss DISK fault-in into a cache pool slot (LRU-evicted) instead of a
+    /// 404 — the no-RDMA sibling of `--lora-stageable`. Needs
+    /// `ATLAS_LORA_ROTATE=1` (so decode runs eager and the disk swap can
+    /// re-point a cache slot) and `--max-loras > resident count` for cache
+    /// headroom. Empty = today's behaviour, byte-identical.
+    #[arg(long, value_name = "NAME=PATH_OR_HF_ID", value_parser = parse_lora_adapter_spec)]
+    pub lora_stageable_disk: Vec<(String, String)>,
 }
 
 /// Value parser for `--lora-adapter NAME=PATH_OR_HF_ID`.
@@ -569,7 +579,23 @@ fn parse_lora_stageable_spec(s: &str) -> Result<(String, String, String), String
 
 #[cfg(test)]
 mod stageable_spec_tests {
-    use super::parse_lora_stageable_spec;
+    use super::{parse_lora_adapter_spec, parse_lora_stageable_spec};
+
+    #[test]
+    fn parses_disk_stageable() {
+        // `--lora-stageable-disk NAME=PATH_OR_HF_ID` reuses parse_lora_adapter_spec.
+        assert_eq!(
+            parse_lora_adapter_spec("cold-a=/data/adapters/cold-a"),
+            Ok(("cold-a".to_string(), "/data/adapters/cold-a".to_string()))
+        );
+        assert_eq!(
+            parse_lora_adapter_spec("cold-b=org/cold-b-lora"),
+            Ok(("cold-b".to_string(), "org/cold-b-lora".to_string()))
+        );
+        assert!(parse_lora_adapter_spec("cold-a").is_err());
+        assert!(parse_lora_adapter_spec("=/data/adapters/cold-a").is_err());
+        assert!(parse_lora_adapter_spec("cold-a=").is_err());
+    }
 
     #[test]
     fn parses_three_parts() {

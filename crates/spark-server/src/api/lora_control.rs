@@ -36,9 +36,15 @@ pub async fn resolve_request_adapter_slot(
     // to pick a served LoRA). A `model` that is the base model (or any name not
     // a resident adapter) falls through to `None` → installed active (`-1`),
     // never an unknown-adapter 400.
+    // A cold STAGEABLE name reached via the `model` field must fall through
+    // resolve_adapter_slot (which returns None for a non-resident name) into
+    // ensure_adapter_hot_opt, so select it here too. This also fixes
+    // `model=<peer-stageable>` routing (previously only reachable via `adapter`).
     let selector = match adapter {
         Some(a) => Some(a),
-        None if state.adapter_names.iter().any(|n| n == model) => Some(model),
+        None if state.adapter_names.iter().any(|n| n == model) || state.is_stageable_name(model) => {
+            Some(model)
+        }
         None => None,
     };
     if let Some(slot) =

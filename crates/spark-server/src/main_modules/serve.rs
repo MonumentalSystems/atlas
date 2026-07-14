@@ -690,22 +690,81 @@ pub(crate) async fn serve(mut args: cli::ServeArgs) -> Result<()> {
              least one --lora-adapter (and --max-loras > that count for cache headroom)"
         );
     }
-    // Promotion is armed only when the registry is non-empty, a peer is set, AND
-    // a rotation channel exists (a LoRA pool is resident). Otherwise every field
-    // is inert and a miss 404s byte-identically to today.
-    let promotion =
-        if !lora_stageable.is_empty() && lora_peer_addr.is_some() && !lora_states.is_empty() {
-            Some(Arc::new(
-                crate::main_modules::promotion::PromotionManager::default(),
-            ))
-        } else {
-            None
-        };
+    // DISK-stageable registry (the no-RDMA sibling): name -> (resolved dir, peft).
+    // The dir is resolved HF-id-or-path via the model_resolver; peft is parsed +
+    // rank-checked at startup (fail-fast like load_lora_adapters). The disk swap
+    // re-reads adapter_config.json at promote time, so this copy is only for
+    // advertising + rank validation.
+    let mut lora_disk_stageable = std::collections::HashMap::new();
+    for (name, spec) in &args.lora_stageable_disk {
+        if lora_states.iter().any(|s| &s.name == name) || lora_stageable.contains_key(name) {
+            anyhow::bail!(
+                "--lora-stageable-disk '{name}' collides with a resident/peer-stageable \
+                 adapter name"
+            );
+        }
+        let dir = crate::model_resolver::resolve_adapter_dir(spec, args.cache_dir.as_deref())
+            .with_context(|| format!("--lora-stageable-disk '{name}': resolve '{spec}'"))?;
+        let cfg_path = dir.join("adapter_config.json");
+        let raw = std::fs::read_to_string(&cfg_path).with_context(|| {
+            format!(
+                "--lora-stageable-disk '{name}': read peft config {}",
+                cfg_path.display()
+            )
+        })?;
+        let peft = atlas_core::config::parse_peft_adapter_config(&raw).with_context(|| {
+            format!(
+                "--lora-stageable-disk '{name}': parse {}",
+                cfg_path.display()
+            )
+        })?;
+        if peft.r > args.max_lora_rank {
+            anyhow::bail!(
+                "--lora-stageable-disk '{name}' r={} > --max-lora-rank {}",
+                peft.r,
+                args.max_lora_rank
+            );
+        }
+        lora_disk_stageable.insert(name.clone(), (dir, peft));
+    }
+    if !lora_disk_stageable.is_empty() && lora_states.is_empty() {
+        anyhow::bail!(
+            "--lora-stageable-disk needs a resident pool to promote INTO; start with at \
+             least one --lora-adapter and --max-loras > that count"
+        );
+    }
+    // The disk swap re-points a cache slot only when rotation is armed
+    // (decode runs eager). ATLAS_LORA_ROTATE=1 arms it; a peer being set also
+    // forces eager decode, so accept either.
+    if !lora_disk_stageable.is_empty()
+        && !spark_model::lora::lora_rotate_env()
+        && lora_peer_addr.is_none()
+    {
+        anyhow::bail!(
+            "--lora-stageable-disk needs rotation armed: set ATLAS_LORA_ROTATE=1 so decode \
+             runs eager and the disk swap can re-point a cache slot"
+        );
+    }
+    // Promotion is armed when a LoRA pool is resident AND there is at least one
+    // stageable source — a peer-backed registry (needs a peer) OR a disk-backed
+    // registry. Otherwise every field is inert and a miss 404s byte-identically
+    // to today. The coalescer is backing-agnostic; peer and disk misses share it.
+    let promotion = if (!lora_stageable.is_empty() && lora_peer_addr.is_some()
+        || !lora_disk_stageable.is_empty())
+        && !lora_states.is_empty()
+    {
+        Some(Arc::new(
+            crate::main_modules::promotion::PromotionManager::default(),
+        ))
+    } else {
+        None
+    };
     if promotion.is_some() {
         tracing::info!(
-            "LoRA #27: {} stageable adapter(s) armed for demand promotion \
+            "LoRA #27: {} peer + {} disk stageable adapter(s) armed for demand promotion \
              (peer={:?}, cache headroom={} slots)",
             lora_stageable.len(),
+            lora_disk_stageable.len(),
             lora_peer_addr,
             args.max_loras.saturating_sub(lora_states.len()),
         );
@@ -769,6 +828,7 @@ pub(crate) async fn serve(mut args: cli::ServeArgs) -> Result<()> {
         lora_peer_addr,
         promotion,
         promoted_slots: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+        lora_disk_stageable,
     });
 
     serve_phases::log_behavior_audit(&args, &ptx_set);

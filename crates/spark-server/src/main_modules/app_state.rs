@@ -144,6 +144,14 @@ pub struct AppState {
     /// `name -> slot` (and drops any evicted name) so subsequent requests for the
     /// same adapter fast-path to the resident cache slot without another promote.
     pub promoted_slots: Arc<std::sync::RwLock<std::collections::HashMap<String, i32>>>,
+    /// DISK-stageable registry: `name -> (resolved adapter dir, peft)`. Parsed at
+    /// startup (fail-fast) for `/v1/models` advertising + rank validation; the
+    /// disk swap re-reads the config at promote time. Empty ⇒ no disk fault-in
+    /// (byte-identical to today). The no-RDMA sibling of `lora_stageable`.
+    pub lora_disk_stageable: std::collections::HashMap<
+        String,
+        (std::path::PathBuf, atlas_core::config::PeftAdapterConfig),
+    >,
 }
 
 use crate::main_modules::promotion::PromoteReject;
@@ -162,13 +170,27 @@ impl AppState {
     /// ONE promote (they all resolve to the same slot). The coalescing lock is
     /// never held across the scheduler round-trip.
     pub async fn ensure_adapter_hot_opt(&self, name: &str) -> Result<Option<i32>, PromoteReject> {
-        // Constraint (a): only stageable names with promotion armed proceed.
-        let (Some(promotion), Some(peer_addr), Some(tx)) =
-            (&self.promotion, &self.lora_peer_addr, &self.rotation_tx)
-        else {
+        // Gate on (promotion armed + rotation channel) — NOT on peer_addr, so a
+        // no-peer DISK-stageable serve still faults in. The per-backing branch
+        // below decides how to source the adapter (RDMA peer or local disk).
+        let (Some(promotion), Some(tx)) = (&self.promotion, &self.rotation_tx) else {
             return Ok(None);
         };
-        let Some(stageable) = self.lora_stageable.get(name).cloned() else {
+        // Classify the miss: peer-stageable (needs a peer_addr) or disk-stageable.
+        // A peer-stageable name with no peer configured is inert (Ok(None), the
+        // byte-identical resident-only 400 at the caller).
+        enum Backing {
+            Peer(crate::main_modules::promotion::StageableAdapter, String),
+            Disk(std::path::PathBuf),
+        }
+        let backing = if let Some(st) = self.lora_stageable.get(name).cloned() {
+            match &self.lora_peer_addr {
+                Some(addr) => Backing::Peer(st, addr.clone()),
+                None => return Ok(None),
+            }
+        } else if let Some((dir, _peft)) = self.lora_disk_stageable.get(name) {
+            Backing::Disk(dir.clone())
+        } else {
             return Ok(None);
         };
 
@@ -184,7 +206,6 @@ impl AppState {
 
         let promoted_slots = Arc::clone(&self.promoted_slots);
         let tx = tx.clone();
-        let peer_addr = peer_addr.clone();
         let name_owned = name.to_string();
 
         let slot = promotion
@@ -198,8 +219,14 @@ impl AppState {
                 {
                     return Ok(slot);
                 }
-                let (slot, evicted) =
-                    Self::dispatch_promote(&tx, &peer_addr, &name_owned, &stageable).await?;
+                let (slot, evicted) = match backing {
+                    Backing::Peer(st, addr) => {
+                        Self::dispatch_promote(&tx, &addr, &name_owned, &st).await?
+                    }
+                    Backing::Disk(dir) => {
+                        Self::dispatch_promote_disk(&tx, &name_owned, &dir).await?
+                    }
+                };
                 // Update the overlay: drop the evicted name, map the new one.
                 let mut ov = promoted_slots.write().expect("promoted_slots poisoned");
                 if let Some(ev) = evicted {
@@ -210,6 +237,15 @@ impl AppState {
             })
             .await?;
         Ok(Some(slot))
+    }
+
+    /// True when `name` is a stageable (promotable-but-not-resident) adapter —
+    /// either peer-backed (`--lora-stageable`) or disk-backed
+    /// (`--lora-stageable-disk`). Used by routing/advertising to treat cold
+    /// names as selectable without adding them to the resident `adapter_names`
+    /// routing index.
+    pub fn is_stageable_name(&self, name: &str) -> bool {
+        self.lora_stageable.contains_key(name) || self.lora_disk_stageable.contains_key(name)
     }
 
     /// Send one `Promote` command to the scheduler and await its ack. The RDMA
@@ -258,6 +294,50 @@ impl AppState {
             Ok(Ok(Ok(LoraAck::Promoted { slot, evicted }))) => Ok((slot as i32, evicted)),
             Ok(Ok(Ok(LoraAck::Done))) => Err(PromoteReject::Peer(
                 "scheduler returned a non-promote ack for a promote".to_string(),
+            )),
+        }
+    }
+
+    /// No-RDMA sibling of [`Self::dispatch_promote`]: send one `PromoteDisk`
+    /// command (disk fault-in into an LRU victim slot) to the scheduler and
+    /// await its ack. Same 30s quiescence bound and same retryable
+    /// POOL_FULL / `ref_count>0` classification as the peer path; the disk swap
+    /// re-parses the dir's `adapter_config.json`, so no peft arg is needed.
+    async fn dispatch_promote_disk(
+        tx: &mpsc::Sender<crate::scheduler::LoraRotation>,
+        name: &str,
+        dir: &std::path::Path,
+    ) -> Result<(i32, Option<String>), PromoteReject> {
+        use crate::scheduler::{LoraAck, LoraCommand};
+
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+        let cmd = LoraCommand::PromoteDisk {
+            name: name.to_string(),
+            dir: dir.to_path_buf(),
+        };
+        if tx.send((cmd, ack_tx)).await.is_err() {
+            return Err(PromoteReject::Peer(
+                "scheduler promote channel closed".to_string(),
+            ));
+        }
+        let acked = tokio::time::timeout(std::time::Duration::from_secs(30), ack_rx).await;
+        match acked {
+            Err(_timeout) => Err(PromoteReject::PoolFull(
+                "disk promotion timed out waiting for scheduler quiescence; retry".to_string(),
+            )),
+            Ok(Err(_recv)) => Err(PromoteReject::Peer(
+                "scheduler dropped the promote ack (shutting down?)".to_string(),
+            )),
+            Ok(Ok(Err(reason))) => {
+                if reason.contains("POOL_FULL") || reason.contains("ref_count>0") {
+                    Err(PromoteReject::PoolFull(reason))
+                } else {
+                    Err(PromoteReject::Peer(reason))
+                }
+            }
+            Ok(Ok(Ok(LoraAck::Promoted { slot, evicted }))) => Ok((slot as i32, evicted)),
+            Ok(Ok(Ok(LoraAck::Done))) => Err(PromoteReject::Peer(
+                "scheduler returned a non-promote ack for a disk promote".to_string(),
             )),
         }
     }

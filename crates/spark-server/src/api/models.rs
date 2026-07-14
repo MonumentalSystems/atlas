@@ -36,6 +36,23 @@ pub async fn list_models(State(state): State<Arc<AppState>>) -> Json<ModelListRe
             owned_by: "atlas-spark".to_string(),
         });
     }
+    // Cold STAGEABLE names (peer- and disk-backed) are selectable via `model`
+    // and fault in on first use — advertise them too (before the base model),
+    // bounded by the same cap. They are NOT in adapter_names (the resident
+    // routing index), so this only affects what /v1/models lists.
+    for name in state
+        .lora_stageable
+        .keys()
+        .chain(state.lora_disk_stageable.keys())
+        .take(MAX_ADVERTISED_MODELS.saturating_sub(data.len()))
+    {
+        data.push(ModelInfo {
+            id: name.clone(),
+            object: "model".to_string(),
+            created: crate::openai::unix_timestamp(),
+            owned_by: "atlas-spark".to_string(),
+        });
+    }
     data.push(ModelInfo {
         id: state.model_name.clone(),
         object: "model".to_string(),
@@ -55,7 +72,9 @@ pub async fn get_model(
 ) -> Response {
     // Any resident adapter is a routable model id (M2): `models.retrieve(name)`
     // must succeed for every adapter advertised by /v1/models, not just slot 0.
-    let known = model_id == state.model_name || state.adapter_names.iter().any(|n| n == &model_id);
+    let known = model_id == state.model_name
+        || state.adapter_names.iter().any(|n| n == &model_id)
+        || state.is_stageable_name(&model_id);
     if known {
         Json(serde_json::json!({
             "id": model_id,
