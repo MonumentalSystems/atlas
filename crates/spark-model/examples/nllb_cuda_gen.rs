@@ -148,22 +148,36 @@ fn main() -> Result<()> {
     let dscr = DecScratch::new(&ctx)?;
 
     // ---- greedy (KV cache) ----
+    let t0 = std::time::Instant::now();
     let greedy = dctx.greedy(&dscr, FORCED_BOS)?;
+    let gdt = t0.elapsed().as_secs_f64();
     println!("[nllb] greedy ids   = {greedy:?}");
     anyhow::ensure!(
         greedy == EXPECTED_GREEDY,
         "greedy (KV cache) diverged from reference"
     );
-    println!("[nllb] greedy PASS (KV cache, token-exact)");
+    println!(
+        "[nllb] greedy PASS (KV cache, token-exact) — {} tok in {:.3}s = {:.1} tok/s",
+        greedy.len(),
+        gdt,
+        greedy.len() as f64 / gdt
+    );
 
     // ---- beam search (KV cache, num_beams=5) ----
+    let t1 = std::time::Instant::now();
     let beam = dctx.beam(&dscr, FORCED_BOS, 5, 1.0)?;
+    let bdt = t1.elapsed().as_secs_f64();
     println!("[nllb] beam=5 ids   = {beam:?}");
     anyhow::ensure!(
         beam == EXPECTED_BEAM5,
         "beam=5 (KV cache) diverged from reference"
     );
-    println!("[nllb] beam=5 PASS (KV cache, token-exact)");
+    println!(
+        "[nllb] beam=5 PASS (KV cache, token-exact) — {} tok in {:.3}s = {:.1} tok/s",
+        beam.len(),
+        bdt,
+        beam.len() as f64 / bdt
+    );
 
     println!("[nllb] ALL PASS — KV-cache greedy + beam both token-exact vs HF");
     Ok(())
