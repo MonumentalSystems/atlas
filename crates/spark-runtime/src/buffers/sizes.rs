@@ -258,11 +258,14 @@ impl BufferSizes {
         let fp8_act = m * max_proj_k;
         let fp8_act_scale = m * max_proj_k.div_ceil(128) * 4;
         // LoRA scratch — only when an adapter is configured (adapter_max_rank
-        // set programmatically pre-build). Widest v0 target n_out =
-        // max(hidden, intermediate): covers k/v, o/down (hidden) and gate/up
-        // (intermediate); q_proj (2*q_heads*head_dim) is excluded in v0.
+        // set programmatically pre-build). Widest target n_out =
+        // max(hidden, intermediate, q_proj): covers k/v, o/down (hidden),
+        // gate/up (intermediate), and gated q_proj (2*q_heads*head_dim, which
+        // can exceed both — e.g. 35B 2*16*256=8192 > hidden 4096).
         let (lora_xa, lora_delta, lora_hact, lora_seq_slot) = if config.adapter_max_rank > 0 {
-            let max_n = h.max(config.intermediate_size);
+            let max_n = h
+                .max(config.intermediate_size)
+                .max(q_proj_mul * q_heads * hd);
             (
                 m * config.adapter_max_rank * bf16,
                 m * max_n * bf16,
