@@ -397,6 +397,17 @@ impl TransformerModel {
             (DevicePtr::NULL, DevicePtr::NULL)
         };
 
+        // Request-scoped LoRA routing (two-phase prefill) — same dedicated
+        // arena buffer + m-element uniform slot array as prefill_a. See
+        // prefill_a.rs for the placement rationale. `DevicePtr(0)` (no pool)
+        // → installed-pair fallback; `-1` resolves to active.
+        let seq_slot = self.upload_seq_slot_uniform(
+            seq.adapter_slot,
+            proc_count,
+            self.buffers.lora_seq_slot(),
+            stream,
+        )?;
+
         let attn_metadata = AttnMetadataDev {
             positions: meta_base,
             positions_h: meta_base,
@@ -406,6 +417,7 @@ impl TransformerModel {
             block_table: block_table_dev,
             max_blocks_per_seq: seq.block_table.len() as u32,
             num_seqs: 1,
+            seq_slot,
         };
 
         let ctx = ForwardContext {
@@ -420,6 +432,8 @@ impl TransformerModel {
             // and must use the bit-faithful WY4 recurrence (see layer.rs).
             gdn_exact_replay: marconi_skip,
             token_ids: None,
+            // #30: request slot pairs (None unless routing to a non-active slot).
+            routed_lora_layers: self.routed_slot_layers(seq.adapter_slot),
         };
 
         // ── 4. Per-layer forward: SSM uses three-phase, attention uses standard ──

@@ -255,6 +255,7 @@ pub fn parse_expert_index(name: &str) -> Option<usize> {
     None
 }
 
+pub mod adapter;
 mod gguf;
 mod loader;
 pub mod mlx_int8;

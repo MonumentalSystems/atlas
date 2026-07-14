@@ -61,7 +61,14 @@ impl TransformerModel {
         ssm_cache_slots: usize,
         ssm_checkpoint_interval: usize,
     ) -> Result<Self> {
-        let rms_norm_kernel = gpu.kernel("norm", "rms_norm")?;
+        // `rms_norm_kernel` normalizes exactly one weight: `final_norm` (a
+        // checkpoint tensor). Models that ship HF-vanilla norm weights load it
+        // exactly and must use the vanilla kernel.
+        let rms_norm_kernel = if crate::ships_vanilla_norm_weights(&config) {
+            gpu.kernel("rms_norm_vanilla", "rms_norm_vanilla")?
+        } else {
+            gpu.kernel("norm", "rms_norm")?
+        };
         let dense_gemv_kernel = gpu.kernel("gemv", "dense_gemv_bf16")?;
         // FP32-output dense GEMV — the FP32 logits path required an FP32
         // residual stream, which no longer exists, so this stays
@@ -444,6 +451,8 @@ impl TransformerModel {
             lm_head_fp8,
             layers,
             buffers,
+            lora: None,
+            lora_rotatable: false,
             kv_cache: Mutex::new(kv_cache),
             gpu,
             rms_norm_kernel,

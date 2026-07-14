@@ -37,7 +37,6 @@ impl TransformerModel {
             // Only generated tokens past `prompt_len` are "newly seq-owned"
             // at this point — pass prompt_len as matched_tokens so insert
             // skips re-bumping the prompt portion.
-            //
             // Phase 6.3 sliding-window: when HSS has slid older blocks out,
             // `block_table` no longer parallels `tokens` from index 0 — the
             // physical IDs at the front of block_table now hold WRITES for
@@ -49,8 +48,8 @@ impl TransformerModel {
             // Skip when the prefix cache is a no-op (`--enable-prefix-caching`
             // off): the manual inc_ref below would never get a paired dec_ref
             // from cache eviction, leaking the seq's blocks every request.
-            // Also skip when HSS sliding has occurred (front of block_table no
-            // longer parallels tokens) and on vision prompts.
+            // Also skip on HSS-slid (front of block_table no longer parallels
+            // tokens) and vision prompts — both handled by the guard below.
             if self.prefix_cache.is_active()
                 && !self.tokens_have_vision_pad(&seq.tokens)
                 && seq.hss_window_start() == 0
@@ -128,6 +127,17 @@ impl TransformerModel {
                 tracing::error!("free_sequence: gpu.synchronize after zero_slot({slot}): {e:#}");
             }
             self.ssm_pool.release_slot(slot);
+        }
+
+        // Task #25: release this sequence's LoRA slot ref (the single terminal
+        // chokepoint every stamped seq routes through — normal stop/EOS/length,
+        // error/abort, prefill-error frees, and swap-out spill). Guarded by the
+        // RESOLVED `acquired_adapter_slot` (`-1` = never acquired: the non-
+        // scheduler alloc paths and the base no-LoRA path skip this) and zeroed
+        // so it fires exactly once per acquire, idempotent against a double free.
+        if seq.acquired_adapter_slot >= 0 {
+            self.release_adapter_slot(seq.acquired_adapter_slot);
+            seq.acquired_adapter_slot = -1;
         }
 
         // Release prefix cache refs before freeing blocks.
@@ -215,6 +225,30 @@ impl TransformerModel {
                     "free_sequence: destroy_graph(verify[{}]): {e:#}",
                     seq.slot_idx
                 );
+            }
+        }
+        // verify_kgamma_graph + fused_graph are keyed by (slot, K). They now
+        // capture the LoRA bgmv-vs-installed-pair branch and read the per-seq
+        // seq_slot buffer, so a freed slot's entries MUST be destroyed — else a
+        // reused slot replays a stale adapter index (multi-adapter + DFlash
+        // spec-decode output corruption). Drop every K for this slot.
+        for graph_map in [&self.verify_kgamma_graph, &self.fused_graph] {
+            let mut cache = graph_map.lock();
+            let keys: Vec<(usize, usize)> = cache
+                .keys()
+                .filter(|k| k.0 == seq.slot_idx)
+                .copied()
+                .collect();
+            for k in keys {
+                if let Some(graph) = cache.remove(&k)
+                    && let Err(e) = self.gpu.destroy_graph(graph)
+                {
+                    tracing::error!(
+                        "free_sequence: destroy_graph(kgamma/fused[{},{}]): {e:#}",
+                        k.0,
+                        k.1
+                    );
+                }
             }
         }
 

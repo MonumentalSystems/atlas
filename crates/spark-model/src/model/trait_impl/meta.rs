@@ -193,6 +193,13 @@ impl TransformerModel {
         let num_attn_layers = self.config.num_attention_layers();
         Ok(SequenceState {
             adapter_id: 0,
+            adapter_slot: -1,          // default: defer to installed active adapter
+            acquired_adapter_slot: -1, // Task #25: no ref held until prefill acquires
+            src_lang_id: 0,            // NLLB-only per-request lang (0 = deployment default)
+            tgt_lang_id: 0,
+            num_beams: 1,
+            length_penalty: 1.0,
+            early_stopping: false,
             tokens: Vec::new(),
             block_table: Vec::new(),
             seq_len: 0,

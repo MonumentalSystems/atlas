@@ -98,7 +98,7 @@ pub struct CompressorWeights {
     pub wkv: DenseWeight,
     /// gate_proj: same shape as wkv.
     pub wgate: DenseWeight,
-    /// kv_norm weight `[head_dim]` — STANDARD RMSNorm (loaded via dense_minus_one).
+    /// kv_norm weight `[head_dim]` — HF-vanilla RMSNorm (loaded exactly).
     pub norm: DenseWeight,
     /// position_bias / ape: [ratio, proj_dim] BF16, added to the gate before softmax.
     pub ape: spark_runtime::gpu::DevicePtr,
@@ -187,6 +187,11 @@ pub struct Qwen3AttentionLayer {
     pub(super) post_attn_norm: DenseWeight,
     pub(super) ffn: FfnComponent,
     pub(super) attn_layer_idx: usize,
+    /// Startup-static LoRA adapter overlay for the K/V/O projections (v0;
+    /// q_proj excluded — gated Q+gate interleave). Installed
+    /// post-construction via `set_lora_weights`; `None` = base-only.
+    /// M0: stored only — the compute-path reads land in M1.
+    pub(super) lora: Option<crate::layers::ops::lora_delta::LoraAttnWeights>,
     /// Whether Q projection includes an output gate (Q+Gate interleaved).
     /// When true, q_proj output is 2× q_dim; attn output is gated by sigmoid.
     /// When false (e.g. Qwen3-VL), q_proj output is q_dim; no gating applied.
@@ -281,7 +286,16 @@ pub struct Qwen3AttentionLayer {
     pub(super) per_token_group_quant_fp8_k: KernelHandle,
     pub(super) fp8_gemm_t_blockscaled_k: KernelHandle,
     // Kernels — decode (GEMV M=1)
+    /// Offset-from-1 `rms_norm` (`out = x * (1 + w) / rms`). Used ONLY for the
+    /// unweighted normalize (`norm_unit_w()` is zero-filled, so `1 + 0 = 1`).
     pub(super) rms_norm_k: KernelHandle,
+    /// The norm kernel for every weight that comes from the CHECKPOINT.
+    /// Same handle as `rms_norm_k` for offset-from-1 models; `rms_norm_vanilla`
+    /// (`out = x * w / rms`) for models that ship HF-vanilla norm weights.
+    pub(super) rms_norm_w_k: KernelHandle,
+    /// True when `rms_norm_w_k` is the vanilla kernel — i.e. the checkpoint's
+    /// norm weights are loaded exactly, with no `-1` pre-subtraction.
+    pub(super) norm_vanilla: bool,
     pub(super) rms_norm_residual_k: KernelHandle,
     /// Gemma-4 FP32-input rms_norm (absolute formula).
     pub(super) rms_norm_f32_in_k: KernelHandle,
