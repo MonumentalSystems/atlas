@@ -3,10 +3,14 @@
 //! CPU NLLB-200 translation CLI.
 //!
 //! Usage:
-//!   nllb-translate --model <dir> --src eng_Latn --tgt fra_Latn "Hello, world."
+//!   nllb-translate --model <dir> [--lora <adapter_dir>] \
+//!       --src eng_Latn --tgt fra_Latn "Hello, world."
 //!
 //! `<dir>` is a safetensors NLLB checkpoint (e.g. a local clone of
-//! `MonumentalSystems/nllb-200-3.3B`). Prints the translation to stdout.
+//! `MonumentalSystems/nllb-200-3.3B`). `--lora <adapter_dir>` optionally applies
+//! a HuggingFace PEFT LoRA adapter (`adapter_config.json` +
+//! `adapter_model.safetensors`) as a runtime delta. Prints the translation to
+//! stdout.
 
 use std::path::PathBuf;
 
@@ -16,6 +20,7 @@ use tokenizers::Tokenizer;
 
 struct Args {
     model: PathBuf,
+    lora: Option<PathBuf>,
     src: String,
     tgt: String,
     text: String,
@@ -25,6 +30,7 @@ struct Args {
 
 fn parse_args() -> Result<Args> {
     let mut model = None;
+    let mut lora = None;
     let mut src = "eng_Latn".to_string();
     let mut tgt = "fra_Latn".to_string();
     let mut max_new = 128usize;
@@ -36,6 +42,7 @@ fn parse_args() -> Result<Args> {
             "--model" | "-m" => {
                 model = Some(PathBuf::from(it.next().context("--model needs a value")?))
             }
+            "--lora" => lora = Some(PathBuf::from(it.next().context("--lora needs a value")?)),
             "--src" => src = it.next().context("--src needs a value")?,
             "--tgt" => tgt = it.next().context("--tgt needs a value")?,
             "--max-new" => max_new = it.next().context("--max-new needs a value")?.parse()?,
@@ -49,6 +56,7 @@ fn parse_args() -> Result<Args> {
     }
     Ok(Args {
         model,
+        lora,
         src,
         tgt,
         text: text_parts.join(" "),
@@ -62,13 +70,17 @@ fn main() -> Result<()> {
 
     eprintln!("[nllb] loading {} ...", args.model.display());
     let t0 = std::time::Instant::now();
-    let model = NllbModel::load_dir(&args.model)?;
+    let model = match &args.lora {
+        Some(lora_dir) => NllbModel::load_dir_with_lora(&args.model, lora_dir)?,
+        None => NllbModel::load_dir(&args.model)?,
+    };
     eprintln!(
-        "[nllb] loaded in {:.1}s (d_model={}, enc={}, dec={})",
+        "[nllb] loaded in {:.1}s (d_model={}, enc={}, dec={}, lora_modules={})",
         t0.elapsed().as_secs_f32(),
         model.cfg.d_model,
         model.cfg.encoder_layers,
-        model.cfg.decoder_layers
+        model.cfg.decoder_layers,
+        model.lora_modules(),
     );
 
     let tok = Tokenizer::from_file(args.model.join("tokenizer.json"))

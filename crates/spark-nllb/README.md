@@ -51,11 +51,37 @@ Asserts the encoder hidden-state checksum and the exact greedy token sequence
 against the HuggingFace reference. Skips silently when `NLLB_MODEL_DIR` is unset
 (so CPU CI without the weights stays green).
 
+## LoRA adapters
+
+A HuggingFace PEFT LoRA adapter can be applied as a **runtime delta** (never
+merged into the base weights), matching the GPU engine's philosophy:
+
+```bash
+nllb-translate --model /path/to/nllb-200-3.3B-st \
+    --lora /path/to/adapter \
+    --src eng_Latn --tgt fra_Latn "Hello, world."
+```
+
+`<adapter>` is a standard PEFT directory (`adapter_config.json` +
+`adapter_model.safetensors`). For each adapted projection the output becomes
+`y = x·Wᵀ + b + scale·(x·Aᵀ)·Bᵀ`, with `scale = alpha/r` (or `alpha/√r` under
+rsLoRA). Every projection is covered: encoder + decoder self-attention
+`q/k/v/out_proj`, decoder cross-attention `q/out_proj` + the cached cross
+`k/v_proj`, and the FFN `fc1/fc2`. Modules the adapter does not target fall
+through to the base weight unchanged; a `B == 0` (freshly-initialised) adapter
+is a byte-exact no-op. See `src/lora.rs`.
+
 ## Status / next steps
 
 - ✅ CPU fp32 encoder-decoder forward, greedy + beam search (NLLB defaults:
   `num_beams=5`, `length_penalty=1.0`, `early_stopping=false`), exact-match
   with HF `transformers` on both.
-- ⏳ GPU path: the closest reusable asset is Atlas's ViT vision encoder
-  (biased LayerNorm, bias-GEMM, dense non-causal SDPA) plus a new plain-ReLU
-  kernel and decoder cross-attention orchestration.
+- ✅ PEFT LoRA adapters (runtime delta on every projection), validated
+  end-to-end against the real 3.3B checkpoint (zero-B no-op + live-delta).
+- ✅ GPU path (CUDA / GB10 + Metal): full encoder + decoder with cross-attention,
+  KV cache, and beam search — bit-faithful to this CPU reference and exact-match
+  to HF. Lives in `spark-model` (`examples/nllb_cuda_*`, `examples/nllb_metal_*`,
+  `kernels/{gb10,metal}/nllb-200-3.3b` + `common/nllb_encoder.{cu,metal}`), with a
+  bf16 tensor-core decode pipeline, M=1 GEMV decode, and request/beam batching.
+  LoRA is not yet wired into the GPU path — this crate's CPU delta is the
+  reference for that follow-up.

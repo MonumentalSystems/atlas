@@ -11,9 +11,11 @@
 //! validated end-to-end without the CUDA/Metal stack.
 
 pub mod config;
+pub mod lora;
 pub mod model;
 pub mod ops;
 pub mod weights;
 
 pub use config::NllbConfig;
+pub use lora::LoraSet;
 pub use model::NllbModel;

@@ -13,6 +13,7 @@ use std::path::Path;
 use anyhow::Result;
 
 use crate::config::NllbConfig;
+use crate::lora::LoraSet;
 use crate::ops;
 use crate::weights::{Tensor, WeightStore};
 
@@ -21,6 +22,10 @@ mod beam;
 pub struct NllbModel {
     pub cfg: NllbConfig,
     w: WeightStore,
+    /// Optional PEFT LoRA adapter applied as a runtime delta on every adapted
+    /// projection (encoder + decoder self/cross attention + FFN). `None` = the
+    /// base checkpoint, byte-identical to the pre-LoRA path.
+    lora: Option<LoraSet>,
 }
 
 /// Cached cross-attention K/V (projected encoder output), one entry per
@@ -34,11 +39,56 @@ impl NllbModel {
     pub fn load_dir(dir: &Path) -> Result<Self> {
         let cfg = NllbConfig::from_json(&std::fs::read_to_string(dir.join("config.json"))?)?;
         let w = WeightStore::load_dir(dir)?;
-        Ok(Self { cfg, w })
+        Ok(Self { cfg, w, lora: None })
+    }
+
+    /// Load the base checkpoint and attach a PEFT LoRA adapter from `lora_dir`.
+    pub fn load_dir_with_lora(dir: &Path, lora_dir: &Path) -> Result<Self> {
+        let mut m = Self::load_dir(dir)?;
+        m.lora = Some(LoraSet::load_dir(lora_dir)?);
+        Ok(m)
+    }
+
+    /// Attach (or replace) the LoRA adapter on an already-loaded model.
+    pub fn set_lora(&mut self, lora: Option<LoraSet>) {
+        self.lora = lora;
+    }
+
+    /// Number of modules the attached adapter overrides (0 if none).
+    pub fn lora_modules(&self) -> usize {
+        self.lora.as_ref().map_or(0, LoraSet::adapted_modules)
     }
 
     fn d(&self) -> usize {
         self.cfg.d_model
+    }
+
+    /// `y = x·Wᵀ + b` plus the LoRA residual for `module` when an adapter
+    /// overrides it. `module` is the weight path minus `.weight`
+    /// (e.g. `model.encoder.layers.0.self_attn.q_proj`); the base weight is
+    /// `{module}.weight` and the bias `{module}.bias`.
+    fn linear_lora(
+        &self,
+        module: &str,
+        x: &[f32],
+        rows: usize,
+        in_dim: usize,
+        out_dim: usize,
+    ) -> Vec<f32> {
+        let mut y = ops::linear(
+            x,
+            rows,
+            in_dim,
+            &self.g(&format!("{module}.weight")).data,
+            out_dim,
+            Some(&self.g(&format!("{module}.bias")).data),
+        );
+        if let Some(lora) = &self.lora {
+            if let Some(delta) = lora.delta(module, x, rows) {
+                ops::add_inplace(&mut y, &delta);
+            }
+        }
+        y
     }
 
     // ---- embeddings --------------------------------------------------------
@@ -109,36 +159,15 @@ impl NllbModel {
             None => kv_in.len() / d,
         };
 
-        let mut q = ops::linear(
-            q_in,
-            tq,
-            d,
-            &self.g(&format!("{prefix}.q_proj.weight")).data,
-            d,
-            Some(&self.g(&format!("{prefix}.q_proj.bias")).data),
-        );
+        let mut q = self.linear_lora(&format!("{prefix}.q_proj"), q_in, tq, d, d);
         for v in q.iter_mut() {
             *v *= scaling;
         }
         let (k, val) = match precomputed_kv {
             Some(ckv) => (ckv.k.clone(), ckv.v.clone()),
             None => (
-                ops::linear(
-                    kv_in,
-                    tk,
-                    d,
-                    &self.g(&format!("{prefix}.k_proj.weight")).data,
-                    d,
-                    Some(&self.g(&format!("{prefix}.k_proj.bias")).data),
-                ),
-                ops::linear(
-                    kv_in,
-                    tk,
-                    d,
-                    &self.g(&format!("{prefix}.v_proj.weight")).data,
-                    d,
-                    Some(&self.g(&format!("{prefix}.v_proj.bias")).data),
-                ),
+                self.linear_lora(&format!("{prefix}.k_proj"), kv_in, tk, d, d),
+                self.linear_lora(&format!("{prefix}.v_proj"), kv_in, tk, d, d),
             ),
         };
 
@@ -172,35 +201,14 @@ impl NllbModel {
                 }
             }
         }
-        ops::linear(
-            &ctx,
-            tq,
-            d,
-            &self.g(&format!("{prefix}.out_proj.weight")).data,
-            d,
-            Some(&self.g(&format!("{prefix}.out_proj.bias")).data),
-        )
+        self.linear_lora(&format!("{prefix}.out_proj"), &ctx, tq, d, d)
     }
 
     fn ffn(&self, x: &[f32], rows: usize, layer_prefix: &str, ffn_dim: usize) -> Vec<f32> {
         let d = self.d();
-        let mut h = ops::linear(
-            x,
-            rows,
-            d,
-            &self.g(&format!("{layer_prefix}.fc1.weight")).data,
-            ffn_dim,
-            Some(&self.g(&format!("{layer_prefix}.fc1.bias")).data),
-        );
+        let mut h = self.linear_lora(&format!("{layer_prefix}.fc1"), x, rows, d, ffn_dim);
         ops::relu_inplace(&mut h);
-        ops::linear(
-            &h,
-            rows,
-            ffn_dim,
-            &self.g(&format!("{layer_prefix}.fc2.weight")).data,
-            d,
-            Some(&self.g(&format!("{layer_prefix}.fc2.bias")).data),
-        )
+        self.linear_lora(&format!("{layer_prefix}.fc2"), &h, rows, ffn_dim, d)
     }
 
     fn ln(&self, x: &mut [f32], rows: usize, prefix: &str) {
@@ -248,22 +256,8 @@ impl NllbModel {
             .map(|l| {
                 let p = format!("model.decoder.layers.{l}.encoder_attn");
                 CrossKv {
-                    k: ops::linear(
-                        enc_out,
-                        src,
-                        d,
-                        &self.g(&format!("{p}.k_proj.weight")).data,
-                        d,
-                        Some(&self.g(&format!("{p}.k_proj.bias")).data),
-                    ),
-                    v: ops::linear(
-                        enc_out,
-                        src,
-                        d,
-                        &self.g(&format!("{p}.v_proj.weight")).data,
-                        d,
-                        Some(&self.g(&format!("{p}.v_proj.bias")).data),
-                    ),
+                    k: self.linear_lora(&format!("{p}.k_proj"), enc_out, src, d, d),
+                    v: self.linear_lora(&format!("{p}.v_proj"), enc_out, src, d, d),
                 }
             })
             .collect()
