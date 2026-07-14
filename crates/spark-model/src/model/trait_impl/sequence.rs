@@ -37,7 +37,6 @@ impl TransformerModel {
             // Only generated tokens past `prompt_len` are "newly seq-owned"
             // at this point — pass prompt_len as matched_tokens so insert
             // skips re-bumping the prompt portion.
-            //
             // Phase 6.3 sliding-window: when HSS has slid older blocks out,
             // `block_table` no longer parallels `tokens` from index 0 — the
             // physical IDs at the front of block_table now hold WRITES for
@@ -49,8 +48,8 @@ impl TransformerModel {
             // Skip when the prefix cache is a no-op (`--enable-prefix-caching`
             // off): the manual inc_ref below would never get a paired dec_ref
             // from cache eviction, leaking the seq's blocks every request.
-            // Also skip when HSS sliding has occurred (front of block_table no
-            // longer parallels tokens) and on vision prompts.
+            // Also skip on HSS-slid (front of block_table no longer parallels
+            // tokens) and vision prompts — both handled by the guard below.
             if self.prefix_cache.is_active()
                 && !self.tokens_have_vision_pad(&seq.tokens)
                 && seq.hss_window_start() == 0
