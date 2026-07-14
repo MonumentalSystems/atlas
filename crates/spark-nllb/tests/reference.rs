@@ -31,6 +31,12 @@ const FORCED_BOS: u32 = 256057;
 const EXPECTED_GEN: &[u32] = &[
     256057, 17994, 141190, 248079, 25358, 123732, 248105, 30213, 248079, 1724, 25601, 385, 2,
 ];
+// beam=5, length_penalty=1.0, early_stopping=false (NLLB defaults):
+//   "Bonjour, comment vous portez-vous aujourd'hui ?"
+const EXPECTED_BEAM5: &[u32] = &[
+    256057, 17994, 141190, 248079, 25358, 4255, 956, 34821, 248105, 30213, 102506, 248116, 15510,
+    385, 2,
+];
 
 #[test]
 fn nllb_greedy_matches_reference() {
@@ -50,5 +56,17 @@ fn nllb_greedy_matches_reference() {
 
     // Greedy generation exact-token match.
     let out = model.generate(INPUT_IDS, FORCED_BOS, 64);
-    assert_eq!(out, EXPECTED_GEN, "generated ids diverged from reference");
+    assert_eq!(out, EXPECTED_GEN, "greedy ids diverged from reference");
+}
+
+#[test]
+fn nllb_beam5_matches_reference() {
+    let Some(dir) = model_dir() else {
+        eprintln!("NLLB_MODEL_DIR not set — skipping");
+        return;
+    };
+    let model = NllbModel::load_dir(&dir).expect("load model");
+    // NLLB defaults: num_beams=5, length_penalty=1.0, early_stopping=false.
+    let out = model.generate_beam(INPUT_IDS, FORCED_BOS, 5, 64, 1.0, false);
+    assert_eq!(out, EXPECTED_BEAM5, "beam=5 ids diverged from reference");
 }

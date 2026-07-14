@@ -34,11 +34,12 @@ cargo run -p spark-nllb --release --bin nllb-translate -- \
     --model /path/to/nllb-200-3.3B-st \
     --src eng_Latn --tgt fra_Latn \
     "Hello, world. How are you today?"
-# -> Bonjour, comment allez-vous, mon monde ?
+# -> Bonjour, comment vous portez-vous aujourd'hui ?
 ```
 
 `--src` / `--tgt` are NLLB FLORES-200 language codes (`eng_Latn`, `fra_Latn`,
-`spa_Latn`, `deu_Latn`, …).
+`spa_Latn`, `deu_Latn`, …). `--beams N` sets the beam width (default `5`, the
+NLLB default; `--beams 1` is greedy).
 
 ## Validation
 
@@ -52,8 +53,9 @@ against the HuggingFace reference. Skips silently when `NLLB_MODEL_DIR` is unset
 
 ## Status / next steps
 
-- ✅ CPU fp32 encoder-decoder forward + greedy generation, exact-match with HF.
+- ✅ CPU fp32 encoder-decoder forward, greedy + beam search (NLLB defaults:
+  `num_beams=5`, `length_penalty=1.0`, `early_stopping=false`), exact-match
+  with HF `transformers` on both.
 - ⏳ GPU path: the closest reusable asset is Atlas's ViT vision encoder
   (biased LayerNorm, bias-GEMM, dense non-causal SDPA) plus a new plain-ReLU
   kernel and decoder cross-attention orchestration.
-- ⏳ Beam search (NLLB default is `num_beams=5`); this runtime is greedy.

@@ -20,6 +20,7 @@ struct Args {
     tgt: String,
     text: String,
     max_new: usize,
+    beams: usize,
 }
 
 fn parse_args() -> Result<Args> {
@@ -27,6 +28,7 @@ fn parse_args() -> Result<Args> {
     let mut src = "eng_Latn".to_string();
     let mut tgt = "fra_Latn".to_string();
     let mut max_new = 128usize;
+    let mut beams = 5usize; // NLLB default num_beams
     let mut text_parts = Vec::new();
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
@@ -37,6 +39,7 @@ fn parse_args() -> Result<Args> {
             "--src" => src = it.next().context("--src needs a value")?,
             "--tgt" => tgt = it.next().context("--tgt needs a value")?,
             "--max-new" => max_new = it.next().context("--max-new needs a value")?.parse()?,
+            "--beams" => beams = it.next().context("--beams needs a value")?.parse()?,
             other => text_parts.push(other.to_string()),
         }
     }
@@ -50,6 +53,7 @@ fn parse_args() -> Result<Args> {
         tgt,
         text: text_parts.join(" "),
         max_new,
+        beams: beams.max(1),
     })
 }
 
@@ -87,7 +91,8 @@ fn main() -> Result<()> {
     input_ids.push(eos);
 
     let t1 = std::time::Instant::now();
-    let out_ids = model.generate(&input_ids, tgt_id, args.max_new);
+    // NLLB defaults: length_penalty=1.0, early_stopping=false.
+    let out_ids = model.generate_beam(&input_ids, tgt_id, args.beams, args.max_new, 1.0, false);
     let dt = t1.elapsed().as_secs_f32();
 
     let text = tok

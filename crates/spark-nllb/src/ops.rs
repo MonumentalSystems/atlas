@@ -103,3 +103,32 @@ pub fn argmax(x: &[f32]) -> usize {
     }
     best
 }
+
+/// In-place log-softmax over a single row: `x[i] -= logsumexp(x)`.
+pub fn log_softmax_inplace(x: &mut [f32]) {
+    let max = x.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let mut sum = 0f32;
+    for &v in x.iter() {
+        sum += (v - max).exp();
+    }
+    let lse = max + sum.ln();
+    for v in x.iter_mut() {
+        *v -= lse;
+    }
+}
+
+/// Indices of the `k` largest values, in descending order of value.
+///
+/// Ties break toward the lower index (matches PyTorch `topk` on CPU, which
+/// keeps the earlier index for equal values). `k` is clamped to `x.len()`.
+pub fn top_k_indices(x: &[f32], k: usize) -> Vec<usize> {
+    let k = k.min(x.len());
+    let mut idx: Vec<usize> = (0..x.len()).collect();
+    // Partial sort: select the top-k by value desc, index asc on ties.
+    idx.select_nth_unstable_by(k.saturating_sub(1).min(x.len() - 1), |&a, &b| {
+        x[b].partial_cmp(&x[a]).unwrap().then(a.cmp(&b))
+    });
+    idx.truncate(k);
+    idx.sort_by(|&a, &b| x[b].partial_cmp(&x[a]).unwrap().then(a.cmp(&b)));
+    idx
+}
