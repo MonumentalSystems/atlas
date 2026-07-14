@@ -129,6 +129,15 @@ pub enum LoraCommand {
         name: String,
         peft: atlas_core::config::PeftAdapterConfig,
     },
+    /// No-RDMA sibling of [`Self::Promote`]: demand-driven DISK promote of a
+    /// stageable-but-not-resident adapter loaded from `dir` into a cache pool
+    /// slot (victim chosen on the model thread), then made active. The chosen
+    /// slot + any evicted name flow back through the ack. No `peft`: the disk
+    /// swap re-parses the dir's `adapter_config.json`.
+    PromoteDisk {
+        name: String,
+        dir: std::path::PathBuf,
+    },
 }
 
 /// Successful result of a [`LoraCommand`] applied at quiescence. Rotate/Load
@@ -344,6 +353,16 @@ pub fn run(
                             .map_err(|e| format!("{e:#}"));
                         if let Err(ref e) = r {
                             tracing::warn!("LoRA promote '{name}' failed: {e}");
+                        }
+                        r
+                    }
+                    LoraCommand::PromoteDisk { name, dir } => {
+                        let r = model
+                            .promote_lora_from_disk(&dir, &name)
+                            .map(|(slot, evicted)| LoraAck::Promoted { slot, evicted })
+                            .map_err(|e| format!("{e:#}"));
+                        if let Err(ref e) = r {
+                            tracing::warn!("LoRA disk-promote '{name}' failed: {e}");
                         }
                         r
                     }
