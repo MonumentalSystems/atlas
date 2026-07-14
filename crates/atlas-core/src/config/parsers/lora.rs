@@ -19,12 +19,14 @@ use serde::Deserialize;
 
 /// v0 target-module allow-list. Deltas apply on full-attention layers
 /// (holo-3.1-0.8b: layer indices 3,7,11,15,19,23) plus the dense SwiGLU FFN.
-/// `q_proj` is deliberately absent: `attn_output_gate=true` models emit an
-/// interleaved Q+gate `q_proj` output (`ModelConfig::attn_gated`,
-/// `config.rs:289`) that a PEFT delta maps onto only partially — rejected in
-/// v0 rather than mis-sliced. GDN/linear-attention modules are likewise
-/// rejected (no exact-replay parity harness for the recurrence yet).
+/// `q_proj` IS supported: on `attn_output_gate=true` models the raw projection
+/// emits the interleaved `[Q|gate]` at width `2·q_heads·head_dim` — the FULL
+/// width the PEFT `lora_B` was trained against (verified `[8192,16]` on
+/// holo-3.1-35b), so the delta folds onto the raw interleaved basis exactly
+/// like k/v/o (the deinterleave is deferred past the fold). GDN/linear-attention
+/// modules stay rejected (no exact-replay parity harness for the recurrence yet).
 pub const PEFT_SUPPORTED_TARGET_MODULES: &[&str] = &[
+    "q_proj",
     "k_proj",
     "v_proj",
     "o_proj",
@@ -240,10 +242,6 @@ fn parse_target_modules(v: &serde_json::Value) -> Result<Vec<String>> {
 fn validate_target_module(entry: &str) -> Result<()> {
     let leaf = entry.rsplit('.').next().unwrap_or(entry);
     match leaf {
-        "q_proj" => bail!(
-            "REJECT(q_proj): base model uses attn_output_gate (gated/interleaved Q+gate q_proj \
-             output); q_proj adapters are unsupported in v0"
-        ),
         // GDN / linear-attention projections — reject both the fused
         // (`in_proj_qkvz`/`in_proj_ba`) and split (`in_proj_qkv`/`in_proj_z`/
         // `in_proj_a`/`in_proj_b`) spellings, plus `out_proj`/`conv1d`.

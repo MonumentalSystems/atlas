@@ -71,14 +71,14 @@ fn missing_use_rslora_rejected_named() {
 }
 
 #[test]
-fn q_proj_rejected_named() {
+fn q_proj_accepted() {
+    // q_proj is now a supported target: on attn_output_gate models the raw
+    // interleaved [Q|gate] output is the exact width the PEFT lora_B trained
+    // against, so the delta folds like k/v/o. Must parse, not reject.
     let mut j = base_json();
     j["target_modules"] = serde_json::json!(["q_proj", "v_proj"]);
-    let err = parse_peft_adapter_config(&j.to_string())
-        .unwrap_err()
-        .to_string();
-    assert!(err.contains("REJECT(q_proj)"), "{err}");
-    assert!(err.contains("attn_output_gate"), "{err}");
+    let cfg = parse_peft_adapter_config(&j.to_string()).unwrap();
+    assert!(cfg.target_modules.iter().any(|m| m == "q_proj"));
 }
 
 #[test]

@@ -55,16 +55,19 @@ fn classify_key_maps_supported_and_rejects_unsupported() {
         (47, LoraModule::DownProj, AdapterAb::A)
     );
 
-    // Rejects — every unsupported shape is a NAMED hard error, never a
-    // silent skip / None:
-    // q_proj is gated (interleaved Q+gate) → rejected even on a full-attn layer.
-    assert!(
+    // q_proj IS supported (gated interleaved [Q|gate] folds like k/v/o on a
+    // full-attn layer) → classifies to QProj, not a rejection.
+    assert_eq!(
         classify_key(
             "base_model.model.model.layers.3.self_attn.q_proj.lora_A.weight",
             &cfg
         )
-        .is_err()
+        .unwrap(),
+        (3, LoraModule::QProj, AdapterAb::A)
     );
+
+    // Rejects — every unsupported shape is a NAMED hard error, never a
+    // silent skip / None:
     // A GDN/linear-attention layer (layer 0) — LoRA is full-attention only.
     assert!(
         classify_key(

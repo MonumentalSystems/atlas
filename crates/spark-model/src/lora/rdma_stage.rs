@@ -27,7 +27,7 @@ use crate::weight_map::DenseWeight;
 /// `lora_A/lora_B` tensor is classified to (layer, module, A|B) and mapped to
 /// its byte sub-region `pool + slot*slot_bytes + a_off|b_off`. The adapter's
 /// real rank r is read from the tensor shape (A=[r,in], B=[out,r]). Rejections
-/// from `classify_key` (q_proj / GDN / wrong-layer / non-PEFT key) fire here
+/// from `classify_key` (GDN / wrong-layer / non-PEFT key) fire here
 /// too — never a silent skip.
 pub fn build_land_targets(
     manifest: &WeightManifest,

@@ -21,8 +21,8 @@ use crate::weight_map::DenseWeight;
 /// Qwen3.5-family attention trunk — qwen3_5 DENSE (holo-3.1-0.8b), holo3_1_moe
 /// (holo-3.1-35b-a3b, MoE), and qwen3_6_moe (Qwen3.6-35B-A3B, MoE). All route to
 /// `Qwen35WeightLoader`, so their full-attention layers are `Qwen3AttentionLayer`
-/// — what the install walk downcasts to (attention-only k/v/o; MoE expert MLPs +
-/// q_proj + SSM layers stay rejected by `classify_key`). Other families stay
+/// — what the install walk downcasts to (attention q/k/v/o; MoE expert MLPs +
+/// SSM layers stay rejected by `classify_key`). Other families stay
 /// rejected (no validated mapping). NOTE: `qwen3_5_moe` on disk is rewritten to
 /// `qwen3_6_moe` at parse time (dispatch.rs, MRoPE MoE), so we gate the
 /// post-dispatch name — the on-disk `qwen3_5_moe` never reaches here.

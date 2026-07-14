@@ -26,9 +26,11 @@ fn pool_slot_bytes_absolute_golden() {
     // Absolute byte count for the factory config @ max_rank=16: 12
     // full-attention layers × Σ_modules (max_rank·(in+out))·2. Pins the
     // layout absolutely (a dims/pad change is caught), not just the
-    // slot_base == k·slot_bytes relation.
+    // slot_base == k·slot_bytes relation. q_proj adds 32·(2048+8192)=327680
+    // B/layer (gated out = 2·16·256 = 8192), ×12 = 3_932_160 over the prior
+    // k/v/o/gate/up/down-only 12_582_912.
     let cfg = cfg();
-    assert_eq!(pool_slot_bytes(&cfg, 16), 12_582_912);
+    assert_eq!(pool_slot_bytes(&cfg, 16), 16_515_072);
 }
 
 #[test]
@@ -281,6 +283,7 @@ fn select_routed_pair_by_global_index_and_module() {
     let o = dummy_pair(300, 2048, 1024);
     layers[3] = Some(LoraLayerWeights {
         layer_idx: 3,
+        q_proj: None,
         k_proj: Some(k),
         v_proj: Some(v),
         o_proj: Some(o),
