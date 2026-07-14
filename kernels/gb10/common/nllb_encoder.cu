@@ -444,3 +444,20 @@ extern "C" __global__ void nllb_argmax_batched(
     }
     if (tid == 0) out[b] = sidx[0];
 }
+
+// Reorder batch-major caches by a beam permutation: dst[i] = src[perm[i]] for
+// rows 0..used (all layers call this per step). Used by beam-batching to
+// materialise each child beam's cache from its parent slot (HF _reorder_cache).
+extern "C" __global__ void nllb_gather_batched(
+    const __nv_bfloat16* __restrict__ src, __nv_bfloat16* __restrict__ dst,
+    const unsigned int* __restrict__ perm, unsigned int B, unsigned int used,
+    unsigned int stride, unsigned int d) {
+    unsigned long long idx = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned long long total = (unsigned long long)B * used * d;
+    if (idx >= total) return;
+    unsigned int i = (unsigned int)(idx / ((unsigned long long)used * d)); // dst batch slot
+    unsigned long long rem = idx % ((unsigned long long)used * d);         // row*d + elem
+    unsigned int src_b = perm[i];
+    dst[(unsigned long long)i * stride * d + rem] =
+        src[(unsigned long long)src_b * stride * d + rem];
+}
