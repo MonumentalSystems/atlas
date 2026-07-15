@@ -40,7 +40,9 @@ impl Qwen3SsmLayer {
         // no post-deinterleave is needed. Highest priority (all other weight
         // slots are NULL on this path).
         if self.qkvz_q2.is_some() {
-            self.qkvz_q2_prefill_gemm(ctx.gpu, normed, proj_dst, k, stream)?;
+            let scratch = ctx.buffers.q2_dequant_scratch();
+            let act_q8 = ctx.buffers.q2_act_q8();
+            self.qkvz_q2_prefill_gemm(ctx.gpu, normed, proj_dst, scratch, act_q8, k, stream)?;
             return Ok(());
         }
         // Env override: ATLAS_GDN_BF16_WEIGHTS=1 forces the BF16 dense
