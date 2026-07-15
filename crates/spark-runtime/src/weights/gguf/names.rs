@@ -57,11 +57,69 @@ pub fn translate(gguf_name: &str, arch: &str) -> Option<GgufName> {
 }
 
 /// Architecture-specific overrides. Return `Some(_)` to short-circuit
-/// [`translate_default`], `None` to fall through. Intentionally a no-op today —
-/// the hook exists so per-arch quirks land in one obvious place.
-fn arch_override(_gguf_name: &str, _arch: &str) -> Option<GgufName> {
-    // e.g. match _arch { "phi3" | "falcon" => { ... custom sub-name remaps ... } }
-    None
+/// [`translate_default`], `None` to fall through so [`translate_default`] runs.
+fn arch_override(gguf_name: &str, arch: &str) -> Option<GgufName> {
+    match arch {
+        // Qwen3.5/3.6 GDN-hybrid (`general.architecture = qwen35`). llama.cpp
+        // emits the linear-attention (Gated DeltaNet) projections under `ssm_*`
+        // / `attn_{qkv,gate}` names and the second RMSNorm as
+        // `post_attention_norm`; everything else (attn_q/k/v/output, q/k norms,
+        // ffn_*, top-level tensors) matches the default translation.
+        "qwen35" | "qwen3_5" => translate_qwen35_layer(gguf_name),
+        _ => None,
+    }
+}
+
+/// Qwen3.5/3.6-specific per-layer name remaps. Returns `None` for names the
+/// default translator already handles (so they fall through), and for anything
+/// unrecognized.
+///
+/// Layer roles are positional (every `full_attention_interval`-th layer is full
+/// attention, the rest are GDN/linear-attention), but the tensor NAMES are
+/// unambiguous per role: full-attention layers carry `attn_q/k/v/output`, GDN
+/// layers carry `attn_qkv` (fused Q|K|V), `attn_gate` (the Z gate) and the
+/// `ssm_*` family. So a pure name map suffices — no layer-index arithmetic.
+///
+/// GDN → Atlas HF mapping (`model.layers.N.linear_attn.*`, consumed by
+/// `Qwen35DenseWeightLoader`'s `LinearAttention` arm):
+///   * `attn_qkv`   → `in_proj_qkv`   (fused Q|K|V, rows = ssm_qkv_size)
+///   * `attn_gate`  → `in_proj_z`     (Z gate, rows = ssm_z_size)
+///   * `ssm_alpha`  → `in_proj_a`     ([num_v_heads, hidden])
+///   * `ssm_beta`   → `in_proj_b`     ([num_v_heads, hidden])
+///   * `ssm_conv1d` → `conv1d`
+///   * `ssm_a`      → `A_log`         (bare — no `.weight`; F32 decay, per v-head)
+///   * `ssm_dt.bias`→ `dt_bias`       (bare — loader keys it without `.bias`)
+///   * `ssm_norm`   → `norm`
+///   * `ssm_out`    → `out_proj`
+fn translate_qwen35_layer(gguf_name: &str) -> Option<GgufName> {
+    let rest = gguf_name.strip_prefix("blk.")?;
+    let (n_str, sub) = rest.split_once('.')?;
+    let layer: usize = n_str.parse().ok()?;
+    let la = |suffix: &str| format!("{HF_PREFIX}.layers.{layer}.linear_attn.{suffix}");
+
+    let hf = match sub {
+        // Second RMSNorm (both layer roles). GGUF names it `post_attention_norm`
+        // rather than the default translator's `ffn_norm`.
+        "post_attention_norm.weight" => {
+            format!("{HF_PREFIX}.layers.{layer}.post_attention_layernorm.weight")
+        }
+        // GDN / linear-attention (Gated DeltaNet) projections.
+        "attn_qkv.weight" => la("in_proj_qkv.weight"),
+        "attn_gate.weight" => la("in_proj_z.weight"),
+        "ssm_alpha.weight" => la("in_proj_a.weight"),
+        "ssm_beta.weight" => la("in_proj_b.weight"),
+        "ssm_conv1d.weight" => la("conv1d.weight"),
+        "ssm_norm.weight" => la("norm.weight"),
+        "ssm_out.weight" => la("out_proj.weight"),
+        // Bare (extension-less) SSM gate params — the loader keys A_log / dt_bias
+        // without a `.weight` / `.bias` suffix, and loads them as F32.
+        "ssm_a" => la("A_log"),
+        "ssm_dt.bias" => la("dt_bias"),
+        // Everything else (attn_norm, attn_q/k/v/output, attn_q/k_norm, ffn_*)
+        // is handled by the default translator.
+        _ => return None,
+    };
+    Some(GgufName::Direct(hf))
 }
 
 /// The default (llama/qwen2/qwen3/gemma-family) name translation.
@@ -285,6 +343,83 @@ mod tests {
         assert_eq!(translate("blk.0.something_new.weight", "llama"), None);
         assert_eq!(translate("blk.0.attn_q.scale", "llama"), None);
         assert_eq!(translate("garbage", "llama"), None);
+    }
+
+    #[test]
+    fn qwen35_gdn_and_norm_mappings() {
+        // Second RMSNorm renamed vs. the default `ffn_norm`.
+        assert_eq!(
+            translate("blk.0.post_attention_norm.weight", "qwen35"),
+            direct("model.layers.0.post_attention_layernorm.weight")
+        );
+        // GDN / linear-attention projections → `linear_attn.*`.
+        assert_eq!(
+            translate("blk.0.attn_qkv.weight", "qwen35"),
+            direct("model.layers.0.linear_attn.in_proj_qkv.weight")
+        );
+        assert_eq!(
+            translate("blk.0.attn_gate.weight", "qwen35"),
+            direct("model.layers.0.linear_attn.in_proj_z.weight")
+        );
+        assert_eq!(
+            translate("blk.2.ssm_alpha.weight", "qwen35"),
+            direct("model.layers.2.linear_attn.in_proj_a.weight")
+        );
+        assert_eq!(
+            translate("blk.2.ssm_beta.weight", "qwen35"),
+            direct("model.layers.2.linear_attn.in_proj_b.weight")
+        );
+        assert_eq!(
+            translate("blk.4.ssm_conv1d.weight", "qwen35"),
+            direct("model.layers.4.linear_attn.conv1d.weight")
+        );
+        assert_eq!(
+            translate("blk.4.ssm_norm.weight", "qwen35"),
+            direct("model.layers.4.linear_attn.norm.weight")
+        );
+        assert_eq!(
+            translate("blk.4.ssm_out.weight", "qwen35"),
+            direct("model.layers.4.linear_attn.out_proj.weight")
+        );
+        // Bare (extension-less) F32 gate params keyed without a suffix.
+        assert_eq!(
+            translate("blk.1.ssm_a", "qwen35"),
+            direct("model.layers.1.linear_attn.A_log")
+        );
+        assert_eq!(
+            translate("blk.1.ssm_dt.bias", "qwen35"),
+            direct("model.layers.1.linear_attn.dt_bias")
+        );
+    }
+
+    #[test]
+    fn qwen35_shared_names_fall_through_to_default() {
+        // Full-attention + FFN + norms shared with the default translator.
+        assert_eq!(
+            translate("blk.3.attn_q.weight", "qwen35"),
+            direct("model.layers.3.self_attn.q_proj.weight")
+        );
+        assert_eq!(
+            translate("blk.3.attn_output.weight", "qwen35"),
+            direct("model.layers.3.self_attn.o_proj.weight")
+        );
+        assert_eq!(
+            translate("blk.3.attn_q_norm.weight", "qwen35"),
+            direct("model.layers.3.self_attn.q_norm.weight")
+        );
+        assert_eq!(
+            translate("blk.0.attn_norm.weight", "qwen35"),
+            direct("model.layers.0.input_layernorm.weight")
+        );
+        assert_eq!(
+            translate("blk.0.ffn_down.weight", "qwen35"),
+            direct("model.layers.0.mlp.down_proj.weight")
+        );
+        assert_eq!(
+            translate("token_embd.weight", "qwen35"),
+            direct("model.embed_tokens.weight")
+        );
+        assert_eq!(translate("output.weight", "qwen35"), direct("lm_head.weight"));
     }
 
     #[test]
