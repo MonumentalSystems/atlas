@@ -66,8 +66,81 @@ fn arch_override(gguf_name: &str, arch: &str) -> Option<GgufName> {
         // `post_attention_norm`; everything else (attn_q/k/v/output, q/k norms,
         // ffn_*, top-level tensors) matches the default translation.
         "qwen35" | "qwen3_5" => translate_qwen35_layer(gguf_name),
+        // mmproj vision tower (`general.architecture = clip`,
+        // `clip.projector_type = qwen3vl_merger`). Names live in a disjoint
+        // namespace (`v.*` / `mm.*`) from the text backbone, so this never
+        // collides with the qwen35 text arm — the two GGUFs open separately.
+        "clip" => translate_clip(gguf_name),
         _ => None,
     }
+}
+
+/// HF prefix Atlas's Qwen3.6 ViT tower loads its tensors under. See
+/// `Qwen35WeightLoader::load_vision_encoder`, which probes
+/// `model.visual.patch_embed.proj.weight`. The mmproj GGUF path always produces
+/// the flat form, so we emit `model.visual.*`.
+const VISION_PREFIX: &str = "model.visual";
+
+/// Translate an mmproj (`general.architecture = clip`) tensor name to the
+/// `model.visual.*` HF name Atlas's Qwen3.6 vision encoder expects.
+///
+/// llama.cpp's `clip` writer (projector `qwen3vl_merger`) names the tower:
+///   * per-block  `v.blk.N.{attn_qkv,attn_out,ffn_up,ffn_down,ln1,ln2}.{w,b}`
+///   * patch conv `v.patch_embd.{weight,weight.1,bias}`
+///   * pos table  `v.position_embd.weight`
+///   * post-norm  `v.post_ln.{weight,bias}`      (→ the final merger's norm)
+///   * projector  `mm.0.{w,b}` (fc1), `mm.2.{w,b}` (fc2); `mm.1` = GELU, no tensor
+///
+/// The consumer (`Qwen35WeightLoader::load_vision_encoder`) reads:
+/// `blocks.N.{norm1,attn.qkv,attn.proj,norm2,mlp.linear_fc1,mlp.linear_fc2}`,
+/// `patch_embed.proj`, `pos_embed.weight`, and a single `merger.{norm,
+/// linear_fc1,linear_fc2}`.
+///
+/// NOTE — the patch-embed WEIGHT (`v.patch_embd.weight{,.1}`) is a temporal-split
+/// Conv3d that a 1:1 map cannot fuse; those frames are intercepted by the loader
+/// (`value_transform::vision_patch_frame` → `patch_embed_concat`) BEFORE this
+/// translator runs, so they are (correctly) left unmatched here. Only the
+/// patch-embed BIAS maps 1:1.
+fn translate_clip(gguf_name: &str) -> Option<GgufName> {
+    // ── Per-block: `v.blk.N.<stem>.<ext>` ──
+    if let Some(rest) = gguf_name.strip_prefix("v.blk.") {
+        let (n_str, sub) = rest.split_once('.')?;
+        let layer: usize = n_str.parse().ok()?;
+        let (stem, ext) = match sub.rsplit_once('.') {
+            Some((stem, ext @ ("weight" | "bias"))) => (stem, ext),
+            _ => return None,
+        };
+        let hf_sub = match stem {
+            "ln1" => "norm1",
+            "ln2" => "norm2",
+            "attn_qkv" => "attn.qkv",
+            "attn_out" => "attn.proj",
+            "ffn_up" => "mlp.linear_fc1",
+            "ffn_down" => "mlp.linear_fc2",
+            _ => return None,
+        };
+        return Some(GgufName::Direct(format!(
+            "{VISION_PREFIX}.blocks.{layer}.{hf_sub}.{ext}"
+        )));
+    }
+
+    // ── Top-level (non-block) tensors ──
+    let hf = match gguf_name {
+        // Projector MLP: mm.0 = fc1, mm.2 = fc2 (mm.1 is the GELU, no tensor).
+        "mm.0.weight" => format!("{VISION_PREFIX}.merger.linear_fc1.weight"),
+        "mm.0.bias" => format!("{VISION_PREFIX}.merger.linear_fc1.bias"),
+        "mm.2.weight" => format!("{VISION_PREFIX}.merger.linear_fc2.weight"),
+        "mm.2.bias" => format!("{VISION_PREFIX}.merger.linear_fc2.bias"),
+        // Post-encoder LayerNorm feeds the final merger → merger.norm.
+        "v.post_ln.weight" => format!("{VISION_PREFIX}.merger.norm.weight"),
+        "v.post_ln.bias" => format!("{VISION_PREFIX}.merger.norm.bias"),
+        // Learned absolute position table `[2304, 1152]` (interpolated/image).
+        "v.position_embd.weight" => format!("{VISION_PREFIX}.pos_embed.weight"),
+        // Patch-embed Conv3d bias maps 1:1 (the weight frames are loader-fused).
+        "v.patch_embd.bias" => format!("{VISION_PREFIX}.patch_embed.proj.bias"),
+        _ => return None,
+    };
+    Some(GgufName::Direct(hf))
 }
 
 /// Qwen3.5/3.6-specific per-layer name remaps. Returns `None` for names the
@@ -200,233 +273,4 @@ pub fn expert_name(layer: usize, proj: &str, e: usize) -> String {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn direct(name: &str) -> Option<GgufName> {
-        Some(GgufName::Direct(name.to_string()))
-    }
-
-    #[test]
-    fn top_level_tensors() {
-        assert_eq!(
-            translate("token_embd.weight", "llama"),
-            direct("model.embed_tokens.weight")
-        );
-        assert_eq!(
-            translate("output_norm.weight", "llama"),
-            direct("model.norm.weight")
-        );
-        assert_eq!(translate("output.weight", "llama"), direct("lm_head.weight"));
-        assert_eq!(translate("rope_freqs.weight", "llama"), Some(GgufName::Drop));
-    }
-
-    #[test]
-    fn attention_projections() {
-        assert_eq!(
-            translate("blk.0.attn_q.weight", "qwen3"),
-            direct("model.layers.0.self_attn.q_proj.weight")
-        );
-        assert_eq!(
-            translate("blk.7.attn_k.weight", "qwen3"),
-            direct("model.layers.7.self_attn.k_proj.weight")
-        );
-        assert_eq!(
-            translate("blk.7.attn_v.weight", "qwen3"),
-            direct("model.layers.7.self_attn.v_proj.weight")
-        );
-        assert_eq!(
-            translate("blk.7.attn_output.weight", "qwen3"),
-            direct("model.layers.7.self_attn.o_proj.weight")
-        );
-    }
-
-    #[test]
-    fn norms_and_mlp() {
-        assert_eq!(
-            translate("blk.3.attn_norm.weight", "llama"),
-            direct("model.layers.3.input_layernorm.weight")
-        );
-        assert_eq!(
-            translate("blk.3.ffn_norm.weight", "llama"),
-            direct("model.layers.3.post_attention_layernorm.weight")
-        );
-        assert_eq!(
-            translate("blk.3.ffn_gate.weight", "llama"),
-            direct("model.layers.3.mlp.gate_proj.weight")
-        );
-        assert_eq!(
-            translate("blk.3.ffn_up.weight", "llama"),
-            direct("model.layers.3.mlp.up_proj.weight")
-        );
-        assert_eq!(
-            translate("blk.3.ffn_down.weight", "llama"),
-            direct("model.layers.3.mlp.down_proj.weight")
-        );
-    }
-
-    #[test]
-    fn qwen3_qk_norms() {
-        assert_eq!(
-            translate("blk.11.attn_q_norm.weight", "qwen3"),
-            direct("model.layers.11.self_attn.q_norm.weight")
-        );
-        assert_eq!(
-            translate("blk.11.attn_k_norm.weight", "qwen3"),
-            direct("model.layers.11.self_attn.k_norm.weight")
-        );
-    }
-
-    #[test]
-    fn qwen2_qkv_biases() {
-        assert_eq!(
-            translate("blk.2.attn_q.bias", "qwen2"),
-            direct("model.layers.2.self_attn.q_proj.bias")
-        );
-        assert_eq!(
-            translate("blk.2.attn_k.bias", "qwen2"),
-            direct("model.layers.2.self_attn.k_proj.bias")
-        );
-        assert_eq!(
-            translate("blk.2.attn_v.bias", "qwen2"),
-            direct("model.layers.2.self_attn.v_proj.bias")
-        );
-    }
-
-    #[test]
-    fn moe_router_and_expert_stack() {
-        assert_eq!(
-            translate("blk.4.ffn_gate_inp.weight", "qwen3"),
-            direct("model.layers.4.mlp.gate.weight")
-        );
-        assert_eq!(
-            translate("blk.4.ffn_gate_exps.weight", "qwen3"),
-            Some(GgufName::ExpertStack { layer: 4, proj: "gate" })
-        );
-        assert_eq!(
-            translate("blk.4.ffn_up_exps.weight", "qwen3"),
-            Some(GgufName::ExpertStack { layer: 4, proj: "up" })
-        );
-        assert_eq!(
-            translate("blk.4.ffn_down_exps.weight", "qwen3"),
-            Some(GgufName::ExpertStack { layer: 4, proj: "down" })
-        );
-    }
-
-    #[test]
-    fn expert_name_expansion() {
-        assert_eq!(
-            expert_name(4, "gate", 17),
-            "model.layers.4.mlp.experts.17.gate_proj.weight"
-        );
-        assert_eq!(
-            expert_name(0, "down", 0),
-            "model.layers.0.mlp.experts.0.down_proj.weight"
-        );
-    }
-
-    #[test]
-    fn robust_layer_index_parsing() {
-        assert_eq!(
-            translate("blk.123.attn_q.weight", "llama"),
-            direct("model.layers.123.self_attn.q_proj.weight")
-        );
-        assert_eq!(
-            translate("blk.5.attn_q_norm.weight", "qwen3"),
-            direct("model.layers.5.self_attn.q_norm.weight")
-        );
-    }
-
-    #[test]
-    fn unrecognized_names_return_none() {
-        assert_eq!(translate("blk.x.attn_q.weight", "llama"), None);
-        assert_eq!(translate("blk.0.something_new.weight", "llama"), None);
-        assert_eq!(translate("blk.0.attn_q.scale", "llama"), None);
-        assert_eq!(translate("garbage", "llama"), None);
-    }
-
-    #[test]
-    fn qwen35_gdn_and_norm_mappings() {
-        // Second RMSNorm renamed vs. the default `ffn_norm`.
-        assert_eq!(
-            translate("blk.0.post_attention_norm.weight", "qwen35"),
-            direct("model.layers.0.post_attention_layernorm.weight")
-        );
-        // GDN / linear-attention projections → `linear_attn.*`.
-        assert_eq!(
-            translate("blk.0.attn_qkv.weight", "qwen35"),
-            direct("model.layers.0.linear_attn.in_proj_qkv.weight")
-        );
-        assert_eq!(
-            translate("blk.0.attn_gate.weight", "qwen35"),
-            direct("model.layers.0.linear_attn.in_proj_z.weight")
-        );
-        assert_eq!(
-            translate("blk.2.ssm_alpha.weight", "qwen35"),
-            direct("model.layers.2.linear_attn.in_proj_a.weight")
-        );
-        assert_eq!(
-            translate("blk.2.ssm_beta.weight", "qwen35"),
-            direct("model.layers.2.linear_attn.in_proj_b.weight")
-        );
-        assert_eq!(
-            translate("blk.4.ssm_conv1d.weight", "qwen35"),
-            direct("model.layers.4.linear_attn.conv1d.weight")
-        );
-        assert_eq!(
-            translate("blk.4.ssm_norm.weight", "qwen35"),
-            direct("model.layers.4.linear_attn.norm.weight")
-        );
-        assert_eq!(
-            translate("blk.4.ssm_out.weight", "qwen35"),
-            direct("model.layers.4.linear_attn.out_proj.weight")
-        );
-        // Bare (extension-less) F32 gate params keyed without a suffix.
-        assert_eq!(
-            translate("blk.1.ssm_a", "qwen35"),
-            direct("model.layers.1.linear_attn.A_log")
-        );
-        assert_eq!(
-            translate("blk.1.ssm_dt.bias", "qwen35"),
-            direct("model.layers.1.linear_attn.dt_bias")
-        );
-    }
-
-    #[test]
-    fn qwen35_shared_names_fall_through_to_default() {
-        // Full-attention + FFN + norms shared with the default translator.
-        assert_eq!(
-            translate("blk.3.attn_q.weight", "qwen35"),
-            direct("model.layers.3.self_attn.q_proj.weight")
-        );
-        assert_eq!(
-            translate("blk.3.attn_output.weight", "qwen35"),
-            direct("model.layers.3.self_attn.o_proj.weight")
-        );
-        assert_eq!(
-            translate("blk.3.attn_q_norm.weight", "qwen35"),
-            direct("model.layers.3.self_attn.q_norm.weight")
-        );
-        assert_eq!(
-            translate("blk.0.attn_norm.weight", "qwen35"),
-            direct("model.layers.0.input_layernorm.weight")
-        );
-        assert_eq!(
-            translate("blk.0.ffn_down.weight", "qwen35"),
-            direct("model.layers.0.mlp.down_proj.weight")
-        );
-        assert_eq!(
-            translate("token_embd.weight", "qwen35"),
-            direct("model.embed_tokens.weight")
-        );
-        assert_eq!(translate("output.weight", "qwen35"), direct("lm_head.weight"));
-    }
-
-    #[test]
-    fn unknown_arch_falls_through_to_default() {
-        assert_eq!(
-            translate("blk.0.attn_q.weight", "some_future_arch"),
-            direct("model.layers.0.self_attn.q_proj.weight")
-        );
-    }
-}
+mod tests;

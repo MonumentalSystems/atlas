@@ -279,6 +279,111 @@ fn reorder_out_cols(
     Ok(())
 }
 
+// ── Vision (mmproj / `general.architecture = "clip"`) transforms ──
+//
+// The Qwen3-VL ViT tensors already land in Atlas's expected HF layout under the
+// loader's normal GGUF→HF dim reversal: every `v.blk.*` projection (fused
+// `attn_qkv` [1152,3456]→[3456,1152], `attn_out`, `ffn_up`/`ffn_down`), every
+// LayerNorm + bias, `v.post_ln.*` (→ merger.norm — a plain BIASED LayerNorm, NO
+// +1 offset) and `v.position_embd.weight` [1152,2304]→[2304,1152] is a plain
+// copy. The ONE tensor needing custom shape work is the patch embedding:
+// llama.cpp splits Qwen3-VL's Conv3d (temporal_patch_size = 2) into TWO per-frame
+// Conv2d tensors that Atlas wants fused into a single
+// [out_ch, in_ch·T·patch·patch] linear weight.
+
+/// True if `arch` is a CLIP/mmproj vision tower (`general.architecture="clip"`).
+pub fn is_clip(arch: &str) -> bool {
+    arch == "clip"
+}
+
+/// The Atlas HF name the fused patch-embed weight is stored under (the name the
+/// vision consumer `Qwen35WeightLoader::load_vision_encoder` reads).
+pub const VISION_PATCH_EMBED_HF: &str = "model.visual.patch_embed.proj.weight";
+
+/// Patch-embed geometry, read from the mmproj `clip.vision.*` metadata.
+#[derive(Clone, Copy, Debug)]
+pub struct VisionPatchDims {
+    /// Output channels = ViT hidden (`clip.vision.embedding_length`, 1152).
+    pub out_ch: usize,
+    /// Input image channels (RGB → 3).
+    pub in_ch: usize,
+    /// Spatial patch side (`clip.vision.patch_size`, 16).
+    pub patch: usize,
+}
+
+impl VisionPatchDims {
+    /// Elements in one per-temporal-frame Conv2d row (`in_ch·patch·patch`).
+    fn frame_row(&self) -> usize {
+        self.in_ch * self.patch * self.patch
+    }
+}
+
+/// Read [`VisionPatchDims`] from mmproj metadata; `None` if keys are missing.
+pub fn vision_patch_dims(gguf: &GgufFile) -> Option<VisionPatchDims> {
+    let out_ch = gguf.get_u64("clip.vision.embedding_length")? as usize;
+    let patch = gguf.get_u64("clip.vision.patch_size")? as usize;
+    if out_ch == 0 || patch == 0 {
+        return None;
+    }
+    Some(VisionPatchDims {
+        out_ch,
+        in_ch: 3,
+        patch,
+    })
+}
+
+/// If `gguf_name` is a patch-embed temporal frame, return its frame index.
+/// llama.cpp names frame 0 `v.patch_embd.weight` and each later frame
+/// `v.patch_embd.weight.<n>` (`n` from 1). The trailing `.<n>` breaks the default
+/// `.weight`/`.bias` split, so this MUST be matched before the name translator.
+/// (`v.patch_embd.bias` returns `None` — it maps 1:1 through the name table.)
+pub fn vision_patch_frame(gguf_name: &str) -> Option<usize> {
+    let rest = gguf_name.strip_prefix("v.patch_embd.weight")?;
+    if rest.is_empty() {
+        return Some(0);
+    }
+    rest.strip_prefix('.').and_then(|n| n.parse::<usize>().ok())
+}
+
+/// Fuse the per-temporal-frame Conv2d patch-embed tensors into Atlas's
+/// `[out_ch, in_ch·T·patch·patch]` linear weight (row-major F32).
+///
+/// `frames[t]` is one dequantized `v.patch_embd.weight{,.1,…}`, row-major in the
+/// loader's reversed HF layout `[out_ch, in_ch, patch, patch]`. The output K axis
+/// is ordered `c·(T·P·P) + t·(P·P) + ky·P + kx` — IDENTICAL to the pixel channel
+/// order `vision_preprocess` writes (`off = c·(T·P·P)+t·(P·P)+py·P+px`), so the
+/// patch-embed GEMM lines up channel-for-channel with the uploaded pixels.
+///
+/// LAYOUT ASSUMPTION (validate numerically on GB10): `frames` are in temporal
+/// order — `v.patch_embd.weight` = t0, `v.patch_embd.weight.1` = t1. Swapping
+/// them scrambles every patch embedding.
+pub fn patch_embed_concat(frames: &[&[f32]], dims: &VisionPatchDims) -> Result<Vec<f32>> {
+    let temporal = frames.len();
+    ensure!(temporal > 0, "patch_embed_concat: no temporal frames");
+    let blk = dims.patch * dims.patch; // P·P copied per (o,c,t)
+    let frame_row = dims.frame_row(); // in_ch·P·P
+    let dst_row = dims.in_ch * temporal * blk; // in_ch·T·P·P (= 1536)
+    for (t, f) in frames.iter().enumerate() {
+        ensure!(
+            f.len() == dims.out_ch * frame_row,
+            "patch_embed_concat: frame {t} has {} elems, expected {}",
+            f.len(),
+            dims.out_ch * frame_row
+        );
+    }
+    let mut out = vec![0f32; dims.out_ch * dst_row];
+    for o in 0..dims.out_ch {
+        for c in 0..dims.in_ch {
+            for (t, frame) in frames.iter().enumerate() {
+                let src = o * frame_row + c * blk;
+                let dst = o * dst_row + c * (temporal * blk) + t * blk;
+                out[dst..dst + blk].copy_from_slice(&frame[src..src + blk]);
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// f32 → bf16 bits, round-to-nearest-even (NaN quieted).
 #[inline]
 fn f32_to_bf16(f: f32) -> u16 {
