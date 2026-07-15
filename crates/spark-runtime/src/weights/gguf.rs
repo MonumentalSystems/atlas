@@ -60,6 +60,16 @@ pub fn find_gguf(dir: &Path) -> Option<PathBuf> {
         .or_else(|| candidates.into_iter().next())
 }
 
+/// True when the native keep-packed Q2_0 decode path is enabled
+/// (`ATLAS_GGUF_NATIVE_Q2=1`). Off by default: the loader dequants every id-42
+/// tensor to BF16 exactly as before, so the default path is byte-identical.
+/// When on, the "big" transform-free FFN projections (see
+/// [`names::is_keep_packed_proj`]) are uploaded as raw `block_q2_0` blocks and
+/// tagged [`WeightDtype::PackedQ2_0`] for in-kernel dequant at decode.
+fn native_q2_enabled() -> bool {
+    std::env::var("ATLAS_GGUF_NATIVE_Q2").ok().as_deref() == Some("1")
+}
+
 /// The id-42 PrismML group size, from `ATLAS_GGUF_Q2_GROUP` (default 128).
 fn q2_group_usize() -> usize {
     match std::env::var("ATLAS_GGUF_Q2_GROUP").ok().as_deref() {
@@ -250,8 +260,14 @@ impl super::WeightLoader for GgufLoader {
         tracing::info!("Loading GGUF weights from {}", path.display());
 
         let force_cpu = std::env::var("ATLAS_GGUF_FORCE_CPU").ok().as_deref() == Some("1");
+        let native_q2 = native_q2_enabled();
         let q2_group = q2_group_usize();
         let q2_variant = q2_group_variant(q2_group);
+        if native_q2 {
+            tracing::info!(
+                "ATLAS_GGUF_NATIVE_Q2=1: keeping id-42 FFN projections packed (group {q2_group})"
+            );
+        }
 
         // ── Backbone (text model) ──
         let (bb_file, bb_mmap, bb_gguf) = sidecar::open_gguf(&path)?;
@@ -307,7 +323,7 @@ impl super::WeightLoader for GgufLoader {
 
         // Pass 1: backbone → weights.
         sidecar::load_pass(
-            self, gpu, &bb_gguf, &bb_mmap, &arch, gdn, force_cpu, q2_group, q2_variant,
+            self, gpu, &bb_gguf, &bb_mmap, &arch, gdn, force_cpu, native_q2, q2_group, q2_variant,
             &mut weights, &mut skipped,
         )?;
         drop(bb_gguf);
@@ -319,9 +335,11 @@ impl super::WeightLoader for GgufLoader {
         // No GDN transforms (gdn = None) and no expert fan-out for clip.
         if let (Some((mm_file, mm_mmap, mm_gguf)), Some(mm_arch)) = (mmproj, mmproj_arch) {
             let before = weights.len();
+            // mmproj is a `clip` tower — no qwen35 FFN names, so native_q2 is
+            // irrelevant there; pass false to keep it on the plain BF16 path.
             sidecar::load_pass(
-                self, gpu, &mm_gguf, &mm_mmap, &mm_arch, None, force_cpu, q2_group, q2_variant,
-                &mut weights, &mut skipped,
+                self, gpu, &mm_gguf, &mm_mmap, &mm_arch, None, force_cpu, false, q2_group,
+                q2_variant, &mut weights, &mut skipped,
             )?;
             tracing::info!(
                 "Merged {} mmproj tensors (arch '{}') into the weight store",

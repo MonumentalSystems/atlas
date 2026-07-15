@@ -167,6 +167,12 @@ impl Qwen3AttentionLayer {
             ),
         };
 
+        // Keep-packed Q2_0 (Tier-1c): transient-dequant to BF16 then dense GEMM.
+        // Highest priority — the NVFP4/FP8/dense fallbacks below read NULL here.
+        if let Some(q2) = weight_opt.and_then(|w| w.as_packed_q2()) {
+            return self.q2_prefill_gemm(ctx.gpu, q2, normed, out, n, stream);
+        }
+
         let use_t_pipelined =
             std::env::var("ATLAS_ATTN_PREFILL_T_PIPE").ok().as_deref() == Some("1");
         if ops::cutlass_nvfp4_attn_qkv_enabled(label)

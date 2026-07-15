@@ -35,6 +35,14 @@ impl Qwen3SsmLayer {
         } else {
             ctx.buffers.ssm_qkvz()
         };
+        // Tier-1c keep-packed Q2_0: transient-dequant the fused qkvz then dense
+        // GEMM. Bonsai is `sequential_qkvz`, so `proj_dst == deinterleaved` and
+        // no post-deinterleave is needed. Highest priority (all other weight
+        // slots are NULL on this path).
+        if self.qkvz_q2.is_some() {
+            self.qkvz_q2_prefill_gemm(ctx.gpu, normed, proj_dst, k, stream)?;
+            return Ok(());
+        }
         // Env override: ATLAS_GDN_BF16_WEIGHTS=1 forces the BF16 dense
         // GEMM path for QKVZ — bypassing both FP8 and NVFP4 weight-quant
         // paths. Tests whether weight-quantization noise on qkvz (esp.

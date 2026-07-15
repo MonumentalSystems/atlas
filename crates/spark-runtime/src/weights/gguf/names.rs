@@ -347,6 +347,39 @@ fn translate_layer_sub(layer: usize, sub: &str) -> Option<GgufName> {
     )))
 }
 
+/// True if a mapped HF tensor name is a "big" dense projection that the native
+/// keep-packed Q2_0 decode path (`ATLAS_GGUF_NATIVE_Q2=1`) can serve without
+/// dequantizing — i.e. its weight stays a raw `block_q2_0` buffer in VRAM.
+///
+/// Scoped for Tier-1 (decode) to the dense **FFN** projections only
+/// (`gate_proj` / `up_proj` / `down_proj`), the bulk of a dense checkpoint's
+/// weight. These have no load-time value transform and a matching consumer in
+/// `DenseFfnLayer` (native `q2_0_gemv`). Deliberately EXCLUDED for now:
+///   * attention `q/k/v/o_proj` and `lm_head` — keep-packable (transform-free)
+///     but their layer-side consumers are not yet wired; they stay on the
+///     BF16→NVFP4 path. Extending this filter requires adding those setters.
+///   * all GDN / linear-attention projections (`in_proj_*`, `out_proj`,
+///     `conv1d`, …) — these carry value-head REORDER transforms
+///     (`value_transform::needs` is true), and a column reorder splits Q2_0
+///     blocks, so they can never be kept packed. The caller ANDs this with
+///     `!value_transform::needs(hf)` as a belt-and-suspenders guard.
+///
+/// Pure + name-only, so it is unit-testable without a GPU or a real GGUF.
+pub fn is_keep_packed_proj(hf: &str) -> bool {
+    hf.ends_with(".mlp.gate_proj.weight")
+        || hf.ends_with(".mlp.up_proj.weight")
+        || hf.ends_with(".mlp.down_proj.weight")
+        // Tier-1c: FULL-ATTENTION q/k/v/o projections. These are standard
+        // attention (NO GDN value-head reorder — `value_transform::needs` is
+        // false for them), so they keep-pack DIRECTLY like the FFN. The GDN
+        // `linear_attn.in_proj_*` still need a packed row-permute and are
+        // handled by `value_transform::packed_reorder_rows`, NOT this filter.
+        || hf.ends_with(".self_attn.q_proj.weight")
+        || hf.ends_with(".self_attn.k_proj.weight")
+        || hf.ends_with(".self_attn.v_proj.weight")
+        || hf.ends_with(".self_attn.o_proj.weight")
+}
+
 /// Expand an [`GgufName::ExpertStack`] into the concrete per-expert HF name for
 /// expert `e`. The loader calls this while slicing the stacked tensor so the
 /// naming convention lives next to the translation table it mirrors.

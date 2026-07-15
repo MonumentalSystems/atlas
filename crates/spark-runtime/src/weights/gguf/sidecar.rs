@@ -101,6 +101,7 @@ pub fn load_pass(
     arch: &str,
     gdn: Option<value_transform::GdnDims>,
     force_cpu: bool,
+    native_q2: bool,
     q2_group: usize,
     q2_variant: container::Q2Group,
     weights: &mut HashMap<String, WeightTensor>,
@@ -151,6 +152,70 @@ pub fn load_pass(
 
         // GGUF dims are ggml-order; Atlas/HF shape is the reverse.
         let hf_shape: Vec<usize> = tensor.dims.iter().rev().copied().collect();
+
+        // ── Native keep-packed Q2_0 short-circuit ──
+        // When `ATLAS_GGUF_NATIVE_Q2=1`, upload the raw `block_q2_0` bytes for
+        // the big transform-free FFN projections UNCHANGED and tag them
+        // `PackedQ2_0` so the model's `q2_0_gemv` decode path dequants in-kernel
+        // (no BF16 expansion, no downstream NVFP4 requant). This is the whole
+        // memory win. Excludes GDN reorder tensors via `!value_transform::needs`
+        // (a column reorder would split blocks). Non-id-42 and non-FFN tensors,
+        // and the flag-off default, are untouched below.
+        if native_q2
+            && id == 42
+            && let names::GgufName::Direct(ref hf_name) = target
+            && names::is_keep_packed_proj(hf_name)
+            && !value_transform::needs(hf_name)
+        {
+            let ptr = gpu.alloc(raw.len())?;
+            gpu.copy_h2d(raw, ptr)?;
+            weights.insert(
+                hf_name.clone(),
+                WeightTensor {
+                    ptr,
+                    shape: hf_shape,
+                    dtype: WeightDtype::PackedQ2_0 {
+                        group: q2_group as u16,
+                    },
+                },
+            );
+            continue;
+        }
+
+        // ── Native keep-packed Q2_0 GDN row-permute short-circuit (Tier-1c) ──
+        // The big GDN input projections (`in_proj_qkv` V-region, `in_proj_z`)
+        // carry a value-head ROW reorder. Because that permutation moves whole
+        // `value_head_dim`-row block-runs and one row is an integer number of
+        // `block_q2_0` blocks, we can apply it directly to the PACKED bytes and
+        // keep the weight 2-bit (byte-exact vs dequant→reorder→requant). The
+        // within-row column reorder of `out_proj` is NOT handled here (stays on
+        // its NVFP4/BF16 path). Runs BEFORE the CPU-dequant `needs()` branch so
+        // these tensors never expand to BF16.
+        if native_q2
+            && id == 42
+            && let names::GgufName::Direct(ref hf_name) = target
+            && let Some(after_qk) = value_transform::packed_reorder_rows(hf_name)
+            && let Some(dims) = gdn
+        {
+            let block_bytes = 2 + q2_group / 4; // fp16 scale + group/4 code bytes
+            let permuted = value_transform::reorder_packed_rows(
+                raw, &hf_shape, &dims, after_qk, q2_group, block_bytes,
+            )
+            .with_context(|| format!("packed GDN row-permute {hf_name}"))?;
+            let ptr = gpu.alloc(permuted.len())?;
+            gpu.copy_h2d(&permuted, ptr)?;
+            weights.insert(
+                hf_name.clone(),
+                WeightTensor {
+                    ptr,
+                    shape: hf_shape,
+                    dtype: WeightDtype::PackedQ2_0 {
+                        group: q2_group as u16,
+                    },
+                },
+            );
+            continue;
+        }
 
         // For qwen35 tensors whose VALUES need fixing, dequant on the CPU and
         // rewrite the BF16 host bytes before upload; everything else (all clip
