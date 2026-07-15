@@ -43,6 +43,30 @@ pub fn q12_batched_scratch_bytes(n: usize, chunk_len: usize, top_k: usize, mrope
     moe + n * per_stream_meta + stage_meta + h_state_ptrs
 }
 
+/// Bytes for the native keep-packed Q2_0 prefill transient-dequant scratch: the
+/// LARGEST keep-packed projection `[N, K]` expanded to BF16 (2 bytes/elem). The
+/// prefill dequant writes `N*K` BF16 elements into this buffer, which is then
+/// consumed by the same-stream GEMM and reused by the next projection.
+///
+/// Every keep-packed projection has exactly one dimension equal to
+/// `hidden_size` (FFN gate/up `[inter, h]`, FFN down `[h, inter]`, attention
+/// q/k/v/o `[·, h]` or `[h, ·]`, fused GDN `in_proj_qkvz [qkvz, h]`), so
+/// `N*K = max_other_dim * hidden` — an EXACT bound, not an over-estimate, for
+/// the covered families (the k/v and gated-q terms are safe upper bounds).
+/// Independent of batch tokens (this dequants the WEIGHT, not activations).
+pub fn q2_dequant_scratch_bytes(config: &ModelConfig) -> usize {
+    let bf16 = 2;
+    let hd = config.head_dim;
+    let q_proj_mul = if config.attn_gated { 2 } else { 1 };
+    let max_n = config
+        .intermediate_size
+        .max(config.ssm_qkvz_size())
+        .max(config.mamba2_in_proj_size())
+        .max(config.num_attention_heads * q_proj_mul * hd)
+        .max(2 * config.num_key_value_heads * hd);
+    max_n * config.hidden_size * bf16
+}
+
 /// Byte sizes of each buffer, derived from ModelConfig.
 #[derive(Debug, Clone)]
 pub struct BufferSizes {
@@ -108,6 +132,13 @@ pub struct BufferSizes {
     pub fp8_act: usize,
     /// Per-128-block FP32 scales paired with `fp8_act` (one f32 per 128 elems).
     pub fp8_act_scale: usize,
+    /// Native keep-packed Q2_0 prefill transient-dequant scratch
+    /// (`ATLAS_GGUF_NATIVE_Q2=1`). ONE persistent BF16 `[N,K]` buffer sized to
+    /// the LARGEST keep-packed projection, REUSED for every per-projection
+    /// dequant so prefill stops doing a per-matmul cuMemAlloc +
+    /// cuStreamSynchronize + cuMemFree (the multi-second fixed cost behind the
+    /// 3.7 s / 28-token TTFT regression). 0 (→ NULL) unless the flag is set.
+    pub q2_dequant_scratch: usize,
 }
 
 impl BufferSizes {
@@ -271,6 +302,24 @@ impl BufferSizes {
             0
         };
 
+        // Native keep-packed Q2_0 prefill transient-dequant scratch (Tier-1,
+        // ATLAS_GGUF_NATIVE_Q2=1). ONE persistent BF16 `[N,K]` buffer sized to
+        // the LARGEST keep-packed projection, reused for every per-projection
+        // dequant so prefill stops doing a per-matmul cuMemAlloc +
+        // cuStreamSynchronize + cuMemFree (a multi-second FIXED cost — 3.7 s
+        // TTFT even on a 28-token prompt, independent of prompt length). The
+        // dequant kernel writes N*K BF16 elems into the front and the
+        // same-stream GEMM consumes them before the next projection dequants.
+        // Widest projection: fused GDN `in_proj_qkvz` [ssm_qkvz_size, hidden] or
+        // FFN gate/down [intermediate, hidden] (N*K is direction-independent).
+        // 0 (→ NULL) unless the flag is set, so non-Q2 models pay nothing.
+        let q2_dequant_scratch =
+            if std::env::var("ATLAS_GGUF_NATIVE_Q2").ok().as_deref() == Some("1") {
+                q2_dequant_scratch_bytes(config)
+            } else {
+                0
+            };
+
         // Dense-FFN activation-quant scratch, shared across all layers (SSOT).
         // Sized for the largest projection K = max(hidden, intermediate); the
         // dense_ffn prefill paths pass `h.max(inter)` to the requant kernels.
@@ -401,6 +450,7 @@ impl BufferSizes {
             ffn_act_scale,
             fp8_act,
             fp8_act_scale,
+            q2_dequant_scratch,
         }
     }
 
@@ -436,5 +486,6 @@ impl BufferSizes {
             + self.ffn_act_scale
             + self.fp8_act
             + self.fp8_act_scale
+            + self.q2_dequant_scratch
     }
 }

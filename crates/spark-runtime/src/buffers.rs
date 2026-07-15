@@ -10,7 +10,9 @@ use anyhow::Result;
 use atlas_core::config::ModelConfig;
 
 mod sizes;
-pub use sizes::{BufferSizes, Q12_SIZING_STREAMS, q12_batched_scratch_bytes};
+pub use sizes::{
+    BufferSizes, Q12_SIZING_STREAMS, q12_batched_scratch_bytes, q2_dequant_scratch_bytes,
+};
 
 /// Pre-allocated GPU buffers for a single forward pass.
 ///
@@ -96,6 +98,9 @@ pub struct BufferArena {
     fp8_act: DevicePtr,
     /// Persistent per-128-block FP32 scales paired with `fp8_act`.
     fp8_act_scale: DevicePtr,
+    /// Persistent BF16 transient-dequant scratch for native keep-packed Q2_0
+    /// prefill. Reused per projection — replaces a per-matmul alloc/sync/free.
+    q2_dequant_scratch: DevicePtr,
     /// Maximum batch tokens this arena was sized for.
     max_batch_tokens: usize,
     /// Sizes in bytes for each buffer (for debug/logging).
@@ -169,6 +174,12 @@ impl BufferArena {
         };
         let fp8_act = gpu.alloc(sizes.fp8_act)?;
         let fp8_act_scale = gpu.alloc(sizes.fp8_act_scale)?;
+        // Q2_0 prefill dequant scratch. 0 → NULL unless ATLAS_GGUF_NATIVE_Q2.
+        let q2_dequant_scratch = if sizes.q2_dequant_scratch > 0 {
+            gpu.alloc(sizes.q2_dequant_scratch)?
+        } else {
+            DevicePtr::NULL
+        };
 
         tracing::info!(
             "Buffer arena: {} tokens × {:.1} MB total (attn_out={:.1}MB, ssm_deint={:.1}MB, kv_lora_rank={})",
@@ -212,6 +223,7 @@ impl BufferArena {
             ffn_act_scale,
             fp8_act,
             fp8_act_scale,
+            q2_dequant_scratch,
             max_batch_tokens,
             sizes,
         })
@@ -322,6 +334,16 @@ impl BufferArena {
     /// Persistent per-128-block FP32 scales paired with `fp8_act`.
     pub fn fp8_act_scale(&self) -> DevicePtr {
         self.fp8_act_scale
+    }
+    /// Persistent BF16 transient-dequant scratch for native keep-packed Q2_0
+    /// prefill. Reused per projection: dequant into it, GEMM reads it (same
+    /// stream), no free. NULL unless `ATLAS_GGUF_NATIVE_Q2`.
+    pub fn q2_dequant_scratch(&self) -> DevicePtr {
+        self.q2_dequant_scratch
+    }
+    /// Allocated byte size of `q2_dequant_scratch` (debug bounds-check).
+    pub fn q2_dequant_scratch_bytes(&self) -> usize {
+        self.sizes.q2_dequant_scratch
     }
     pub fn splitk_workspace(&self) -> DevicePtr {
         self.splitk_workspace

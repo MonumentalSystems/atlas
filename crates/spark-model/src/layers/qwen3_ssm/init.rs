@@ -315,14 +315,18 @@ impl Qwen3SsmLayer {
     }
 
     /// Transient-dequant prefill GEMM for the packed qkvz: dequant the 2-bit
-    /// `[qkvz_size, h]` weight into a BF16 scratch, run `dense_gemm`
-    /// (`out[m, qkvz_size] = in[m, h] @ w^T`), free. Mirrors the FFN/attention
-    /// packed prefill. Errors if the dequant kernel is absent.
+    /// `[qkvz_size, h]` weight into the caller-provided PERSISTENT BF16 `scratch`
+    /// (the arena `q2_dequant_scratch`, sized to the largest packed projection),
+    /// run `dense_gemm` (`out[m, qkvz_size] = in[m, h] @ w^T`). Mirrors the
+    /// FFN/attention packed prefill — no per-matmul alloc/sync/free; the dequant
+    /// orders before the GEMM on the same `stream`. Errors if the dequant kernel
+    /// is absent.
     pub(crate) fn qkvz_q2_prefill_gemm(
         &self,
         gpu: &dyn GpuBackend,
         input: DevicePtr,
         out: DevicePtr,
+        scratch: DevicePtr,
         m: u32,
         stream: u64,
     ) -> Result<()> {
@@ -334,7 +338,6 @@ impl Qwen3SsmLayer {
             anyhow::bail!("dequant_q2_0_gn_to_bf16 kernel missing — packed-Q2 GDN prefill unavailable");
         }
         let (n, k) = (w.n, w.k);
-        let scratch = gpu.alloc((n as usize) * (k as usize) * 2)?; // BF16
         crate::layers::ops::dequant_q2_0_gn_to_bf16(
             gpu,
             self.dequant_q2_0_gn_k,
@@ -361,8 +364,6 @@ impl Qwen3SsmLayer {
         } else {
             crate::layers::ops::dense_gemm(gpu, self.dense_gemm_k, input, &dw, out, m, n, k, stream)?;
         }
-        gpu.synchronize(stream)?;
-        let _ = gpu.free(scratch);
         Ok(())
     }
 

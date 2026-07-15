@@ -1301,11 +1301,19 @@ impl DenseFfnLayer {
                 anyhow::bail!("packed-Q2 FFN prefill supports SiLU only (got {:?})", self.activation);
             }
             let tc = self.dense_gemm_tc_k.0 != 0;
-            // Dequant one packed-Q2 projection into a freshly-alloc'd BF16 scratch
-            // `[n, k]`, run the BF16 GEMM (A=`in` [m,k] → out [m,n]), free scratch.
+            // Dequant one packed-Q2 projection into the PERSISTENT arena BF16
+            // scratch `[n, k]`, run the BF16 GEMM (A=`in` [m,k] → out [m,n]). No
+            // per-matmul alloc/sync/free: the arena buffer is sized to the
+            // largest packed projection and reused. Gate → up → down run
+            // sequentially on `stream`, so each GEMM consumes the scratch before
+            // the next projection's dequant overwrites it (same-stream order).
+            let scratch = ctx.buffers.q2_dequant_scratch();
             let q2_gemm = |w: &PackedQ2Weight, input: DevicePtr, out: DevicePtr| -> Result<()> {
                 let (n, k) = (w.n, w.k);
-                let scratch = ctx.gpu.alloc((n as usize) * (k as usize) * 2)?; // BF16
+                debug_assert!(
+                    (n as usize) * (k as usize) * 2 <= ctx.buffers.q2_dequant_scratch_bytes(),
+                    "packed-Q2 FFN dequant scratch too small for [{n},{k}] BF16"
+                );
                 ops::dequant_q2_0_gn_to_bf16(
                     ctx.gpu,
                     self.dequant_q2_0_gn_k,
@@ -1322,10 +1330,6 @@ impl DenseFfnLayer {
                 } else {
                     ops::dense_gemm(ctx.gpu, self.dense_gemm_bf16_k, input, &dw, out, m, n, k, stream)?;
                 }
-                // GEMM consumed `scratch` on `stream`; sync before freeing so the
-                // transient BF16 buffer never outlives its single matmul.
-                ctx.gpu.synchronize(stream)?;
-                let _ = ctx.gpu.free(scratch);
                 Ok(())
             };
             q2_gemm(&q2w.gate_proj, input, gate_out)?;

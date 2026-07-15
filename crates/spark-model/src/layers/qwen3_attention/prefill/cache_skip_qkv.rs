@@ -170,7 +170,12 @@ impl Qwen3AttentionLayer {
         // Keep-packed Q2_0 (Tier-1c): transient-dequant to BF16 then dense GEMM.
         // Highest priority — the NVFP4/FP8/dense fallbacks below read NULL here.
         if let Some(q2) = weight_opt.and_then(|w| w.as_packed_q2()) {
-            return self.q2_prefill_gemm(ctx.gpu, q2, normed, out, n, stream);
+            let scratch = ctx.buffers.q2_dequant_scratch();
+            debug_assert!(
+                (q2.n as usize) * (q2.k as usize) * 2 <= ctx.buffers.q2_dequant_scratch_bytes(),
+                "packed-Q2 QKV dequant scratch too small"
+            );
+            return self.q2_prefill_gemm(ctx.gpu, q2, normed, out, scratch, n, stream);
         }
 
         let use_t_pipelined =
