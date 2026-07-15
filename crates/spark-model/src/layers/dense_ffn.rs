@@ -1111,14 +1111,53 @@ impl DenseFfnLayer {
         Ok(output)
     }
 
+    /// Packed-Q2 batched decode FFN for `m` concurrent rows (`m >= 2`). Mirrors
+    /// the single-token `forward` packed-Q2 arm — per-projection keep-packed
+    /// `q2_0_gemv_vec_batchm` (BF16 `[m,·]` activation × 2-bit weight, dequant in
+    /// the dot-product, no BF16/NVFP4 expansion), SiLU-mul between gate/up, then
+    /// down — but with `m` activation rows staged per weight read. This is the
+    /// correctness path for concurrent decode (C>=2): the NVFP4 `forward_k2/k3`
+    /// GEMVs read the NULL NVFP4 fallback weights, so packed-Q2 must route here.
+    /// The wrapper chunks internally for `m > 8`. SiLU only (Ternary-Bonsai is a
+    /// SwiGLU); output lands in `moe_output` as `[m, h]` row-major.
+    fn forward_km_q2(
+        &self,
+        q2w: &DenseFfnWeightsQ2,
+        input: DevicePtr,
+        ctx: &ForwardContext,
+        m: u32,
+        stream: u64,
+    ) -> Result<()> {
+        if self.q2_0_gemv_batchm_k.0 == 0 {
+            anyhow::bail!(
+                "q2_0_gemv_vec_batchm kernel missing in this target build — packed-Q2 \
+                 batched decode (ATLAS_GGUF_NATIVE_Q2, C>=2) is unavailable"
+            );
+        }
+        if self.activation != FfnActivation::SiLU {
+            anyhow::bail!("packed-Q2 FFN batched decode supports SiLU only (got {:?})", self.activation);
+        }
+        let inter = ctx.config.intermediate_size as u32;
+        let gate_out = ctx.buffers.expert_gate_out();
+        let up_out = ctx.buffers.expert_up_out();
+        let batchm = |w: &PackedQ2Weight, inp: DevicePtr, out: DevicePtr| -> Result<()> {
+            ops::q2_0_gemv_vec_batchm(ctx.gpu, self.q2_0_gemv_batchm_k, inp, w, out, m, stream)
+        };
+        batchm(&q2w.gate_proj, input, gate_out)?;
+        batchm(&q2w.up_proj, input, up_out)?;
+        ops::silu_mul(ctx.gpu, self.act_mul, gate_out, up_out, gate_out, m * inter, stream)?;
+        let output = ctx.buffers.moe_output();
+        batchm(&q2w.down_proj, gate_out, output)?;
+        Ok(())
+    }
+
     /// K=2 speculative: batched GEMV for 2 tokens.
     /// 3 launches: dual batch2 (gate+up) + silu_mul + batch2 (down).
     pub fn forward_k2(&self, input: DevicePtr, ctx: &ForwardContext, stream: u64) -> Result<()> {
-        // Packed-Q2 has NULL NVFP4 fallback weights; the batched spec-decode
-        // paths have no packed branch. Dense qwen35 has no MTP so this is never
-        // reached — bail defensively rather than launch a null-weight GEMV.
-        if self.q2_weights.is_some() {
-            anyhow::bail!("packed-Q2 FFN has no batched (forward_k2) path; decode-GEMV only");
+        // Packed-Q2: NVFP4 fallback weights are NULL, so the NVFP4 batch2 GEMVs
+        // below would fault. Route to the keep-packed batchm FFN (m=2).
+        if let Some(ref q2w) = self.q2_weights {
+            return self.forward_km_q2(q2w, input, ctx, 2, stream);
         }
         let h = ctx.config.hidden_size as u32;
         let inter = ctx.config.intermediate_size as u32;
@@ -1166,8 +1205,9 @@ impl DenseFfnLayer {
     /// K=3 speculative: batched GEMV for 3 tokens.
     /// 3 launches: dual batch3 (gate+up) + silu_mul + batch3 (down).
     pub fn forward_k3(&self, input: DevicePtr, ctx: &ForwardContext, stream: u64) -> Result<()> {
-        if self.q2_weights.is_some() {
-            anyhow::bail!("packed-Q2 FFN has no batched (forward_k3) path; decode-GEMV only");
+        // Packed-Q2: route to the keep-packed batchm FFN (m=3); NVFP4 weights null.
+        if let Some(ref q2w) = self.q2_weights {
+            return self.forward_km_q2(q2w, input, ctx, 3, stream);
         }
         let h = ctx.config.hidden_size as u32;
         let inter = ctx.config.intermediate_size as u32;
