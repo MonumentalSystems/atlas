@@ -334,3 +334,24 @@ fn clip_unrecognized_names_return_none() {
     // clip names never leak into the default (backbone) translation.
     assert_eq!(translate("v.blk.0.attn_qkv.weight", "llama"), None);
 }
+
+#[test]
+fn keep_packed_proj_scoped_to_dense_ffn() {
+    // The three FFN projections keep-pack (Tier-1 decode scope).
+    assert!(is_keep_packed_proj("model.layers.0.mlp.gate_proj.weight"));
+    assert!(is_keep_packed_proj("model.layers.31.mlp.up_proj.weight"));
+    assert!(is_keep_packed_proj("model.layers.7.mlp.down_proj.weight"));
+
+    // Deliberately NOT kept packed yet: attention q/k/v/o, lm_head, embeddings,
+    // norms, and every GDN/linear-attn projection (the last also excluded by
+    // value_transform::needs at the call site).
+    assert!(!is_keep_packed_proj("model.layers.0.self_attn.q_proj.weight"));
+    assert!(!is_keep_packed_proj("model.layers.0.self_attn.o_proj.weight"));
+    assert!(!is_keep_packed_proj("lm_head.weight"));
+    assert!(!is_keep_packed_proj("model.embed_tokens.weight"));
+    assert!(!is_keep_packed_proj("model.layers.0.input_layernorm.weight"));
+    assert!(!is_keep_packed_proj("model.layers.0.linear_attn.in_proj_qkv.weight"));
+    assert!(!is_keep_packed_proj("model.layers.0.linear_attn.out_proj.weight"));
+    // A bias must never match (only .weight projections are packed).
+    assert!(!is_keep_packed_proj("model.layers.0.mlp.gate_proj.bias"));
+}
