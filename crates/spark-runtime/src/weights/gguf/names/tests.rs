@@ -342,11 +342,16 @@ fn keep_packed_proj_scoped_to_dense_ffn() {
     assert!(is_keep_packed_proj("model.layers.31.mlp.up_proj.weight"));
     assert!(is_keep_packed_proj("model.layers.7.mlp.down_proj.weight"));
 
-    // Deliberately NOT kept packed yet: attention q/k/v/o, lm_head, embeddings,
-    // norms, and every GDN/linear-attn projection (the last also excluded by
-    // value_transform::needs at the call site).
-    assert!(!is_keep_packed_proj("model.layers.0.self_attn.q_proj.weight"));
-    assert!(!is_keep_packed_proj("model.layers.0.self_attn.o_proj.weight"));
+    // Tier-1c: FULL-ATTENTION q/k/v/o keep-pack DIRECTLY (transform-free).
+    assert!(is_keep_packed_proj("model.layers.0.self_attn.q_proj.weight"));
+    assert!(is_keep_packed_proj("model.layers.3.self_attn.k_proj.weight"));
+    assert!(is_keep_packed_proj("model.layers.3.self_attn.v_proj.weight"));
+    assert!(is_keep_packed_proj("model.layers.0.self_attn.o_proj.weight"));
+
+    // Deliberately NOT matched by this filter: lm_head, embeddings, norms, and
+    // the GDN/linear-attn projections. The GDN input projections keep-pack via
+    // `value_transform::packed_reorder_rows` (a packed row-permute), NOT here;
+    // `out_proj` (column reorder) stays on its NVFP4/BF16 path.
     assert!(!is_keep_packed_proj("lm_head.weight"));
     assert!(!is_keep_packed_proj("model.embed_tokens.weight"));
     assert!(!is_keep_packed_proj("model.layers.0.input_layernorm.weight"));

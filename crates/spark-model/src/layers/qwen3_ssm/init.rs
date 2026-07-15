@@ -34,6 +34,13 @@ impl Qwen3SsmLayer {
             out_proj_dense: None,
             qkvz_fp8w: None,
             out_proj_fp8w: None,
+            qkvz_q2: None,
+            q2_0_gemv_k: super::super::try_kernel(gpu, "q2_0_gemv_vec", "q2_0_gemv_vec"),
+            dequant_q2_0_gn_k: super::super::try_kernel(
+                gpu,
+                "dequant_gguf_bf16",
+                "dequant_q2_0_gn_to_bf16",
+            ),
             sequential_qkvz: false,
             rms_norm_residual_k: gpu.kernel("norm", "rms_norm_residual")?,
             gated_rms_norm_k: gpu.kernel("norm", "gated_rms_norm")?,
@@ -296,6 +303,67 @@ impl Qwen3SsmLayer {
         layer.qkvz_nvfp4_t = qkvz_nvfp4_t;
         layer.out_proj_nvfp4_t = out_proj_nvfp4_t;
         Ok(layer)
+    }
+
+    /// Install the Tier-1c keep-packed ternary Q2_0 fused `in_proj_qkvz`
+    /// (`ATLAS_GGUF_NATIVE_Q2`). Decode dispatches `q2_0_gemv_vec`; prefill
+    /// transient-dequants via [`Self::qkvz_q2_prefill_gemm`]. `out_proj` is
+    /// unaffected (stays NVFP4). Requires `sequential_qkvz` (Bonsai concats
+    /// [Q|K|V|Z] at load).
+    pub fn set_packed_q2_qkvz(&mut self, qkvz: crate::weight_map::PackedQ2Weight) {
+        self.qkvz_q2 = Some(qkvz);
+    }
+
+    /// Transient-dequant prefill GEMM for the packed qkvz: dequant the 2-bit
+    /// `[qkvz_size, h]` weight into a BF16 scratch, run `dense_gemm`
+    /// (`out[m, qkvz_size] = in[m, h] @ w^T`), free. Mirrors the FFN/attention
+    /// packed prefill. Errors if the dequant kernel is absent.
+    pub(crate) fn qkvz_q2_prefill_gemm(
+        &self,
+        gpu: &dyn GpuBackend,
+        input: DevicePtr,
+        out: DevicePtr,
+        m: u32,
+        stream: u64,
+    ) -> Result<()> {
+        let w = self
+            .qkvz_q2
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("qkvz_q2_prefill_gemm: no packed qkvz installed"))?;
+        if self.dequant_q2_0_gn_k.0 == 0 {
+            anyhow::bail!("dequant_q2_0_gn_to_bf16 kernel missing — packed-Q2 GDN prefill unavailable");
+        }
+        let (n, k) = (w.n, w.k);
+        let scratch = gpu.alloc((n as usize) * (k as usize) * 2)?; // BF16
+        crate::layers::ops::dequant_q2_0_gn_to_bf16(
+            gpu,
+            self.dequant_q2_0_gn_k,
+            w.weight,
+            scratch,
+            n,
+            k,
+            w.group as u32,
+            stream,
+        )?;
+        let dw = DenseWeight { weight: scratch };
+        if self.dense_gemm_pipelined_k.0 != 0 {
+            crate::layers::ops::dense_gemm_bf16_pipelined(
+                gpu,
+                self.dense_gemm_pipelined_k,
+                input,
+                &dw,
+                out,
+                m,
+                n,
+                k,
+                stream,
+            )?;
+        } else {
+            crate::layers::ops::dense_gemm(gpu, self.dense_gemm_k, input, &dw, out, m, n, k, stream)?;
+        }
+        gpu.synchronize(stream)?;
+        let _ = gpu.free(scratch);
+        Ok(())
     }
 
     /// Install native FP8 block-scaled weights for the decode GEMV path.

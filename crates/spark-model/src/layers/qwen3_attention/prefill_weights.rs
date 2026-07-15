@@ -114,6 +114,77 @@ impl Qwen3AttentionLayer {
         self.o_nvfp4_t = o_nvfp4_t;
     }
 
+    /// Install keep-packed ternary Q2_0 q/k/v/o weights (Tier-1c,
+    /// `ATLAS_GGUF_NATIVE_Q2=1`). Decode dispatches `q2_0_gemv_vec` (2-bit
+    /// resident, no NVFP4); prefill transient-dequants each to BF16 via
+    /// [`Self::q2_prefill_gemm`]. Replaces the NVFP4 decode weights (which are
+    /// NULL on this path — no NVFP4 was allocated).
+    pub fn set_packed_q2_weights(
+        &mut self,
+        q: crate::weight_map::PackedQ2Weight,
+        k: crate::weight_map::PackedQ2Weight,
+        v: crate::weight_map::PackedQ2Weight,
+        o: crate::weight_map::PackedQ2Weight,
+    ) {
+        self.q_weight = Some(QuantWeight::PackedQ2(q));
+        self.k_weight = Some(QuantWeight::PackedQ2(k));
+        self.v_weight = Some(QuantWeight::PackedQ2(v));
+        self.o_weight = Some(QuantWeight::PackedQ2(o));
+    }
+
+    /// Transient-dequant prefill GEMM for a keep-packed Q2_0 projection: dequant
+    /// the 2-bit weight `[n, k]` into a freshly-allocated BF16 scratch, run the
+    /// BF16 `dense_gemm` (`out[m,n] = in[m,k] @ w^T`), free the scratch. Mirrors
+    /// `DenseFfnLayer`'s FFN prefill — the resident weight stays 2-bit. Returns
+    /// an error if the dequant kernel is absent in this build.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn q2_prefill_gemm(
+        &self,
+        gpu: &dyn GpuBackend,
+        w: &crate::weight_map::PackedQ2Weight,
+        input: DevicePtr,
+        out: DevicePtr,
+        m: u32,
+        stream: u64,
+    ) -> Result<()> {
+        if self.dequant_q2_0_gn_k.0 == 0 {
+            anyhow::bail!(
+                "dequant_q2_0_gn_to_bf16 kernel missing — packed-Q2 attention prefill unavailable"
+            );
+        }
+        let (n, k) = (w.n, w.k);
+        let scratch = gpu.alloc((n as usize) * (k as usize) * 2)?; // BF16
+        crate::layers::ops::dequant_q2_0_gn_to_bf16(
+            gpu,
+            self.dequant_q2_0_gn_k,
+            w.weight,
+            scratch,
+            n,
+            k,
+            w.group as u32,
+            stream,
+        )?;
+        let dw = crate::weight_map::DenseWeight { weight: scratch };
+        if self.dense_gemm_pipelined_k.0 != 0 {
+            crate::layers::ops::dense_gemm_bf16_pipelined(
+                gpu,
+                self.dense_gemm_pipelined_k,
+                input,
+                &dw,
+                out,
+                m,
+                n,
+                k,
+                stream,
+            )?;
+        } else {
+            crate::layers::ops::dense_gemm(gpu, self.dense_gemm_k, input, &dw, out, m, n, k, stream)?;
+        }
+        gpu.synchronize(stream)?;
+        let _ = gpu.free(scratch);
+        Ok(())
+    }
+
     /// Set native FP8 checkpoint weights for the `w8a16_gemv` decode path.
     ///
     /// The block-scaled FP8 weights stored here (weight + per-128 `row_scale`)

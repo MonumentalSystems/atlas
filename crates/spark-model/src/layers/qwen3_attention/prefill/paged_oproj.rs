@@ -25,6 +25,11 @@ impl Qwen3AttentionLayer {
         stream: u64,
     ) -> Result<DevicePtr> {
         let o_out = ctx.buffers.norm_output();
+        // Keep-packed Q2_0 (Tier-1c): transient-dequant o_proj then dense GEMM.
+        if let Some(q2) = self.o_weight.as_ref().and_then(|w| w.as_packed_q2()) {
+            self.q2_prefill_gemm(ctx.gpu, q2, attn_out, o_out, n, stream)?;
+            return Ok(o_out);
+        }
         let force_w8a8 = ops::fp8_blockscaled_prefill_enabled();
         if ops::cutlass_nvfp4_attn_o_enabled()
             && let Some(ref nvfp4_t) = self.o_nvfp4_t

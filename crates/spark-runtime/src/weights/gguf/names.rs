@@ -287,6 +287,15 @@ pub fn is_keep_packed_proj(hf: &str) -> bool {
     hf.ends_with(".mlp.gate_proj.weight")
         || hf.ends_with(".mlp.up_proj.weight")
         || hf.ends_with(".mlp.down_proj.weight")
+        // Tier-1c: FULL-ATTENTION q/k/v/o projections. These are standard
+        // attention (NO GDN value-head reorder — `value_transform::needs` is
+        // false for them), so they keep-pack DIRECTLY like the FFN. The GDN
+        // `linear_attn.in_proj_*` still need a packed row-permute and are
+        // handled by `value_transform::packed_reorder_rows`, NOT this filter.
+        || hf.ends_with(".self_attn.q_proj.weight")
+        || hf.ends_with(".self_attn.k_proj.weight")
+        || hf.ends_with(".self_attn.v_proj.weight")
+        || hf.ends_with(".self_attn.o_proj.weight")
 }
 
 /// Expand an [`GgufName::ExpertStack`] into the concrete per-expert HF name for

@@ -129,6 +129,13 @@ impl Qwen3AttentionLayer {
             ),
         };
 
+        // Keep-packed Q2_0 (Tier-1c): transient-dequant to BF16 then dense GEMM.
+        // Highest priority — the NVFP4/FP8/dense fallbacks below all read NULL
+        // pointers on this path.
+        if let Some(q2) = weight_opt.and_then(|w| w.as_packed_q2()) {
+            return self.q2_prefill_gemm(ctx.gpu, q2, normed, out, n, stream);
+        }
+
         let force_w8a8 = ops::fp8_blockscaled_prefill_enabled();
         // W8A8 + FP32 epilogue: requires NON-transposed FP8 weights with
         // block scales (matches the kernel signature). The attn layer stores

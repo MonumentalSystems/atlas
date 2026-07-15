@@ -294,3 +294,74 @@ fn patch_embed_concat_rejects_wrong_frame_len() {
     let bad = vec![0.0f32; 7];
     assert!(super::patch_embed_concat(&[&good, &bad], &dims).is_err());
 }
+
+#[test]
+fn packed_reorder_rows_moves_whole_blocks_like_reorder_rows() {
+    // Small GDN geometry: 2 k-heads, 6 v-heads (num_v_per_k=3), hd=4 rows/head.
+    // K=8, group=4 → 2 blocks/row; block_bytes=6 → row_bytes=12.
+    let d = GdnDims {
+        num_k_heads: 2,
+        num_v_heads: 6,
+        value_head_dim: 4,
+        key_head_dim: 4,
+    };
+    let (group, block_bytes) = (4usize, 6usize);
+    let k = 8usize;
+    let qk_rows = d.qk_rows(); // 2*4*2 = 16
+    let v_rows = d.num_v_heads * d.value_head_dim; // 24
+    let n = qk_rows + v_rows; // 40
+    let row_bytes = (k / group) * block_bytes; // 12
+    // Tag every byte of row r with value r (mod 256) so we can trace movement.
+    let raw: Vec<u8> = (0..n)
+        .flat_map(|r| std::iter::repeat(r as u8).take(row_bytes))
+        .collect();
+    let shape = [n, k];
+    let out = super::reorder_packed_rows(&raw, &shape, &d, true, group, block_bytes).unwrap();
+
+    // Q|K region (rows 0..qk_rows) is untouched.
+    for r in 0..qk_rows {
+        for b in 0..row_bytes {
+            assert_eq!(out[r * row_bytes + b], r as u8, "Q|K row {r} moved");
+        }
+    }
+    // V region: HF value-head hf gathers GGUF head gguf_head(hf); within a head
+    // the 4 rows keep order. Reference: expected source row for dest row.
+    for hf in 0..d.num_v_heads {
+        let g = d.gguf_head(hf);
+        for j in 0..d.value_head_dim {
+            let dst = qk_rows + hf * d.value_head_dim + j;
+            let src = qk_rows + g * d.value_head_dim + j;
+            for b in 0..row_bytes {
+                assert_eq!(
+                    out[dst * row_bytes + b], src as u8,
+                    "V dest row {dst} should come from src {src}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn packed_reorder_rows_classifier() {
+    assert_eq!(
+        super::packed_reorder_rows("model.layers.0.linear_attn.in_proj_qkv.weight"),
+        Some(true)
+    );
+    assert_eq!(
+        super::packed_reorder_rows("model.layers.0.linear_attn.in_proj_z.weight"),
+        Some(false)
+    );
+    // Single-row reorders and column reorders are NOT packed-reorderable.
+    assert_eq!(
+        super::packed_reorder_rows("model.layers.0.linear_attn.in_proj_a.weight"),
+        None
+    );
+    assert_eq!(
+        super::packed_reorder_rows("model.layers.0.linear_attn.out_proj.weight"),
+        None
+    );
+    assert_eq!(
+        super::packed_reorder_rows("model.layers.0.self_attn.q_proj.weight"),
+        None
+    );
+}
