@@ -101,6 +101,10 @@ pub struct BufferArena {
     /// Persistent BF16 transient-dequant scratch for native keep-packed Q2_0
     /// prefill. Reused per projection — replaces a per-matmul alloc/sync/free.
     q2_dequant_scratch: DevicePtr,
+    /// Persistent q8_1_mmq activation scratch for native Q2_0 MMQ prefill
+    /// (`ATLAS_GGUF_NATIVE_Q2_MMQ`). Shared by every kept-packed projection;
+    /// each seam quantizes its activation here then runs the packed MMQ GEMM.
+    q2_act_q8: DevicePtr,
     /// Maximum batch tokens this arena was sized for.
     max_batch_tokens: usize,
     /// Sizes in bytes for each buffer (for debug/logging).
@@ -180,6 +184,12 @@ impl BufferArena {
         } else {
             DevicePtr::NULL
         };
+        // Q2_0 MMQ prefill q8_1 activation scratch. 0 → NULL unless ATLAS_GGUF_NATIVE_Q2_MMQ.
+        let q2_act_q8 = if sizes.q2_act_q8 > 0 {
+            gpu.alloc(sizes.q2_act_q8)?
+        } else {
+            DevicePtr::NULL
+        };
 
         tracing::info!(
             "Buffer arena: {} tokens × {:.1} MB total (attn_out={:.1}MB, ssm_deint={:.1}MB, kv_lora_rank={})",
@@ -224,6 +234,7 @@ impl BufferArena {
             fp8_act,
             fp8_act_scale,
             q2_dequant_scratch,
+            q2_act_q8,
             max_batch_tokens,
             sizes,
         })
@@ -344,6 +355,15 @@ impl BufferArena {
     /// Allocated byte size of `q2_dequant_scratch` (debug bounds-check).
     pub fn q2_dequant_scratch_bytes(&self) -> usize {
         self.sizes.q2_dequant_scratch
+    }
+    /// q8_1_mmq activation scratch for native Q2_0 MMQ prefill. NULL unless
+    /// `ATLAS_GGUF_NATIVE_Q2_MMQ`.
+    pub fn q2_act_q8(&self) -> DevicePtr {
+        self.q2_act_q8
+    }
+    /// Allocated byte size of `q2_act_q8` (debug bounds-check).
+    pub fn q2_act_q8_bytes(&self) -> usize {
+        self.sizes.q2_act_q8
     }
     pub fn splitk_workspace(&self) -> DevicePtr {
         self.splitk_workspace

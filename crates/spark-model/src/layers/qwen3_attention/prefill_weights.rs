@@ -149,15 +149,48 @@ impl Qwen3AttentionLayer {
         input: DevicePtr,
         out: DevicePtr,
         scratch: DevicePtr,
+        act_q8: DevicePtr,
         m: u32,
         stream: u64,
     ) -> Result<()> {
+        let (n, k) = (w.n, w.k);
+
+        // Tier-2 native MMQ (ATLAS_GGUF_NATIVE_Q2_MMQ=1): quantize `input` to q8_1
+        // then run the packed 2-bit MMQ GEMM — no BF16 weight dequant, no shared
+        // `q2_dequant_scratch` race. Group-128 only (else fall through).
+        if self.q2_0_mmq_nc_k.0 != 0
+            && self.q4k_quant_act_k.0 != 0
+            && crate::layers::ops::native_q2_mmq_enabled()
+            && w.group == 128
+        {
+            crate::layers::ops::quantize_act_q8_1(
+                gpu,
+                self.q4k_quant_act_k,
+                input,
+                act_q8,
+                m,
+                k,
+                stream,
+            )?;
+            return crate::layers::ops::q2_0_mmq_gemm(
+                gpu,
+                self.q2_0_mmq_nc_k,
+                self.q2_0_mmq_wc_k,
+                act_q8,
+                w.weight,
+                out,
+                m,
+                n,
+                k,
+                stream,
+            );
+        }
+
         if self.dequant_q2_0_gn_k.0 == 0 {
             anyhow::bail!(
                 "dequant_q2_0_gn_to_bf16 kernel missing — packed-Q2 attention prefill unavailable"
             );
         }
-        let (n, k) = (w.n, w.k);
         crate::layers::ops::dequant_q2_0_gn_to_bf16(
             gpu,
             self.dequant_q2_0_gn_k,

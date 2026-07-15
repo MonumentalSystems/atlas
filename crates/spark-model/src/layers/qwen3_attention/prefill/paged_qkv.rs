@@ -138,7 +138,8 @@ impl Qwen3AttentionLayer {
                 (q2.n as usize) * (q2.k as usize) * 2 <= ctx.buffers.q2_dequant_scratch_bytes(),
                 "packed-Q2 QKV dequant scratch too small"
             );
-            return self.q2_prefill_gemm(ctx.gpu, q2, normed, out, scratch, n, stream);
+            let act_q8 = ctx.buffers.q2_act_q8();
+            return self.q2_prefill_gemm(ctx.gpu, q2, normed, out, scratch, act_q8, n, stream);
         }
 
         let force_w8a8 = ops::fp8_blockscaled_prefill_enabled();

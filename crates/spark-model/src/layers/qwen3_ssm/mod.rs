@@ -58,6 +58,13 @@ pub struct Qwen3SsmLayer {
     q2_0_gemv_k: KernelHandle,
     /// Load-time packed-Q2 → BF16 dequant for the transient-dequant qkvz prefill.
     dequant_q2_0_gn_k: KernelHandle,
+    /// Native Q2_0 MMQ prefill (Tier-2, `ATLAS_GGUF_NATIVE_Q2_MMQ`): keep-packed
+    /// tensor-core int8 MMA for the fused qkvz projection vs a shared q8_1
+    /// activation. `KernelHandle(0)` → transient-dequant fallback. The q8_1
+    /// activation quantizer is shared with Q4_K (`q4k_quant_act_k`).
+    q2_0_mmq_nc_k: KernelHandle,
+    q2_0_mmq_wc_k: KernelHandle,
+    q4k_quant_act_k: KernelHandle,
     /// When true, QKVZ projection output is already sequential [Q|K|V|Z].
     /// Skips the deinterleave kernel (used by Qwen3.5 where QKV+Z are
     /// concatenated at load time rather than interleaved per-group).

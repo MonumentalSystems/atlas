@@ -41,7 +41,8 @@ impl Qwen3SsmLayer {
         // slots are NULL on this path).
         if self.qkvz_q2.is_some() {
             let scratch = ctx.buffers.q2_dequant_scratch();
-            self.qkvz_q2_prefill_gemm(ctx.gpu, normed, proj_dst, scratch, k, stream)?;
+            let act_q8 = ctx.buffers.q2_act_q8();
+            self.qkvz_q2_prefill_gemm(ctx.gpu, normed, proj_dst, scratch, act_q8, k, stream)?;
             return Ok(());
         }
         // Env override: ATLAS_GDN_BF16_WEIGHTS=1 forces the BF16 dense

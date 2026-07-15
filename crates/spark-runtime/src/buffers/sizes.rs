@@ -139,6 +139,15 @@ pub struct BufferSizes {
     /// cuStreamSynchronize + cuMemFree (the multi-second fixed cost behind the
     /// 3.7 s / 28-token TTFT regression). 0 (→ NULL) unless the flag is set.
     pub q2_dequant_scratch: usize,
+    /// Native Q2_0 MMQ prefill q8_1 activation scratch (`ATLAS_GGUF_NATIVE_Q2_MMQ=1`).
+    /// ONE persistent q8_1_mmq buffer (`m*kpad*4 + 1MB`) shared by every kept-packed
+    /// projection (FFN gate/up/down, attn q/k/v/o, GDN qkvz): each seam quantizes
+    /// its BF16 activation into this buffer then runs the packed MMQ GEMM — so the
+    /// 2-bit weight is never dequantized to a BF16 scratch (kills the ~2s dequant
+    /// tax AND the shared-`q2_dequant_scratch` co-dispatch race). Sized to the
+    /// widest projection K = max(hidden, intermediate, q_heads*head_dim).
+    /// 0 (→ NULL) unless the MMQ sub-flag is set.
+    pub q2_act_q8: usize,
 }
 
 impl BufferSizes {
@@ -320,6 +329,21 @@ impl BufferSizes {
                 0
             };
 
+        // Native Q2_0 MMQ prefill q8_1 activation scratch (ATLAS_GGUF_NATIVE_Q2_MMQ=1).
+        // Widest projection INPUT dim K: FFN gate/up (h) or down (intermediate),
+        // attn qkv (h) or o (q_heads*head_dim), GDN qkvz (h). q8_1_mmq is 4 bytes/
+        // elem over kpad (K rounded to 256), + 1MB margin — matches q8_1_scratch_bytes.
+        let q2_act_q8 =
+            if std::env::var("ATLAS_GGUF_NATIVE_Q2_MMQ").ok().as_deref() == Some("1") {
+                let kmax = h
+                    .max(config.intermediate_size)
+                    .max(config.num_attention_heads * hd);
+                let kpad = kmax.div_ceil(256) * 256;
+                m * kpad * 4 + (1 << 20)
+            } else {
+                0
+            };
+
         // Dense-FFN activation-quant scratch, shared across all layers (SSOT).
         // Sized for the largest projection K = max(hidden, intermediate); the
         // dense_ffn prefill paths pass `h.max(inter)` to the requant kernels.
@@ -451,6 +475,7 @@ impl BufferSizes {
             fp8_act,
             fp8_act_scale,
             q2_dequant_scratch,
+            q2_act_q8,
         }
     }
 
@@ -487,5 +512,6 @@ impl BufferSizes {
             + self.fp8_act
             + self.fp8_act_scale
             + self.q2_dequant_scratch
+            + self.q2_act_q8
     }
 }
