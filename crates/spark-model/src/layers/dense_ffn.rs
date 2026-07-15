@@ -253,6 +253,13 @@ pub struct DenseFfnLayer {
     // buffer, run the normal BF16 GEMM, free the scratch — the resident weight
     // stays 2-bit. Decode uses the native `q2_0_gemv` (no dequant). Tier-1 path.
     dequant_q2_0_gn_k: KernelHandle,
+    // Native Q2_0 MMQ prefill (Tier-2, `ATLAS_GGUF_NATIVE_Q2_MMQ=1`): keeps the
+    // 2-bit weight packed and runs a tensor-core int8 MMA (dequant-in-register)
+    // against a q8_1 activation — no BF16 weight scratch, no dequant tax, no race.
+    // The q8_1 activation quantizer is SHARED with Q4_K (`q4k_quant_act_k`).
+    // KernelHandle(0) when absent → falls back to the transient-dequant path.
+    q2_0_mmq_nc_k: KernelHandle,
+    q2_0_mmq_wc_k: KernelHandle,
 }
 
 impl DenseFfnLayer {
@@ -365,6 +372,8 @@ impl DenseFfnLayer {
                 "dequant_gguf_bf16",
                 "dequant_q2_0_gn_to_bf16",
             ),
+            q2_0_mmq_nc_k: super::try_kernel(gpu, "q2_0_mmq", "atlas_q2_0_mmq128_nc"),
+            q2_0_mmq_wc_k: super::try_kernel(gpu, "q2_0_mmq", "atlas_q2_0_mmq128_wc"),
         };
         Ok(layer)
     }
@@ -1314,21 +1323,76 @@ impl DenseFfnLayer {
         // per-matmul scratch is BF16 — the WeightStore blocks stay 2-bit. Decode
         // still uses the native `q2_0_gemv` (no dequant). SiLU only.
         if let Some(ref q2w) = self.q2_weights {
+            if self.activation != FfnActivation::SiLU {
+                anyhow::bail!("packed-Q2 FFN prefill supports SiLU only (got {:?})", self.activation);
+            }
+
+            // Tier-2 native MMQ prefill (ATLAS_GGUF_NATIVE_Q2_MMQ=1): quantize the
+            // activation to q8_1 ONCE per projection-input (gate/up share `input`;
+            // down re-quantizes `gate_out`), then run the packed 2-bit MMQ GEMM —
+            // no BF16 weight dequant, no shared `q2_dequant_scratch`. Requires the
+            // MMQ kernel + the shared q8_1 quantizer + group-128 weights.
+            let q2_mmq = self.q2_0_mmq_nc_k.0 != 0
+                && self.q4k_quant_act_k.0 != 0
+                && ops::native_q2_mmq_enabled()
+                && q2w.gate_proj.group == 128
+                && q2w.up_proj.group == 128
+                && q2w.down_proj.group == 128;
+            if q2_mmq {
+                static Q2MMQ_LOG: std::sync::Once = std::sync::Once::new();
+                Q2MMQ_LOG.call_once(|| {
+                    eprintln!(
+                        "[atlas] ATLAS_GGUF_NATIVE_Q2_MMQ=1: dense-FFN prefill via native packed Q2_0 MMQ (W2A8, keep-packed)"
+                    );
+                });
+                let a_q8 = ctx.buffers.q2_act_q8();
+                let mmq = |w: &PackedQ2Weight, out: DevicePtr| -> Result<()> {
+                    ops::q2_0_mmq_gemm(
+                        ctx.gpu,
+                        self.q2_0_mmq_nc_k,
+                        self.q2_0_mmq_wc_k,
+                        a_q8,
+                        w.weight,
+                        out,
+                        m,
+                        w.n,
+                        w.k,
+                        stream,
+                    )
+                };
+                // gate/up: quantize `input` [m,h] once, feed both.
+                ops::quantize_act_q8_1(ctx.gpu, self.q4k_quant_act_k, input, a_q8, m, h, stream)?;
+                mmq(&q2w.gate_proj, gate_out)?;
+                mmq(&q2w.up_proj, up_out)?;
+                ops::silu_mul(ctx.gpu, self.act_mul, gate_out, up_out, gate_out, m * inter, stream)?;
+                // down: quantize `gate_out` [m,inter] (same-stream after silu_mul).
+                let output = ctx.buffers.moe_output();
+                ops::quantize_act_q8_1(ctx.gpu, self.q4k_quant_act_k, gate_out, a_q8, m, inter, stream)?;
+                mmq(&q2w.down_proj, output)?;
+                return Ok(());
+            }
+
+            // Transient-dequant stopgap (Tier-1): requires the load-time dequant kernel.
             if self.dequant_q2_0_gn_k.0 == 0 {
                 anyhow::bail!(
                     "dequant_q2_0_gn_to_bf16 kernel missing in this target build — \
                      packed-Q2 (ATLAS_GGUF_NATIVE_Q2) prefill is unavailable"
                 );
             }
-            if self.activation != FfnActivation::SiLU {
-                anyhow::bail!("packed-Q2 FFN prefill supports SiLU only (got {:?})", self.activation);
-            }
             let tc = self.dense_gemm_tc_k.0 != 0;
-            // Dequant one packed-Q2 projection into a freshly-alloc'd BF16 scratch
-            // `[n, k]`, run the BF16 GEMM (A=`in` [m,k] → out [m,n]), free scratch.
+            // Dequant one packed-Q2 projection into the PERSISTENT arena BF16
+            // scratch `[n, k]`, run the BF16 GEMM (A=`in` [m,k] → out [m,n]). No
+            // per-matmul alloc/sync/free: the arena buffer is sized to the
+            // largest packed projection and reused. Gate → up → down run
+            // sequentially on `stream`, so each GEMM consumes the scratch before
+            // the next projection's dequant overwrites it (same-stream order).
+            let scratch = ctx.buffers.q2_dequant_scratch();
             let q2_gemm = |w: &PackedQ2Weight, input: DevicePtr, out: DevicePtr| -> Result<()> {
                 let (n, k) = (w.n, w.k);
-                let scratch = ctx.gpu.alloc((n as usize) * (k as usize) * 2)?; // BF16
+                debug_assert!(
+                    (n as usize) * (k as usize) * 2 <= ctx.buffers.q2_dequant_scratch_bytes(),
+                    "packed-Q2 FFN dequant scratch too small for [{n},{k}] BF16"
+                );
                 ops::dequant_q2_0_gn_to_bf16(
                     ctx.gpu,
                     self.dequant_q2_0_gn_k,
@@ -1345,10 +1409,6 @@ impl DenseFfnLayer {
                 } else {
                     ops::dense_gemm(ctx.gpu, self.dense_gemm_bf16_k, input, &dw, out, m, n, k, stream)?;
                 }
-                // GEMM consumed `scratch` on `stream`; sync before freeing so the
-                // transient BF16 buffer never outlives its single matmul.
-                ctx.gpu.synchronize(stream)?;
-                let _ = ctx.gpu.free(scratch);
                 Ok(())
             };
             q2_gemm(&q2w.gate_proj, input, gate_out)?;

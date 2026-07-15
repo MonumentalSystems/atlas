@@ -133,10 +133,14 @@ impl Qwen3AttentionLayer {
     }
 
     /// Transient-dequant prefill GEMM for a keep-packed Q2_0 projection: dequant
-    /// the 2-bit weight `[n, k]` into a freshly-allocated BF16 scratch, run the
-    /// BF16 `dense_gemm` (`out[m,n] = in[m,k] @ w^T`), free the scratch. Mirrors
-    /// `DenseFfnLayer`'s FFN prefill — the resident weight stays 2-bit. Returns
-    /// an error if the dequant kernel is absent in this build.
+    /// the 2-bit weight `[n, k]` into the caller-provided PERSISTENT BF16
+    /// `scratch` (the arena `q2_dequant_scratch`, sized to the largest packed
+    /// projection), run the BF16 `dense_gemm` (`out[m,n] = in[m,k] @ w^T`).
+    /// Mirrors `DenseFfnLayer`'s FFN prefill — the resident weight stays 2-bit.
+    /// No per-matmul alloc/sync/free: the dequant is ordered before the GEMM on
+    /// the same `stream`, and consecutive projections reuse `scratch` because
+    /// each GEMM consumes it before the next dequant overwrites it. Returns an
+    /// error if the dequant kernel is absent in this build.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn q2_prefill_gemm(
         &self,
@@ -144,16 +148,49 @@ impl Qwen3AttentionLayer {
         w: &crate::weight_map::PackedQ2Weight,
         input: DevicePtr,
         out: DevicePtr,
+        scratch: DevicePtr,
+        act_q8: DevicePtr,
         m: u32,
         stream: u64,
     ) -> Result<()> {
+        let (n, k) = (w.n, w.k);
+
+        // Tier-2 native MMQ (ATLAS_GGUF_NATIVE_Q2_MMQ=1): quantize `input` to q8_1
+        // then run the packed 2-bit MMQ GEMM — no BF16 weight dequant, no shared
+        // `q2_dequant_scratch` race. Group-128 only (else fall through).
+        if self.q2_0_mmq_nc_k.0 != 0
+            && self.q4k_quant_act_k.0 != 0
+            && crate::layers::ops::native_q2_mmq_enabled()
+            && w.group == 128
+        {
+            crate::layers::ops::quantize_act_q8_1(
+                gpu,
+                self.q4k_quant_act_k,
+                input,
+                act_q8,
+                m,
+                k,
+                stream,
+            )?;
+            return crate::layers::ops::q2_0_mmq_gemm(
+                gpu,
+                self.q2_0_mmq_nc_k,
+                self.q2_0_mmq_wc_k,
+                act_q8,
+                w.weight,
+                out,
+                m,
+                n,
+                k,
+                stream,
+            );
+        }
+
         if self.dequant_q2_0_gn_k.0 == 0 {
             anyhow::bail!(
                 "dequant_q2_0_gn_to_bf16 kernel missing — packed-Q2 attention prefill unavailable"
             );
         }
-        let (n, k) = (w.n, w.k);
-        let scratch = gpu.alloc((n as usize) * (k as usize) * 2)?; // BF16
         crate::layers::ops::dequant_q2_0_gn_to_bf16(
             gpu,
             self.dequant_q2_0_gn_k,
@@ -180,8 +217,6 @@ impl Qwen3AttentionLayer {
         } else {
             crate::layers::ops::dense_gemm(gpu, self.dense_gemm_k, input, &dw, out, m, n, k, stream)?;
         }
-        gpu.synchronize(stream)?;
-        let _ = gpu.free(scratch);
         Ok(())
     }
 
