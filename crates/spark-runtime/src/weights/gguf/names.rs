@@ -71,6 +71,11 @@ fn arch_override(gguf_name: &str, arch: &str) -> Option<GgufName> {
         // tied `token_embd` → `model.shared`, cross-attention), so this arch is
         // fully handled here and never falls through to `translate_default`.
         "nllb" | "m2m_100" => translate_nllb(gguf_name),
+        // mmproj vision tower (`general.architecture = clip`,
+        // `clip.projector_type = qwen3vl_merger`). Names live in a disjoint
+        // namespace (`v.*` / `mm.*`) from the text backbone, so this never
+        // collides with the qwen35 text arm — the two GGUFs open separately.
+        "clip" => translate_clip(gguf_name),
         _ => None,
     }
 }
@@ -150,6 +155,74 @@ fn translate_nllb(gguf_name: &str) -> Option<GgufName> {
     Some(GgufName::Direct(format!(
         "model.{side}.layers.{layer}.{hf_module}.{ext}"
     )))
+}
+
+/// HF prefix Atlas's Qwen3.6 ViT tower loads its tensors under. See
+/// `Qwen35WeightLoader::load_vision_encoder`, which probes
+/// `model.visual.patch_embed.proj.weight`. The mmproj GGUF path always produces
+/// the flat form, so we emit `model.visual.*`.
+const VISION_PREFIX: &str = "model.visual";
+
+/// Translate an mmproj (`general.architecture = clip`) tensor name to the
+/// `model.visual.*` HF name Atlas's Qwen3.6 vision encoder expects.
+///
+/// llama.cpp's `clip` writer (projector `qwen3vl_merger`) names the tower:
+///   * per-block  `v.blk.N.{attn_qkv,attn_out,ffn_up,ffn_down,ln1,ln2}.{w,b}`
+///   * patch conv `v.patch_embd.{weight,weight.1,bias}`
+///   * pos table  `v.position_embd.weight`
+///   * post-norm  `v.post_ln.{weight,bias}`      (→ the final merger's norm)
+///   * projector  `mm.0.{w,b}` (fc1), `mm.2.{w,b}` (fc2); `mm.1` = GELU, no tensor
+///
+/// The consumer (`Qwen35WeightLoader::load_vision_encoder`) reads:
+/// `blocks.N.{norm1,attn.qkv,attn.proj,norm2,mlp.linear_fc1,mlp.linear_fc2}`,
+/// `patch_embed.proj`, `pos_embed.weight`, and a single `merger.{norm,
+/// linear_fc1,linear_fc2}`.
+///
+/// NOTE — the patch-embed WEIGHT (`v.patch_embd.weight{,.1}`) is a temporal-split
+/// Conv3d that a 1:1 map cannot fuse; those frames are intercepted by the loader
+/// (`value_transform::vision_patch_frame` → `patch_embed_concat`) BEFORE this
+/// translator runs, so they are (correctly) left unmatched here. Only the
+/// patch-embed BIAS maps 1:1.
+fn translate_clip(gguf_name: &str) -> Option<GgufName> {
+    // ── Per-block: `v.blk.N.<stem>.<ext>` ──
+    if let Some(rest) = gguf_name.strip_prefix("v.blk.") {
+        let (n_str, sub) = rest.split_once('.')?;
+        let layer: usize = n_str.parse().ok()?;
+        let (stem, ext) = match sub.rsplit_once('.') {
+            Some((stem, ext @ ("weight" | "bias"))) => (stem, ext),
+            _ => return None,
+        };
+        let hf_sub = match stem {
+            "ln1" => "norm1",
+            "ln2" => "norm2",
+            "attn_qkv" => "attn.qkv",
+            "attn_out" => "attn.proj",
+            "ffn_up" => "mlp.linear_fc1",
+            "ffn_down" => "mlp.linear_fc2",
+            _ => return None,
+        };
+        return Some(GgufName::Direct(format!(
+            "{VISION_PREFIX}.blocks.{layer}.{hf_sub}.{ext}"
+        )));
+    }
+
+    // ── Top-level (non-block) tensors ──
+    let hf = match gguf_name {
+        // Projector MLP: mm.0 = fc1, mm.2 = fc2 (mm.1 is the GELU, no tensor).
+        "mm.0.weight" => format!("{VISION_PREFIX}.merger.linear_fc1.weight"),
+        "mm.0.bias" => format!("{VISION_PREFIX}.merger.linear_fc1.bias"),
+        "mm.2.weight" => format!("{VISION_PREFIX}.merger.linear_fc2.weight"),
+        "mm.2.bias" => format!("{VISION_PREFIX}.merger.linear_fc2.bias"),
+        // Post-encoder LayerNorm feeds the final merger → merger.norm.
+        "v.post_ln.weight" => format!("{VISION_PREFIX}.merger.norm.weight"),
+        "v.post_ln.bias" => format!("{VISION_PREFIX}.merger.norm.bias"),
+        // Learned absolute position table `[2304, 1152]` (interpolated/image).
+        "v.position_embd.weight" => format!("{VISION_PREFIX}.pos_embed.weight"),
+        // Patch-embed Conv3d bias maps 1:1 (the weight frames are loader-fused).
+        "v.patch_embd.bias" => format!("{VISION_PREFIX}.patch_embed.proj.bias"),
+        _ => return None,
+    };
+    Some(GgufName::Direct(hf))
 }
 
 /// Qwen3.5/3.6-specific per-layer name remaps. Returns `None` for names the
