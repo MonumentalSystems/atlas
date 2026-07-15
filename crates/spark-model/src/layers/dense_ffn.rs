@@ -241,6 +241,11 @@ pub struct DenseFfnLayer {
     // dense qwen35 has no MTP so no batched decode reaches the FFN today.
     #[allow(dead_code)]
     q2_0_gemv_batchm_k: KernelHandle,
+    // Load-time packed-Q2 → BF16 dequant kernel (`dequant_gguf_bf16` module).
+    // Used by packed-Q2 PREFILL: dequant each proj into a TRANSIENT BF16 scratch
+    // buffer, run the normal BF16 GEMM, free the scratch — the resident weight
+    // stays 2-bit. Decode uses the native `q2_0_gemv` (no dequant). Tier-1 path.
+    dequant_q2_0_gn_k: KernelHandle,
 }
 
 impl DenseFfnLayer {
@@ -343,6 +348,11 @@ impl DenseFfnLayer {
             q2_weights: None,
             q2_0_gemv_k: super::try_kernel(gpu, "q2_0_gemv", "q2_0_gemv"),
             q2_0_gemv_batchm_k: super::try_kernel(gpu, "q2_0_gemv", "q2_0_gemv_batchm"),
+            dequant_q2_0_gn_k: super::try_kernel(
+                gpu,
+                "dequant_gguf_bf16",
+                "dequant_q2_0_gn_to_bf16",
+            ),
         };
         Ok(layer)
     }
@@ -362,6 +372,13 @@ impl DenseFfnLayer {
         inter: u32,
         stream: u64,
     ) -> Result<()> {
+        // Packed-Q2 (ATLAS_GGUF_NATIVE_Q2) FFN keeps its NVFP4 source weights
+        // NULL — the Q4_K prefill copy is built by dequant-ing those (NULL) NVFP4
+        // blocks, so running it here is a null-ptr kernel launch (CUDA 700).
+        // Packed-Q2 has its own prefill path (transient dequant), so skip.
+        if self.q2_weights.is_some() {
+            return Ok(());
+        }
         let q4k_active = self.q4k_mmq_nc_k.0 != 0
             && self.q4k_quant_act_k.0 != 0
             && self.q4k_quant_w_k.0 != 0
@@ -445,6 +462,13 @@ impl DenseFfnLayer {
         inter: u32,
         stream: u64,
     ) -> Result<()> {
+        // Packed-Q2 (ATLAS_GGUF_NATIVE_Q2) FFN keeps its NVFP4 source weights
+        // NULL. This W4A4-MMQ finalize is active by DEFAULT (SiLU + kernels
+        // present) and repacks the NVFP4 gate/up — over NULL pointers that's a
+        // CUDA-700 illegal access. Packed-Q2 uses its own decode/prefill path.
+        if self.q2_weights.is_some() {
+            return Ok(());
+        }
         let active = self.nvfp4_mmq_nc_k.0 != 0
             && self.nvfp4_quant_act_k.0 != 0
             && self.nvfp4_repack_k.0 != 0
@@ -1255,16 +1279,57 @@ impl DenseFfnLayer {
         let gate_out = ctx.buffers.expert_gate_out();
         let up_out = ctx.buffers.expert_up_out();
 
-        // Native keep-packed Q2_0: prefill (tensor-core MMQ over packed 2-bit
-        // weights, or transient dequant→GEMM) is a deferred Tier-2 phase. The
-        // NVFP4 fallback weights are NULL for packed-Q2 layers, so we must not
-        // fall through to the w4a16 prefill GEMM (null-weight launch = CUDA
-        // 700). Bail with a clear message until the packed prefill lands.
-        if self.q2_weights.is_some() {
-            anyhow::bail!(
-                "packed-Q2 (ATLAS_GGUF_NATIVE_Q2) FFN prefill is not yet implemented \
-                 (Tier-2 phase): decode-GEMV only for now"
-            );
+        // Native keep-packed Q2_0 prefill (Tier-1): the resident weight stays
+        // 2-bit, but prefill has no packed-MMQ kernel yet (that's Tier-2). So we
+        // dequant each projection into a TRANSIENT BF16 scratch `[N, K]` via the
+        // load-time `dequant_q2_0_gn_to_bf16` kernel, run the normal BF16
+        // prefill GEMM (tensor-core when present), then free the scratch. Only a
+        // per-matmul scratch is BF16 — the WeightStore blocks stay 2-bit. Decode
+        // still uses the native `q2_0_gemv` (no dequant). SiLU only.
+        if let Some(ref q2w) = self.q2_weights {
+            if self.dequant_q2_0_gn_k.0 == 0 {
+                anyhow::bail!(
+                    "dequant_q2_0_gn_to_bf16 kernel missing in this target build — \
+                     packed-Q2 (ATLAS_GGUF_NATIVE_Q2) prefill is unavailable"
+                );
+            }
+            if self.activation != FfnActivation::SiLU {
+                anyhow::bail!("packed-Q2 FFN prefill supports SiLU only (got {:?})", self.activation);
+            }
+            let tc = self.dense_gemm_tc_k.0 != 0;
+            // Dequant one packed-Q2 projection into a freshly-alloc'd BF16 scratch
+            // `[n, k]`, run the BF16 GEMM (A=`in` [m,k] → out [m,n]), free scratch.
+            let q2_gemm = |w: &PackedQ2Weight, input: DevicePtr, out: DevicePtr| -> Result<()> {
+                let (n, k) = (w.n, w.k);
+                let scratch = ctx.gpu.alloc((n as usize) * (k as usize) * 2)?; // BF16
+                ops::dequant_q2_0_gn_to_bf16(
+                    ctx.gpu,
+                    self.dequant_q2_0_gn_k,
+                    w.weight,
+                    scratch,
+                    n,
+                    k,
+                    w.group as u32,
+                    stream,
+                )?;
+                let dw = DenseWeight { weight: scratch };
+                if tc {
+                    ops::dense_gemm_tc(ctx.gpu, self.dense_gemm_tc_k, input, &dw, out, m, n, k, stream)?;
+                } else {
+                    ops::dense_gemm(ctx.gpu, self.dense_gemm_bf16_k, input, &dw, out, m, n, k, stream)?;
+                }
+                // GEMM consumed `scratch` on `stream`; sync before freeing so the
+                // transient BF16 buffer never outlives its single matmul.
+                ctx.gpu.synchronize(stream)?;
+                let _ = ctx.gpu.free(scratch);
+                Ok(())
+            };
+            q2_gemm(&q2w.gate_proj, input, gate_out)?;
+            q2_gemm(&q2w.up_proj, input, up_out)?;
+            ops::silu_mul(ctx.gpu, self.act_mul, gate_out, up_out, gate_out, m * inter, stream)?;
+            let output = ctx.buffers.moe_output();
+            q2_gemm(&q2w.down_proj, gate_out, output)?;
+            return Ok(());
         }
 
         // FP8 prefill dispatch: per-projection block-scaled E4M3 weight × BF16

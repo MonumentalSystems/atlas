@@ -70,6 +70,38 @@ pub fn q2_0_gemv_batchm(
         .launch(stream)
 }
 
+/// Dequant a packed Q2_0 weight `[N, K]` (contiguous `block_q2_0` blocks) into a
+/// pre-allocated BF16 scratch buffer `[N, K]` on `stream`, IN PLACE (no alloc,
+/// no host sync). Reuses the load-time `dequant_q2_0_gn_to_bf16` kernel
+/// (`dequant_gguf_bf16` module). Used by packed-Q2 PREFILL: dequant → transient
+/// BF16 → normal BF16 GEMM → free scratch (the resident weight stays 2-bit).
+///
+/// `n_blocks = n * (k / group)`; each block is `2 + group/4` bytes and expands
+/// to `group` BF16 elements. Kernel: grid `(n_blocks,1,1)` block `(256,1,1)`.
+#[allow(clippy::too_many_arguments)]
+pub fn dequant_q2_0_gn_to_bf16(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    blocks: DevicePtr,
+    out: DevicePtr,
+    n: u32,
+    k: u32,
+    group: u32,
+    stream: u64,
+) -> Result<()> {
+    let n_blocks = n * (k / group);
+    let block_bytes = 2 + group / 4;
+    KernelLaunch::new(gpu, kernel)
+        .grid([n_blocks, 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(blocks)
+        .arg_ptr(out)
+        .arg_u32(n_blocks)
+        .arg_u32(group)
+        .arg_u32(block_bytes)
+        .launch(stream)
+}
+
 #[cfg(test)]
 mod tests {
     use half::f16;
