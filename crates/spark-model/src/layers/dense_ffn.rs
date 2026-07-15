@@ -228,7 +228,7 @@ pub struct DenseFfnLayer {
     w8a16_gemm_t_m128_k: KernelHandle,
 
     /// Native keep-packed ternary Q2_0 dense MLP weights (`ATLAS_GGUF_NATIVE_Q2`).
-    /// When installed via `set_q2_weights`, decode dispatches `q2_0_gemv`
+    /// When installed via `set_q2_weights`, decode dispatches `q2_0_gemv_vec`
     /// (BF16 activation × packed 2-bit weight, dequant-in-dot-product) — the
     /// weights stay 2-bit resident (no NVFP4 requant). Highest-priority forward
     /// branch. Prefill/batched paths for packed-Q2 are a deferred (Tier-2) phase
@@ -346,8 +346,12 @@ impl DenseFfnLayer {
             ),
             w8a16_gemm_t_m128_k: super::try_kernel(gpu, "w8a16_gemm_t_m128", "w8a16_gemm_t_m128"),
             q2_weights: None,
-            q2_0_gemv_k: super::try_kernel(gpu, "q2_0_gemv", "q2_0_gemv"),
-            q2_0_gemv_batchm_k: super::try_kernel(gpu, "q2_0_gemv", "q2_0_gemv_batchm"),
+            // Winner of the decode-GEMV bench: candidate B (vectorized code loads
+            // + smem A-stage, 1 warp/row × 8 rows/CTA). ~268 GB/s (98% of the
+            // 273 GB/s LPDDR5X peak) at gate/up M=1 — 9.5× the original
+            // whole-block-strided `q2_0_gemv`. Same `(code-1)*d` FP32 numerics.
+            q2_0_gemv_k: super::try_kernel(gpu, "q2_0_gemv_vec", "q2_0_gemv_vec"),
+            q2_0_gemv_batchm_k: super::try_kernel(gpu, "q2_0_gemv_vec", "q2_0_gemv_vec_batchm"),
             dequant_q2_0_gn_k: super::try_kernel(
                 gpu,
                 "dequant_gguf_bf16",
@@ -728,10 +732,10 @@ impl DenseFfnLayer {
                 anyhow::bail!("packed-Q2 FFN decode supports SiLU only (got {:?})", self.activation);
             }
             let output = ctx.buffers.moe_output();
-            ops::q2_0_gemv(ctx.gpu, self.q2_0_gemv_k, input, &q2w.gate_proj, gate_out, stream)?;
-            ops::q2_0_gemv(ctx.gpu, self.q2_0_gemv_k, input, &q2w.up_proj, up_out, stream)?;
+            ops::q2_0_gemv_vec(ctx.gpu, self.q2_0_gemv_k, input, &q2w.gate_proj, gate_out, stream)?;
+            ops::q2_0_gemv_vec(ctx.gpu, self.q2_0_gemv_k, input, &q2w.up_proj, up_out, stream)?;
             ops::silu_mul(ctx.gpu, self.act_mul, gate_out, up_out, gate_out, inter, stream)?;
-            ops::q2_0_gemv(ctx.gpu, self.q2_0_gemv_k, gate_out, &q2w.down_proj, output, stream)?;
+            ops::q2_0_gemv_vec(ctx.gpu, self.q2_0_gemv_k, gate_out, &q2w.down_proj, output, stream)?;
             return Ok(output);
         }
 

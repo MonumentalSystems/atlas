@@ -37,6 +37,8 @@ mod gemm_dense_int8;
 mod gemm_quant;
 #[path = "ops/gemv_q2.rs"]
 mod gemv_q2;
+#[path = "ops/gemv_q2_vec.rs"]
+mod gemv_q2_vec;
 #[path = "ops/hyper_connection.rs"]
 mod hyper_connection;
 #[path = "ops/kv_cache.rs"]
@@ -108,6 +110,7 @@ pub use gemm_dense::*;
 pub use gemm_dense_int8::*;
 pub use gemm_quant::*;
 pub use gemv_q2::*;
+pub use gemv_q2_vec::*;
 pub use hyper_connection::*;
 pub use kv_cache::*;
 pub use kv_cache_fp8k::*;
