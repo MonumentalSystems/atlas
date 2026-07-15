@@ -39,9 +39,22 @@ pub enum WeightDtype {
     FP8E8M0,
     UInt8,
     Int64,
+    /// Keep-packed PrismML ternary Q2_0 (ggml id 42): raw on-disk blocks stay
+    /// 2-bit in VRAM (fp16 scale + 2-bit codes per group of `group` elements),
+    /// dequantized in-kernel by the native `q2_0_gemv` decode path. Only
+    /// produced by the GGUF loader under `ATLAS_GGUF_NATIVE_Q2=1`. Its byte
+    /// footprint is NOT a per-element size (2-bit codes + an inline scale per
+    /// group), so [`WeightDtype::byte_size`] returns 0 for this variant and the
+    /// real size is computed in [`WeightTensor::byte_size`] (shape + group).
+    PackedQ2_0 { group: u16 },
 }
 
 impl WeightDtype {
+    /// Bytes per element for the fixed-width dtypes. Returns 0 for
+    /// [`WeightDtype::PackedQ2_0`], whose footprint is block-based, not
+    /// per-element — [`WeightTensor::byte_size`] handles that variant directly.
+    /// No caller multiplies a `PackedQ2_0` numel by this (the only producers of
+    /// packed tensors — the GGUF FFN loader — size via `WeightTensor`).
     pub fn byte_size(self) -> usize {
         match self {
             Self::BF16 => 2,
@@ -50,6 +63,7 @@ impl WeightDtype {
             Self::FP8E8M0 => 1,
             Self::UInt8 => 1,
             Self::Int64 => 8,
+            Self::PackedQ2_0 { .. } => 0,
         }
     }
 
@@ -102,7 +116,30 @@ impl WeightTensor {
     }
 
     pub fn byte_size(&self) -> usize {
-        self.num_elements() * self.dtype.byte_size()
+        match self.dtype {
+            // Packed Q2_0: `n_blocks = numel / group` blocks of
+            // `2 + group/4` bytes (34 @ g128, 18 @ g64) — the on-disk footprint.
+            WeightDtype::PackedQ2_0 { group } => {
+                let g = group as usize;
+                debug_assert!(g == 128 || g == 64, "unexpected Q2_0 group {g}");
+                let n_blocks = self.num_elements() / g.max(1);
+                n_blocks * (2 + g / 4)
+            }
+            d => self.num_elements() * d.byte_size(),
+        }
+    }
+
+    /// The Q2_0 group size if this tensor is keep-packed ternary, else `None`.
+    pub fn q2_group(&self) -> Option<u16> {
+        match self.dtype {
+            WeightDtype::PackedQ2_0 { group } => Some(group),
+            _ => None,
+        }
+    }
+
+    /// True if this tensor holds keep-packed ternary Q2_0 blocks (id 42).
+    pub fn is_packed_q2(&self) -> bool {
+        matches!(self.dtype, WeightDtype::PackedQ2_0 { .. })
     }
 }
 
@@ -289,5 +326,53 @@ mod from_str_tests {
         }
         assert!(WeightDtype::from_safetensors_str("F16").is_err());
         assert!(WeightDtype::from_safetensors_str("bogus").is_err());
+    }
+}
+
+#[cfg(test)]
+mod packed_q2_tests {
+    use super::*;
+    use crate::gpu::DevicePtr;
+
+    /// A packed Q2_0 tensor's on-GPU footprint is block-based, not per-element:
+    /// `n_blocks * (2 + group/4)` bytes. Locks the group-128 (34 B) and
+    /// group-64 (18 B) sizing so `WeightStore::total_bytes` reflects the real
+    /// ~2.1 bpw resident, not a bogus per-element multiply.
+    #[test]
+    fn packed_q2_byte_size_is_block_based() {
+        // [n=2, k=256] @ group 128 → 2 rows × 2 blocks × 34 B = 136 B.
+        let t = WeightTensor {
+            ptr: DevicePtr::NULL,
+            shape: vec![2, 256],
+            dtype: WeightDtype::PackedQ2_0 { group: 128 },
+        };
+        assert_eq!(t.num_elements(), 512);
+        assert_eq!(t.byte_size(), (512 / 128) * (2 + 128 / 4));
+        assert_eq!(t.byte_size(), 136);
+        assert_eq!(t.q2_group(), Some(128));
+        assert!(t.is_packed_q2());
+
+        // group-64 → 18 B blocks: [n=1, k=128] → 2 blocks × 18 = 36 B.
+        let t64 = WeightTensor {
+            ptr: DevicePtr::NULL,
+            shape: vec![1, 128],
+            dtype: WeightDtype::PackedQ2_0 { group: 64 },
+        };
+        assert_eq!(t64.byte_size(), (128 / 64) * (2 + 64 / 4));
+        assert_eq!(t64.byte_size(), 36);
+
+        // Per-element size is undefined for packed; must be 0 so no caller
+        // silently multiplies numel by it.
+        assert_eq!(WeightDtype::PackedQ2_0 { group: 128 }.byte_size(), 0);
+
+        // BF16 sizing of the SAME shape is 4× larger — the memory win.
+        let bf16 = WeightTensor {
+            ptr: DevicePtr::NULL,
+            shape: vec![2, 256],
+            dtype: WeightDtype::BF16,
+        };
+        assert!(bf16.byte_size() > t.byte_size() * 3);
+        assert_eq!(bf16.q2_group(), None);
+        assert!(!bf16.is_packed_q2());
     }
 }

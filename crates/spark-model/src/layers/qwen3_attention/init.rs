@@ -182,6 +182,12 @@ impl Qwen3AttentionLayer {
             norm_vanilla: crate::ships_vanilla_norm_weights(config),
             rms_norm_residual_k: gpu.kernel("norm", "rms_norm_residual")?,
             dense_gemv_k: gpu.kernel("gemv", "dense_gemv_bf16")?,
+            dequant_q2_0_gn_k: super::super::try_kernel(
+                gpu,
+                "dequant_gguf_bf16",
+                "dequant_q2_0_gn_to_bf16",
+            ),
+            q2_0_gemv_k: super::super::try_kernel(gpu, "q2_0_gemv_vec", "q2_0_gemv_vec"),
             w4a16_gemv_k: gpu.kernel("w4a16_gemv", "w4a16_gemv")?,
             w8a16_gemv_k: gpu.kernel("w8a16_gemv", "w8a16_gemv")?,
             w8a16_gemm_k: super::super::try_kernel(gpu, "w8a16_gemm", "w8a16_gemm"),

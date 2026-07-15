@@ -172,6 +172,84 @@ pub fn needs(hf_name: &str) -> bool {
     classify(hf_name).is_some()
 }
 
+/// For the native keep-packed Q2_0 path (`ATLAS_GGUF_NATIVE_Q2=1`): tensors whose
+/// value transform is a *pure whole-row* value-head reorder ([`Op::ReorderRows`]
+/// with `head_dim_rows = true`) can stay 2-bit — the permutation moves whole
+/// `value_head_dim`-row blocks, and one row is an integer number of `block_q2_0`
+/// blocks (`K / group`), so it never splits a group. [`reorder_packed_rows`]
+/// applies the SAME permutation directly to the packed bytes, leaving the weight
+/// HF-correct while packed. Returns `Some(after_qk)` for the two big GDN input
+/// projections (`in_proj_qkv` → V-region only, `in_proj_z` → whole tensor),
+/// `None` for everything else (which stays on the dequant→BF16 path):
+///   * `in_proj_a`/`in_proj_b`/`dt_bias` reorder SINGLE rows (`head_dim_rows =
+///     false`); tiny, left BF16.
+///   * `out_proj` is a within-row COLUMN reorder ([`Op::ReorderOutCols`]) that
+///     would need an intra-row block shuffle — deferred, stays on its NVFP4/BF16
+///     path.
+///   * `A_log` / norms are F32 scalar transforms — never packed.
+pub fn packed_reorder_rows(hf_name: &str) -> Option<bool> {
+    // Match by NAME, not just the `Op`: `conv1d` shares `in_proj_qkv`'s
+    // `ReorderRows{after_qk,head_dim_rows}` classification but is a 3-D
+    // recurrence tensor (`[d_inner,1,k]`) that must stay BF16 — never packed.
+    if hf_name.ends_with(".linear_attn.in_proj_qkv.weight") {
+        return Some(true); // reorder V-region rows only (after the Q|K partition)
+    }
+    if hf_name.ends_with(".linear_attn.in_proj_z.weight") {
+        return Some(false); // whole tensor is value heads
+    }
+    None
+}
+
+/// Apply the value-head row reorder ([`packed_reorder_rows`]) directly to the raw
+/// `block_q2_0` bytes of a keep-packed tensor. Byte-exact analog of
+/// [`reorder_rows`]: because dequant is per-block and one HF row spans
+/// `k / group` whole blocks (`row_bytes = (k/group) * block_bytes`), permuting
+/// whole `value_head_dim`-row block-runs here is bit-identical to permuting the
+/// dequantized rows. `raw` is `[n, k]` row-major packed; returns the reordered
+/// copy.
+pub fn reorder_packed_rows(
+    raw: &[u8],
+    hf_shape: &[usize],
+    dims: &GdnDims,
+    after_qk: bool,
+    group: usize,
+    block_bytes: usize,
+) -> Result<Vec<u8>> {
+    ensure!(
+        hf_shape.len() == 2,
+        "packed reorder expects 2-D [n,k], got {hf_shape:?}"
+    );
+    let (n, k) = (hf_shape[0], hf_shape[1]);
+    ensure!(
+        k % group == 0,
+        "packed reorder: k={k} not a multiple of group={group}"
+    );
+    let row_bytes = (k / group) * block_bytes;
+    ensure!(
+        raw.len() == n * row_bytes,
+        "packed reorder: raw len {} != n*row_bytes {}",
+        raw.len(),
+        n * row_bytes
+    );
+    let hd = dims.value_head_dim; // rows per value head
+    let base_row = if after_qk { dims.qk_rows() } else { 0 };
+    let region_rows = dims.num_v_heads * hd;
+    ensure!(
+        base_row + region_rows <= n,
+        "packed reorder: V region rows [{base_row}..{}] exceed n={n}",
+        base_row + region_rows
+    );
+    let mut out = raw.to_vec();
+    let blk = hd * row_bytes; // bytes per value head
+    for hf in 0..dims.num_v_heads {
+        let g = dims.gguf_head(hf);
+        let d = (base_row + hf * hd) * row_bytes;
+        let s = (base_row + g * hd) * row_bytes;
+        out[d..d + blk].copy_from_slice(&raw[s..s + blk]);
+    }
+    Ok(out)
+}
+
 /// Apply the qwen35 value transform (if any) to the dequantized F32 values
 /// `buf` in place. `hf_shape` is the tensor's HF (row-major) shape. No-op for
 /// names [`classify`] does not recognize.

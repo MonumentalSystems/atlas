@@ -181,6 +181,13 @@ impl Qwen3AttentionLayer {
             ),
         };
 
+        // Keep-packed Q2_0 (Tier-1c): transient-dequant to BF16 then dense GEMM.
+        // Highest priority — the NVFP4/FP8/dense fallbacks below all read NULL
+        // pointers on this path.
+        if let Some(q2) = weight_opt.and_then(|w| w.as_packed_q2()) {
+            return self.q2_prefill_gemm(ctx.gpu, q2, normed, out, n, stream);
+        }
+
         // Native FP4: pre-quantized activations x original NVFP4 weights.
         if let (Some((a4p, a4sf)), Some(nvfp4)) = (a4, weight_opt.and_then(|w| w.as_nvfp4())) {
             let _ = label;
