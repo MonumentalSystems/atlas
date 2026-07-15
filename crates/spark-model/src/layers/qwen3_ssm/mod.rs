@@ -48,20 +48,16 @@ pub struct Qwen3SsmLayer {
     qkvz_fp8w: Option<Fp8Weight>,
     out_proj_fp8w: Option<Fp8Weight>,
     /// Tier-1c keep-packed ternary Q2_0 fused in_proj_qkvz (`ATLAS_GGUF_NATIVE_Q2`).
-    /// The [Q|K|V|Z] rows are byte-concatenated from the packed `in_proj_qkv`
-    /// (V-region row-permuted) and `in_proj_z` (row-permuted) tensors at load, so
-    /// the 2-bit weight is HF-correct. Decode dispatches `q2_0_gemv_vec`; prefill
-    /// transient-dequants to BF16. `out_proj` stays on its NVFP4 path (its column
-    /// reorder is not packed-permutable in this tier).
+    /// [Q|K|V|Z] rows byte-concatenated from packed `in_proj_qkv` (V-region
+    /// row-permuted) + `in_proj_z` (row-permuted) at load, so the 2-bit weight is
+    /// HF-correct. `out_proj` stays NVFP4 (column reorder not packed-permutable here).
     qkvz_q2: Option<crate::weight_map::PackedQ2Weight>,
-    /// Native `q2_0_gemv_vec` decode kernel for the packed qkvz.
+    /// Q2_0 kernels for the packed qkvz: `gemv` = `q2_0_gemv_vec` decode; `dequant`
+    /// = load-time packed→BF16 for the transient-dequant prefill fallback;
+    /// `mmq_{nc,wc}` = Tier-2 keep-packed tensor-core MMQ prefill (`KernelHandle(0)`
+    /// → fallback); `q4k_quant_act` = shared q8_1 activation quantizer.
     q2_0_gemv_k: KernelHandle,
-    /// Load-time packed-Q2 → BF16 dequant for the transient-dequant qkvz prefill.
     dequant_q2_0_gn_k: KernelHandle,
-    /// Native Q2_0 MMQ prefill (Tier-2, `ATLAS_GGUF_NATIVE_Q2_MMQ`): keep-packed
-    /// tensor-core int8 MMA for the fused qkvz projection vs a shared q8_1
-    /// activation. `KernelHandle(0)` → transient-dequant fallback. The q8_1
-    /// activation quantizer is shared with Q4_K (`q4k_quant_act_k`).
     q2_0_mmq_nc_k: KernelHandle,
     q2_0_mmq_wc_k: KernelHandle,
     q4k_quant_act_k: KernelHandle,
