@@ -27,6 +27,7 @@ mod container;
 mod dequant_cpu;
 mod dequant_gpu;
 mod names;
+mod value_transform;
 
 pub use config::config_from_gguf_dir;
 
@@ -255,6 +256,24 @@ impl super::WeightLoader for GgufLoader {
         let q2_group = q2_group_usize();
         let q2_variant = q2_group_variant(q2_group);
 
+        // Qwen3.5/3.6 GDN-hybrid GGUFs (llama.cpp `qwen35` converter) encode a
+        // handful of GDN / RMSNorm tensor VALUES differently than Atlas's
+        // kernels expect (norm +1 offset, `A_log = ln(-ssm_a)`, and a value-head
+        // reorder). Read the GDN head geometry once so the loader can invert
+        // them per tensor (see `value_transform`).
+        let is_qwen35 = value_transform::is_qwen35(&arch);
+        let gdn = if is_qwen35 {
+            value_transform::gdn_dims(&gguf, &arch)
+        } else {
+            None
+        };
+        if is_qwen35 && gdn.is_none() {
+            bail!(
+                "GGUF arch '{arch}' is qwen35-family but the SSM metadata keys \
+                 ({arch}.ssm.*) are missing; cannot apply GDN value transforms"
+            );
+        }
+
         // Pre-flight: sum BF16 output bytes over tensors we will actually keep.
         let est_bf16: usize = gguf
             .tensors
@@ -288,11 +307,36 @@ impl super::WeightLoader for GgufLoader {
                 .with_context(|| format!("tensor {} out of bounds in GGUF", tensor.name))?;
 
             let id = tensor.ggml_type.id();
-            let bf16_ptr = dequant_to_device(gpu, id, raw, num_elements, q2_group, force_cpu)
-                .with_context(|| format!("dequant tensor {}", tensor.name))?;
-
             // GGUF dims are ggml-order; Atlas/HF shape is the reverse.
             let hf_shape: Vec<usize> = tensor.dims.iter().rev().copied().collect();
+
+            // For qwen35 tensors whose VALUES need fixing, dequant on the CPU
+            // and rewrite the BF16 host bytes before upload; everything else
+            // takes the normal prefer-GPU dequant path.
+            let bf16_ptr = match (&target, gdn) {
+                (names::GgufName::Direct(hf_name), Some(dims))
+                    if value_transform::needs(hf_name) =>
+                {
+                    // Dequant to F32 (not BF16) so the near-1.0 RMSNorm offset and
+                    // the `ln(-ssm_a)` recovery keep full precision, transform the
+                    // values, then round to BF16 once for upload.
+                    let gt = dequant_cpu::GgmlType::from_id(id, q2_group)
+                        .with_context(|| format!("ggml type for {}", tensor.name))?;
+                    let mut vals = vec![0f32; num_elements];
+                    dequant_cpu::dequant_to_f32(gt, raw, num_elements, &mut vals)
+                        .with_context(|| {
+                            format!("CPU dequant for qwen35 transform {}", tensor.name)
+                        })?;
+                    value_transform::apply(hf_name, &mut vals, &hf_shape, &dims)
+                        .with_context(|| format!("qwen35 value transform {hf_name}"))?;
+                    let host = value_transform::to_bf16_bytes(&vals);
+                    let ptr = gpu.alloc(host.len())?;
+                    gpu.copy_h2d(&host, ptr)?;
+                    ptr
+                }
+                _ => dequant_to_device(gpu, id, raw, num_elements, q2_group, force_cpu)
+                    .with_context(|| format!("dequant tensor {}", tensor.name))?,
+            };
 
             match target {
                 names::GgufName::Direct(hf_name) => {
