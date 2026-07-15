@@ -6,12 +6,18 @@ translation-focused *encoder-decoder* (seq2seq) transformer.
 
 ## Why a separate crate
 
-Atlas's production engine is **decoder-only and GPU-only**: the
-`TransformerLayer`/paged-KV/scheduler stack assumes causal autoregressive
-generation, and `GpuBackend` has no CPU implementation. NLLB is a seq2seq model
-(bidirectional encoder + decoder cross-attention + sinusoidal absolute
-positions + ReLU FFN + biased LayerNorm), so the `spark-model` marker loader for
-`model_type = "m2m_100" | "nllb"` deliberately fails fast.
+Atlas's production engine is **GPU-only** (`GpuBackend` has no CPU
+implementation), and its *generic* `TransformerLayer`/paged-KV/scheduler stack
+is decoder-only — it assumes causal autoregressive generation. NLLB is a seq2seq
+model (bidirectional encoder + decoder cross-attention + sinusoidal absolute
+positions + ReLU FFN + biased LayerNorm), so the *generic* `spark-model` marker
+loader for `model_type = "m2m_100" | "nllb"` deliberately fails fast.
+
+NLLB **is** served on the GPU, but through a *dedicated* encoder-decoder runtime
+(`spark-model` `model/nllb`, `NllbGpuModel`) that `build_model` selects before
+the generic loader — including straight from an NLLB **GGUF** (arch `nllb`),
+whose `enc/dec.blk.N.*` tensors the GPU loader remaps in
+`spark-runtime` `weights::gguf::names` (the same map this crate applies on CPU).
 
 This crate is the *"load it at least on CPU"* path: a dependency-light, fp32
 port of HuggingFace `M2M100ForConditionalGeneration` that actually loads the
