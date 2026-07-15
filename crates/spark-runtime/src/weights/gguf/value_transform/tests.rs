@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+#![allow(clippy::needless_range_loop)] // explicit indices read clearer in these tensor-layout tests
 
 use super::*;
 
@@ -227,4 +228,69 @@ fn gdn_dims_geometry() {
     let d = dims();
     assert_eq!(d.num_v_per_k(), 3);
     assert_eq!(d.qk_rows(), 2 * 128 * 16);
+}
+
+#[test]
+fn clip_arch_gate() {
+    assert!(super::is_clip("clip"));
+    assert!(!super::is_clip("qwen35"));
+}
+
+#[test]
+fn vision_patch_frame_parsing() {
+    use super::vision_patch_frame as f;
+    assert_eq!(f("v.patch_embd.weight"), Some(0));
+    assert_eq!(f("v.patch_embd.weight.1"), Some(1));
+    assert_eq!(f("v.patch_embd.weight.2"), Some(2));
+    assert_eq!(f("v.patch_embd.bias"), None);
+    assert_eq!(f("v.post_ln.weight"), None);
+    assert_eq!(f("v.blk.0.attn_qkv.weight"), None);
+}
+
+#[test]
+fn patch_embed_concat_interleaves_temporal_within_channel() {
+    // out_ch=2, in_ch=1, patch=2 → blk=4, frame_row=4, T=2, dst_row=8.
+    let dims = super::VisionPatchDims {
+        out_ch: 2,
+        in_ch: 1,
+        patch: 2,
+    };
+    let f0: Vec<f32> = (0..8).map(|x| x as f32).collect(); // o0:0..4  o1:4..8
+    let f1: Vec<f32> = (10..18).map(|x| x as f32).collect(); // o0:10..14 o1:14..18
+    let out = super::patch_embed_concat(&[&f0, &f1], &dims).unwrap();
+    // row o: [t0 block (4)] then [t1 block (4)]  (single channel)
+    assert_eq!(
+        out,
+        vec![
+            0.0, 1.0, 2.0, 3.0, 10.0, 11.0, 12.0, 13.0, // o0
+            4.0, 5.0, 6.0, 7.0, 14.0, 15.0, 16.0, 17.0, // o1
+        ]
+    );
+}
+
+#[test]
+fn patch_embed_concat_channel_major_then_temporal() {
+    // out_ch=1, in_ch=2, patch=1 → blk=1, K = c*T + t.
+    let dims = super::VisionPatchDims {
+        out_ch: 1,
+        in_ch: 2,
+        patch: 1,
+    };
+    let f0 = vec![10.0f32, 11.0]; // c0,c1 of frame0
+    let f1 = vec![20.0f32, 21.0]; // c0,c1 of frame1
+    let out = super::patch_embed_concat(&[&f0, &f1], &dims).unwrap();
+    // K0=c0t0, K1=c0t1, K2=c1t0, K3=c1t1
+    assert_eq!(out, vec![10.0, 20.0, 11.0, 21.0]);
+}
+
+#[test]
+fn patch_embed_concat_rejects_wrong_frame_len() {
+    let dims = super::VisionPatchDims {
+        out_ch: 2,
+        in_ch: 1,
+        patch: 2,
+    };
+    let good = vec![0.0f32; 8];
+    let bad = vec![0.0f32; 7];
+    assert!(super::patch_embed_concat(&[&good, &bad], &dims).is_err());
 }

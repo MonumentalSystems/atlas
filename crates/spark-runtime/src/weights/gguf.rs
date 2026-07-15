@@ -27,6 +27,7 @@ mod container;
 mod dequant_cpu;
 mod dequant_gpu;
 mod names;
+mod sidecar;
 mod value_transform;
 
 pub use config::config_from_gguf_dir;
@@ -38,8 +39,12 @@ use std::path::{Path, PathBuf};
 use super::{WeightDtype, WeightStore, WeightTensor, check_oom_guard, evict_page_cache};
 use crate::gpu::{DevicePtr, GpuBackend};
 
-/// Locate the GGUF weight file in `dir`. Returns the lexicographically-first
-/// `*.gguf` (also the first shard, `*-00001-of-*`, of a split file).
+/// Locate the backbone GGUF weight file in `dir`. Returns the
+/// lexicographically-first non-mmproj `*.gguf` (also the first shard,
+/// `*-00001-of-*`, of a split file). The mmproj vision sidecar is excluded here
+/// and loaded separately (see [`sidecar::find_mmproj`]); a dir that is *only* an
+/// mmproj falls back to the first file so the caller still gets a path to error
+/// on.
 pub fn find_gguf(dir: &Path) -> Option<PathBuf> {
     let mut candidates: Vec<PathBuf> = std::fs::read_dir(dir)
         .ok()?
@@ -48,7 +53,11 @@ pub fn find_gguf(dir: &Path) -> Option<PathBuf> {
         .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("gguf"))
         .collect();
     candidates.sort();
-    candidates.into_iter().next()
+    candidates
+        .iter()
+        .find(|p| !sidecar::is_mmproj(p))
+        .cloned()
+        .or_else(|| candidates.into_iter().next())
 }
 
 /// The id-42 PrismML group size, from `ATLAS_GGUF_Q2_GROUP` (default 128).
@@ -240,30 +249,25 @@ impl super::WeightLoader for GgufLoader {
             .with_context(|| format!("No .gguf file found in {}", model_dir.display()))?;
         tracing::info!("Loading GGUF weights from {}", path.display());
 
-        let file = std::fs::File::open(&path)
-            .with_context(|| format!("Failed to open {}", path.display()))?;
-        // SAFETY: same mmap contract as the safetensors loader.
-        let mmap = unsafe { memmap2::MmapOptions::new().map(&file)? };
-
-        let gguf = container::GgufFile::parse(&mmap)
-            .with_context(|| format!("Failed to parse GGUF container: {}", path.display()))?;
-
-        let arch = gguf
-            .get_str("general.architecture")
-            .unwrap_or("llama")
-            .to_lowercase();
         let force_cpu = std::env::var("ATLAS_GGUF_FORCE_CPU").ok().as_deref() == Some("1");
         let q2_group = q2_group_usize();
         let q2_variant = q2_group_variant(q2_group);
 
+        // ── Backbone (text model) ──
+        let (bb_file, bb_mmap, bb_gguf) = sidecar::open_gguf(&path)?;
+        let arch = bb_gguf
+            .get_str("general.architecture")
+            .unwrap_or("llama")
+            .to_lowercase();
+
         // Qwen3.5/3.6 GDN-hybrid GGUFs (llama.cpp `qwen35` converter) encode a
         // handful of GDN / RMSNorm tensor VALUES differently than Atlas's
         // kernels expect (norm +1 offset, `A_log = ln(-ssm_a)`, and a value-head
-        // reorder). Read the GDN head geometry once so the loader can invert
+        // reorder). Read the GDN head geometry once so `load_pass` can invert
         // them per tensor (see `value_transform`).
         let is_qwen35 = value_transform::is_qwen35(&arch);
         let gdn = if is_qwen35 {
-            value_transform::gdn_dims(&gguf, &arch)
+            value_transform::gdn_dims(&bb_gguf, &arch)
         } else {
             None
         };
@@ -274,99 +278,60 @@ impl super::WeightLoader for GgufLoader {
             );
         }
 
-        // Pre-flight: sum BF16 output bytes over tensors we will actually keep.
-        let est_bf16: usize = gguf
-            .tensors
-            .iter()
-            .filter(|t| {
-                !matches!(
-                    names::translate(&t.name, &arch),
-                    None | Some(names::GgufName::Drop)
-                )
-            })
-            .map(|t| t.num_elements() * WeightDtype::BF16.byte_size())
-            .sum();
-        preflight_oom(gpu, est_bf16, oom_reserve_bytes, self.peak_memory_multiplier)?;
+        // ── Optional mmproj vision-tower sidecar ──
+        // Open it (if present) up front so the pre-flight OOM check covers both
+        // files. mmaps are virtual, so holding two at once costs no RAM.
+        let mmproj_path = sidecar::find_mmproj(model_dir, &path);
+        let mmproj = match &mmproj_path {
+            Some(mp) => {
+                tracing::info!("Found mmproj vision sidecar {}", mp.display());
+                Some(sidecar::open_gguf(mp)?)
+            }
+            None => None,
+        };
+        let mmproj_arch = mmproj.as_ref().map(|(_, _, g)| {
+            g.get_str("general.architecture")
+                .unwrap_or("clip")
+                .to_lowercase()
+        });
+
+        // Pre-flight: combined BF16 footprint of both files.
+        let mut est = sidecar::est_bf16(&bb_gguf, &arch);
+        if let (Some((_, _, mm_gguf)), Some(mm_arch)) = (mmproj.as_ref(), mmproj_arch.as_ref()) {
+            est += sidecar::est_bf16(mm_gguf, mm_arch);
+        }
+        preflight_oom(gpu, est, oom_reserve_bytes, self.peak_memory_multiplier)?;
 
         let mut weights: HashMap<String, WeightTensor> = HashMap::new();
         let mut skipped = 0usize;
 
-        for tensor in &gguf.tensors {
-            let target = match names::translate(&tensor.name, &arch) {
-                Some(names::GgufName::Drop) | None => continue,
-                Some(t) => t,
-            };
+        // Pass 1: backbone → weights.
+        sidecar::load_pass(
+            self, gpu, &bb_gguf, &bb_mmap, &arch, gdn, force_cpu, q2_group, q2_variant,
+            &mut weights, &mut skipped,
+        )?;
+        drop(bb_gguf);
+        drop(bb_mmap);
+        evict_page_cache(&bb_file);
 
-            let num_elements = tensor.num_elements();
-            let raw_len = gguf
-                .tensor_byte_size(tensor, q2_variant)
-                .with_context(|| format!("byte-len for tensor {}", tensor.name))?;
-            let start = gguf.tensor_abs_offset(tensor);
-            let raw = mmap
-                .get(start..start + raw_len)
-                .with_context(|| format!("tensor {} out of bounds in GGUF", tensor.name))?;
-
-            let id = tensor.ggml_type.id();
-            // GGUF dims are ggml-order; Atlas/HF shape is the reverse.
-            let hf_shape: Vec<usize> = tensor.dims.iter().rev().copied().collect();
-
-            // For qwen35 tensors whose VALUES need fixing, dequant on the CPU
-            // and rewrite the BF16 host bytes before upload; everything else
-            // takes the normal prefer-GPU dequant path.
-            let bf16_ptr = match (&target, gdn) {
-                (names::GgufName::Direct(hf_name), Some(dims))
-                    if value_transform::needs(hf_name) =>
-                {
-                    // Dequant to F32 (not BF16) so the near-1.0 RMSNorm offset and
-                    // the `ln(-ssm_a)` recovery keep full precision, transform the
-                    // values, then round to BF16 once for upload.
-                    let gt = dequant_cpu::GgmlType::from_id(id, q2_group)
-                        .with_context(|| format!("ggml type for {}", tensor.name))?;
-                    let mut vals = vec![0f32; num_elements];
-                    dequant_cpu::dequant_to_f32(gt, raw, num_elements, &mut vals)
-                        .with_context(|| {
-                            format!("CPU dequant for qwen35 transform {}", tensor.name)
-                        })?;
-                    value_transform::apply(hf_name, &mut vals, &hf_shape, &dims)
-                        .with_context(|| format!("qwen35 value transform {hf_name}"))?;
-                    let host = value_transform::to_bf16_bytes(&vals);
-                    let ptr = gpu.alloc(host.len())?;
-                    gpu.copy_h2d(&host, ptr)?;
-                    ptr
-                }
-                _ => dequant_to_device(gpu, id, raw, num_elements, q2_group, force_cpu)
-                    .with_context(|| format!("dequant tensor {}", tensor.name))?,
-            };
-
-            match target {
-                names::GgufName::Direct(hf_name) => {
-                    weights.insert(
-                        hf_name,
-                        WeightTensor {
-                            ptr: bf16_ptr,
-                            shape: hf_shape,
-                            dtype: WeightDtype::BF16,
-                        },
-                    );
-                }
-                names::GgufName::ExpertStack { layer, proj } => {
-                    self.emit_experts(
-                        &mut weights,
-                        bf16_ptr,
-                        &hf_shape,
-                        layer,
-                        proj,
-                        &mut skipped,
-                    )?;
-                }
-                names::GgufName::Drop => unreachable!("Drop filtered above"),
-            }
+        // Pass 2: mmproj sidecar → SAME weights map (clip names land under
+        // `model.visual.*`, disjoint from the backbone's `model.layers.*`).
+        // No GDN transforms (gdn = None) and no expert fan-out for clip.
+        if let (Some((mm_file, mm_mmap, mm_gguf)), Some(mm_arch)) = (mmproj, mmproj_arch) {
+            let before = weights.len();
+            sidecar::load_pass(
+                self, gpu, &mm_gguf, &mm_mmap, &mm_arch, None, force_cpu, q2_group, q2_variant,
+                &mut weights, &mut skipped,
+            )?;
+            tracing::info!(
+                "Merged {} mmproj tensors (arch '{}') into the weight store",
+                weights.len() - before,
+                mm_arch,
+            );
+            drop(mm_gguf);
+            drop(mm_mmap);
+            evict_page_cache(&mm_file);
         }
-
-        // Drop the mapping before evicting its pages from the (unified) cache.
-        drop(gguf);
-        drop(mmap);
-        evict_page_cache(&file);
 
         if skipped > 0 {
             tracing::info!("EP: skipped {} remote expert slices", skipped);
@@ -468,5 +433,38 @@ mod tests {
         let found = find_gguf(&dir).unwrap();
         assert_eq!(found.file_name().unwrap().to_str().unwrap(), "a.gguf");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn find_gguf_skips_mmproj_and_find_mmproj_pairs() {
+        let dir =
+            std::env::temp_dir().join(format!("atlas_gguf_mmproj_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // The mmproj sorts lexicographically FIRST ('B' < 'T'), so a naive
+        // first-file pick would wrongly select the sidecar as the backbone.
+        std::fs::write(dir.join("Bonsai-mmproj-Q8_0.gguf"), b"x").unwrap();
+        std::fs::write(dir.join("Ternary-Bonsai-27B-Q2_0.gguf"), b"x").unwrap();
+
+        let backbone = find_gguf(&dir).unwrap();
+        assert_eq!(
+            backbone.file_name().unwrap().to_str().unwrap(),
+            "Ternary-Bonsai-27B-Q2_0.gguf"
+        );
+        let mmproj = sidecar::find_mmproj(&dir, &backbone).unwrap();
+        assert_eq!(
+            mmproj.file_name().unwrap().to_str().unwrap(),
+            "Bonsai-mmproj-Q8_0.gguf"
+        );
+
+        // A text-only dir yields no sidecar.
+        let dir2 =
+            std::env::temp_dir().join(format!("atlas_gguf_textonly_{}", std::process::id()));
+        std::fs::create_dir_all(&dir2).unwrap();
+        std::fs::write(dir2.join("model-Q2_0.gguf"), b"x").unwrap();
+        let bb2 = find_gguf(&dir2).unwrap();
+        assert!(sidecar::find_mmproj(&dir2, &bb2).is_none());
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&dir2).ok();
     }
 }

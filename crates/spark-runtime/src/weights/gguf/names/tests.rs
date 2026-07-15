@@ -323,3 +323,109 @@ fn unknown_arch_falls_through_to_default() {
         direct("model.layers.0.self_attn.q_proj.weight")
     );
 }
+
+#[test]
+fn clip_block_attn_and_ffn() {
+    assert_eq!(
+        translate("v.blk.0.attn_qkv.weight", "clip"),
+        direct("model.visual.blocks.0.attn.qkv.weight")
+    );
+    assert_eq!(
+        translate("v.blk.0.attn_qkv.bias", "clip"),
+        direct("model.visual.blocks.0.attn.qkv.bias")
+    );
+    assert_eq!(
+        translate("v.blk.13.attn_out.weight", "clip"),
+        direct("model.visual.blocks.13.attn.proj.weight")
+    );
+    assert_eq!(
+        translate("v.blk.13.attn_out.bias", "clip"),
+        direct("model.visual.blocks.13.attn.proj.bias")
+    );
+    assert_eq!(
+        translate("v.blk.26.ffn_up.weight", "clip"),
+        direct("model.visual.blocks.26.mlp.linear_fc1.weight")
+    );
+    assert_eq!(
+        translate("v.blk.26.ffn_down.weight", "clip"),
+        direct("model.visual.blocks.26.mlp.linear_fc2.weight")
+    );
+    assert_eq!(
+        translate("v.blk.5.ffn_up.bias", "clip"),
+        direct("model.visual.blocks.5.mlp.linear_fc1.bias")
+    );
+}
+
+#[test]
+fn clip_block_norms() {
+    assert_eq!(
+        translate("v.blk.0.ln1.weight", "clip"),
+        direct("model.visual.blocks.0.norm1.weight")
+    );
+    assert_eq!(
+        translate("v.blk.0.ln1.bias", "clip"),
+        direct("model.visual.blocks.0.norm1.bias")
+    );
+    assert_eq!(
+        translate("v.blk.7.ln2.weight", "clip"),
+        direct("model.visual.blocks.7.norm2.weight")
+    );
+    assert_eq!(
+        translate("v.blk.7.ln2.bias", "clip"),
+        direct("model.visual.blocks.7.norm2.bias")
+    );
+}
+
+#[test]
+fn clip_patch_bias_and_position_embed() {
+    assert_eq!(
+        translate("v.patch_embd.bias", "clip"),
+        direct("model.visual.patch_embed.proj.bias")
+    );
+    // The temporal-split conv WEIGHT frames are intercepted by the loader,
+    // so the name map deliberately leaves them unmatched.
+    assert_eq!(translate("v.patch_embd.weight", "clip"), None);
+    assert_eq!(translate("v.patch_embd.weight.1", "clip"), None);
+    assert_eq!(
+        translate("v.position_embd.weight", "clip"),
+        direct("model.visual.pos_embed.weight")
+    );
+}
+
+#[test]
+fn clip_merger_and_projector() {
+    assert_eq!(
+        translate("v.post_ln.weight", "clip"),
+        direct("model.visual.merger.norm.weight")
+    );
+    assert_eq!(
+        translate("v.post_ln.bias", "clip"),
+        direct("model.visual.merger.norm.bias")
+    );
+    assert_eq!(
+        translate("mm.0.weight", "clip"),
+        direct("model.visual.merger.linear_fc1.weight")
+    );
+    assert_eq!(
+        translate("mm.0.bias", "clip"),
+        direct("model.visual.merger.linear_fc1.bias")
+    );
+    assert_eq!(
+        translate("mm.2.weight", "clip"),
+        direct("model.visual.merger.linear_fc2.weight")
+    );
+    assert_eq!(
+        translate("mm.2.bias", "clip"),
+        direct("model.visual.merger.linear_fc2.bias")
+    );
+}
+
+#[test]
+fn clip_unrecognized_names_return_none() {
+    assert_eq!(translate("v.blk.0.unknown.weight", "clip"), None);
+    assert_eq!(translate("v.blk.0.attn_qkv.scale", "clip"), None);
+    assert_eq!(translate("v.blk.x.ln1.weight", "clip"), None);
+    assert_eq!(translate("mm.1.weight", "clip"), None); // GELU, no tensor
+    // clip names never leak into the default (backbone) translation.
+    assert_eq!(translate("v.blk.0.attn_qkv.weight", "llama"), None);
+}
