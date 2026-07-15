@@ -4,44 +4,7 @@
 
 use atlas_core::config::ModelConfig;
 
-/// Streams assumed when provisioning scratch for the Q12 kernel-batched
-/// prefill path. The per-stream metadata region scales with N, so the
-/// scratch buffer must be sized for a realistic max concurrent batched
-/// streams. Beyond this, `check_kernel_batched_eligible` falls the dispatch
-/// back to the per-stream path (which respects the same arena cap), so this
-/// bound only governs how often the fast path is available — never safety.
-pub const Q12_SIZING_STREAMS: usize = 8;
-
-/// Exact scratch footprint (bytes) of the Q12 kernel-batched prefill staging
-/// for `n` streams of `chunk_len` tokens each. SSOT for both scratch sizing
-/// (`BufferSizes::from_config`) and the pre-flight eligibility check
-/// (`check_kernel_batched_eligible`), so the two can never disagree about
-/// whether a batch fits. Mirrors the staging layout in `batch_kernel.rs`
-/// (MoE topk area + N per-stream meta blocks) and `stage_batched.rs`
-/// (stacked positions ×(3 if MRoPE) + slots + block/seq_len pointer arrays)
-/// plus the per-SSM-layer `h_state_ptrs` JIT slot.
-pub fn q12_batched_scratch_bytes(n: usize, chunk_len: usize, top_k: usize, mrope: bool) -> usize {
-    let total = n * chunk_len;
-    // MoE topk staging (indices+weights, both ×n streams), 64-byte aligned.
-    let moe = ((total * top_k * 4 * 2) + 63) & !63;
-    // Per-stream meta block — same formula as batch_kernel.rs.
-    let per_stream_meta = ((chunk_len * 16) + 64).max(4096);
-    // Stacked BatchedAttnMetadata (stage_batched.rs layout).
-    let pos = (total * 4 + 7) & !7;
-    let pos_streams = if mrope { 3 } else { 1 };
-    let slot = (total * 8 + 7) & !7;
-    let ptrs = ((n * std::mem::size_of::<u64>()) + 7) & !7;
-    // VARLEN cu_seqlens [n+1] i32 prefix-sum, staged after the pointer arrays
-    // (stage_batched.rs:122-126). This term scales with n, so omitting it made
-    // the SSOT under-count grow with batch size: at n>=4 the h_state_ptrs JIT
-    // slot overlapped a live per-stream pointer table → cross-stream KV/GDN
-    // bleed in decode (n<=3 clean, absorbed by over-provisioning slack).
-    let cu_seqlens = (((n + 1) * 4) + 7) & !7;
-    let stage_meta = pos_streams * pos + slot + 2 * ptrs + cu_seqlens;
-    // h_state_ptrs JIT slot consumed per SSM layer (N device pointers).
-    let h_state_ptrs = n * std::mem::size_of::<u64>();
-    moe + n * per_stream_meta + stage_meta + h_state_ptrs
-}
+use super::sizes_q12::{Q12_SIZING_STREAMS, q12_batched_scratch_bytes};
 
 /// Byte sizes of each buffer, derived from ModelConfig.
 #[derive(Debug, Clone)]
@@ -112,6 +75,23 @@ pub struct BufferSizes {
     pub fp8_act: usize,
     /// Per-128-block FP32 scales paired with `fp8_act` (one f32 per 128 elems).
     pub fp8_act_scale: usize,
+    /// LoRA shrink output `xa = x@Aᵀ`: [m, adapter_max_rank] BF16.
+    /// 0 (→ NULL alloc) when no adapter is configured (adapter_max_rank == 0).
+    pub lora_xa: usize,
+    /// LoRA expand output `delta = xa@Bᵀ`: [m, max target n_out] BF16, where
+    /// max n_out = max(hidden, intermediate) — covers k/v/o/gate/up/down in
+    /// v0 (q_proj is excluded). 0 (→ NULL) when no adapter.
+    pub lora_delta: usize,
+    /// LoRA hidden-activation scratch [m, intermediate_size] BF16 for the
+    /// runtime delta path on FFN projections. 0 (→ NULL) when no adapter.
+    pub lora_hact: usize,
+    /// LoRA per-request routing slots `[m]` i32 — one adapter SLOT index per
+    /// prefilling token (all equal for a single-request prefill; resolves
+    /// `-1`→active before upload). Dedicated buffer (not a packed meta offset)
+    /// so the m-element prefill slot array never collides with the per-path
+    /// positions/slots/block_table region. 0 (→ NULL) when no adapter
+    /// (adapter_max_rank == 0).
+    pub lora_seq_slot: usize,
 }
 
 impl BufferSizes {
@@ -246,6 +226,24 @@ impl BufferSizes {
         let max_proj_k = h.max(q_heads * hd).max(mamba2_d_inner);
         let fp8_act = m * max_proj_k;
         let fp8_act_scale = m * max_proj_k.div_ceil(128) * 4;
+        // LoRA scratch — only when an adapter is configured (adapter_max_rank
+        // set programmatically pre-build). Widest target n_out =
+        // max(hidden, intermediate, q_proj): covers k/v, o/down (hidden),
+        // gate/up (intermediate), and gated q_proj (2*q_heads*head_dim, which
+        // can exceed both — e.g. 35B 2*16*256=8192 > hidden 4096).
+        let (lora_xa, lora_delta, lora_hact, lora_seq_slot) = if config.adapter_max_rank > 0 {
+            let max_n = h
+                .max(config.intermediate_size)
+                .max(q_proj_mul * q_heads * hd);
+            (
+                m * config.adapter_max_rank * bf16,
+                m * max_n * bf16,
+                m * config.intermediate_size * bf16,
+                m * 4, // [m] i32 per-request routing slots (prefill path)
+            )
+        } else {
+            (0, 0, 0, 0)
+        };
 
         // GDN FLA chunked-prefill scratch — ONE buffer holding W|U|S|uc back-to-back,
         // sized for the chunked-prefill arena (nt = ceil(max_batch_tokens / CHUNK)).
@@ -420,6 +418,10 @@ impl BufferSizes {
             ffn_act_scale,
             fp8_act,
             fp8_act_scale,
+            lora_xa,
+            lora_delta,
+            lora_hact,
+            lora_seq_slot,
         }
     }
 
@@ -456,5 +458,9 @@ impl BufferSizes {
             + self.ffn_act_scale
             + self.fp8_act
             + self.fp8_act_scale
+            + self.lora_xa
+            + self.lora_delta
+            + self.lora_hact
+            + self.lora_seq_slot
     }
 }

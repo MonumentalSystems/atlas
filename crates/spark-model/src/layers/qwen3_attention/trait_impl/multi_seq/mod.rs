@@ -43,7 +43,11 @@ impl Qwen3AttentionLayer {
     ) -> Result<()> {
         let _ = states; // Attention layers use EmptyLayerState — no per-seq state.
         let bs = kv_cache.block_size() as u32;
-        let c = ctx::MultiSeqCtx::new(self, ctx, hidden, residual, num_seqs, bs, stream);
+        let mut c = ctx::MultiSeqCtx::new(self, ctx, hidden, residual, num_seqs, bs, stream);
+        // Per-request LoRA routing slot buffer for this step (from metadata).
+        if let Some(m) = ctx.attn_metadata.as_ref() {
+            c.seq_slot = m.seq_slot;
+        }
 
         // DeepSeek-V4: Manifold-Constrained Hyper-Connections (mHC).
         if self.hc.is_some() {

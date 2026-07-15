@@ -154,6 +154,40 @@ impl BufferArena {
     /// for every reusable buffer. Treats raw bytes as f32 lanes — exact
     /// numeric meaning is irrelevant; we only need a stable fingerprint that
     /// differs iff the bytes differ. Synchronizes the stream first.
+    /// LoRA compressed activation scratch `xa = x@Aᵀ` [M, max_rank] BF16.
+    /// `DevicePtr::NULL` when no adapter is configured.
+    pub fn lora_xa(&self) -> DevicePtr {
+        self.lora_xa
+    }
+    /// Allocated byte size of `lora_xa` (0 when no adapter).
+    pub fn lora_xa_bytes(&self) -> usize {
+        self.sizes.lora_xa
+    }
+    /// LoRA expand scratch `delta = xa@Bᵀ` [M, max(hidden, intermediate)]
+    /// BF16. `DevicePtr::NULL` when no adapter is configured.
+    pub fn lora_delta(&self) -> DevicePtr {
+        self.lora_delta
+    }
+    /// Allocated byte size of `lora_delta` (0 when no adapter).
+    pub fn lora_delta_bytes(&self) -> usize {
+        self.sizes.lora_delta
+    }
+    /// LoRA hidden-activation scratch [M, intermediate_size] BF16 for the
+    /// runtime FFN delta path. `DevicePtr::NULL` when no adapter.
+    pub fn lora_hact(&self) -> DevicePtr {
+        self.lora_hact
+    }
+    /// Allocated byte size of `lora_hact` (0 when no adapter).
+    pub fn lora_hact_bytes(&self) -> usize {
+        self.sizes.lora_hact
+    }
+    /// LoRA per-request routing slots `[max_batch_tokens]` i32 for the prefill
+    /// path — one adapter SLOT index per prefilling token. `DevicePtr::NULL`
+    /// when no adapter is configured.
+    pub fn lora_seq_slot(&self) -> DevicePtr {
+        self.lora_seq_slot
+    }
+
     pub fn debug_buffer_checksum(&self, gpu: &dyn GpuBackend, stream: u64, tag: &str) {
         gpu.synchronize(stream).ok();
         let probe = |name: &str, ptr: DevicePtr, bytes: usize| {
