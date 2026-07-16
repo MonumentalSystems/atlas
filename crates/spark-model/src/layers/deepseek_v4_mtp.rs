@@ -334,7 +334,7 @@ impl DeepseekV4MtpHead {
             gdn_exact_replay: false,
             token_ids: ctx.token_ids,
             routed_lora_layers: None, // #30: MTP draft body; no prefill LoRA route.
-            moe_lora_route: crate::layer::MoeLoraRoute::Fold, // MTP draft: reject_decode_lora guards.
+            moe_lora_route: crate::layer::MoeLoraRoute::Skip, // MTP draft body: no lora installed here; Skip = no fold (safe/inert)
         };
 
         // `decode_inner_hc` reads the persistent multi-stream state from

@@ -89,7 +89,7 @@ impl TransformerModel {
             gdn_exact_replay: false,
             token_ids: None,
             routed_lora_layers: None, // #30: MTP/draft decode never routes prefill.
-            moe_lora_route: crate::layer::MoeLoraRoute::Fold, // decode: reject_decode_lora guards.
+            moe_lora_route: self.decode_moe_route(), // route-aware: base(Skip) skips fold, adapter folds (single-seq reject lifted)
         };
         let prop_state = seq
             .proposer_state

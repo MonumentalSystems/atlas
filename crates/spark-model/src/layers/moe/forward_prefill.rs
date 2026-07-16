@@ -52,7 +52,11 @@ impl MoeLayer {
         // UNSORTED — no sorted fold hook). Refuse LOUDLY there rather than serve
         // base-only output with an adapter installed (the per-token batched fold
         // is the decode/verify followup, docs/design/lora-solid.md Incr 4).
-        if self.lora.is_some() {
+        // Route-aware: only a request that actually FOLDS (routes to the adapter)
+        // needs the sorted grouped path — a base/non-active request (`Skip`) has
+        // no delta and prefills the short/batched fallback byte-identically, so it
+        // must NOT be refused just because an adapter is resident.
+        if self.lora.is_some() && !matches!(ctx.moe_lora_route, crate::layer::MoeLoraRoute::Skip) {
             let bf16_batched = self.bf16_gate_weight_ptrs.is_some()
                 && !(self.moe_bf16_grouped_gemm_k.0 != 0 && num_tokens > 64 && !hip_force_batched);
             let fp8_batched = self.fp8_gate_weight_ptrs.is_some()

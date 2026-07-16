@@ -68,12 +68,20 @@ def main():
         # router mlp.gate: in=H -> out=E
         add(f"{pfx}.mlp.gate.lora_A.weight", rng.normal(0, std, (r, H)).astype(np.float32))
         add(f"{pfx}.mlp.gate.lora_B.weight", rng.normal(0, std, (E, r)).astype(np.float32))
+        full = os.environ.get("LORA_FULL") == "1"  # also emit gate/up experts
         for e in experts:
             # expert down_proj: in=MI -> out=H
             add(f"{pfx}.mlp.experts.{e}.down_proj.lora_A.weight",
                 rng.normal(0, std, (r, MI)).astype(np.float32))
             add(f"{pfx}.mlp.experts.{e}.down_proj.lora_B.weight",
                 rng.normal(0, std, (H, r)).astype(np.float32))
+            if full:
+                # expert gate_proj + up_proj: in=H -> out=MI
+                for proj in ("gate_proj", "up_proj"):
+                    add(f"{pfx}.mlp.experts.{e}.{proj}.lora_A.weight",
+                        rng.normal(0, std, (r, H)).astype(np.float32))
+                    add(f"{pfx}.mlp.experts.{e}.{proj}.lora_B.weight",
+                        rng.normal(0, std, (MI, r)).astype(np.float32))
 
     # serialize safetensors (bf16)
     os.makedirs(out, exist_ok=True)
