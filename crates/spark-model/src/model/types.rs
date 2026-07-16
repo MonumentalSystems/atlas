@@ -279,6 +279,14 @@ pub struct TransformerModel {
     /// Feature-2 token overlay kernels, resolved once at construction via
     /// `try_kernel` (null-on-miss ⇒ overlay silently unused on an older image).
     pub(super) overlay_kernels: crate::layers::ops::token_overlay::OverlayKernels,
+    /// Feature-2 per-forward overlay route: the current request's `adapter_slot`,
+    /// stamped at each `Model::{prefill,decode,...}` entry (the scheduler drives
+    /// the model serially on one thread, so a plain atomic is sufficient). The
+    /// overlay hooks resolve it through `routed_prefill_slot` so a request that
+    /// selects a NON-active pool adapter gets THAT adapter's overlay, not the
+    /// pool's active one. `i32::MIN` marks a mixed-adapter decode batch (per-token
+    /// `seq_slot` routing deferred to SOLID Incr-4) ⇒ the hooks skip.
+    pub(super) overlay_route_slot: std::sync::atomic::AtomicI32,
 }
 
 /// Pinned host memory staging buffer with reusable metadata Vecs.

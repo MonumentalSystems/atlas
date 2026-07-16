@@ -55,6 +55,7 @@ impl Model for TransformerModel {
         *self.vision_owned_images.lock() = owned_images;
     }
     fn prefill(&self, tokens: &[u32], seq: &mut SequenceState, stream: u64) -> Result<DevicePtr> {
+        self.stamp_overlay_route(seq.adapter_slot);
         self.prefill_dispatch(tokens, seq, stream)
     }
     fn prefill_chunk(
@@ -66,6 +67,7 @@ impl Model for TransformerModel {
         is_last_chunk: bool,
         stream: u64,
     ) -> Result<DevicePtr> {
+        self.stamp_overlay_route(seq.adapter_slot);
         self.prefill_chunk_dispatch(tokens, seq, chunk_start, chunk_len, is_last_chunk, stream)
     }
     fn prefill_twophase(
@@ -75,9 +77,11 @@ impl Model for TransformerModel {
         chunk_size: usize,
         stream: u64,
     ) -> Result<DevicePtr> {
+        self.stamp_overlay_route(seq.adapter_slot);
         self.prefill_twophase_dispatch(tokens, seq, chunk_size, stream)
     }
     fn decode(&self, token: u32, seq: &mut SequenceState, _stream: u64) -> Result<DevicePtr> {
+        self.stamp_overlay_route(seq.adapter_slot);
         self.decode_dispatch(token, seq, _stream)
     }
     fn decode_batch(
@@ -86,6 +90,7 @@ impl Model for TransformerModel {
         seqs: &mut [&mut SequenceState],
         stream: u64,
     ) -> Result<DevicePtr> {
+        self.stamp_overlay_route_batch(seqs);
         self.decode_batch_dispatch(tokens, seqs, stream)
     }
     fn mixed_forward(
@@ -99,6 +104,10 @@ impl Model for TransformerModel {
         prefill_is_last: bool,
         stream: u64,
     ) -> Result<crate::traits::MixedForwardResult> {
+        // Mixed decode+prefill batch spans multiple adapters ⇒ mark mixed so the
+        // overlay hooks skip (per-token seq_slot routing is SOLID Incr-4).
+        self.overlay_route_slot
+            .store(i32::MIN, std::sync::atomic::Ordering::Relaxed);
         self.mixed_forward_dispatch(
             decode_tokens,
             decode_seqs,

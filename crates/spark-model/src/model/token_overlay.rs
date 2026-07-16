@@ -30,8 +30,45 @@ impl TransformerModel {
     /// pool's `active` index, or `-1` (base / no delta) when no pool is resident.
     /// A `-1` return makes every hook a no-op, so a non-overlay LoRA run and a
     /// no-LoRA run are both byte-identical.
+    /// Stamp the per-forward overlay route from a single request's `adapter_slot`
+    /// (called at each single-sequence `Model` entry). Cheap unconditional store;
+    /// the hooks still early-return when no overlay is installed.
+    pub(super) fn stamp_overlay_route(&self, adapter_slot: i32) {
+        self.overlay_route_slot
+            .store(adapter_slot, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Stamp from a batch: the shared `adapter_slot` when every sequence agrees,
+    /// else `i32::MIN` (mixed ⇒ the overlay hooks skip; per-token `seq_slot`
+    /// routing is SOLID Incr-4). An empty batch resets to `-1`.
+    pub(super) fn stamp_overlay_route_batch(&self, seqs: &[&mut crate::traits::SequenceState]) {
+        let slot = match seqs.split_first() {
+            Some((first, rest)) if rest.iter().all(|s| s.adapter_slot == first.adapter_slot) => {
+                first.adapter_slot
+            }
+            Some(_) => i32::MIN,
+            None => -1,
+        };
+        self.overlay_route_slot
+            .store(slot, std::sync::atomic::Ordering::Relaxed);
+    }
+
     pub(super) fn overlay_active_slot(&self) -> i32 {
-        self.lora.as_ref().map(|l| l.active as i32).unwrap_or(-1)
+        let Some(l) = self.lora.as_ref() else {
+            return -1;
+        };
+        let req = self
+            .overlay_route_slot
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if req == i32::MIN {
+            // Mixed-adapter decode batch: per-token seq_slot routing is deferred
+            // (SOLID Incr-4). Skip rather than uniform-apply one adapter's overlay.
+            return -1;
+        }
+        // Resolve the REQUEST's adapter_slot (not the pool's `active`): a request
+        // that selects a non-active pool slot must get that slot's overlay. `-1`
+        // (defer-to-active) resolves to `active`; out-of-range ⇒ None ⇒ skip.
+        l.routed_prefill_slot(req).map(|s| s as i32).unwrap_or(-1)
     }
 
     /// Overlay the embedding rows of overridden vocab ids in place on `out`.

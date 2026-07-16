@@ -536,6 +536,7 @@ impl TransformerModel {
             embed_scale_kernel,
             overlays: None,
             overlay_kernels,
+            overlay_route_slot: std::sync::atomic::AtomicI32::new(-1),
         })
     }
 }
