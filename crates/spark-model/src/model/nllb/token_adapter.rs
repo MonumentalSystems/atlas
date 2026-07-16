@@ -77,6 +77,43 @@ pub(super) fn override_source(id: u32, trainable: &[u32]) -> Option<usize> {
     trainable.iter().position(|&t| t == id)
 }
 
+/// Keep only the trainable indices addressable in the served `vocab`, returning
+/// `(kept, skipped_extension_count)`. Indices in `[vocab, r)` are vocab-extension
+/// tokens (a resized adapter served on a smaller base) — dropped so the overlay
+/// stays inside the served embedding. PEFT appends extension tokens as the
+/// largest indices with delta rows in the same order, so dropping the tail
+/// preserves the positional delta mapping for the kept ones; a non-tail-ordered
+/// index (a kept index after a larger kept index) would break that alignment and
+/// is a hard error. An index `>= r` is out of the adapter itself and also errors.
+/// Pure — unit-tested.
+pub(super) fn clamp_trainable_to_vocab(
+    trainable: &[u32],
+    r: usize,
+    vocab: usize,
+) -> Result<(Vec<u32>, usize)> {
+    let mut kept: Vec<u32> = Vec::with_capacity(trainable.len());
+    let mut skipped = 0usize;
+    let mut max_kept: i64 = -1;
+    for &idx in trainable {
+        let u = idx as usize;
+        if u >= r {
+            bail!("NLLB token_adapter: trainable index {idx} out of range (R={r})");
+        } else if u >= vocab {
+            skipped += 1;
+        } else {
+            if (idx as i64) < max_kept {
+                bail!(
+                    "NLLB token_adapter: trainable_token_indices not tail-ordered \
+                     ({idx} after {max_kept}); cannot align delta rows after clamping"
+                );
+            }
+            max_kept = idx as i64;
+            kept.push(idx);
+        }
+    }
+    Ok((kept, skipped))
+}
+
 /// Host mirror of the row-diff kernel: `max|a[r]-b[r]| > thresh`. Used by the
 /// CPU tests (and documents the exact device predicate).
 #[cfg(test)]
@@ -144,20 +181,33 @@ pub(super) fn build_overlay(
             delta.shape
         );
     }
-    // The lm_head gemv N and embed addressing are bounded by the served vocab, so
-    // a smaller base literally cannot emit the new tokens.
-    if vocab < r {
-        bail!(
-            "NLLB token_adapter: served base vocab {vocab} < adapter embedding {r}; \
-             serve the resized/merged base"
+    // Rows beyond the served vocab are vocab-extension tokens (e.g. a new
+    // `<lexeme>` control token appended past the base). The served tokenizer
+    // cannot emit them and the lm_head gemv N / embed addressing are bounded by
+    // `vocab`, so they can never participate in this deployment. Clamp the
+    // overlay to the served vocab and report exactly what is skipped — never
+    // silently drop coverage. To use the extension tokens, serve the resized
+    // tokenizer/config so `vocab` grows to cover them.
+    let r_eff = r.min(vocab);
+    if r > vocab {
+        tracing::warn!(
+            "NLLB token_adapter: adapter embedding {r} > served vocab {vocab}; \
+             {} vocab-extension row(s) beyond the served vocab are skipped \
+             (serve the resized tokenizer/config to use them)",
+            r - vocab
         );
     }
-    for &idx in trainable {
-        if idx as usize >= r || idx as usize >= vocab {
-            bail!("NLLB token_adapter: trainable index {idx} out of range (R={r}, vocab={vocab})");
-        }
+    // Keep only trainable indices addressable in the served vocab; the (tail)
+    // extension indices and their delta rows are dropped together.
+    let (trainable_kept, skipped_ext) = clamp_trainable_to_vocab(trainable, r, vocab)?;
+    if skipped_ext > 0 {
+        tracing::warn!(
+            "NLLB token_adapter: {skipped_ext} trainable token(s) address extension rows \
+             beyond served vocab {vocab} — skipped"
+        );
     }
-    if trainable.len() != t {
+    let trainable: &[u32] = &trainable_kept;
+    if trainable.len() != t && skipped_ext == 0 {
         // Not fatal: the delta rows map positionally to trainable_token_indices.
         tracing::warn!(
             "NLLB token_adapter: {t} delta rows but {} trainable indices — using min",
@@ -165,21 +215,21 @@ pub(super) fn build_overlay(
         );
     }
 
-    // 1) differing rows: max|base_layer[r]-embed[r]| > thresh.
-    let flags_dev = gpu.alloc(r)?;
+    // 1) differing rows over the served vocab only: max|base_layer[r]-embed[r]| > thresh.
+    let flags_dev = gpu.alloc(r_eff)?;
     let rowdiff = gpu.kernel("nllb_encoder", "nllb_embed_rowdiff_bf16")?;
     KernelLaunch::new(gpu, rowdiff)
-        .grid([div_ceil(r as u32, 256), 1, 1])
+        .grid([div_ceil(r_eff as u32, 256), 1, 1])
         .block([256, 1, 1])
         .arg_ptr(base.ptr)
         .arg_ptr(embed_table)
         .arg_ptr(flags_dev)
-        .arg_u32(r as u32)
+        .arg_u32(r_eff as u32)
         .arg_u32(d as u32)
         .arg_f32(ROWDIFF_THRESH)
         .launch(gpu.default_stream())?;
     gpu.synchronize(gpu.default_stream())?;
-    let mut flags = vec![0u8; r];
+    let mut flags = vec![0u8; r_eff];
     gpu.copy_d2h(flags_dev, &mut flags)?;
     gpu.free(flags_dev)?;
     let row_diff: Vec<bool> = flags.iter().map(|&f| f != 0).collect();

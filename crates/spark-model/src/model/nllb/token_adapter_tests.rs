@@ -107,3 +107,43 @@ fn peft_cfg_parses_trainable_token_indices() {
     let cfg: PeftCfg = serde_json::from_str(without).unwrap();
     assert!(cfg.trainable_token_indices.is_empty());
 }
+
+/// The Kuku v24.3 case: a resized adapter (R=256206) served on the merged base
+/// (vocab=256205). The single `<lexeme>` extension index (256205) is skipped so
+/// the overlay stays inside the served embedding, leaving no in-vocab trainables.
+#[test]
+fn clamp_drops_extension_index_on_smaller_base() {
+    let (kept, skipped) = clamp_trainable_to_vocab(&[256205], 256206, 256205).unwrap();
+    assert!(kept.is_empty());
+    assert_eq!(skipped, 1);
+}
+
+/// In-vocab trainables are kept and their tail extension siblings dropped; the
+/// kept prefix preserves positional (delta-row) order.
+#[test]
+fn clamp_keeps_in_vocab_and_drops_tail_extension() {
+    let (kept, skipped) = clamp_trainable_to_vocab(&[100, 200, 256205], 256206, 256205).unwrap();
+    assert_eq!(kept, vec![100, 200]);
+    assert_eq!(skipped, 1);
+}
+
+/// A resized base (vocab >= R) keeps every index — no clamping.
+#[test]
+fn clamp_noop_when_base_covers_adapter() {
+    let (kept, skipped) = clamp_trainable_to_vocab(&[100, 256205], 256206, 256206).unwrap();
+    assert_eq!(kept, vec![100, 256205]);
+    assert_eq!(skipped, 0);
+}
+
+/// A kept index after a larger kept index would mis-align delta rows once the
+/// tail is dropped — rejected rather than silently corrupting the overlay.
+#[test]
+fn clamp_rejects_non_tail_ordered_kept_indices() {
+    assert!(clamp_trainable_to_vocab(&[200, 100, 256205], 256206, 256205).is_err());
+}
+
+/// An index outside the adapter embedding itself (>= R) is a hard error.
+#[test]
+fn clamp_rejects_index_beyond_adapter() {
+    assert!(clamp_trainable_to_vocab(&[999], 500, 500).is_err());
+}
