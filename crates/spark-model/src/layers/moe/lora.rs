@@ -335,10 +335,14 @@ impl MoeLayer {
         let Some(ref route) = l.expert_route else {
             return Ok(()); // router-only adapter: no expert down fold
         };
-        // Request-granularity opt-out (base / non-active pays nothing; a mixed /
-        // non-active batch REFUSES loudly rather than mis-fold one adapter onto
-        // rows it does not own). Byte-identical base decode preserved.
-        if !self.moe_route_gate(ctx, "expert-down-decode")? {
+        // SOLID Incr-4: when a per-row `row_adapter` map is supplied (batched
+        // decode), the launch is UNCONDITIONAL and route-agnostic — base rows
+        // no-op device-side via `row_adapter[row/top_k] < 0`, so the fold is
+        // captured into the shared `padded_n` graph and replays correctly across
+        // arbitrary base/adapter compositions. Consult the request-granularity
+        // `moe_route_gate` ONLY on the single-seq NULL-map path (its `Skip`/
+        // `Refuse` host branch would otherwise bake one route into the graph).
+        if row_adapter == DevicePtr::NULL && !self.moe_route_gate(ctx, "expert-down-decode")? {
             return Ok(());
         }
         anyhow::ensure!(

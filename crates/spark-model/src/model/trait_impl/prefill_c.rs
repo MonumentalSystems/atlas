@@ -418,6 +418,7 @@ impl TransformerModel {
             max_blocks_per_seq: seq.block_table.len() as u32,
             num_seqs: 1,
             seq_slot,
+            moe_row_adapter: spark_runtime::gpu::DevicePtr::NULL,
         };
 
         let ctx = ForwardContext {

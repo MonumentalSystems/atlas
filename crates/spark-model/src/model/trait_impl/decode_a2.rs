@@ -238,6 +238,22 @@ impl TransformerModel {
             moe_lora_route: self.decode_moe_route(), // route-aware: base(Skip) decodes; adapter refuses
         };
 
+        // SOLID Incr-4: a batch containing a row that routes to a NON-active
+        // adapter (`Refuse`, stamped by `stamp_decode_moe_batch`) cannot be
+        // served by the single-active per-row fold — the gather-BGMV tests only
+        // the SIGN of the row map, so a non-active slot would fold the ACTIVE
+        // adapter's tables onto it. Bail HERE, before any graph lookup/capture,
+        // so this host error never mutates the padded_n graph shape (a captured
+        // graph must stay route-agnostic across replays). Base + active-adapter
+        // rows in the same batch are fine (the per-row map skips base rows).
+        if matches!(ctx.moe_lora_route, crate::layer::MoeLoraRoute::Refuse) {
+            anyhow::bail!(
+                "MoE LoRA batched decode: a sequence in this batch routes to a non-active \
+                 adapter under single-active phase-1; refusing rather than folding the active \
+                 adapter's delta onto rows it does not own. Serve one adapter active per batch."
+            );
+        }
+
         // ── Phase 2: CUDA graph lookup / capture ──
         let mut graphs = if use_graphs {
             Some(self.batch_decode_graphs.lock())

@@ -16,8 +16,21 @@ impl MoeLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
-        // Feature-1 phase-1: batched decode does not yet fold the expert delta.
-        self.reject_decode_lora(ctx, "forward_batched")?;
+        // SOLID Incr-4: batched decode folds the routed-expert gate/up + down
+        // LoRA delta per token (below), gated by the device per-row `row_adapter`
+        // map so base rows no-op and the launch is route-agnostic under capture.
+        // The `reject_decode_lora` bail is lifted here; a batch containing a
+        // NON-active adapter (`Refuse`) is bailed host-side in
+        // `decode_batch_compute_main` before graph lookup, so it never reaches
+        // this fold. `row_adapter_base` is the fixed-address `[num_seqs]` i32 map
+        // uploaded per step (MoE `-1 = base` semantics); `DevicePtr(0)` when no
+        // adapter is resident, in which case the fold hooks fall back to the
+        // request-granularity `moe_route_gate` (a homogeneous batch folds all
+        // rows; base skips) — see `apply_expert_lora_decode_{gateup,down}`.
+        let row_adapter_base = ctx
+            .attn_metadata
+            .as_ref()
+            .map_or(DevicePtr::NULL, |m| m.moe_row_adapter);
         let h = ctx.config.hidden_size as u32;
         let inter = ctx.config.moe_intermediate_size as u32;
         let num_experts = ctx.config.num_experts as u32;
@@ -123,6 +136,17 @@ impl MoeLayer {
             let scratch = ctx.buffers.scratch();
             let indices_dev = scratch;
             let weights_dev = scratch.offset(top_k as usize * 4);
+
+            // Per-row LoRA map slice for THIS token: the fold's `n_slots == top_k`
+            // (`row/top_k == 0`), so token `t`'s entry is `row_adapter_base + t*4`
+            // (i32). The offset is a structural loop constant → a fixed address
+            // baked correctly per captured graph. NULL base stays NULL (no
+            // per-row map; the hooks then use the request gate).
+            let ra_t = if row_adapter_base.0 != 0 {
+                row_adapter_base.offset(t * 4)
+            } else {
+                DevicePtr::NULL
+            };
 
             if let Some(tid2eid) = self.tid2eid_dev {
                 // DeepSeek-V4 hash routing: expert selection is static
@@ -230,6 +254,11 @@ impl MoeLayer {
                     top_k,
                     stream,
                 )?;
+                // SOLID Incr-4: fold gate/up delta BEFORE the fused silu+down.
+                self.apply_expert_lora_decode_gateup(
+                    expert_gate_out, expert_up_out, input_t, indices_dev, top_k, top_k, ra_t, ctx,
+                    stream,
+                )?;
                 ops::moe_expert_silu_down_shared_bf16(
                     ctx.gpu,
                     self.moe_expert_silu_down_shared_bf16_k,
@@ -272,6 +301,11 @@ impl MoeLayer {
                     inter,
                     h,
                     top_k,
+                    stream,
+                )?;
+                // SOLID Incr-4: fold gate/up delta BEFORE the fused silu+down.
+                self.apply_expert_lora_decode_gateup(
+                    expert_gate_out, expert_up_out, input_t, indices_dev, top_k, top_k, ra_t, ctx,
                     stream,
                 )?;
                 ops::moe_expert_silu_down_shared_fp8(
@@ -343,6 +377,11 @@ impl MoeLayer {
                     top_k,
                     stream,
                 )?;
+                // SOLID Incr-4: fold gate/up delta BEFORE the fused silu+down.
+                self.apply_expert_lora_decode_gateup(
+                    expert_gate_out, expert_up_out, input_t, indices_dev, top_k, top_k, ra_t, ctx,
+                    stream,
+                )?;
                 ops::moe_expert_silu_down_shared_t(
                     ctx.gpu,
                     self.e8m0_or(
@@ -390,6 +429,11 @@ impl MoeLayer {
                     top_k,
                     stream,
                 )?;
+                // SOLID Incr-4: fold gate/up delta BEFORE the fused silu+down.
+                self.apply_expert_lora_decode_gateup(
+                    expert_gate_out, expert_up_out, input_t, indices_dev, top_k, top_k, ra_t, ctx,
+                    stream,
+                )?;
                 ops::moe_expert_silu_down_shared(
                     ctx.gpu,
                     self.moe_expert_silu_down_shared,
@@ -410,6 +454,16 @@ impl MoeLayer {
                     stream,
                 )?;
             }
+
+            // SOLID Incr-4: fold the routed-expert down_proj delta into this
+            // token's `expert_down_out` (slot-major [top_k, hidden]) IN PLACE,
+            // recomputing x = silu(gate)*up from the still-materialized
+            // gate/up out — BEFORE the weighted-sum blend (so the router weight
+            // scales base+delta). Route-agnostic via `ra_t` (base rows no-op).
+            self.apply_expert_lora_decode_down(
+                expert_gate_out, expert_up_out, expert_down_out, indices_dev, top_k, top_k, ra_t,
+                ctx, stream,
+            )?;
 
             ops::moe_weighted_sum_blend(
                 ctx.gpu,

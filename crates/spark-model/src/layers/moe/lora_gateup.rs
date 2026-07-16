@@ -118,7 +118,10 @@ impl MoeLayer {
         if l.gate_route.is_none() && l.up_route.is_none() {
             return Ok(());
         }
-        if !self.moe_route_gate(ctx, "expert-gateup-decode")? {
+        // SOLID Incr-4: a non-NULL per-row map supersedes the request gate — the
+        // batched fold launches unconditionally and skips base rows device-side
+        // (route-agnostic capture). Single-seq (NULL map) still uses the gate.
+        if row_adapter == DevicePtr::NULL && !self.moe_route_gate(ctx, "expert-gateup-decode")? {
             return Ok(());
         }
         anyhow::ensure!(

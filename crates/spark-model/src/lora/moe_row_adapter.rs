@@ -98,6 +98,45 @@ pub fn build_moe_row_adapter_host(
     Some(map)
 }
 
+/// SOLID Incr-4 (batched decode fold): build the per-row `[padded_n]` i32
+/// adapter map the device-side MoE gather-BGMV fold reads. One token per
+/// sequence at decode, so a per-row map IS a per-seq map (no `top_k` expansion —
+/// the kernel indexes `row_adapter[row / top_k]`).
+///
+/// Per row `i`, `resolve_moe_lora_route(adapter_slots[i], active, has_moe_lora)`:
+///   - `Fold` (owns the installed active adapter) ⇒ write `active` (`>= 0` when
+///     an adapter is resident — the kernel only tests the SIGN, and the single
+///     active adapter's per-expert tables are folded). When no adapter is
+///     installed (`has_moe_lora == false`) `active` is `-1`, so the row
+///     correctly skips.
+///   - `Skip` (base / non-active) ⇒ `-1` (device kernel skips the row — MoE's
+///     `< 0 = base` semantics, NOT the attention `seq_slot` `-1 → active`).
+///   - `Refuse` (non-active adapter present) ⇒ `-1` DEFENSIVELY. A `Refuse`
+///     batch is bailed host-side before this map is ever uploaded
+///     (`stamp_decode_moe_batch` + the `decode_batch_compute_main` pre-lookup
+///     guard); mapping to base here means a leaked `Refuse` row folds NOTHING
+///     rather than mis-folding the wrong adapter.
+///   - pad rows (`i >= adapter_slots.len()`) ⇒ `-1` (skip).
+///
+/// Pure + GPU-free so the routing is unit-testable without hardware; the device
+/// upload is a thin wrapper (`upload_moe_row_adapter`).
+pub fn build_moe_row_adapter_decode(
+    adapter_slots: &[i32],
+    padded_n: usize,
+    active: i32,
+    has_moe_lora: bool,
+) -> Vec<i32> {
+    (0..padded_n)
+        .map(|i| match adapter_slots.get(i).copied() {
+            Some(slot) => match resolve_moe_lora_route(slot, active, has_moe_lora) {
+                MoeLoraRoute::Fold => active,
+                MoeLoraRoute::Skip | MoeLoraRoute::Refuse => -1,
+            },
+            None => -1, // pad row
+        })
+        .collect()
+}
+
 #[cfg(test)]
 #[path = "moe_row_adapter_tests.rs"]
 mod tests;

@@ -75,3 +75,48 @@ fn row_adapter_rejects_malformed() {
     // Non-monotonic boundary.
     assert!(build_moe_row_adapter_host(&[0, 4, 2], &[0, 1]).is_none());
 }
+
+// ── SOLID Incr-4 batched-decode per-row map (build_moe_row_adapter_decode) ──
+
+#[test]
+fn decode_map_off_when_no_moe_lora() {
+    // No adapter installed (active = -1, has = false): every row must skip so an
+    // off run folds NOTHING even though resolve() returns the inert Fold.
+    let map = build_moe_row_adapter_decode(&[-1, 0, 2], 4, -1, false);
+    assert_eq!(map, vec![-1, -1, -1, -1]);
+}
+
+#[test]
+fn decode_map_all_base_skips() {
+    // Concurrent base-only batch with an adapter resident: all rows -1, pads -1.
+    let map = build_moe_row_adapter_decode(&[-1, -1], 4, 0, true);
+    assert_eq!(map, vec![-1, -1, -1, -1]);
+}
+
+#[test]
+fn decode_map_mixed_base_and_active() {
+    // active adapter = slot 3. Rows: [active, base, active] padded to 4.
+    // Active rows carry `active` (>=0 => fold); base + pad carry -1 (skip).
+    let map = build_moe_row_adapter_decode(&[3, -1, 3], 4, 3, true);
+    assert_eq!(map, vec![3, -1, 3, -1]);
+}
+
+#[test]
+fn decode_map_refuse_row_defensively_skips() {
+    // A non-active adapter row (slot 1, active 0) resolves Refuse; the batch is
+    // bailed host-side before upload, but if it leaked, the map skips (-1) rather
+    // than folding the wrong adapter. Active-owning rows still fold.
+    let map = build_moe_row_adapter_decode(&[0, 1], 2, 0, true);
+    assert_eq!(map, vec![0, -1]);
+}
+
+#[test]
+fn decode_map_padding_widths() {
+    // The uploaded buffer is always [padded_n]; unused rows pad with -1.
+    for padded_n in [2usize, 4, 8] {
+        let map = build_moe_row_adapter_decode(&[0], padded_n, 0, true);
+        assert_eq!(map.len(), padded_n);
+        assert_eq!(map[0], 0);
+        assert!(map[1..].iter().all(|&v| v == -1));
+    }
+}

@@ -150,6 +150,7 @@ impl TransformerModel {
             max_blocks_per_seq: max_blocks,
             num_seqs: 1,
             seq_slot,
+            moe_row_adapter: spark_runtime::gpu::DevicePtr::NULL,
         };
 
         // CUDA graphs cannot capture NCCL all-reduce (it runs on a separate

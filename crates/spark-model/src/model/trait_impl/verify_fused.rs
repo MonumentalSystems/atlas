@@ -163,6 +163,7 @@ impl TransformerModel {
             max_blocks_per_seq: max_blocks,
             num_seqs: m as u32,
             seq_slot,
+            moe_row_adapter: spark_runtime::gpu::DevicePtr::NULL,
         };
 
         // FP8 calibration re-enable (mirrors verify_b.rs).

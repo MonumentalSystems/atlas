@@ -97,22 +97,33 @@ impl TransformerModel {
         self.store_decode_moe_route(self.moe_lora_route(adapter_slot));
     }
 
-    /// Stamp from a decode batch: `Skip` only when EVERY sequence is base (so
-    /// base requests decode normally even while an adapter is resident); any
-    /// adapter-using row makes the batch `Fold`, which `reject_decode_lora`
-    /// turns into a loud bail (per-row decode fold is SOLID Incr-4). Empty batch
-    /// resolves to `Skip`.
+    /// Stamp from a decode batch — 3-way reduction over the rows' per-seq routes
+    /// (SOLID Incr-4). Any row routing to a NON-active adapter (`Refuse`) stamps
+    /// `Refuse`: the single-active phase-1 fold cannot honor a second adapter's
+    /// identity (the device gather-BGMV checks only the SIGN of the per-row map,
+    /// so a non-active slot would silently fold the ACTIVE adapter's tables), so
+    /// `decode_batch_compute_main` bails host-side before graph lookup. Else any
+    /// adapter-owning row stamps `Fold` (the batched per-row map skips base rows
+    /// individually, so base seqs in a mixed batch still decode clean). Only when
+    /// EVERY row is base (or an empty batch) does it stamp `Skip` (nothing to
+    /// fold; base decode stays byte-identical).
     pub(crate) fn stamp_decode_moe_batch(&self, seqs: &[&mut crate::traits::SequenceState]) {
-        let all_skip = seqs.iter().all(|s| {
-            matches!(
-                self.moe_lora_route(s.adapter_slot),
-                crate::layer::MoeLoraRoute::Skip
-            )
-        });
-        self.store_decode_moe_route(if all_skip {
-            crate::layer::MoeLoraRoute::Skip
+        use crate::layer::MoeLoraRoute;
+        let mut any_fold = false;
+        for s in seqs.iter() {
+            match self.moe_lora_route(s.adapter_slot) {
+                MoeLoraRoute::Refuse => {
+                    self.store_decode_moe_route(MoeLoraRoute::Refuse);
+                    return;
+                }
+                MoeLoraRoute::Fold => any_fold = true,
+                MoeLoraRoute::Skip => {}
+            }
+        }
+        self.store_decode_moe_route(if any_fold {
+            MoeLoraRoute::Fold
         } else {
-            crate::layer::MoeLoraRoute::Fold
+            MoeLoraRoute::Skip
         });
     }
 

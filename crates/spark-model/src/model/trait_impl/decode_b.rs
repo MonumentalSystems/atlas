@@ -360,6 +360,8 @@ impl TransformerModel {
             max_blocks_per_seq: prefill_seq.block_table.len() as u32,
             num_seqs: 1,
             seq_slot: prefill_seq_slot,
+            // Prefilling seq in the mixed batch: MoE fold via the request gate.
+            moe_row_adapter: spark_runtime::gpu::DevicePtr::NULL,
         };
 
         // ── 5. Build decode layer states ──

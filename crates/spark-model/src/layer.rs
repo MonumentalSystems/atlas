@@ -109,6 +109,20 @@ pub struct AttnMetadataDev {
     /// graph. `DevicePtr(0)` on every non-routed path (single-seq decode,
     /// prefill, verify, MLA, MTP) — the bgmv apply sites no-op when it is null.
     pub seq_slot: DevicePtr,
+    /// SOLID Incr-4 (batched decode MoE fold): `[num_seqs]` i32 per-row adapter
+    /// map for the MoE expert gather-BGMV fold, at this device address. MoE
+    /// semantics (distinct from `seq_slot`): `< 0` = base / no fold (device
+    /// kernel skips the row); `>= 0` = fold the installed active adapter's
+    /// per-expert delta on that row. Built by
+    /// [`crate::lora::build_moe_row_adapter_decode`] and uploaded each decode
+    /// step to a stable address (the metadata `+160` gap), so the batched fold
+    /// stays inside the captured decode graph and is route-agnostic across
+    /// replays (base rows no-op individually). `DevicePtr(0)` when no adapter is
+    /// resident and on every non-batched path (the fold hooks then fall back to
+    /// the request-granularity `moe_route_gate`). NOT the `seq_slot` buffer —
+    /// that resolves `-1 → active` (attention defer-to-active), which would fold
+    /// the adapter onto base rows here.
+    pub moe_row_adapter: DevicePtr,
 }
 
 /// Q12 batched-prefill device-side metadata.
