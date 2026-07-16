@@ -59,8 +59,9 @@ impl MoeLayer {
         // single-active short prefill folds correctly, a base/non-active request
         // (`Skip`) folds nothing and stays byte-identical, and the requests that
         // still cannot be served refuse downstream in `forward_batched` at the
-        // correct granularity — router (`mlp.gate`) via `reject_batched_router_lora`,
-        // and mixed/packed or non-active adapters via `moe_route_gate` `Refuse`.
+        // correct granularity — the router (`mlp.gate`) delta now folds on the
+        // batched path via `apply_router_lora_batched` (SOLID Incr-4), and
+        // mixed/packed or non-active adapters refuse via `moe_route_gate` `Refuse`.
         // (The device per-row prefill map for a MIXED short-prefill batch is the
         // Incr-3 follow-up: `build_moe_row_adapter_host`, still refused for now.)
 

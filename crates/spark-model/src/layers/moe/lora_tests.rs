@@ -6,12 +6,57 @@
 //! = num_experts, decode down x-recompute = moe_inter); gate/up's `k_in=hidden`
 //! must NOT size it. GPU-free (pure function).
 
-use super::lora_delta_cols;
+use super::{lora_delta_cols, router_expert_entry};
+use crate::layers::ops::lora_delta::LoraPair;
+use crate::layers::ops::moe_lora_grouped::pack_expert_tables;
+use crate::weight_map::DenseWeight;
+use spark_runtime::gpu::DevicePtr;
 
 // Holo-3.1-35B-A3B shapes: hidden=2048, moe_inter=512, num_experts=256.
 const NUM_EXPERTS: u32 = 256;
 const MOE_INTER: u32 = 512;
 const HIDDEN: u32 = 2048;
+
+/// Build a GPU-free router `LoraPair` with distinct dummy A/B device addresses
+/// (`DevicePtr` is a thin `u64` newtype, so no allocation is needed to test the
+/// pure entry mapping). `k_in=hidden`, `n_out=num_experts` — the router pair's
+/// real dims.
+fn dummy_router_pair(a_addr: u64, b_addr: u64, scale: f32, rank: u32) -> LoraPair {
+    LoraPair {
+        a: DenseWeight {
+            weight: DevicePtr(a_addr),
+        },
+        b: DenseWeight {
+            weight: DevicePtr(b_addr),
+        },
+        rank,
+        k_in: HIDDEN,
+        n_out: NUM_EXPERTS,
+        scale,
+        max_rank: rank,
+    }
+}
+
+#[test]
+fn router_entry_is_expert_zero_from_pair() {
+    // The router pair maps to a single (expert_id=0, a, b, scale) entry — the
+    // router owns the only slot of the degenerate 1-"expert" gather table.
+    let rp = dummy_router_pair(0xA000, 0xB000, 0.5, 16);
+    assert_eq!(router_expert_entry(&rp), (0u16, 0xA000u64, 0xB000u64, 0.5f32));
+}
+
+#[test]
+fn router_entry_packs_to_len_one_table() {
+    // Packing that single entry yields a length-1 dense route (n_experts == 1),
+    // so `moe_lora_gather_bgmv` sees exactly one "expert" and every all-zero
+    // `indices` row resolves to it.
+    let rp = dummy_router_pair(0xAAAA, 0xBBBB, 2.0, 8);
+    let t = pack_expert_tables(&[router_expert_entry(&rp)]).unwrap();
+    assert_eq!(t.n_experts, 1);
+    assert_eq!(t.a, vec![0xAAAA]);
+    assert_eq!(t.b, vec![0xBBBB]);
+    assert_eq!(t.scale, vec![2.0]);
+}
 
 #[test]
 fn full_adapter_takes_max_of_router_and_down() {

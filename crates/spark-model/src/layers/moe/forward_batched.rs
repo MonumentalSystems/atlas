@@ -17,19 +17,19 @@ impl MoeLayer {
         stream: u64,
     ) -> Result<()> {
         // SOLID Incr-4: batched decode folds the routed-expert gate/up + down
-        // LoRA delta per token (below), gated by the device per-row `row_adapter`
-        // map so base rows no-op and the launch is route-agnostic under capture.
-        // The `reject_decode_lora` bail is lifted here; a batch containing a
-        // NON-active adapter (`Refuse`) is bailed host-side in
-        // `decode_batch_compute_main` before graph lookup, so it never reaches
-        // this fold. `row_adapter_base` is the fixed-address `[num_seqs]` i32 map
-        // uploaded per step (MoE `-1 = base` semantics); `DevicePtr(0)` when no
-        // adapter is resident, in which case the fold hooks fall back to the
-        // request-granularity `moe_route_gate` (a homogeneous batch folds all
-        // rows; base skips) — see `apply_expert_lora_decode_{gateup,down}`.
-        // Router (mlp.gate) delta is NOT folded on the batched path — refuse
-        // loudly for a router-adapted adapter rather than silently drop it.
-        self.reject_batched_router_lora(ctx)?;
+        // LoRA delta per token (below) AND the router (mlp.gate) delta on the
+        // whole-batch gate_logits before top-k (`apply_router_lora_batched`,
+        // after the gate GEMM), all gated by the device per-row `row_adapter` map
+        // so base rows no-op and the launches are route-agnostic under capture.
+        // The `reject_decode_lora` / `reject_batched_router_lora` bails are lifted
+        // here; a batch containing a NON-active adapter (`Refuse`) is bailed
+        // host-side in `decode_batch_compute_main` before graph lookup, so it
+        // never reaches these folds. `row_adapter_base` is the fixed-address
+        // `[num_seqs]` i32 map uploaded per step (MoE `-1 = base` semantics);
+        // `DevicePtr(0)` when no adapter is resident, in which case the fold hooks
+        // fall back to the request-granularity `moe_route_gate` (a homogeneous
+        // batch folds all rows; base skips) — see
+        // `apply_expert_lora_decode_{gateup,down}` and `apply_router_lora_batched`.
         let row_adapter_base = ctx
             .attn_metadata
             .as_ref()
@@ -118,6 +118,24 @@ impl MoeLayer {
         if !fp32_gate {
             super::dump::dump_gate_logits(ctx.gpu, stream, gate_logits, n, num_experts)?;
         }
+
+        // SOLID Incr-4 (router): fold the router (mlp.gate) LoRA delta onto the
+        // whole-batch gate_logits IN PLACE, BEFORE top-k — one launch over all N
+        // tokens (the gate GEMM already produced every row), route-agnostic via
+        // the device per-row `row_adapter` map (base rows no-op). No-op when no
+        // router adapter is installed; refuses the FP32-gate path (no BF16-ULP
+        // oracle). Multi-adapter `Refuse` is bailed upstream, pre-capture. This is
+        // the batched analogue of the prefill/single-seq `apply_router_lora_prefill`
+        // call site, and bit-identical to the single-stream decode router fold.
+        self.apply_router_lora_batched(
+            router_in,
+            gate_logits,
+            n,
+            row_adapter_base,
+            fp32_gate,
+            ctx,
+            stream,
+        )?;
 
         // Per-token: topK routing + expert dispatch + weighted sum
         let h_usize = h as usize;

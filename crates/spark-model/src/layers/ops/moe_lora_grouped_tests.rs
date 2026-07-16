@@ -116,6 +116,36 @@ fn short_prefill_slot_rows_map_to_owning_token() {
     assert_eq!(expand, [1024, 8, 1]);
 }
 
+// ── SOLID Incr-4 router fold (degenerate 1-"expert" gather, top_k=1) ──────────
+
+#[test]
+fn router_fold_top_k_one_row_is_token() {
+    // The batched router fold drives the gather with top_k=1, so `row / top_k`
+    // collapses to `row` — each flat row IS its token, and `row_adapter[row]` is
+    // that token's own base/adapt sign (no per-token slice needed).
+    for row in [0u32, 1, 3, 4, 255, 4095] {
+        assert_eq!(gather_row_token(row, 1), row, "row={row}");
+    }
+}
+
+#[test]
+fn router_fold_grid_covers_all_experts_qwen36() {
+    // Qwen3.6-35B-A3B router fold: n_out = num_experts = 256, C=4 concurrent
+    // tokens, n_slots = n = 4 (one row per token, NOT expanded by top_k). Shrink
+    // outputs max_rank, expand outputs all 256 experts.
+    let (shrink, expand) = gather_bgmv_grids(16, 256, 4);
+    assert_eq!(shrink, [4, 4, 1]); // ceil(16/4)=4 rank groups, 4 token rows
+    assert_eq!(expand, [64, 4, 1]); // ceil(256/4)=64 expert groups
+}
+
+#[test]
+fn router_fold_grid_single_token_decode() {
+    // n=1 decode (the single-stream oracle the batched fold must match): one row.
+    let (shrink, expand) = gather_bgmv_grids(32, 256, 1);
+    assert_eq!(shrink, [8, 1, 1]);
+    assert_eq!(expand, [64, 1, 1]);
+}
+
 // ── Prefill chunk-window grid math (grouped_down_wc) ──────────────────────────
 
 /// Local re-derivation of the pre-chunk `wc = ceil(te/64).max(1)` so the tests

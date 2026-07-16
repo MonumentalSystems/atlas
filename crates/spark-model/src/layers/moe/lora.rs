@@ -58,6 +58,15 @@ pub(super) fn lora_delta_cols(router_n_out: Option<u32>, down_k_in: Option<u32>)
     r.max(d).max(1)
 }
 
+/// PURE (unit-tested): map the router `LoraPair` to the single
+/// `(expert_id, a_addr, b_addr, scale)` entry `pack_expert_tables` packs into the
+/// degenerate 1-"expert" router route. Expert id is always `0` (the router owns
+/// the only table slot); the A/B device addresses and scale come straight off the
+/// pair. Extracted so the degenerate-table shape is verifiable without a GPU.
+pub(super) fn router_expert_entry(rp: &LoraPair) -> (u16, u64, u64, f32) {
+    (0, rp.a.weight.0, rp.b.weight.0, rp.scale)
+}
+
 /// One MoE layer's installed router + routed-expert LoRA + apply scratch.
 pub(crate) struct MoeLoraWeights {
     /// Router (`mlp.gate`) delta on the routing logits (`None` if unadapted).
@@ -87,6 +96,16 @@ pub(crate) struct MoeLoraWeights {
     pub(super) gate_route: Option<MoeExpertRoute>,
     /// Expert up_proj fold route (same dims as gate). `None` when no `Up` pairs.
     pub(super) up_route: Option<MoeExpertRoute>,
+    /// SOLID Incr-4 (router): the router (`mlp.gate`) `LoraPair` repackaged as a
+    /// DEGENERATE 1-"expert" route table so the batched-decode router fold reuses
+    /// `moe_lora_gather_bgmv` VERBATIM (no new kernel). `n_experts=1`, expert 0 =
+    /// the router pair; `k_in=hidden`, `n_out=num_experts`, `max_rank=router rank`.
+    /// `None` when the adapter installs no router pair (mirrors `router`).
+    router_route: Option<MoeExpertRoute>,
+    /// `[cap]` u32 all-zero `indices` for the router gather fold — every flat row
+    /// "routes" to fake-expert 0 (the router pair). Fixed device address + constant
+    /// zero contents ⇒ capture-safe. `DevicePtr::NULL` when no router pair.
+    router_zero_indices: DevicePtr,
 }
 
 impl MoeLayer {
@@ -142,6 +161,22 @@ impl MoeLayer {
         let expert_route = Self::build_expert_route(&experts, ExpertProj::Down, gpu)?;
         let gate_route = Self::build_expert_route(&experts, ExpertProj::Gate, gpu)?;
         let up_route = Self::build_expert_route(&experts, ExpertProj::Up, gpu)?;
+        // SOLID Incr-4 (router): repackage the router pair as a 1-entry expert
+        // route + a constant all-zero `indices` buffer so the batched-decode
+        // router fold reuses `moe_lora_gather_bgmv` unchanged. Both are `None`/
+        // NULL for a router-less adapter, so a gate/up/down-only adapter pays
+        // nothing here. Fixed device addresses ⇒ stable capture args.
+        let router_route = match router.as_ref() {
+            Some(rp) => Some(Self::build_router_route(rp, gpu)?),
+            None => None,
+        };
+        let router_zero_indices = if router.is_some() {
+            let d = gpu.alloc(cap * 4)?; // [cap] u32, all rows -> fake-expert 0
+            gpu.memset(d, 0, cap * 4)?;
+            d
+        } else {
+            DevicePtr::NULL
+        };
         tracing::info!(
             "MoE LoRA installed: router={}, {} expert pair(s) (gate={} up={} down={}), \
              cap={cap} rows, scratch={:.2} MiB",
@@ -161,6 +196,8 @@ impl MoeLayer {
             expert_route,
             gate_route,
             up_route,
+            router_route,
+            router_zero_indices,
         });
         Ok(())
     }
@@ -211,6 +248,36 @@ impl MoeLayer {
             n_out: sample.n_out,
             max_rank: sample.max_rank,
         }))
+    }
+
+    /// SOLID Incr-4 (router): pack the single router (`mlp.gate`) `LoraPair` into a
+    /// DEGENERATE 1-entry [`MoeExpertRoute`] (expert 0 = the router pair) so the
+    /// batched-decode router fold drives `moe_lora_gather_bgmv` verbatim — the
+    /// router logits `[N, num_experts]` are exactly a one-"expert" case of the
+    /// expert gather. `k_in=hidden`, `n_out=num_experts`, `max_rank=router rank`
+    /// come straight off the pair. Uploads the same u64 A/B + f32 scale tables
+    /// `build_expert_route` produces, just with the one manufactured entry —
+    /// load-time-fixed device addresses ⇒ stable capture args.
+    pub(super) fn build_router_route(rp: &LoraPair, gpu: &dyn GpuBackend) -> Result<MoeExpertRoute> {
+        let tables = pack_expert_tables(&[router_expert_entry(rp)])
+            .expect("single entry => pack_expert_tables returns Some");
+        let up = |vals: &[u8]| -> Result<DevicePtr> {
+            let d = gpu.alloc(vals.len())?;
+            gpu.copy_h2d(vals, d)?;
+            Ok(d)
+        };
+        let a_bytes: Vec<u8> = tables.a.iter().flat_map(|p| p.to_le_bytes()).collect();
+        let b_bytes: Vec<u8> = tables.b.iter().flat_map(|p| p.to_le_bytes()).collect();
+        let s_bytes: Vec<u8> = tables.scale.iter().flat_map(|s| s.to_le_bytes()).collect();
+        Ok(MoeExpertRoute {
+            a_table: up(&a_bytes)?,
+            b_table: up(&b_bytes)?,
+            scale_table: up(&s_bytes)?,
+            n_experts: tables.n_experts, // == 1
+            k_in: rp.k_in,               // hidden
+            n_out: rp.n_out,             // num_experts
+            max_rank: rp.max_rank,
+        })
     }
 
     /// Per-request fold gate (Feature-1). Returns `true` to fold, `false` to
@@ -433,21 +500,97 @@ impl MoeLayer {
         Ok(())
     }
 
-    /// Batched decode folds routed-expert gate/up/down but NOT the router
-    /// (`mlp.gate`) delta — refuse loudly rather than silently drop it. No-op when
-    /// no router adapter is installed or the batch is base-only (`Skip`). The
-    /// batched router fold is a followup (needs an n-generic router fold on the
-    /// per-token gate logits before top-k in the batched path).
-    pub(crate) fn reject_batched_router_lora(&self, ctx: &ForwardContext) -> Result<()> {
-        let has_router = self.lora.as_ref().is_some_and(|l| l.router.is_some());
-        if has_router && !matches!(ctx.moe_lora_route, MoeLoraRoute::Skip) {
-            anyhow::bail!(
-                "MoE LoRA batched decode does not yet fold the router (mlp.gate) delta; a \
-                 router-adapted adapter in a concurrent batch would silently drop it. Use a \
-                 down/gate/up-only adapter for batched decode, or single-stream for router."
-            );
+    /// SOLID Incr-4 (router): fold the router (`mlp.gate`) LoRA delta onto the
+    /// whole-batch `gate_logits` (`[n, num_experts]`) IN PLACE, BEFORE top-k, on
+    /// the BATCHED decode path — so a router-adapted adapter now serves
+    /// concurrently instead of being refused. One launch over all `n` tokens
+    /// (`gate_logits` is a single dense GEMM output; no per-token loop), reusing
+    /// `moe_lora_gather_bgmv` with the degenerate 1-"expert" `router_route` +
+    /// the constant all-zero `indices` (every row → the router pair) and `top_k=1`
+    /// (so `row / top_k == row` — one sign-check per token against the SAME
+    /// `row_adapter` map the expert folds read). Base rows (`row_adapter[row] < 0`)
+    /// no-op device-side, so a mixed base+single-adapter batch folds only the
+    /// adapter rows. Bit-identical to the single-stream decode router fold
+    /// (`apply_router_lora_prefill`, n=1) — same `dense_gemv_bf16` reduction body
+    /// and `bf16_scaled_add` fold boundary.
+    ///
+    /// Zero-overhead when off (`self.lora == None` early-return); a router-less
+    /// adapter (`router_route == None`) also no-ops. Graph-capture legal: the
+    /// launch decision is install-time (`self.lora`/`router_route` present, and the
+    /// host-CONSTANT `fp32_gate`), never a per-replay host branch; all kernel args
+    /// are pointer/value-stable. The genuinely-mixed multi-adapter (`Refuse`) case
+    /// is bailed UPSTREAM, pre-capture (`reject_decode_moe_refuse` in
+    /// `decode_batch_compute_main`), so it never reaches this fold.
+    ///
+    /// The FP32-gate path (`ATLAS_FP32_GATE` / fp32 routing) is REFUSED: the BF16
+    /// gather kernel has no BF16-ULP oracle on the FP32 `gate_logits_f32` buffer.
+    /// This is a host-constant condition (env + install-time gate format), so the
+    /// bail is deterministic per process and never conditionally taints a captured
+    /// graph.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn apply_router_lora_batched(
+        &self,
+        router_in: DevicePtr,
+        gate_logits: DevicePtr,
+        n: u32,
+        row_adapter: DevicePtr,
+        fp32_gate: bool,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        let Some(ref l) = self.lora else { return Ok(()) };
+        let Some(ref rr) = l.router_route else {
+            return Ok(()); // router-less adapter: nothing to fold on the logits
+        };
+        // Refuse the FP32-gate path ONLY when this batch actually folds. The BF16
+        // gather kernel has no BF16-ULP oracle on the FP32 `gate_logits_f32` buffer,
+        // but a base/`Skip` batch folds nothing (the device self-skips an all-base
+        // per-row map; the NULL-map `moe_route_gate` returns false below), so it
+        // must NOT trip this bail — otherwise a pure-base decode with a router
+        // adapter merely RESIDENT + FP32 gate would wrongly error (regression vs the
+        // old `reject_batched_router_lora` `Skip` carve-out). Mixed multi-adapter
+        // (`Refuse`) is already bailed upstream, pre-capture.
+        let folds = !matches!(ctx.moe_lora_route, MoeLoraRoute::Skip);
+        anyhow::ensure!(
+            !(fp32_gate && folds),
+            "MoE LoRA batched router fold requires BF16 gate_logits; the FP32-gate path \
+             (ATLAS_FP32_GATE / fp32 routing) has no BF16-ULP oracle against the single-stream \
+             router fold. Unset the FP32-gate flag to serve a router-adapted adapter \
+             concurrently, or route router adapters single-stream."
+        );
+        // NULL-map single-active fallback — identical to
+        // `apply_expert_lora_decode_down` (this file): consult the
+        // request-granularity `moe_route_gate` ONLY when there is no per-row map
+        // (its `Skip`/`Refuse` host branch would otherwise bake one route into the
+        // captured graph). With a per-row map present, the launch is unconditional
+        // and route-agnostic — base rows self-skip device-side.
+        if row_adapter == DevicePtr::NULL && !self.moe_route_gate(ctx, "router-decode")? {
+            return Ok(());
         }
-        Ok(())
+        anyhow::ensure!(
+            n <= l.cap,
+            "MoE LoRA batched router fold: n ({n}) exceeds LoRA scratch cap ({}); raise \
+             ATLAS_LORA_EXPERT_MAX_TOKENS to >= num_tokens.",
+            l.cap
+        );
+        // Degenerate expert gather: `router_zero_indices` (all 0) routes every row
+        // to `router_route`'s single entry; `top_k=1` makes `row/top_k == row` so
+        // `row_adapter[row]` is this token's base/adapt sign; `x_gather=0` reads the
+        // per-token `router_in` row directly (with top_k=1, x_gather 0/1 coincide).
+        ops::moe_lora_gather_bgmv(
+            ctx.gpu,
+            &l.kernels,
+            rr,
+            router_in,             // x [n, hidden]
+            gate_logits,           // base_out [n, num_experts] BF16, folded in place
+            l.router_zero_indices, // indices [n] all 0 -> fake-expert 0
+            row_adapter,           // [num_tokens] i32 (<0 skip) or NULL
+            l.xa,                  // shrink scratch
+            n,                     // n_slots
+            1,                     // top_k=1 -> row/top_k == row
+            0,                     // x_gather=0: x row == token
+            stream,
+        )
     }
 }
 
