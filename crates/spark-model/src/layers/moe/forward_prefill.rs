@@ -43,41 +43,26 @@ impl MoeLayer {
         // FP8 grouped path is HIP-ready (kernel ported); do not force-batch it.
         let hip_force_batched_fp8 = false;
 
-        // Feature-1 MoE LoRA: the router/expert down-fold is now wired into ALL
-        // THREE grouped prefill bodies (nvfp4 below, bf16 in forward_prefill_bf16,
-        // fp8 in forward_prefill_fp8) — they write the same sorted BF16
-        // `expert_down_out`, so one device kernel (`moe_lora_grouped_down`) folds
-        // every base. The only uncovered path is the SHORT-prefill / missing-
-        // grouped-kernel / HIP-forced fallback to `forward_batched` (per-token,
-        // UNSORTED — no sorted fold hook). Refuse LOUDLY there rather than serve
-        // base-only output with an adapter installed (the per-token batched fold
-        // is the decode/verify followup, docs/design/lora-solid.md Incr 4).
-        // Route-aware: only a request that actually FOLDS (routes to the adapter)
-        // needs the sorted grouped path — a base/non-active request (`Skip`) has
-        // no delta and prefills the short/batched fallback byte-identically, so it
-        // must NOT be refused just because an adapter is resident.
-        if self.lora.is_some() && !matches!(ctx.moe_lora_route, crate::layer::MoeLoraRoute::Skip) {
-            let bf16_batched = self.bf16_gate_weight_ptrs.is_some()
-                && !(self.moe_bf16_grouped_gemm_k.0 != 0 && num_tokens > 64 && !hip_force_batched);
-            let fp8_batched = self.fp8_gate_weight_ptrs.is_some()
-                && !(self.moe_fp8_grouped_gemm_k.0 != 0
-                    && num_tokens > 64
-                    && !hip_force_batched_fp8);
-            if bf16_batched || fp8_batched {
-                anyhow::bail!(
-                    "MoE LoRA (Feature-1) folds on the grouped prefill path; this {} layer \
-                     dispatches to forward_batched (short prefill <=64 tokens, missing grouped \
-                     kernel, or HIP force) which is per-token/unsorted and has NO fold hook. \
-                     Refusing rather than silently dropping the delta (the per-token batched \
-                     fold is the followup, docs/design/lora-solid.md Incr 4).",
-                    if self.bf16_gate_weight_ptrs.is_some() {
-                        "bf16"
-                    } else {
-                        "fp8"
-                    }
-                );
-            }
-        }
+        // Feature-1 MoE LoRA: the router/expert fold is wired into ALL THREE
+        // grouped prefill bodies (nvfp4 below, bf16 in forward_prefill_bf16, fp8 in
+        // forward_prefill_fp8) — they write the same sorted BF16 `expert_down_out`,
+        // so one device kernel (`moe_lora_grouped_down`) folds every base. The
+        // SHORT-prefill / missing-grouped-kernel / HIP-forced fallback to
+        // `forward_batched` is NO LONGER uncovered (SOLID Incr-4): it folds the
+        // routed-expert gate/up + down delta PER TOKEN via
+        // `apply_expert_lora_decode_{gateup,down}`. A prefill `ForwardContext`
+        // always carries `moe_row_adapter == NULL` (only batched DECODE uploads a
+        // per-row map), so those hooks take the single-active fallback — the
+        // request-granularity `moe_route_gate` folds all `top_k` slots of every
+        // token, which is exactly `num_tokens` independent replays of the C=1
+        // decode fold (GPU-validated bit-clean). Hence NO refuse here: a
+        // single-active short prefill folds correctly, a base/non-active request
+        // (`Skip`) folds nothing and stays byte-identical, and the requests that
+        // still cannot be served refuse downstream in `forward_batched` at the
+        // correct granularity — router (`mlp.gate`) via `reject_batched_router_lora`,
+        // and mixed/packed or non-active adapters via `moe_route_gate` `Refuse`.
+        // (The device per-row prefill map for a MIXED short-prefill batch is the
+        // Incr-3 follow-up: `build_moe_row_adapter_host`, still refused for now.)
 
         // BF16 experts (FP8-dequant-on-load path): same dispatch shape as
         // FP8 — grouped GEMM for long prefills, fused per-token for short.

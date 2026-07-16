@@ -94,12 +94,37 @@ fn row_token_decomposition_matches_kernel() {
     assert_eq!(gather_row_token(23, 8), 2); // K=3 verify, token 2
 }
 
+#[test]
+fn short_prefill_slot_rows_map_to_owning_token() {
+    // Short (<=64-token) LoRA prefill through forward_batched folds each token
+    // independently: for token t the fold sees n_slots=top_k flat rows
+    // t*top_k .. t*top_k+top_k, and the gate/up x_gather=1 shrink reads x-row
+    // (row / top_k) == t (the token's own input) for EVERY slot s. Pin that the
+    // flat (token, slot) → token decomposition holds across a full short-prefill
+    // token sweep, so no slot of token t ever gathers another token's activation.
+    for top_k in [1u32, 2, 8] {
+        for t in 0..64u32 {
+            for s in 0..top_k {
+                assert_eq!(gather_row_token(t * top_k + s, top_k), t, "t={t} s={s} k={top_k}");
+            }
+        }
+    }
+    // And the decode/prefill gather grid is per-token exact (n_slots = top_k for a
+    // single token), matching the single-token decode replay the prefill mirrors.
+    let (shrink, expand) = gather_bgmv_grids(16, 4096, 8);
+    assert_eq!(shrink, [4, 8, 1]);
+    assert_eq!(expand, [1024, 8, 1]);
+}
+
 // ── Prefill chunk-window grid math (grouped_down_wc) ──────────────────────────
 
 /// Local re-derivation of the pre-chunk `wc = ceil(te/64).max(1)` so the tests
-/// pin the full-window equivalence against an independent formula.
+/// pin the full-window equivalence independently of `grouped_down_wc` (which
+/// computes it via `spark_runtime::kernel_args::div_ceil` over a saturating
+/// window). This oracle takes the pre-diffed row count directly and applies the
+/// `.max(1)` clamp itself, so a regression in the launcher's window math is caught.
 fn div_ceil64(n: u32) -> u32 {
-    ((n + 63) / 64).max(1)
+    n.div_ceil(64).max(1)
 }
 
 #[test]
