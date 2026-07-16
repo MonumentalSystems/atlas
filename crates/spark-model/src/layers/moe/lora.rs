@@ -398,4 +398,21 @@ impl MoeLayer {
         }
         Ok(())
     }
+
+    /// Batched decode folds routed-expert gate/up/down but NOT the router
+    /// (`mlp.gate`) delta — refuse loudly rather than silently drop it. No-op when
+    /// no router adapter is installed or the batch is base-only (`Skip`). The
+    /// batched router fold is a followup (needs an n-generic router fold on the
+    /// per-token gate logits before top-k in the batched path).
+    pub(crate) fn reject_batched_router_lora(&self, ctx: &ForwardContext) -> Result<()> {
+        let has_router = self.lora.as_ref().is_some_and(|l| l.router.is_some());
+        if has_router && !matches!(ctx.moe_lora_route, MoeLoraRoute::Skip) {
+            anyhow::bail!(
+                "MoE LoRA batched decode does not yet fold the router (mlp.gate) delta; a \
+                 router-adapted adapter in a concurrent batch would silently drop it. Use a \
+                 down/gate/up-only adapter for batched decode, or single-stream for router."
+            );
+        }
+        Ok(())
+    }
 }

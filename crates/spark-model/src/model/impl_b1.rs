@@ -185,6 +185,17 @@ impl TransformerModel {
             Some(lw) => lw.active as i32,
             None => return Ok(DevicePtr(0)),
         };
+        // Metadata-layout constraint: seq_slot occupies +128..(+128+padded_n·4)
+        // and this map sits at +160, so they only stay disjoint for padded_n<=8.
+        // Refuse LOUDLY beyond that rather than silently clobber attention routing
+        // (relocating the map to its own arena buffer is the followup for wider
+        // concurrent-LoRA decode).
+        anyhow::ensure!(
+            padded_n <= 8,
+            "concurrent LoRA decode is limited to batch<=8 (moe_row_adapter/seq_slot \
+             metadata layout); got padded_n={padded_n}. Use --max-batch-size <=8 with a \
+             resident MoE adapter, or wait for the relocated-map followup."
+        );
         let adapter_slots: Vec<i32> = seqs.iter().map(|s| s.adapter_slot).collect();
         let host = crate::lora::build_moe_row_adapter_decode(&adapter_slots, padded_n, active, true);
         let bytes: Vec<u8> = host.iter().flat_map(|v| v.to_le_bytes()).collect();

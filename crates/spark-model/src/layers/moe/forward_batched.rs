@@ -27,6 +27,9 @@ impl MoeLayer {
         // adapter is resident, in which case the fold hooks fall back to the
         // request-granularity `moe_route_gate` (a homogeneous batch folds all
         // rows; base skips) — see `apply_expert_lora_decode_{gateup,down}`.
+        // Router (mlp.gate) delta is NOT folded on the batched path — refuse
+        // loudly for a router-adapted adapter rather than silently drop it.
+        self.reject_batched_router_lora(ctx)?;
         let row_adapter_base = ctx
             .attn_metadata
             .as_ref()
