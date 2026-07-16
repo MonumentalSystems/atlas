@@ -1,0 +1,164 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+
+//! Device-side MoE expert down_proj LoRA fold launcher (`moe_lora_grouped_down`).
+//!
+//! Replaces the host-synced per-expert loop (`crate::lora::expert_apply`, which
+//! D2H-copies `expert_offsets` and drives a host launch count — both illegal
+//! under CUDA-graph capture) with a single two-launch kernel that reads
+//! `expert_offsets` DEVICE-side. The grid is a STATIC worst-case bound
+//! (`worst_case_m_tiles = ceil(te/64)`, matching the base grouped GEMM), so the
+//! launch shape is constant across capture/replay; per-tile early-return on an
+//! empty / out-of-range / unadapted expert span keeps it correct without a host
+//! value. See `kernels/gb10/common/moe_lora_grouped_down.cu`.
+//!
+//! The fold math is BYTE-IDENTICAL to `apply_lora_bgmv` / per-row
+//! `apply_lora_delta(m=1)` (shrink→BF16 xa, expand→BF16 delta, then
+//! `base += scale·fp32(bf16(delta))`), so one kernel serves the nvfp4, bf16, and
+//! fp8 grouped prefill paths — all write the same sorted BF16 `expert_down_out`.
+
+use anyhow::Result;
+use spark_runtime::gpu::{DevicePtr, GpuBackend};
+
+use super::lora_delta::LoraKernels;
+
+/// Per-EXPERT routing tables for the grouped down fold — the expert-keyed
+/// analogue of the slot-keyed [`super::lora_delta::LoraRoute`]. Built once at
+/// adapter install from the layer's `Down` pairs; load-time-fixed device
+/// addresses, so they are stable kernel args across capture/replay (adapter
+/// identity for a mixed batch flows through the per-row `moe_row_adapter`, not
+/// these tables).
+///
+/// `n_experts` is the TABLE LENGTH = `max adapted expert id + 1` (NOT the
+/// layer's full `num_experts`): the grid launches `grid.z = n_experts`, and
+/// every adapted expert has index `< n_experts`, so any higher-index expert is
+/// unadapted and correctly folds nothing. `expert_offsets[e]` / `[e+1]` are read
+/// for `e < n_experts <= num_experts`, always in range of the `[num_experts+1]`
+/// prefix sum.
+#[derive(Debug, Clone, Copy)]
+pub struct MoeExpertRoute {
+    /// `[n_experts]` u64 device array of `A_e` addresses (`0` = expert unadapted).
+    pub a_table: DevicePtr,
+    /// `[n_experts]` u64 device array of `B_e` addresses (`0` = expert unadapted).
+    pub b_table: DevicePtr,
+    /// `[n_experts]` f32 device array of per-expert `scale_e` (`0.0` where unadapted).
+    pub scale_table: DevicePtr,
+    /// Table length = max adapted expert id + 1 (== grid.z).
+    pub n_experts: u32,
+    /// Contraction dim of the shrink stage (`moe_intermediate_size`).
+    pub k_in: u32,
+    /// Output dim of the expand stage (`hidden_size`).
+    pub n_out: u32,
+    /// Padded rank (contraction dim of the expand stage; row stride of `B_e`).
+    pub max_rank: u32,
+}
+
+/// PURE (GPU-free, unit-tested): pack a set of adapted-expert
+/// `(expert_id, a_addr, b_addr, scale)` entries into dense `[n_experts]` tables
+/// indexed by expert id, with `0` / `0.0` at every unadapted slot.
+/// `n_experts = max expert_id + 1`. Returns `None` when `entries` is empty (a
+/// router-only adapter installs no expert route). Duplicate expert ids keep the
+/// LAST entry (callers pass at most one `Down` pair per expert).
+pub fn pack_expert_tables(entries: &[(u16, u64, u64, f32)]) -> Option<ExpertTables> {
+    let max_e = entries.iter().map(|(e, ..)| *e).max()?;
+    let n = max_e as usize + 1;
+    let mut a = vec![0u64; n];
+    let mut b = vec![0u64; n];
+    let mut scale = vec![0.0f32; n];
+    for &(e, a_addr, b_addr, sc) in entries {
+        let i = e as usize;
+        a[i] = a_addr;
+        b[i] = b_addr;
+        scale[i] = sc;
+    }
+    Some(ExpertTables {
+        a,
+        b,
+        scale,
+        n_experts: n as u32,
+    })
+}
+
+/// Host-side packed tables from [`pack_expert_tables`], ready for H2D upload.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExpertTables {
+    pub a: Vec<u64>,
+    pub b: Vec<u64>,
+    pub scale: Vec<f32>,
+    pub n_experts: u32,
+}
+
+/// Launch the device-side grouped down fold. `x` = post-SiLU sorted activations
+/// (`[te, k_in]` BF16), `base_out` = sorted `expert_down_out` (`[te, n_out]`
+/// BF16, folded IN PLACE), `expert_offsets` = the device `[num_experts+1]` i32
+/// prefix sum, `sorted_token_ids` = the device `[te]` i32 sorted-row→token map,
+/// `moe_row_adapter` = `[num_tokens]` i32 device map (`< 0` = base skip) or
+/// `DevicePtr::NULL` for the single-active-adapter path, `xa` = the fixed-address
+/// `[te, max_rank]` BF16 shrink scratch (caller guarantees `>= te` rows).
+///
+/// ARG ORDER is in lockstep with `moe_lora_grouped_down.cu` (cuLaunchKernel is
+/// type-blind; the byte-identity oracle is the only guard — keep both in sync).
+#[allow(clippy::too_many_arguments)]
+pub fn moe_lora_grouped_down(
+    gpu: &dyn GpuBackend,
+    kernels: &LoraKernels,
+    route: &MoeExpertRoute,
+    x: DevicePtr,               // [te, k_in] BF16 (post-SiLU sorted)
+    base_out: DevicePtr,        // [te, n_out] BF16, folded in place
+    expert_offsets: DevicePtr,  // [num_experts+1] i32 DEVICE
+    sorted_token_ids: DevicePtr, // [te] i32 DEVICE
+    moe_row_adapter: DevicePtr, // [num_tokens] i32 DEVICE or NULL
+    xa: DevicePtr,              // [te, max_rank] BF16 scratch (fixed address)
+    te: u32,
+    stream: u64,
+) -> Result<()> {
+    use spark_runtime::kernel_args::{KernelLaunch, div_ceil};
+
+    anyhow::ensure!(
+        kernels.moe_down_shrink_k.0 != 0 && kernels.moe_down_expand_fold_k.0 != 0,
+        "moe_lora_grouped_down kernels unresolved (module `moe_lora_grouped_down` missing \
+         from the compiled kernel set — CUDA build required)"
+    );
+    let wc = div_ceil(te, MLG_M_TILE).max(1);
+
+    // Kernel 1: shrink — xa[te, max_rank] = x @ A_e^T.
+    // grid = (ceil(max_rank/4), worst_case_m_tiles, n_experts)  block = (256,1,1).
+    KernelLaunch::new(gpu, kernels.moe_down_shrink_k)
+        .grid([div_ceil(route.max_rank, 4), wc, route.n_experts])
+        .block([256, 1, 1])
+        .arg_ptr(x)
+        .arg_ptr(expert_offsets)
+        .arg_ptr(sorted_token_ids)
+        .arg_ptr(moe_row_adapter)
+        .arg_ptr(route.a_table)
+        .arg_ptr(xa)
+        .arg_u32(route.n_experts)
+        .arg_u32(route.max_rank)
+        .arg_u32(route.k_in)
+        .launch(stream)?;
+
+    // Kernel 2: expand + fold — base_out += scale_e * (xa @ B_e^T).
+    // grid = (ceil(n_out/4), worst_case_m_tiles, n_experts)  block = (256,1,1).
+    KernelLaunch::new(gpu, kernels.moe_down_expand_fold_k)
+        .grid([div_ceil(route.n_out, 4), wc, route.n_experts])
+        .block([256, 1, 1])
+        .arg_ptr(xa)
+        .arg_ptr(expert_offsets)
+        .arg_ptr(sorted_token_ids)
+        .arg_ptr(moe_row_adapter)
+        .arg_ptr(route.b_table)
+        .arg_ptr(route.scale_table)
+        .arg_ptr(base_out)
+        .arg_u32(route.n_experts)
+        .arg_u32(route.n_out)
+        .arg_u32(route.max_rank)
+        .launch(stream)
+}
+
+/// M_TILE the static worst-case grid pairs with — must match the `MLG_M_TILE`
+/// `#define` in `moe_lora_grouped_down.cu` AND the base grouped GEMM's
+/// `worst_case_m_tiles = ceil(total_expanded/64)` sizing.
+pub const MLG_M_TILE: u32 = 64;
+
+#[cfg(test)]
+#[path = "moe_lora_grouped_tests.rs"]
+mod tests;

@@ -43,25 +43,36 @@ impl MoeLayer {
         // FP8 grouped path is HIP-ready (kernel ported); do not force-batch it.
         let hip_force_batched_fp8 = false;
 
-        // Feature-1 MoE LoRA: the router/expert delta fold is wired ONLY into the
-        // NVFP4/dense grouped body below (hooks after the gate GEMM and before the
-        // unpermute). The bf16/fp8 expert branches early-return via
-        // forward_prefill_{bf16,fp8}/forward_batched and would SILENTLY skip the
-        // fold. Refuse loudly rather than serve base-only output with an adapter
-        // installed (phase-1 boundary — bf16/fp8 expert fold is a followup).
-        if self.lora.is_some()
-            && (self.bf16_gate_weight_ptrs.is_some() || self.fp8_gate_weight_ptrs.is_some())
-        {
-            anyhow::bail!(
-                "MoE LoRA (Feature-1) folds only on the NVFP4 grouped prefill path; this \
-                 layer's experts are {}. Refusing rather than silently dropping the delta \
-                 (bf16/fp8 expert fold is a phase-1 followup).",
-                if self.bf16_gate_weight_ptrs.is_some() {
-                    "bf16"
-                } else {
-                    "fp8"
-                }
-            );
+        // Feature-1 MoE LoRA: the router/expert down-fold is now wired into ALL
+        // THREE grouped prefill bodies (nvfp4 below, bf16 in forward_prefill_bf16,
+        // fp8 in forward_prefill_fp8) — they write the same sorted BF16
+        // `expert_down_out`, so one device kernel (`moe_lora_grouped_down`) folds
+        // every base. The only uncovered path is the SHORT-prefill / missing-
+        // grouped-kernel / HIP-forced fallback to `forward_batched` (per-token,
+        // UNSORTED — no sorted fold hook). Refuse LOUDLY there rather than serve
+        // base-only output with an adapter installed (the per-token batched fold
+        // is the decode/verify followup, docs/design/lora-solid.md Incr 4).
+        if self.lora.is_some() {
+            let bf16_batched = self.bf16_gate_weight_ptrs.is_some()
+                && !(self.moe_bf16_grouped_gemm_k.0 != 0 && num_tokens > 64 && !hip_force_batched);
+            let fp8_batched = self.fp8_gate_weight_ptrs.is_some()
+                && !(self.moe_fp8_grouped_gemm_k.0 != 0
+                    && num_tokens > 64
+                    && !hip_force_batched_fp8);
+            if bf16_batched || fp8_batched {
+                anyhow::bail!(
+                    "MoE LoRA (Feature-1) folds on the grouped prefill path; this {} layer \
+                     dispatches to forward_batched (short prefill <=64 tokens, missing grouped \
+                     kernel, or HIP force) which is per-token/unsorted and has NO fold hook. \
+                     Refusing rather than silently dropping the delta (the per-token batched \
+                     fold is the followup, docs/design/lora-solid.md Incr 4).",
+                    if self.bf16_gate_weight_ptrs.is_some() {
+                        "bf16"
+                    } else {
+                        "fp8"
+                    }
+                );
+            }
         }
 
         // BF16 experts (FP8-dequant-on-load path): same dispatch shape as
@@ -380,7 +391,8 @@ impl MoeLayer {
             ctx.buffers.expert_gate_out(),
             expert_down_out,
             expert_offsets,
-            num_experts,
+            sorted_token_ids,
+            total_expanded,
             ctx,
             stream,
         )?;

@@ -27,8 +27,10 @@ use spark_runtime::gpu::{DevicePtr, GpuBackend};
 
 use super::MoeLayer;
 use crate::layer::{ForwardContext, MoeLoraRoute};
+use crate::layers::ops;
 use crate::layers::ops::lora_delta::{LoraKernels, LoraPair};
-use crate::lora::{ExpertLoraLayer, ExpertProj, apply_expert_lora_sorted, apply_router_lora};
+use crate::layers::ops::moe_lora_grouped::{MoeExpertRoute, pack_expert_tables};
+use crate::lora::{ExpertLoraLayer, ExpertProj, apply_router_lora};
 
 /// Per-token cap for the LoRA apply scratch (`ATLAS_LORA_EXPERT_MAX_TOKENS`,
 /// default 4096). Folds over more rows than this are chunked; scratch is sized
@@ -48,15 +50,20 @@ fn max_tokens() -> u32 {
 pub(crate) struct MoeLoraWeights {
     /// Router (`mlp.gate`) delta on the routing logits (`None` if unadapted).
     router: Option<LoraPair>,
-    /// This layer's sparse per-expert pairs.
-    experts: ExpertLoraLayer,
     kernels: LoraKernels,
     /// Row cap the folds chunk to (== scratch capacity in rows).
     cap: u32,
-    /// `[cap, max_rank]` BF16 shrink scratch.
+    /// `[cap, max_rank]` BF16 shrink scratch. For the device-side expert
+    /// down-fold this is indexed by ABSOLUTE sorted row, so `cap` must cover the
+    /// live `total_expanded = num_tokens*top_k` (guarded at the call site).
     xa: DevicePtr,
-    /// `[cap, max_n_out]` BF16 expand scratch.
+    /// `[cap, max_n_out]` BF16 expand scratch (router fold only — the device
+    /// expert down-fold fuses the fold into the expand kernel and needs no
+    /// separate delta buffer).
     delta: DevicePtr,
+    /// Feature-1 device-side expert down_proj fold route (per-expert A/B/scale
+    /// tables). `None` for a router-only adapter (no `Down` pairs installed).
+    expert_route: Option<MoeExpertRoute>,
 }
 
 impl MoeLayer {
@@ -96,6 +103,11 @@ impl MoeLayer {
         let delta = gpu.alloc(cap * max_n_out.max(1) * 2)?;
         gpu.memset(xa, 0, cap * max_rank.max(1) * 2)?;
         gpu.memset(delta, 0, cap * max_n_out.max(1) * 2)?;
+        // Build the device-side per-expert down-fold route: dense [n_experts]
+        // u64 A/B pointer tables + f32 scale table, indexed by expert id (0 =
+        // unadapted). Load-time-fixed addresses -> stable capture args. `None`
+        // for a router-only adapter (no Down pairs).
+        let expert_route = Self::build_expert_route(&experts, gpu)?;
         tracing::info!(
             "MoE LoRA installed: router={}, {} expert pair(s), cap={cap} rows, \
              scratch={:.2} MiB",
@@ -105,13 +117,58 @@ impl MoeLayer {
         );
         self.lora = Some(MoeLoraWeights {
             router,
-            experts,
             kernels,
             cap: cap as u32,
             xa,
             delta,
+            expert_route,
         });
         Ok(())
+    }
+
+    /// Pack the layer's `Down` expert pairs into the device-side per-expert
+    /// route tables (`a`/`b` u64, `scale` f32; dense `[n_experts]`, `0` where an
+    /// expert is unadapted). `n_experts` is the table length (max adapted id +
+    /// 1). Returns `None` for a router-only adapter. `k_in`/`n_out`/`max_rank`
+    /// come from the `Down` pairs (uniform per layer — the pool pads all pairs
+    /// to the same rank; down maps `moe_inter -> hidden`).
+    fn build_expert_route(
+        experts: &ExpertLoraLayer,
+        gpu: &dyn GpuBackend,
+    ) -> Result<Option<MoeExpertRoute>> {
+        let entries: Vec<(u16, u64, u64, f32)> = experts
+            .pairs
+            .iter()
+            .filter(|((_, p), _)| *p == ExpertProj::Down)
+            .map(|((e, _), pair)| (*e, pair.a.weight.0, pair.b.weight.0, pair.scale))
+            .collect();
+        let Some(tables) = pack_expert_tables(&entries) else {
+            return Ok(None);
+        };
+        // Dims from any Down pair (all identical for this projection on a layer).
+        let sample = experts
+            .pairs
+            .iter()
+            .find(|((_, p), _)| *p == ExpertProj::Down)
+            .map(|(_, pr)| pr)
+            .expect("pack_expert_tables returned Some => a Down pair exists");
+        let up = |vals: &[u8]| -> Result<DevicePtr> {
+            let d = gpu.alloc(vals.len())?;
+            gpu.copy_h2d(vals, d)?;
+            Ok(d)
+        };
+        let a_bytes: Vec<u8> = tables.a.iter().flat_map(|p| p.to_le_bytes()).collect();
+        let b_bytes: Vec<u8> = tables.b.iter().flat_map(|p| p.to_le_bytes()).collect();
+        let s_bytes: Vec<u8> = tables.scale.iter().flat_map(|s| s.to_le_bytes()).collect();
+        Ok(Some(MoeExpertRoute {
+            a_table: up(&a_bytes)?,
+            b_table: up(&b_bytes)?,
+            scale_table: up(&s_bytes)?,
+            n_experts: tables.n_experts,
+            k_in: sample.k_in,
+            n_out: sample.n_out,
+            max_rank: sample.max_rank,
+        }))
     }
 
     /// Per-request fold gate (Feature-1). Returns `true` to fold, `false` to
@@ -163,68 +220,62 @@ impl MoeLayer {
     /// Fold the routed-expert down_proj LoRA deltas onto the sorted
     /// `expert_down_out` (`[total_expanded, hidden]`), BEFORE the unpermute +
     /// weighted reduce (so the router weight multiplies base+delta). `x` = the
-    /// post-SiLU sorted activations (`expert_gate_out`). D2H-copies
-    /// `expert_offsets` to drive the host per-expert loop (graph-breaking —
-    /// eager prefill only). No-op when the layer adapts no expert down_proj.
+    /// post-SiLU sorted activations (`expert_gate_out`).
+    ///
+    /// DEVICE-SIDE (Feature-1 Incr-1/2): a single two-launch grouped kernel
+    /// (`moe_lora_grouped_down`) reads `expert_offsets` on device — NO `copy_d2h`,
+    /// NO host launch loop — so it is CUDA-graph-capture LEGAL (unlike the former
+    /// host-synced loop). `expert_offsets`/`sorted_token_ids` are device arrays
+    /// carved from `gate_logits`; `te = total_expanded = num_tokens*top_k`. One
+    /// kernel serves the nvfp4, bf16, and fp8 grouped paths (identical sorted
+    /// BF16 `expert_down_out`). No-op when the layer adapts no expert down_proj
+    /// (router-only adapter -> `expert_route == None`).
     ///
     /// gate/up-proj folds inject inside `run_routed_grouped_gemm` (before
-    /// `silu_mul`); wiring them is a phase-1 followup — down_proj is the
-    /// primary, per the design.
+    /// `silu_mul`); wiring them is a followup — down_proj is the primary.
     pub(crate) fn apply_expert_lora_prefill_down(
         &self,
         expert_gate_out: DevicePtr,
         expert_down_out: DevicePtr,
         expert_offsets: DevicePtr,
-        num_experts: u32,
+        sorted_token_ids: DevicePtr,
+        te: u32,
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
         let Some(ref l) = self.lora else { return Ok(()) };
-        if l.experts.is_empty() {
-            return Ok(());
-        }
-        // Per-request skip (base / non-active pays nothing; mixed batch refuses).
+        let Some(ref route) = l.expert_route else {
+            return Ok(()); // router-only adapter: no expert down fold
+        };
+        // Per-request skip (base / non-active pays nothing; mixed batch REFUSES
+        // loudly until the device per-row map lands — Incr-2). This keeps the
+        // request-granularity opt-out that lets a base run stay byte-identical.
         if !self.moe_route_gate(ctx, "expert-down")? {
             return Ok(());
         }
-        // GRAPH-SAFETY: the D2H of `expert_offsets` below is a blocking host copy
-        // (status 900 = STREAM_CAPTURE_UNSUPPORTED inside a capture region) AND it
-        // drives a data-dependent host launch loop. Under CUDA-graph capture this
-        // silently corrupts the captured graph. Refuse LOUDLY instead. The fix is
-        // to consume `expert_offsets` device-side in a single grouped kernel (the
-        // base grouped GEMM already reads it as a kernel arg — never D2Hs it);
-        // that device-side grouped fold is the documented follow-up
-        // (docs/design/lora-solid.md Incr 1-2). Until it lands, expert LoRA stays
-        // eager-prefill only — never captured, never on the decode/verify path
-        // (reject_decode_lora), so this guard only fires if a future capture path
-        // reaches the host-loop fold before the device kernel replaces it.
-        if ctx.graph_capture {
-            anyhow::bail!(
-                "MoE expert LoRA down-fold host-copies expert_offsets (graph-breaking D2H + \
-                 host-driven launch count); refusing under CUDA-graph capture rather than \
-                 corrupting the captured graph. The device-side grouped fold that reads \
-                 expert_offsets on device is the follow-up (docs/design/lora-solid.md Incr 1-2)."
-            );
-        }
-        // Host-sync the expert row boundaries ([num_experts + 1] u32).
-        let ne1 = num_experts as usize + 1;
-        let mut bytes = vec![0u8; ne1 * 4];
-        ctx.gpu.copy_d2h(expert_offsets, &mut bytes)?;
-        let off_host: Vec<u32> = bytes
-            .chunks_exact(4)
-            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect();
-        apply_expert_lora_sorted(
+        // `xa` is indexed by ABSOLUTE sorted row, so the scratch must cover all
+        // `te` rows (the host loop's cap-chunking is gone). Bail loudly rather
+        // than overrun — raise ATLAS_LORA_EXPERT_MAX_TOKENS for long prefills.
+        anyhow::ensure!(
+            te <= l.cap,
+            "MoE expert LoRA down-fold: total_expanded ({te}) exceeds LoRA scratch cap ({}); \
+             raise ATLAS_LORA_EXPERT_MAX_TOKENS to >= num_tokens*top_k for this prefill chunk.",
+            l.cap
+        );
+        // Incr-1: single active adapter -> moe_row_adapter NULL (the device
+        // per-row base skip via ForwardContext.moe_row_adapter is Incr-2; the
+        // request-level opt-out above already handles a pure base request).
+        ops::moe_lora_grouped_down(
             ctx.gpu,
             &l.kernels,
-            &l.experts,
-            ExpertProj::Down,
-            &off_host,
+            route,
             expert_gate_out,
             expert_down_out,
-            l.cap,
+            expert_offsets,
+            sorted_token_ids,
+            DevicePtr::NULL,
             l.xa,
-            l.delta,
+            te,
             stream,
         )
     }
