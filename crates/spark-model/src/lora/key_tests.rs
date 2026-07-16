@@ -150,6 +150,34 @@ fn classify_key_maps_experts_and_router() {
         (3, LoraTarget::Router, AdapterAb::A)
     );
 
+    // Experts + router are valid on a NON-full-attention (GDN/linear) layer too
+    // — MoE FFN exists on every layer, so a real Qwen3.6/Holo adapter targets
+    // them there. Layer 0 is linear-attention in the factory cfg.
+    assert_eq!(
+        classify_key(
+            "base_model.model.model.layers.0.mlp.experts.5.down_proj.lora_A.weight",
+            &cfg
+        )
+        .unwrap(),
+        (
+            0,
+            LoraTarget::Expert {
+                n: 5,
+                proj: ExpertProj::Down
+            },
+            AdapterAb::A
+        )
+    );
+    assert_eq!(
+        classify_key("base_model.model.model.layers.0.mlp.gate.lora_B.weight", &cfg).unwrap(),
+        (0, LoraTarget::Router, AdapterAb::B)
+    );
+    // But an ATTENTION target on that same linear-attention layer stays rejected.
+    assert!(
+        classify_key("base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight", &cfg)
+            .is_err()
+    );
+
     // Named rejects (never a silent skip):
     // expert index out of range.
     assert!(

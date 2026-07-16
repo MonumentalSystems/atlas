@@ -105,15 +105,27 @@ pub fn classify_key(key: &str, cfg: &ModelConfig) -> Result<(usize, LoraTarget, 
         ),
         other => bail!("REJECT[unsupported-module]: '{key}' targets '{other}'"),
     };
-    match cfg.layer_type(layer_idx) {
-        LayerType::FullAttention => {}
-        lt => bail!(
-            "REJECT[non-full-attention-layer]: '{key}' targets layer {layer_idx} \
-             ({lt:?}); v0 applies LoRA only on the full-attention layers \
-             {:?}. NOTE: dense mlp.* exists on the GDN layers too — train with \
-             layers_to_transform=[3,7,11,15,19,23] to produce a loadable adapter",
-            full_attention_layers(cfg)
-        ),
+    // The full-attention gate applies ONLY to attention + dense-mlp targets:
+    // those projections exist per-attention-layer and the v0 delta path is wired
+    // only on full-attention layers. MoE router (`mlp.gate`) and routed experts
+    // (`mlp.experts.N.*`) live on EVERY MoE layer — including the GDN /
+    // linear-attention layers — so a real Qwen3.6/Holo MoE adapter targets them
+    // there too; gating those to full-attention would wrongly reject the majority
+    // of a MoE adapter's layers. The fold runs in `MoeLayer::forward_*`, which is
+    // present on all MoE layers, so no layer-type restriction applies to them.
+    match target {
+        LoraTarget::Attn(_) => match cfg.layer_type(layer_idx) {
+            LayerType::FullAttention => {}
+            lt => bail!(
+                "REJECT[non-full-attention-layer]: '{key}' targets layer {layer_idx} \
+                 ({lt:?}); v0 applies attention/dense-mlp LoRA only on the full-attention \
+                 layers {:?}. NOTE: dense mlp.* exists on the GDN layers too — train with \
+                 layers_to_transform={:?} to produce a loadable adapter",
+                full_attention_layers(cfg),
+                full_attention_layers(cfg)
+            ),
+        },
+        LoraTarget::Router | LoraTarget::Expert { .. } => {}
     }
     Ok((layer_idx, target, ab))
 }
