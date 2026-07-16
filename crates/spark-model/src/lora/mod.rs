@@ -22,12 +22,14 @@
 mod env;
 mod key;
 mod loading;
+mod overlay;
 mod slot_math;
 mod types;
 
 pub use env::*;
 pub use key::*;
 pub use loading::*;
+pub use overlay::*;
 pub use slot_math::*;
 pub use types::*;
 

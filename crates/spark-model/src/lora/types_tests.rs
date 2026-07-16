@@ -23,6 +23,9 @@ fn adapter_names_and_slot_resolve() {
         target_modules: vec!["k_proj".into()],
         use_rslora: false,
         layers_to_transform: None,
+        trainable_token_indices: Vec::new(),
+        modules_to_save: Vec::new(),
+        lora_embedding: false,
     };
     let mk_slot = |name: &str| AdapterSlot {
         name: name.to_string(),
@@ -79,6 +82,9 @@ fn slot_generation_bump_freshens_adapter_id() {
         target_modules: vec!["k_proj".into()],
         use_rslora: false,
         layers_to_transform: None,
+        trainable_token_indices: Vec::new(),
+        modules_to_save: Vec::new(),
+        lora_embedding: false,
     };
     let mut lw = LoraWeights {
         name: "sol".into(),
@@ -120,6 +126,9 @@ fn ref_count_acquire_release_balance_and_busy_gate() {
         target_modules: vec!["k_proj".into()],
         use_rslora: false,
         layers_to_transform: None,
+        trainable_token_indices: Vec::new(),
+        modules_to_save: Vec::new(),
+        lora_embedding: false,
     };
     let mk_slot = |name: &str| AdapterSlot {
         name: name.to_string(),

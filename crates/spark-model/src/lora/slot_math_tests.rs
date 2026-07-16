@@ -98,6 +98,9 @@ fn scale_table_values_per_slot_and_padded() {
             target_modules: vec!["k_proj".into()],
             use_rslora: rslora,
             layers_to_transform: None,
+            trainable_token_indices: Vec::new(),
+            modules_to_save: Vec::new(),
+            lora_embedding: false,
         },
     };
     let adapters = [mk(16.0, 8, false), mk(16.0, 4, true)];

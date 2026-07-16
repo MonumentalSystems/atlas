@@ -57,7 +57,16 @@ fn audit_adapter(
     //    is a hard error, which IS the "unconsumed adapter tensors fatal"
     //    audit direction.
     let mut found: BTreeMap<(usize, LoraModule), [Option<String>; 2]> = BTreeMap::new();
+    let mut overlay = OverlayTensors::default();
     for name in adapter_store.names() {
+        // Feature 2: token-overlay tensors (`…token_adapter.*`, bare
+        // `modules_to_save` `.weight`, `lora_embedding_*`) are intercepted
+        // ABOVE `classify_key` so its lora_A/lora_B suffix gate never
+        // mis-rejects them. Collected here, applied by the token-overlay path.
+        if let Some(t) = classify_overlay_key(name) {
+            overlay.insert(t, name)?;
+            continue;
+        }
         let (layer, module, ab) = classify_key(name, cfg)?;
         let entry = found.entry((layer, module)).or_default();
         let slot = &mut entry[ab as usize];
@@ -69,6 +78,7 @@ fn audit_adapter(
         }
         *slot = Some(name.to_string());
     }
+    reject_pending_overlay(&overlay)?;
     if found.is_empty() {
         bail!("REJECT[empty-adapter]: no lora_A/lora_B tensors in adapter");
     }
@@ -339,6 +349,9 @@ pub fn load_lora_adapters_multi(
                 target_modules: Vec::new(),
                 use_rslora: false,
                 layers_to_transform: None,
+                trainable_token_indices: Vec::new(),
+                modules_to_save: Vec::new(),
+                lora_embedding: false,
             },
             layers: vec![None; num_layers],
             generation: 0,
