@@ -225,6 +225,12 @@ pub struct LoraWeights {
     /// Task #27: monotonic source for `last_used` ticks (never wraps in
     /// practice). Bumped once per acquire.
     pub lru_tick: AtomicU64,
+    /// Feature-2 (token overlay): per-slot Stage-1 raw overlay upload, `len ==
+    /// slots.len()` (padding slots push `None`). Consumed + cleared by
+    /// `set_lora_weights` (Stage 2 `build_overlay`), which needs the served
+    /// embed/lm_head tables that only exist after weight load. `Vec::new()` /
+    /// all-`None` ⇒ no overlay adapter ⇒ byte-identical to a no-overlay build.
+    pub overlay_raw: Vec<Option<super::overlay_build::OverlayRawSlot>>,
 }
 
 /// Task #27: a per-slot snapshot for the pure victim-selection policy. Taken on

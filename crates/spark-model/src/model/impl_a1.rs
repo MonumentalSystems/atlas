@@ -442,6 +442,9 @@ impl TransformerModel {
         // value is dead code and must not suppress CUDA graphs.
         let has_fp8_calibration = config.fp8_kv_calibration_tokens > 0
             && kv_cache.dtype() == spark_runtime::kv_cache::KvCacheDtype::Fp8;
+        // Feature-2 overlay kernels: resolve before `gpu` is moved into Self.
+        let overlay_kernels =
+            crate::layers::ops::token_overlay::OverlayKernels::new(gpu.as_ref());
         Ok(Self {
             config,
             embed_tokens,
@@ -531,6 +534,8 @@ impl TransformerModel {
             use_fp32_logits,
             logits_fp32_buf,
             embed_scale_kernel,
+            overlays: None,
+            overlay_kernels,
         })
     }
 }

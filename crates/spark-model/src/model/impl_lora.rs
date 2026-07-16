@@ -55,7 +55,7 @@ impl TransformerModel {
         }
     }
 
-    pub fn set_lora_weights(&mut self, lora: Option<crate::lora::LoraWeights>) -> Result<()> {
+    pub fn set_lora_weights(&mut self, mut lora: Option<crate::lora::LoraWeights>) -> Result<()> {
         if let Some(ref lw) = lora {
             // eager-on-rotate: ONLY the global rotate/swap re-point path forces
             // eager decode. A multi-adapter pool no longer implies eager —
@@ -96,7 +96,69 @@ impl TransformerModel {
                 self.lora_rotatable,
             );
         }
+        // Feature-2 Stage 2: build the token-overlay tables from the Stage-1 raw
+        // uploads now that the served embed/lm_head tables exist (they did NOT
+        // at loader time — the two-stage build closes that ordering gap). Only
+        // an adapter that actually shipped overlay tensors reaches the builder;
+        // a run with no overlay leaves `self.overlays == None` (byte-identical).
+        if let Some(ref mut lw) = lora {
+            let raws = std::mem::take(&mut lw.overlay_raw);
+            if raws.iter().any(|r| r.is_some()) {
+                self.build_token_overlays(lw.max_loras, &raws)?;
+            }
+        }
         self.lora = lora;
+        Ok(())
+    }
+
+    /// Stage 2 of the token-overlay build: row-diff each staged adapter's raw
+    /// overlay tensors against the served embed/lm_head tables, compact the
+    /// override rows, and materialize the `[max_loras]` device tables. Sets
+    /// `self.overlays` only when some slot actually overrides a row.
+    fn build_token_overlays(
+        &mut self,
+        max_loras: usize,
+        raws: &[Option<crate::lora::OverlayRawSlot>],
+    ) -> Result<()> {
+        // Tie: lm_head aliases embed (shared buffer OR a quantized head derived
+        // from embed) ⇒ the logit recompute reuses the embed override rows.
+        let tied = self.lm_head_weight.weight.0 == self.embed_tokens.weight.0
+            || self.lm_head_nvfp4.is_some()
+            || self.lm_head_fp8.is_some();
+        let vocab = self.config.vocab_size;
+        let h = self.config.hidden_size;
+        let served_embed = self.embed_tokens.weight;
+        let served_lmhead = self.lm_head_weight.weight;
+        let stream = self.gpu.default_stream();
+        let mut overlays: Vec<Option<crate::lora::EmbedOverlay>> =
+            (0..max_loras).map(|_| None).collect();
+        for (k, raw) in raws.iter().enumerate() {
+            if let Some(slot) = raw
+                && k < max_loras
+            {
+                overlays[k] = crate::lora::build_overlay(
+                    self.gpu.as_ref(),
+                    &self.overlay_kernels,
+                    slot,
+                    served_embed,
+                    served_lmhead,
+                    vocab,
+                    h,
+                    tied,
+                    stream,
+                )?;
+            }
+        }
+        let set =
+            crate::lora::TokenOverlaySet::from_slots(self.gpu.as_ref(), overlays, max_loras, tied)?;
+        if set.any_active() {
+            tracing::info!(
+                "LoRA overlay: token-overlay tables built (max_n_override={}, tied={})",
+                set.max_n_override,
+                tied,
+            );
+            self.overlays = Some(set);
+        }
         Ok(())
     }
 

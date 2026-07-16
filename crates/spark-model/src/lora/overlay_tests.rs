@@ -147,7 +147,7 @@ fn override_set_empty_when_nothing_changes() {
     assert!(build_override_set(&diff, &[]).is_empty());
 }
 
-// ---- reject_pending_overlay staging gate ----
+// ---- reject_pending_overlay load gate (Feature-2 flipped: overlays LOAD) ----
 
 #[test]
 fn no_overlay_tensors_passes_gate() {
@@ -155,12 +155,13 @@ fn no_overlay_tensors_passes_gate() {
 }
 
 #[test]
-fn trainable_tokens_hits_pending_reject() {
+fn trainable_tokens_now_loads_not_rejected() {
+    // Feature-2 flip: an adapter shipping token_adapter overlay tensors is now
+    // LOADED (Stage-1 upload + Stage-2 build), no longer rejected by name.
     let mut t = OverlayTensors::default();
     let k = "base_model.model.model.embed_tokens.token_adapter.base_layer.weight";
     t.insert(classify_overlay_key(k).unwrap(), k).unwrap();
-    let err = reject_pending_overlay(&t).unwrap_err().to_string();
-    assert!(err.contains("REJECT[token-overlay-pending-apply]"), "{err}");
+    assert!(reject_pending_overlay(&t).is_ok());
 }
 
 #[test]

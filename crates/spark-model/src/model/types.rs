@@ -271,6 +271,14 @@ pub struct TransformerModel {
     /// Embedding scale kernel: embeddings *= sqrt(hidden_size).
     /// KernelHandle(0) = disabled (no scaling for this model).
     pub(super) embed_scale_kernel: KernelHandle,
+    /// Feature-2 token overlay: per-adapter-slot embed/lm_head row-override
+    /// tables. `None` ⇒ feature OFF ⇒ every overlay forward hook early-returns
+    /// (byte-identical to a no-overlay build). Built in `set_lora_weights`
+    /// (Stage 2) from the resident pool's Stage-1 raw uploads.
+    pub(super) overlays: Option<crate::lora::TokenOverlaySet>,
+    /// Feature-2 token overlay kernels, resolved once at construction via
+    /// `try_kernel` (null-on-miss ⇒ overlay silently unused on an older image).
+    pub(super) overlay_kernels: crate::layers::ops::token_overlay::OverlayKernels,
 }
 
 /// Pinned host memory staging buffer with reusable metadata Vecs.

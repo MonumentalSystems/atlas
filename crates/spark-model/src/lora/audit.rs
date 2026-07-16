@@ -20,6 +20,10 @@ pub(crate) struct AuditedAdapter {
     pub attn: BTreeMap<(usize, LoraModule), [Option<String>; 2]>,
     pub router: expert_pack::RouterMap,
     pub experts: expert_pack::ExpertMap,
+    /// Feature-2: classified token-overlay tensor coverage (embed/lm_head
+    /// `trainable_tokens` / `modules_to_save`). Consumed by Stage-1
+    /// `stage_overlay_raw`. `lora_embedding_*` is still a Tier-2 load reject.
+    pub overlay: OverlayTensors,
 }
 
 /// Set the (layer, ab) cell of a dedup'd `[a_key, b_key]` audit entry, hard-
@@ -75,9 +79,12 @@ pub(crate) fn audit_adapter(
             }
         }
     }
+    // Feature-2 FLIP: overlay tensors are now LOADED (Stage-1 upload +
+    // Stage-2 build), not blanket-rejected. Only the classic low-rank embedding
+    // LoRA (`lora_embedding_A/B`) remains a Tier-2 NAMED reject.
     reject_pending_overlay(&overlay)?;
-    if found.is_empty() && !expert_pack::present(&router, &experts) {
-        bail!("REJECT[empty-adapter]: no lora_A/lora_B tensors in adapter");
+    if found.is_empty() && !expert_pack::present(&router, &experts) && overlay.is_empty() {
+        bail!("REJECT[empty-adapter]: no lora_A/lora_B or overlay tensors in adapter");
     }
 
     // 2) attention pair completeness + shape audit. PEFT: A=[r, in], B=[out, r].
@@ -122,5 +129,5 @@ pub(crate) fn audit_adapter(
             );
         }
     }
-    Ok(AuditedAdapter { attn: found, router, experts })
+    Ok(AuditedAdapter { attn: found, router, experts, overlay })
 }

@@ -49,6 +49,7 @@ mod kv_cache_fp8k;
 mod kv_cache_turbok;
 #[path = "ops/lora_delta.rs"]
 pub mod lora_delta;
+pub mod token_overlay;
 #[path = "ops/moe_atomic_c4.rs"]
 mod moe_atomic_c4;
 #[path = "ops/moe_expert.rs"]

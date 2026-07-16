@@ -230,7 +230,18 @@ pub fn load_lora_adapters_multi(
     let mut slots: Vec<AdapterSlot> = Vec::with_capacity(adapters.len());
     let mut a_tabs: BTreeMap<(usize, LoraModule), Vec<u64>> = BTreeMap::new();
     let mut b_tabs: BTreeMap<(usize, LoraModule), Vec<u64>> = BTreeMap::new();
+    // Feature-2: Stage-1 raw overlay upload per slot (device scratch owned here;
+    // Stage 2 in `set_lora_weights` row-diffs it against the served embed/lm_head
+    // tables). `None` for adapters that ship no overlay tensors.
+    let mut overlay_raw: Vec<Option<OverlayRawSlot>> = Vec::with_capacity(adapters.len());
     for (k, a) in adapters.iter().enumerate() {
+        overlay_raw.push(stage_overlay_raw(
+            a.store,
+            &audited[k].overlay,
+            &a.peft,
+            cfg.hidden_size,
+            gpu,
+        )?);
         let (mut layers, slot_ptrs) = pack_slot(
             k,
             &a.name,
@@ -353,6 +364,7 @@ pub fn load_lora_adapters_multi(
         pinned,
         last_used: (0..max_loras).map(|_| AtomicU64::new(0)).collect(),
         lru_tick: AtomicU64::new(0),
+        overlay_raw,
     })
 }
 
@@ -399,6 +411,13 @@ pub fn pack_store_into_slot(
         bail!(
             "LoRA disk swap REFUSED: adapter '{name}' carries router/expert deltas \
              (Feature-1); runtime slot-swap of the expert pool is a phase-2 followup"
+        );
+    }
+    if !audited.overlay.is_empty() {
+        bail!(
+            "LoRA disk swap REFUSED: adapter '{name}' ships token-overlay tensors \
+             (Feature-2); runtime slot-swap of the overlay tables is a phase-2 \
+             followup (would silently drop the overlay otherwise)"
         );
     }
     let found = audited.attn;

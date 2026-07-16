@@ -170,35 +170,25 @@ impl OverlayTensors {
     }
 }
 
-/// Feature 2 staging gate, called from the loader once overlay tensors are
-/// collected. Token-overlay tensors are now CLASSIFIED and PARSED (the parser
-/// accepts `trainable_token_indices` / `modules_to_save` `{embed_tokens,
-/// lm_head}`; [`classify_overlay_key`] recognizes the `token_adapter` /
-/// full-save / `lora_embedding` spellings), and the overlay row-selection math
-/// and CUDA kernels (`kernels/gb10/common/token_overlay.cu`) are in tree. The
-/// device-side build and forward application (device pointer tables and
-/// `embed_tokens` / `lm_head` hooks) is the CUDA-verified flip that lands next.
+/// Feature 2 load gate, called from the loader once overlay tensors are
+/// collected. The device-side overlay apply is now WIRED (Stage-1
+/// [`super::overlay_build::stage_overlay_raw`] upload → Stage-2
+/// [`super::overlay_build::build_overlay`] row-diff/compact → the
+/// `embed_tokens` / `lm_head` forward hooks in `crate::model::token_overlay`),
+/// so `trainable_tokens` / `modules_to_save` `{embed_tokens, lm_head}` tensors
+/// are LOADED rather than rejected.
 ///
-/// Until that flip, an adapter carrying overlay tensors is rejected by NAME
-/// rather than silently applied as a no-op (a silently-inert overlay is a
-/// wrong-output bug). `lora_embedding_*` (classic low-rank embed LoRA) is a
-/// distinct Tier-2 mechanism with its own named reject.
+/// The ONLY remaining reject here is the classic low-rank embedding LoRA
+/// (`lora_embedding_A/B`): a distinct Tier-2 mechanism with no kernel yet, named
+/// so the adapter fails loudly rather than being silently mis-applied.
 pub fn reject_pending_overlay(overlay: &OverlayTensors) -> Result<()> {
-    if overlay.is_empty() {
-        return Ok(());
-    }
     if overlay.lora_embedding_seen {
         bail!(
             "REJECT[lora-embedding-unimplemented]: classic low-rank embedding LoRA \
              (lora_embedding_A/B) is not yet supported on the decoder path"
         );
     }
-    bail!(
-        "REJECT[token-overlay-pending-apply]: adapter ships token-overlay tensors \
-         (trainable_tokens / modules_to_save embed_tokens|lm_head); parsing and \
-         classification are wired, but the device-side embed/lm_head overlay apply \
-         (Feature 2 forward hooks) is not yet enabled"
-    );
+    Ok(())
 }
 
 /// Clamp `trainable` ids to the served vocab, preserving list order (the delta

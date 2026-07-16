@@ -50,6 +50,7 @@ fn adapter_names_and_slot_resolve() {
         pinned: 2,
         last_used: (0..8).map(|_| AtomicU64::new(0)).collect(),
         lru_tick: AtomicU64::new(0),
+        overlay_raw: Vec::new(),
     };
     assert_eq!(lw.adapter_names(), vec!["alpha", "beta"]);
     assert_eq!(lw.slot_of("beta"), Some(1));
@@ -110,6 +111,7 @@ fn slot_generation_bump_freshens_adapter_id() {
         pinned: 1,
         last_used: (0..4).map(|_| AtomicU64::new(0)).collect(),
         lru_tick: AtomicU64::new(0),
+        overlay_raw: Vec::new(),
     };
     let id_v1 = lw.adapter_id_for_slot(0);
     assert_eq!(id_v1, adapter_id_hash("sol", 0));
@@ -157,6 +159,7 @@ fn ref_count_acquire_release_balance_and_busy_gate() {
         pinned: 2,
         last_used: (0..4).map(|_| AtomicU64::new(0)).collect(),
         lru_tick: AtomicU64::new(0),
+        overlay_raw: Vec::new(),
     };
 
     // acquire(0) returns the resolved index 0 and increments its counter.
