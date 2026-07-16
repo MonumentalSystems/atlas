@@ -62,6 +62,20 @@ impl MoeLayer {
             self.lora = None;
             return Ok(());
         }
+        // Phase-1 folds only expert down_proj (apply_expert_lora_prefill_down).
+        // A gate/up-proj expert pair would be stored but never folded — refuse
+        // loudly rather than silently ignore it (gate/up fold is a followup).
+        if let Some(((e, proj), _)) = experts
+            .pairs
+            .iter()
+            .find(|((_, p), _)| *p != ExpertProj::Down)
+        {
+            anyhow::bail!(
+                "MoE LoRA (Feature-1) folds only expert down_proj in phase 1; adapter \
+                 targets expert {e} {proj:?}-proj. Refusing rather than silently dropping \
+                 it — restrict target_modules to down_proj, or wait for the gate/up fold."
+            );
+        }
         let all = router.iter().chain(experts.pairs.values());
         let max_n_out = all.clone().map(|p| p.n_out).max().unwrap_or(0) as usize;
         let max_rank = all.map(|p| p.max_rank).max().unwrap_or(0) as usize;

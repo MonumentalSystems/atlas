@@ -43,6 +43,27 @@ impl MoeLayer {
         // FP8 grouped path is HIP-ready (kernel ported); do not force-batch it.
         let hip_force_batched_fp8 = false;
 
+        // Feature-1 MoE LoRA: the router/expert delta fold is wired ONLY into the
+        // NVFP4/dense grouped body below (hooks after the gate GEMM and before the
+        // unpermute). The bf16/fp8 expert branches early-return via
+        // forward_prefill_{bf16,fp8}/forward_batched and would SILENTLY skip the
+        // fold. Refuse loudly rather than serve base-only output with an adapter
+        // installed (phase-1 boundary — bf16/fp8 expert fold is a followup).
+        if self.lora.is_some()
+            && (self.bf16_gate_weight_ptrs.is_some() || self.fp8_gate_weight_ptrs.is_some())
+        {
+            anyhow::bail!(
+                "MoE LoRA (Feature-1) folds only on the NVFP4 grouped prefill path; this \
+                 layer's experts are {}. Refusing rather than silently dropping the delta \
+                 (bf16/fp8 expert fold is a phase-1 followup).",
+                if self.bf16_gate_weight_ptrs.is_some() {
+                    "bf16"
+                } else {
+                    "fp8"
+                }
+            );
+        }
+
         // BF16 experts (FP8-dequant-on-load path): same dispatch shape as
         // FP8 — grouped GEMM for long prefills, fused per-token for short.
         if self.bf16_gate_weight_ptrs.is_some() {
