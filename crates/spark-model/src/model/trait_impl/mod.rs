@@ -20,6 +20,7 @@ use crate::weight_map::{DenseWeight, MtpWeights};
 mod async_chkpt;
 mod decode_a;
 mod decode_a2;
+mod decode_a_diag;
 mod decode_b;
 mod decode_b2;
 mod decode_checkpoint;
@@ -93,7 +94,17 @@ impl Model for TransformerModel {
     ) -> Result<DevicePtr> {
         self.stamp_overlay_route_batch(seqs);
         self.stamp_decode_moe_batch(seqs);
-        self.decode_batch_dispatch(tokens, seqs, stream)
+        let r = self.decode_batch_dispatch(tokens, seqs, stream);
+        if r.is_err() {
+            // A mid-capture refuse (MoE LoRA router/mixed/non-active) in the
+            // batched-decode compute leaves the capture stream recording; release
+            // it so the caller's sequence cleanup doesn't hit
+            // STREAM_CAPTURE_UNSUPPORTED and poison every later op (a single
+            // refused concurrent request would otherwise brick the server). The
+            // batched path captures on the default stream (decode_a2).
+            self.gpu.abort_capture_if_active(self.gpu.default_stream());
+        }
+        r
     }
     fn mixed_forward(
         &self,

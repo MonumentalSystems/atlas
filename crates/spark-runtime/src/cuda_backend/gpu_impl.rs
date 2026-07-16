@@ -326,6 +326,25 @@ impl GpuBackend for AtlasCudaBackend {
         Ok(GraphHandle(graph_exec))
     }
 
+    fn abort_capture_if_active(&self, stream: u64) {
+        // Query capture status; 1 == CU_STREAM_CAPTURE_STATUS_ACTIVE.
+        let mut cap_status: u32 = 0;
+        let q = unsafe { super::cuStreamIsCapturing(stream, &mut cap_status) };
+        if q != 0 || cap_status != 1 {
+            return;
+        }
+        // End the capture to release the stream; discard the partial graph.
+        let mut graph: u64 = 0;
+        let status = unsafe { cuStreamEndCapture(stream, &mut graph) };
+        if status != 0 {
+            tracing::warn!("abort_capture_if_active: cuStreamEndCapture: status {status}");
+            return;
+        }
+        if graph != 0 {
+            unsafe { cuGraphDestroy(graph) };
+        }
+    }
+
     fn launch_graph(&self, graph: GraphHandle, stream: u64) -> Result<()> {
         let status = unsafe { cuGraphLaunch(graph.0, stream) };
         if status != 0 {
