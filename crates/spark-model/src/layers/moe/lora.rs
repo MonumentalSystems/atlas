@@ -306,7 +306,7 @@ impl MoeLayer {
         let cap = l.cap;
         let mut off = 0u32;
         while off < te {
-            let end = (off + cap).min(te);
+            let end = off.saturating_add(cap).min(te);
             // Incr-1: single active adapter -> moe_row_adapter NULL (the device
             // per-row base skip via ForwardContext.moe_row_adapter is Incr-2; the
             // request-level opt-out above already handles a pure base request).

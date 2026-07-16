@@ -60,7 +60,7 @@ impl MoeLayer {
         let cap = l.cap;
         let mut off = 0u32;
         while off < te {
-            let end = (off + cap).min(te);
+            let end = off.saturating_add(cap).min(te);
             if let Some(ref gate) = l.gate_route {
                 ops::moe_lora_grouped_down(
                     ctx.gpu,
