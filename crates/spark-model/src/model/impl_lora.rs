@@ -214,58 +214,83 @@ impl TransformerModel {
             let Some(layer_weights) = layers.get(idx).and_then(|o| o.as_ref()) else {
                 continue;
             };
-            let attn = layer
-                .as_any_mut()
-                .and_then(|a| a.downcast_mut::<crate::layers::Qwen3AttentionLayer>())
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "LoRA: adapted layer {idx} is not a Qwen3AttentionLayer \
-                         (loader/adapter layer-type mismatch)"
-                    )
-                })?;
-            let attn_weights = ops::lora_delta::LoraAttnWeights {
-                // #30: the global layer index (from `self.layers.enumerate()`) —
-                // the key the request slot's GLOBAL-layer-indexed pairs use.
-                layer_idx: idx,
-                q: layer_weights.q_proj,
-                k: layer_weights.k_proj,
-                v: layer_weights.v_proj,
-                o: layer_weights.o_proj,
-                kernels,
-                q_route: mk_route(idx, LoraModule::QProj, &layer_weights.q_proj),
-                k_route: mk_route(idx, LoraModule::KProj, &layer_weights.k_proj),
-                v_route: mk_route(idx, LoraModule::VProj, &layer_weights.v_proj),
-                o_route: mk_route(idx, LoraModule::OProj, &layer_weights.o_proj),
-            };
-            let ffn_weights = if layer_weights.gate_proj.is_some()
-                || layer_weights.up_proj.is_some()
-                || layer_weights.down_proj.is_some()
-            {
-                Some(ops::lora_delta::LoraFfnWeights {
-                    gate: layer_weights.gate_proj,
-                    up: layer_weights.up_proj,
-                    down: layer_weights.down_proj,
-                    kernels,
-                })
-            } else {
-                None
-            };
-            attn.set_lora_weights(attn_weights, ffn_weights)?;
-            // Feature-1: install router + routed-expert deltas onto this layer's
-            // MoE FFN (correctness-first side-path). Only when the adapter carries
-            // them (ATLAS_LORA_EXPERTS=1); base MoE is byte-identical otherwise.
-            if layer_weights.router.is_some()
+            let has_moe = layer_weights.router.is_some()
                 || layer_weights
                     .experts
                     .as_ref()
-                    .is_some_and(|e| !e.is_empty())
-            {
-                attn.set_moe_lora_weights(
-                    layer_weights.router,
-                    layer_weights.experts.clone().unwrap_or_default(),
+                    .is_some_and(|e| !e.is_empty());
+            let has_attn_ffn = layer_weights.q_proj.is_some()
+                || layer_weights.k_proj.is_some()
+                || layer_weights.v_proj.is_some()
+                || layer_weights.o_proj.is_some()
+                || layer_weights.gate_proj.is_some()
+                || layer_weights.up_proj.is_some()
+                || layer_weights.down_proj.is_some();
+            let any = layer.as_any_mut().ok_or_else(|| {
+                anyhow::anyhow!("LoRA: adapted layer {idx} is not downcastable")
+            })?;
+            // Full-attention layer: attention + dense-FFN + MoE. Linear-attention
+            // (GDN/SSM) layer: MoE ONLY — its attention projections are rejected at
+            // classify, but its MoE FFN exists on every layer, so a real all-layer
+            // MoE adapter routes its router/expert deltas here too.
+            if let Some(attn) = any.downcast_mut::<crate::layers::Qwen3AttentionLayer>() {
+                let attn_weights = ops::lora_delta::LoraAttnWeights {
+                    // #30: the global layer index (from `self.layers.enumerate()`) —
+                    // the key the request slot's GLOBAL-layer-indexed pairs use.
+                    layer_idx: idx,
+                    q: layer_weights.q_proj,
+                    k: layer_weights.k_proj,
+                    v: layer_weights.v_proj,
+                    o: layer_weights.o_proj,
                     kernels,
-                    self.gpu.as_ref(),
-                )?;
+                    q_route: mk_route(idx, LoraModule::QProj, &layer_weights.q_proj),
+                    k_route: mk_route(idx, LoraModule::KProj, &layer_weights.k_proj),
+                    v_route: mk_route(idx, LoraModule::VProj, &layer_weights.v_proj),
+                    o_route: mk_route(idx, LoraModule::OProj, &layer_weights.o_proj),
+                };
+                let ffn_weights = if layer_weights.gate_proj.is_some()
+                    || layer_weights.up_proj.is_some()
+                    || layer_weights.down_proj.is_some()
+                {
+                    Some(ops::lora_delta::LoraFfnWeights {
+                        gate: layer_weights.gate_proj,
+                        up: layer_weights.up_proj,
+                        down: layer_weights.down_proj,
+                        kernels,
+                    })
+                } else {
+                    None
+                };
+                attn.set_lora_weights(attn_weights, ffn_weights)?;
+                if has_moe {
+                    attn.set_moe_lora_weights(
+                        layer_weights.router,
+                        layer_weights.experts.clone().unwrap_or_default(),
+                        kernels,
+                        self.gpu.as_ref(),
+                    )?;
+                }
+            } else if let Some(ssm) = any.downcast_mut::<crate::layers::Qwen3SsmLayer>() {
+                if has_attn_ffn {
+                    anyhow::bail!(
+                        "LoRA: attention/dense-FFN delta on linear-attention layer {idx} — \
+                         classify should have rejected this (only MoE router/experts are \
+                         valid on GDN layers)"
+                    );
+                }
+                if has_moe {
+                    ssm.set_moe_lora_weights(
+                        layer_weights.router,
+                        layer_weights.experts.clone().unwrap_or_default(),
+                        kernels,
+                        self.gpu.as_ref(),
+                    )?;
+                }
+            } else {
+                anyhow::bail!(
+                    "LoRA: adapted layer {idx} is neither a Qwen3AttentionLayer nor a \
+                     Qwen3SsmLayer (loader/adapter layer-type mismatch)"
+                );
             }
             installed += 1;
         }

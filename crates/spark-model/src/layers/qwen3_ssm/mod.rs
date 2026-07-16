@@ -193,6 +193,7 @@ pub struct Qwen3SsmLayer {
 // ── Sub-files (split for ≤500 LoC) ────────────────────────────────────────
 mod debug;
 mod init;
+mod lora;
 mod ssm_forward;
 mod trait_decode;
 mod trait_decode_batched;
@@ -208,6 +209,12 @@ mod trait_prefill_recur;
 
 // ── TransformerLayer impl (delegates to per-file inherent _inner methods) ──
 impl TransformerLayer for Qwen3SsmLayer {
+    /// Downcast hook so the LoRA install walk can reach this layer's MoE FFN
+    /// (Feature-1: routed-expert/router deltas exist on GDN layers too).
+    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
+        Some(self)
+    }
+
     fn decode(
         &self,
         hidden: DevicePtr,
