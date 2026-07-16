@@ -52,43 +52,50 @@ impl MoeLayer {
         if !self.moe_route_gate(ctx, "expert-gateup")? {
             return Ok(());
         }
-        anyhow::ensure!(
-            te <= l.cap,
-            "MoE expert LoRA gate/up-fold: total_expanded ({te}) exceeds LoRA scratch cap ({}); \
-             raise ATLAS_LORA_EXPERT_MAX_TOKENS to >= num_tokens*top_k for this prefill chunk.",
-            l.cap
-        );
-        if let Some(ref gate) = l.gate_route {
-            ops::moe_lora_grouped_down(
-                ctx.gpu,
-                &l.kernels,
-                gate,
-                expert_input,
-                expert_gate_out,
-                expert_offsets,
-                sorted_token_ids,
-                DevicePtr::NULL,
-                l.xa,
-                te,
-                1, // x_gather=1: gather token-major expert_input via sorted_token_ids
-                stream,
-            )?;
-        }
-        if let Some(ref up) = l.up_route {
-            ops::moe_lora_grouped_down(
-                ctx.gpu,
-                &l.kernels,
-                up,
-                expert_input,
-                expert_up_out,
-                expert_offsets,
-                sorted_token_ids,
-                DevicePtr::NULL,
-                l.xa,
-                te,
-                1,
-                stream,
-            )?;
+        // Chunk `te` into <= cap-row windows (xa is `[cap, max_rank]`, LOCAL-row
+        // indexed). Gate then up reuse `l.xa` serially per window: gate's expand
+        // fully precedes up's shrink on the ordered stream, so a per-window
+        // gate→up pair preserves the same serial-reuse discipline as the
+        // unchunked path.
+        let cap = l.cap;
+        let mut off = 0u32;
+        while off < te {
+            let end = (off + cap).min(te);
+            if let Some(ref gate) = l.gate_route {
+                ops::moe_lora_grouped_down(
+                    ctx.gpu,
+                    &l.kernels,
+                    gate,
+                    expert_input,
+                    expert_gate_out,
+                    expert_offsets,
+                    sorted_token_ids,
+                    DevicePtr::NULL,
+                    l.xa,
+                    off,
+                    end,
+                    1, // x_gather=1: gather token-major expert_input via sorted_token_ids
+                    stream,
+                )?;
+            }
+            if let Some(ref up) = l.up_route {
+                ops::moe_lora_grouped_down(
+                    ctx.gpu,
+                    &l.kernels,
+                    up,
+                    expert_input,
+                    expert_up_out,
+                    expert_offsets,
+                    sorted_token_ids,
+                    DevicePtr::NULL,
+                    l.xa,
+                    off,
+                    end,
+                    1,
+                    stream,
+                )?;
+            }
+            off = end;
         }
         Ok(())
     }

@@ -46,6 +46,18 @@ fn max_tokens() -> u32 {
     })
 }
 
+/// PURE (unit-tested): the `delta` scratch column count. `delta` has EXACTLY two
+/// consumers — the router fold expand (`router_n_out = num_experts` cols) and the
+/// decode down-fold post-swiglu `x` recompute (`down_k_in = moe_inter` cols).
+/// Gate/up expands fuse into the device kernel and never touch `delta`, so their
+/// `k_in=hidden` must NOT size it. `>= 1` so the alloc is never zero-width (a
+/// gate/up-only, no-router adapter genuinely uses `delta` for nothing).
+pub(super) fn lora_delta_cols(router_n_out: Option<u32>, down_k_in: Option<u32>) -> usize {
+    let r = router_n_out.map_or(0, |v| v as usize);
+    let d = down_k_in.map_or(0, |v| v as usize);
+    r.max(d).max(1)
+}
+
 /// One MoE layer's installed router + routed-expert LoRA + apply scratch.
 pub(crate) struct MoeLoraWeights {
     /// Router (`mlp.gate`) delta on the routing logits (`None` if unadapted).
@@ -53,15 +65,18 @@ pub(crate) struct MoeLoraWeights {
     pub(super) kernels: LoraKernels,
     /// Row cap the folds chunk to (== scratch capacity in rows).
     pub(super) cap: u32,
-    /// `[cap, max_rank]` BF16 shrink scratch. For the device-side expert
-    /// folds this is indexed by ABSOLUTE sorted row (prefill) / flat slot
-    /// (decode), so `cap` must cover the live `total_expanded = num_tokens*top_k`
-    /// (guarded at the call site). Reused SERIALLY across gate/up/down folds on
-    /// the same stream (each shrink fully precedes its expand).
+    /// `[cap, max_rank]` BF16 shrink scratch, indexed by LOCAL row
+    /// (`r - row_offset`, prefill) / flat slot (decode). Prefill folds chunk
+    /// `total_expanded = num_tokens*top_k` into windows of `cap` rows, so this
+    /// stays `cap`-rows regardless of ISL (no `te <= cap` cap). Reused SERIALLY
+    /// across gate/up/down folds on the same stream (each shrink fully precedes
+    /// its expand).
     pub(super) xa: DevicePtr,
-    /// `[cap, max_n_out]` BF16 expand scratch (router fold + the decode down-fold
-    /// post-swiglu `x` recompute — the device grouped folds fuse into the expand
-    /// kernel and need no separate delta buffer).
+    /// `[cap, max(num_experts, moe_inter)]` BF16 expand scratch, sized to its only
+    /// two consumers: the router fold expand (`num_experts` cols) and the decode
+    /// down-fold post-swiglu `x` recompute (`moe_inter = down k_in` cols). The
+    /// device grouped folds fuse their expand and need no separate delta buffer,
+    /// so gate/up's `k_in=hidden` does NOT size this.
     delta: DevicePtr,
     /// Feature-1 device-side expert down_proj fold route (per-expert A/B/scale
     /// tables; `k_in=moe_inter`, `n_out=hidden`). `None` for an adapter with no
@@ -75,9 +90,10 @@ pub(crate) struct MoeLoraWeights {
 }
 
 impl MoeLayer {
-    /// Install this layer's router + routed-expert LoRA. Allocates apply scratch
-    /// sized from the pairs' max `n_out` / `max_rank` and the token cap. A layer
-    /// with neither a router nor any expert pair installs nothing.
+    /// Install this layer's router + routed-expert LoRA. Allocates apply scratch:
+    /// `xa` `[cap, max_rank]` and `delta` `[cap, max(num_experts, moe_inter)]`
+    /// (delta's only two real consumers — see the field docs). A layer with
+    /// neither a router nor any expert pair installs nothing.
     pub(crate) fn set_lora_weights(
         &mut self,
         router: Option<LoraPair>,
@@ -92,16 +108,29 @@ impl MoeLayer {
         // All three expert projections (gate/up/down) now fold on device via their
         // own per-expert route table (built below); the router delta folds on the
         // routing logits. No proj is silently dropped, so no install-time bail.
-        let all = router.iter().chain(experts.pairs.values());
-        let max_n_out = all.clone().map(|p| p.n_out).max().unwrap_or(0) as usize;
-        let max_k_in = all.clone().map(|p| p.k_in).max().unwrap_or(0) as usize;
-        let max_rank = all.map(|p| p.max_rank).max().unwrap_or(0) as usize;
+        let max_rank = router
+            .iter()
+            .chain(experts.pairs.values())
+            .map(|p| p.max_rank)
+            .max()
+            .unwrap_or(0) as usize;
         let cap = max_tokens() as usize;
-        // `delta` is the router expand scratch (`[cap, max_n_out]`) AND, for the
-        // decode expert down-fold, the packed `[n_slots, k_in]` post-swiglu `x`
-        // recompute scratch — size it for the wider of the two so a model whose
-        // `moe_intermediate_size` (k_in) exceeds `hidden` (n_out) still fits.
-        let delta_cols = max_n_out.max(max_k_in).max(1);
+        // `delta` has EXACTLY two consumers, so size it to their real column need
+        // (NOT the max over all pairs' n_out/k_in — the device grouped folds fuse
+        // their expand and never touch `delta`, so gate/up's `k_in=hidden` must
+        // not inflate it):
+        //   1. router fold expand -> `[m, router.n_out = num_experts]`,
+        //   2. decode down-fold post-swiglu `x` recompute -> `[n_slots,
+        //      down.k_in = moe_inter]`.
+        // Holo-35B full adapter: 2048 -> 512 (4x); router-only: 2048 -> 256 (8x).
+        let router_n_out = router.as_ref().map(|p| p.n_out);
+        let down_k_in = experts
+            .pairs
+            .iter()
+            .filter(|((_, p), _)| *p == ExpertProj::Down)
+            .map(|(_, pr)| pr.k_in)
+            .max();
+        let delta_cols = lora_delta_cols(router_n_out, down_k_in);
         let xa = gpu.alloc(cap * max_rank.max(1) * 2)?;
         let delta = gpu.alloc(cap * delta_cols * 2)?;
         gpu.memset(xa, 0, cap * max_rank.max(1) * 2)?;
@@ -268,32 +297,37 @@ impl MoeLayer {
         if !self.moe_route_gate(ctx, "expert-down")? {
             return Ok(());
         }
-        // `xa` is indexed by ABSOLUTE sorted row, so the scratch must cover all
-        // `te` rows (the host loop's cap-chunking is gone). Bail loudly rather
-        // than overrun — raise ATLAS_LORA_EXPERT_MAX_TOKENS for long prefills.
-        anyhow::ensure!(
-            te <= l.cap,
-            "MoE expert LoRA down-fold: total_expanded ({te}) exceeds LoRA scratch cap ({}); \
-             raise ATLAS_LORA_EXPERT_MAX_TOKENS to >= num_tokens*top_k for this prefill chunk.",
-            l.cap
-        );
-        // Incr-1: single active adapter -> moe_row_adapter NULL (the device
-        // per-row base skip via ForwardContext.moe_row_adapter is Incr-2; the
-        // request-level opt-out above already handles a pure base request).
-        ops::moe_lora_grouped_down(
-            ctx.gpu,
-            &l.kernels,
-            route,
-            expert_gate_out,
-            expert_down_out,
-            expert_offsets,
-            sorted_token_ids,
-            DevicePtr::NULL,
-            l.xa,
-            te,
-            0, // x_gather=0: down x is already sorted (x-row == sorted row)
-            stream,
-        )
+        // `xa` is `[cap, max_rank]` indexed by LOCAL row, so a prefill chunk with
+        // `te > cap` is folded in contiguous windows of `cap` sorted rows. Each
+        // window's shrink fully precedes its expand on the ordered stream (serial
+        // xa reuse). `off=0, end=te` (te <= cap) is a single window ≡ the
+        // pre-chunk kernel; rows have no cross-row reduction, so which window a
+        // row lands in cannot change its folded result.
+        let cap = l.cap;
+        let mut off = 0u32;
+        while off < te {
+            let end = (off + cap).min(te);
+            // Incr-1: single active adapter -> moe_row_adapter NULL (the device
+            // per-row base skip via ForwardContext.moe_row_adapter is Incr-2; the
+            // request-level opt-out above already handles a pure base request).
+            ops::moe_lora_grouped_down(
+                ctx.gpu,
+                &l.kernels,
+                route,
+                expert_gate_out,
+                expert_down_out,
+                expert_offsets,
+                sorted_token_ids,
+                DevicePtr::NULL,
+                l.xa,
+                off,
+                end,
+                0, // x_gather=0: down x is already sorted (x-row == sorted row)
+                stream,
+            )?;
+            off = end;
+        }
+        Ok(())
     }
 
     /// SOLID Incr-4: fold the routed-expert down_proj LoRA deltas onto the
@@ -416,3 +450,7 @@ impl MoeLayer {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "lora_tests.rs"]
+mod tests;

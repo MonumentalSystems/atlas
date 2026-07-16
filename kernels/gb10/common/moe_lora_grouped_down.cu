@@ -31,6 +31,18 @@
 // early-return (device-derived, no host value), so the launch shape is a static
 // worst-case bound (worst_case_m_tiles) that captures cleanly.
 //
+// CHUNKING (fixed-cap scratch at any ISL): xa is a [cap, max_rank] BF16 buffer,
+// so a prefill chunk with total_expanded (te) > cap is folded in contiguous
+// row windows [row_offset, row_end) of <= cap rows each (the host hooks loop).
+// Each expert's span is intersected with the window; per-expert tiles rebase to
+// max(m_start, row_offset) so grid.y = ceil((row_end-row_offset)/64) covers the
+// slice. xa is indexed at the LOCAL row (r - row_offset); x / base_out /
+// sorted_token_ids / moe_row_adapter / expert_offsets all stay ABSOLUTE — no
+// input re-basing, so the down path is BIT-IDENTICAL per row regardless of which
+// window a row lands in (each row's reduction is intact; no cross-row/atomic
+// accumulation). row_offset=0, row_end>=te reduces to the pre-chunk kernel
+// exactly (max(m_start,0)=m_start, min(m_end,te)=m_end, r-0=r).
+//
 // Per-row base skip (mixed-batch, Incr-2): when moe_row_adapter != NULL, a row
 // whose owning token (moe_row_adapter[sorted_token_ids[r]]) is < 0 is a base row
 // and is skipped — the whole block takes the skip uniformly (the predicate
@@ -58,11 +70,13 @@ extern "C" __global__ void moe_lora_grouped_down_shrink(
     const int* __restrict__ sorted_token_ids,        // [te] i32 sorted row -> packed token
     const int* __restrict__ moe_row_adapter,         // [num_tokens] i32 or NULL (<0 => base skip)
     const unsigned long long* __restrict__ a_expert_table,  // [num_experts] u64 A_e addr (0 = unadapted)
-    __nv_bfloat16* __restrict__ xa,                  // [te, max_rank] BF16 (out, row-major)
+    __nv_bfloat16* __restrict__ xa,                  // [<=cap, max_rank] BF16 (out, LOCAL row r-row_offset)
     unsigned int num_experts,
     unsigned int max_rank,                           // output dim (== A padded row count)
     unsigned int k_in,                               // contraction dim
-    unsigned int x_gather                            // 0: x row = sorted row r (down); 1: x row = sorted_token_ids[r] (gate/up)
+    unsigned int x_gather,                           // 0: x row = sorted row r (down); 1: x row = sorted_token_ids[r] (gate/up)
+    unsigned int row_offset,                         // first ABSOLUTE sorted row in this chunk's window
+    unsigned int row_end                             // one-past-last ABSOLUTE row (== min(row_offset+cap, te))
 ) {
     const unsigned int e = blockIdx.z;
     if (e >= num_experts) return;
@@ -72,9 +86,16 @@ extern "C" __global__ void moe_lora_grouped_down_shrink(
     const unsigned long long a_addr = a_expert_table[e];
     if (a_addr == 0ULL) return;                      // expert not adapted -> whole tile skips
 
-    const int r0 = m_start + (int)blockIdx.y * MLG_M_TILE;
-    if (r0 >= m_end) return;                          // tile beyond this expert's rows
-    const int r1 = min(r0 + MLG_M_TILE, m_end);
+    // Chunk window: clamp this expert's row span to [row_offset, row_end). Tiles
+    // start at the window-relative expert base so grid.y == ceil(window/64)
+    // covers every expert slice; an expert fully outside the window early-returns
+    // (block-uniform, __syncthreads-safe). row_offset=0, row_end>=te is the
+    // unchunked call: win_start==m_start, win_end==m_end, xa index r-0==r.
+    const int win_start = max(m_start, (int)row_offset);
+    const int win_end = min(m_end, (int)row_end);
+    const int r0 = win_start + (int)blockIdx.y * MLG_M_TILE;
+    if (r0 >= win_end) return;                        // tile beyond this expert's windowed rows
+    const int r1 = min(r0 + MLG_M_TILE, win_end);
 
     const __nv_bfloat16* A_base = (const __nv_bfloat16*)a_addr;  // [max_rank, k_in]
 
@@ -138,7 +159,7 @@ extern "C" __global__ void moe_lora_grouped_down_shrink(
         __syncthreads();
         if (lane == 0) {
             float result = smem[local_out * 2] + smem[local_out * 2 + 1];
-            xa[(unsigned long long)r * max_rank + n] = __float2bfloat16(result);
+            xa[(unsigned long long)(r - (int)row_offset) * max_rank + n] = __float2bfloat16(result);
         }
         __syncthreads();  // guard smem reuse before the next row iteration
     }
@@ -152,7 +173,7 @@ extern "C" __global__ void moe_lora_grouped_down_shrink(
 //
 // Grid: (ceil(n_out/4), worst_case_m_tiles, num_experts)   Block: (256,1,1)
 extern "C" __global__ void moe_lora_grouped_down_expand_fold(
-    const __nv_bfloat16* __restrict__ xa,            // [te, max_rank] BF16 (from kernel 1)
+    const __nv_bfloat16* __restrict__ xa,            // [<=cap, max_rank] BF16 (from kernel 1, LOCAL row r-row_offset)
     const int* __restrict__ expert_offsets,          // [num_experts+1] i32 prefix sum
     const int* __restrict__ sorted_token_ids,        // [te] i32 sorted row -> packed token
     const int* __restrict__ moe_row_adapter,         // [num_tokens] i32 or NULL (<0 => base skip)
@@ -161,7 +182,9 @@ extern "C" __global__ void moe_lora_grouped_down_expand_fold(
     __nv_bfloat16* __restrict__ base_out,            // [te, n_out] BF16 (expert_down_out, in-place fold)
     unsigned int num_experts,
     unsigned int n_out,                              // output dim (== hidden)
-    unsigned int max_rank                            // contraction dim (== B row stride)
+    unsigned int max_rank,                           // contraction dim (== B row stride)
+    unsigned int row_offset,                         // first ABSOLUTE sorted row in this chunk's window
+    unsigned int row_end                             // one-past-last ABSOLUTE row (== min(row_offset+cap, te))
 ) {
     const unsigned int e = blockIdx.z;
     if (e >= num_experts) return;
@@ -171,9 +194,13 @@ extern "C" __global__ void moe_lora_grouped_down_expand_fold(
     const unsigned long long b_addr = b_expert_table[e];
     if (b_addr == 0ULL) return;
 
-    const int r0 = m_start + (int)blockIdx.y * MLG_M_TILE;
-    if (r0 >= m_end) return;
-    const int r1 = min(r0 + MLG_M_TILE, m_end);
+    // Same window clamp as the shrink kernel — xa is read at the LOCAL row
+    // (r - row_offset), base_out folded at the ABSOLUTE row r.
+    const int win_start = max(m_start, (int)row_offset);
+    const int win_end = min(m_end, (int)row_end);
+    const int r0 = win_start + (int)blockIdx.y * MLG_M_TILE;
+    if (r0 >= win_end) return;
+    const int r1 = min(r0 + MLG_M_TILE, win_end);
 
     const __nv_bfloat16* B_base = (const __nv_bfloat16*)b_addr;  // [n_out, max_rank]
     const float scale_e = scale_expert_table[e];
@@ -197,7 +224,7 @@ extern "C" __global__ void moe_lora_grouped_down_expand_fold(
         if (moe_row_adapter != nullptr && moe_row_adapter[sorted_token_ids[r]] < 0) {
             continue;
         }
-        const __nv_bfloat16* Arow = xa + (unsigned long long)r * max_rank;  // [max_rank]
+        const __nv_bfloat16* Arow = xa + (unsigned long long)(r - (int)row_offset) * max_rank;  // [max_rank]
         const uint4* A_vec = (const uint4*)Arow;
 
         float acc = 0.0f;

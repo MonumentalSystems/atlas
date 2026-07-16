@@ -5,7 +5,9 @@
 //! fold. No GPU: verifies dense placement, unadapted `0` sentinels, table
 //! length, and the router-only (empty) case.
 
-use super::{ExpertTables, gather_bgmv_grids, gather_row_token, pack_expert_tables};
+use super::{
+    ExpertTables, gather_bgmv_grids, gather_row_token, grouped_down_wc, pack_expert_tables,
+};
 
 #[test]
 fn empty_entries_none() {
@@ -90,4 +92,61 @@ fn row_token_decomposition_matches_kernel() {
     assert_eq!(gather_row_token(7, 8), 0); // last slot of token 0
     assert_eq!(gather_row_token(8, 8), 1); // first slot of token 1
     assert_eq!(gather_row_token(23, 8), 2); // K=3 verify, token 2
+}
+
+// ── Prefill chunk-window grid math (grouped_down_wc) ──────────────────────────
+
+/// Local re-derivation of the pre-chunk `wc = ceil(te/64).max(1)` so the tests
+/// pin the full-window equivalence against an independent formula.
+fn div_ceil64(n: u32) -> u32 {
+    ((n + 63) / 64).max(1)
+}
+
+#[test]
+fn full_window_equals_prechunk_wc() {
+    // A single window [0, te) must reproduce the old ceil(te/64) grid exactly —
+    // this is the bit-identity (unchunked) path.
+    for te in [0u32, 1, 63, 64, 65, 4096, 4097, 131072] {
+        assert_eq!(grouped_down_wc(0, te), div_ceil64(te), "te={te}");
+    }
+}
+
+#[test]
+fn window_grid_covers_only_the_slice() {
+    // A cap-sized window sizes grid.y to the window, NOT to te. cap=4096 ->
+    // ceil(4096/64)=64 tiles regardless of how far into a huge te it sits.
+    assert_eq!(grouped_down_wc(0, 4096), 64);
+    assert_eq!(grouped_down_wc(4096, 8192), 64);
+    assert_eq!(grouped_down_wc(128000, 131072), 48); // ceil(3072/64)=48 tail
+}
+
+#[test]
+fn empty_window_still_launches_one_tile() {
+    // Degenerate zero-row window clamps to 1 (kernel early-returns per expert).
+    assert_eq!(grouped_down_wc(100, 100), 1);
+    assert_eq!(grouped_down_wc(200, 100), 1); // row_end < row_offset saturates
+}
+
+#[test]
+fn chunks_tile_range_without_gap_or_overlap() {
+    // The hook loop `for off in (0..te).step_by(cap)` must partition [0, te)
+    // contiguously (every row folded exactly once). Verify coverage + the
+    // per-window wc matches the window length.
+    let cap = 4096u32;
+    for te in [1u32, 4096, 4097, 10000, 131072] {
+        let mut off = 0u32;
+        let mut covered = 0u32;
+        let mut prev_end = 0u32;
+        while off < te {
+            let end = (off + cap).min(te);
+            assert_eq!(off, prev_end, "gap/overlap at off={off} (te={te})");
+            let window = end - off;
+            assert!(window <= cap, "window {window} exceeds cap {cap}");
+            assert_eq!(grouped_down_wc(off, end), div_ceil64(window), "te={te}");
+            covered += window;
+            prev_end = end;
+            off = end;
+        }
+        assert_eq!(covered, te, "windows must cover exactly [0,te) for te={te}");
+    }
 }

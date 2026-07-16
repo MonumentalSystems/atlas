@@ -87,8 +87,9 @@ pub struct ExpertTables {
     pub n_experts: u32,
 }
 
-/// Launch the device-side grouped fold. Down (`x_gather==0`): `x` = post-SiLU
-/// sorted activations (`[te, k_in]` BF16), `base_out` = sorted `expert_down_out`.
+/// Launch the device-side grouped fold for ONE chunk window `[row_offset,
+/// row_end)` of the sorted rows. Down (`x_gather==0`): `x` = post-SiLU sorted
+/// activations (`[te, k_in]` BF16), `base_out` = sorted `expert_down_out`.
 /// Gate/up (`x_gather==1`): `x` = the TOKEN-MAJOR `expert_input` (`[num_tokens,
 /// k_in=hidden]` BF16, gathered per sorted row via `sorted_token_ids`), `base_out`
 /// = sorted `expert_gate_out`/`expert_up_out` (`[te, n_out=inter]`). In both,
@@ -97,10 +98,15 @@ pub struct ExpertTables {
 /// prefix sum, `sorted_token_ids` = the device `[te]` i32 sorted-row→token map,
 /// `moe_row_adapter` = `[num_tokens]` i32 device map (`< 0` = base skip) or
 /// `DevicePtr::NULL` for the single-active-adapter path, `xa` = the fixed-address
-/// `[te, max_rank]` BF16 shrink scratch (caller guarantees `>= te` rows).
+/// `[cap, max_rank]` BF16 shrink scratch indexed at the LOCAL row `r-row_offset`
+/// (so the caller only needs `>= (row_end-row_offset)` rows, NOT `>= te`). The
+/// hooks loop `[0, te)` in windows of `cap`; a single call at `row_offset=0,
+/// row_end=te` (te <= cap) is bit-identical to the pre-chunk kernel.
 ///
 /// ARG ORDER is in lockstep with `moe_lora_grouped_down.cu` (cuLaunchKernel is
 /// type-blind; the byte-identity oracle is the only guard — keep both in sync).
+/// `row_offset`/`row_end` are appended LAST in both kernels, so existing arg
+/// offsets are untouched.
 #[allow(clippy::too_many_arguments)]
 pub fn moe_lora_grouped_down(
     gpu: &dyn GpuBackend,
@@ -111,8 +117,9 @@ pub fn moe_lora_grouped_down(
     expert_offsets: DevicePtr,  // [num_experts+1] i32 DEVICE
     sorted_token_ids: DevicePtr, // [te] i32 DEVICE
     moe_row_adapter: DevicePtr, // [num_tokens] i32 DEVICE or NULL
-    xa: DevicePtr,              // [te, max_rank] BF16 scratch (fixed address)
-    te: u32,
+    xa: DevicePtr,              // [cap, max_rank] BF16 scratch (fixed address, LOCAL-row indexed)
+    row_offset: u32,           // first ABSOLUTE sorted row of this chunk window
+    row_end: u32,              // one-past-last ABSOLUTE row (== min(row_offset+cap, te))
     x_gather: u32,             // 0: x row = sorted row r (down); 1: x row = sorted_token_ids[r] (gate/up)
     stream: u64,
 ) -> Result<()> {
@@ -123,10 +130,14 @@ pub fn moe_lora_grouped_down(
         "moe_lora_grouped_down kernels unresolved (module `moe_lora_grouped_down` missing \
          from the compiled kernel set — CUDA build required)"
     );
-    let wc = div_ceil(te, MLG_M_TILE).max(1);
+    // Grid.y covers the window (<= cap rows), not the whole te: each expert's span
+    // ∩ window has at most `window` rows, and per-expert tiles rebase to the
+    // window start device-side.
+    let window = row_end.saturating_sub(row_offset);
+    let wc = div_ceil(window, MLG_M_TILE).max(1);
 
-    // Kernel 1: shrink — xa[te, max_rank] = x @ A_e^T.
-    // grid = (ceil(max_rank/4), worst_case_m_tiles, n_experts)  block = (256,1,1).
+    // Kernel 1: shrink — xa[local_row, max_rank] = x @ A_e^T.
+    // grid = (ceil(max_rank/4), ceil(window/64), n_experts)  block = (256,1,1).
     KernelLaunch::new(gpu, kernels.moe_down_shrink_k)
         .grid([div_ceil(route.max_rank, 4), wc, route.n_experts])
         .block([256, 1, 1])
@@ -140,10 +151,12 @@ pub fn moe_lora_grouped_down(
         .arg_u32(route.max_rank)
         .arg_u32(route.k_in)
         .arg_u32(x_gather)
+        .arg_u32(row_offset)
+        .arg_u32(row_end)
         .launch(stream)?;
 
-    // Kernel 2: expand + fold — base_out += scale_e * (xa @ B_e^T).
-    // grid = (ceil(n_out/4), worst_case_m_tiles, n_experts)  block = (256,1,1).
+    // Kernel 2: expand + fold — base_out[r] += scale_e * (xa[r-row_offset] @ B_e^T).
+    // grid = (ceil(n_out/4), ceil(window/64), n_experts)  block = (256,1,1).
     KernelLaunch::new(gpu, kernels.moe_down_expand_fold_k)
         .grid([div_ceil(route.n_out, 4), wc, route.n_experts])
         .block([256, 1, 1])
@@ -157,7 +170,19 @@ pub fn moe_lora_grouped_down(
         .arg_u32(route.n_experts)
         .arg_u32(route.n_out)
         .arg_u32(route.max_rank)
+        .arg_u32(row_offset)
+        .arg_u32(row_end)
         .launch(stream)
+}
+
+/// PURE (GPU-free, unit-tested): the shrink/expand grid `grid.y` (m-tile count)
+/// for one chunk window `[row_offset, row_end)` — `ceil((row_end-row_offset)/64)`,
+/// min 1. Matches the launcher's `wc`; exposed so the chunk-boundary math is
+/// verifiable without a GPU. A full-window call (`row_offset=0, row_end=te`)
+/// returns exactly the pre-chunk `ceil(te/64)`.
+pub fn grouped_down_wc(row_offset: u32, row_end: u32) -> u32 {
+    use spark_runtime::kernel_args::div_ceil;
+    div_ceil(row_end.saturating_sub(row_offset), MLG_M_TILE).max(1)
 }
 
 /// M_TILE the static worst-case grid pairs with — must match the `MLG_M_TILE`
