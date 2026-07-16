@@ -384,6 +384,7 @@ impl TransformerModel {
             token_ids: None,
             // #30: decode never routes prefill — installed-pair/bgmv path only.
             routed_lora_layers: None,
+            moe_lora_route: crate::layer::MoeLoraRoute::Fold, // decode: reject_decode_lora guards.
         };
 
         let prefill_ctx = ForwardContext {
@@ -399,6 +400,7 @@ impl TransformerModel {
             // #30: the fused (SLAI) prefill portion routes by the prefilling
             // seq's slot (None unless it routes to a non-active slot).
             routed_lora_layers: self.routed_slot_layers(prefill_seq.adapter_slot),
+            moe_lora_route: self.moe_lora_route(prefill_seq.adapter_slot),
         };
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {

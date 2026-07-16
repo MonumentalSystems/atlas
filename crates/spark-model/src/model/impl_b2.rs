@@ -208,6 +208,7 @@ impl TransformerModel {
                 gdn_exact_replay: false,
                 token_ids: None,
                 routed_lora_layers: None, // #30: MTP decode never routes prefill.
+                moe_lora_route: crate::layer::MoeLoraRoute::Fold, // decode: reject_decode_lora guards.
             };
             let drafts = proposer.propose(
                 token_0,

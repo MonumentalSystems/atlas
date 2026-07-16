@@ -434,6 +434,7 @@ impl TransformerModel {
             token_ids: None,
             // #30: request slot pairs (None unless routing to a non-active slot).
             routed_lora_layers: self.routed_slot_layers(seq.adapter_slot),
+            moe_lora_route: self.moe_lora_route(seq.adapter_slot),
         };
 
         // ── 4. Per-layer forward: SSM uses three-phase, attention uses standard ──

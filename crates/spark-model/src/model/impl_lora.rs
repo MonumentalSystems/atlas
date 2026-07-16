@@ -55,6 +55,20 @@ impl TransformerModel {
         }
     }
 
+    /// Feature-1: resolve the MoE-LoRA fold decision for a single-request pass
+    /// from that request's `adapter_slot`. See [`crate::layer::MoeLoraRoute`].
+    /// Base / non-active requests skip (base tokens pay nothing); only the
+    /// installed active adapter's request folds; a request for a different,
+    /// non-installed adapter refuses loudly. No pool resident ⇒ `Fold` (inert:
+    /// the fold hook no-ops on the layer's `self.lora == None`).
+    pub(crate) fn moe_lora_route(&self, adapter_slot: i32) -> crate::layer::MoeLoraRoute {
+        let (active, has) = match self.lora.as_ref() {
+            Some(lw) => (lw.active as i32, true),
+            None => (-1, false),
+        };
+        crate::lora::resolve_moe_lora_route(adapter_slot, active, has)
+    }
+
     pub fn set_lora_weights(&mut self, mut lora: Option<crate::lora::LoraWeights>) -> Result<()> {
         if let Some(ref lw) = lora {
             // eager-on-rotate: ONLY the global rotate/swap re-point path forces

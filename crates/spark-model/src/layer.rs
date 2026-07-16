@@ -250,6 +250,41 @@ pub struct ForwardContext<'a> {
     /// the installed-active-pair path byte-identical. Prefill runs eager
     /// (`graph_capture: false`) so this per-pass CPU borrow is safe.
     pub routed_lora_layers: Option<&'a [Option<crate::lora::LoraLayerWeights>]>,
+    /// Feature-1 MoE-LoRA per-request fold decision for this forward pass,
+    /// resolved by `TransformerModel::moe_lora_route` from the owning request's
+    /// `adapter_slot`. Governs the prefill router/expert fold hooks
+    /// (`layers/moe/lora.rs`). Ignored when no MoE adapter is installed
+    /// (`self.lora == None` short-circuits first — byte-identical off). Default
+    /// `Fold` keeps legacy single-request call sites unchanged.
+    pub moe_lora_route: MoeLoraRoute,
+}
+
+/// Feature-1 MoE-LoRA fold decision for a single forward pass.
+///
+/// The MoE router/expert delta is a SINGLE globally-installed adapter (phase 1):
+/// this gate makes the prefill fold per-request without a device kernel, exactly
+/// mirroring the attention BGMV `seq_slot < 0` skip but at request granularity.
+/// A base request pays nothing; a packed/mixed batch refuses loudly rather than
+/// fold one adapter onto every row (the device-side per-row fold that would let
+/// a mixed batch skip base rows individually is the documented follow-up —
+/// `docs/design/lora-solid.md` Incr 1/3).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MoeLoraRoute {
+    /// Single-request pass whose request owns the installed active MoE adapter:
+    /// FOLD. Also the back-compat default for paths that predate per-request
+    /// routing (decode/verify never reach the fold — `reject_decode_lora` bails
+    /// first — so their value is inert).
+    #[default]
+    Fold,
+    /// Single-request pass that is base (`adapter_slot < 0`, no adapter) or
+    /// routes to a different, non-installed adapter: SKIP the fold entirely.
+    /// Base tokens pay nothing (request-granularity mirror of the attention
+    /// BGMV `seq_slot < 0` early-return).
+    Skip,
+    /// Multi-request / packed / codispatch batch whose per-row adapter identity
+    /// cannot be honored without the device-side per-row fold (follow-up): the
+    /// fold REFUSES loudly rather than mis-apply one adapter to every row.
+    Refuse,
 }
 
 /// A single transformer layer performing the full per-layer computation.

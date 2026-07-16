@@ -9,12 +9,24 @@
 //! host-synced `expert_offsets` (graph-breaking, legal in eager prefill). The
 //! decode/verify forward paths REFUSE (never silently drop the delta) — wiring
 //! the unsorted per-token decode fold is the phase-1 followup.
+//!
+//! HARDENING (this pass): the fold is now (a) zero-overhead when off (the
+//! `self.lora == None` early-return, unchanged) AND per-request — a base or
+//! non-active request SKIPs so base tokens pay nothing (`moe_route_gate` reading
+//! `ctx.moe_lora_route`, the request-granularity mirror of the attention BGMV
+//! `seq_slot < 0` skip); (b) graph-safe by REFUSAL — the `expert_offsets` D2H is
+//! guarded by `ctx.graph_capture` and refuses loudly rather than silently
+//! corrupting a captured graph; a packed/mixed batch (`MoeLoraRoute::Refuse`)
+//! also bails rather than fold one adapter onto rows it does not own. The
+//! device-side grouped fold that reads `expert_offsets` on device (removing the
+//! D2H entirely, enabling capture + mixed batches) is the follow-up:
+//! `docs/design/lora-solid.md` Incr 1-3.
 
 use anyhow::Result;
 use spark_runtime::gpu::{DevicePtr, GpuBackend};
 
 use super::MoeLayer;
-use crate::layer::ForwardContext;
+use crate::layer::{ForwardContext, MoeLoraRoute};
 use crate::layers::ops::lora_delta::{LoraKernels, LoraPair};
 use crate::lora::{ExpertLoraLayer, ExpertProj, apply_expert_lora_sorted, apply_router_lora};
 
@@ -102,9 +114,34 @@ impl MoeLayer {
         Ok(())
     }
 
+    /// Per-request fold gate (Feature-1). Returns `true` to fold, `false` to
+    /// skip with zero overhead, or a loud error to refuse. Consults
+    /// `ctx.moe_lora_route` (resolved from the request's `adapter_slot`):
+    /// `Skip` (base / non-active) folds nothing so base tokens pay nothing;
+    /// `Refuse` (packed/mixed batch or a non-installed adapter) bails rather
+    /// than fold one adapter onto rows it does not own — the device-side
+    /// per-row fold that would skip base rows individually is the follow-up
+    /// (`docs/design/lora-solid.md` Incr 1/3). Called only after the caller has
+    /// confirmed `self.lora.is_some()`, so it never fires on a base run.
+    fn moe_route_gate(&self, ctx: &ForwardContext, path: &str) -> Result<bool> {
+        match ctx.moe_lora_route {
+            MoeLoraRoute::Fold => Ok(true),
+            MoeLoraRoute::Skip => Ok(false),
+            MoeLoraRoute::Refuse => anyhow::bail!(
+                "MoE LoRA (Feature-1) cannot honor per-row adapter identity in this {path} pass \
+                 (packed/mixed batch, or a non-active adapter under single-active phase-1); \
+                 refusing rather than folding one adapter onto rows it does not own. The \
+                 device-side per-row grouped fold is the follow-up (docs/design/lora-solid.md \
+                 Incr 1/3)."
+            ),
+        }
+    }
+
     /// Fold the router LoRA delta onto `gate_logits` (`[n, num_experts]`) in
-    /// place, BEFORE top-k. No-op when the layer has no router delta. Called
-    /// from `forward_prefill` right after the base gate GEMM.
+    /// place, BEFORE top-k. No-op when the layer has no router delta or the
+    /// request opts out (base / non-active). Called from `forward_prefill` right
+    /// after the base gate GEMM. Graph-safe (pure `apply_lora_delta` kernels, no
+    /// host D2H) so it needs no capture guard.
     pub(crate) fn apply_router_lora_prefill(
         &self,
         router_in: DevicePtr,
@@ -115,6 +152,9 @@ impl MoeLayer {
     ) -> Result<()> {
         let Some(ref l) = self.lora else { return Ok(()) };
         let Some(ref rp) = l.router else { return Ok(()) };
+        if !self.moe_route_gate(ctx, "router")? {
+            return Ok(());
+        }
         apply_router_lora(
             ctx.gpu, &l.kernels, rp, router_in, gate_logits, n, l.cap, l.xa, l.delta, stream,
         )
@@ -142,6 +182,29 @@ impl MoeLayer {
         let Some(ref l) = self.lora else { return Ok(()) };
         if l.experts.is_empty() {
             return Ok(());
+        }
+        // Per-request skip (base / non-active pays nothing; mixed batch refuses).
+        if !self.moe_route_gate(ctx, "expert-down")? {
+            return Ok(());
+        }
+        // GRAPH-SAFETY: the D2H of `expert_offsets` below is a blocking host copy
+        // (status 900 = STREAM_CAPTURE_UNSUPPORTED inside a capture region) AND it
+        // drives a data-dependent host launch loop. Under CUDA-graph capture this
+        // silently corrupts the captured graph. Refuse LOUDLY instead. The fix is
+        // to consume `expert_offsets` device-side in a single grouped kernel (the
+        // base grouped GEMM already reads it as a kernel arg — never D2Hs it);
+        // that device-side grouped fold is the documented follow-up
+        // (docs/design/lora-solid.md Incr 1-2). Until it lands, expert LoRA stays
+        // eager-prefill only — never captured, never on the decode/verify path
+        // (reject_decode_lora), so this guard only fires if a future capture path
+        // reaches the host-loop fold before the device kernel replaces it.
+        if ctx.graph_capture {
+            anyhow::bail!(
+                "MoE expert LoRA down-fold host-copies expert_offsets (graph-breaking D2H + \
+                 host-driven launch count); refusing under CUDA-graph capture rather than \
+                 corrupting the captured graph. The device-side grouped fold that reads \
+                 expert_offsets on device is the follow-up (docs/design/lora-solid.md Incr 1-2)."
+            );
         }
         // Host-sync the expert row boundaries ([num_experts + 1] u32).
         let ne1 = num_experts as usize + 1;

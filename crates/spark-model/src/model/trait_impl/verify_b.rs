@@ -225,6 +225,7 @@ impl TransformerModel {
             gdn_exact_replay: false,
             token_ids: Some(self.buffers.token_ids()),
             routed_lora_layers: None, // #30: decode/verify never routes prefill.
+            moe_lora_route: crate::layer::MoeLoraRoute::Fold, // verify: reject_decode_lora guards.
         };
 
         // ── Phase 2: CUDA graph capture / replay ──
