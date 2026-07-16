@@ -123,7 +123,7 @@ impl Model for TransformerModel {
             .store(i32::MIN, std::sync::atomic::Ordering::Relaxed);
         // Decode portion: Skip only if every decode seq is base, else refuse.
         self.stamp_decode_moe_batch(decode_seqs);
-        self.mixed_forward_dispatch(
+        let r = self.mixed_forward_dispatch(
             decode_tokens,
             decode_seqs,
             prefill_tokens,
@@ -132,7 +132,13 @@ impl Model for TransformerModel {
             prefill_chunk_len,
             prefill_is_last,
             stream,
-        )
+        );
+        if r.is_err() {
+            // Same brick guard as decode_batch: a refuse in the captured decode
+            // portion must not leave the default stream recording.
+            self.gpu.abort_capture_if_active(self.gpu.default_stream());
+        }
+        r
     }
 
     /// Q12 Phase 4b override: try the model-level batched dispatch
@@ -258,7 +264,14 @@ impl Model for TransformerModel {
         seq: &mut SequenceState,
         stream: u64,
     ) -> Result<Vec<u32>> {
-        self.decode_verify_dispatch(tokens, seq, stream)
+        let r = self.decode_verify_dispatch(tokens, seq, stream);
+        if r.is_err() {
+            // Same brick guard as decode_batch: a refuse mid-verify-capture
+            // (MTP/spec) must not leave the default stream recording. No-op when
+            // not capturing. Verify captures on default_stream (verify_a/b/…).
+            self.gpu.abort_capture_if_active(self.gpu.default_stream());
+        }
+        r
     }
     fn checkpoint_ssm_states(&self, seq: &mut SequenceState) -> Result<()> {
         self.checkpoint_ssm_states_dispatch(seq)
