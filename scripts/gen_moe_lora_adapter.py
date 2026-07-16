@@ -56,6 +56,7 @@ def main():
         layers = (fa or list(range(L)))[:n_layers]
     experts = list(range(min(n_experts, E)))
     rng = np.random.default_rng(0)  # deterministic (no argless Date/rand)
+    std = float(os.environ.get("LORA_STD", "0.02"))  # init magnitude (strength knob)
 
     tensors = {}
 
@@ -65,14 +66,14 @@ def main():
     for li in layers:
         pfx = f"base_model.model.model.layers.{li}"
         # router mlp.gate: in=H -> out=E
-        add(f"{pfx}.mlp.gate.lora_A.weight", rng.normal(0, 0.02, (r, H)).astype(np.float32))
-        add(f"{pfx}.mlp.gate.lora_B.weight", rng.normal(0, 0.02, (E, r)).astype(np.float32))
+        add(f"{pfx}.mlp.gate.lora_A.weight", rng.normal(0, std, (r, H)).astype(np.float32))
+        add(f"{pfx}.mlp.gate.lora_B.weight", rng.normal(0, std, (E, r)).astype(np.float32))
         for e in experts:
             # expert down_proj: in=MI -> out=H
             add(f"{pfx}.mlp.experts.{e}.down_proj.lora_A.weight",
-                rng.normal(0, 0.02, (r, MI)).astype(np.float32))
+                rng.normal(0, std, (r, MI)).astype(np.float32))
             add(f"{pfx}.mlp.experts.{e}.down_proj.lora_B.weight",
-                rng.normal(0, 0.02, (H, r)).astype(np.float32))
+                rng.normal(0, std, (H, r)).astype(np.float32))
 
     # serialize safetensors (bf16)
     os.makedirs(out, exist_ok=True)
