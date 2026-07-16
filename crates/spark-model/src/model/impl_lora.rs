@@ -127,6 +127,21 @@ impl TransformerModel {
         });
     }
 
+    /// Refuse a non-active-adapter row in a batched/mixed decode BEFORE graph
+    /// lookup so the captured padded_n graph stays route-agnostic.
+    pub(super) fn reject_decode_moe_refuse(
+        &self,
+        ctx: &crate::layer::ForwardContext,
+        path: &str,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            !matches!(ctx.moe_lora_route, crate::layer::MoeLoraRoute::Refuse),
+            "MoE LoRA {path}: a sequence routes to a non-active adapter under single-active \
+             phase-1; refusing rather than mis-folding the active adapter. One adapter per batch."
+        );
+        Ok(())
+    }
+
     pub fn set_lora_weights(&mut self, mut lora: Option<crate::lora::LoraWeights>) -> Result<()> {
         if let Some(ref lw) = lora {
             // eager-on-rotate: ONLY the global rotate/swap re-point path forces

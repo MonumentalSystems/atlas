@@ -405,17 +405,9 @@ impl TransformerModel {
             moe_lora_route: self.moe_lora_route(prefill_seq.adapter_slot),
         };
 
-        // A decode seq routing to a NON-active adapter (Refuse) cannot be folded
-        // by the single-active phase-1 per-row map (it checks only the map's sign)
-        // — bail host-side rather than silently fold the active adapter's tables
-        // onto it (mirrors decode_batch_compute_main). Base + active-adapter rows
-        // in the same mixed batch are fine (per-row map skips base).
-        if matches!(decode_ctx.moe_lora_route, crate::layer::MoeLoraRoute::Refuse) {
-            anyhow::bail!(
-                "MoE LoRA mixed_forward decode: a sequence routes to a non-active adapter \
-                 under single-active phase-1; refusing rather than folding the active adapter."
-            );
-        }
+        // Refuse a non-active-adapter decode row host-side (mirrors
+        // decode_batch_compute_main); base + active rows in the mixed batch fold fine.
+        self.reject_decode_moe_refuse(&decode_ctx, "mixed_forward decode")?;
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             // 6a. Decode: N sequences × 1 token each on hidden[0..padded_n*H)
