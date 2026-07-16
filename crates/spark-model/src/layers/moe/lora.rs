@@ -97,12 +97,18 @@ impl MoeLayer {
         }
         let all = router.iter().chain(experts.pairs.values());
         let max_n_out = all.clone().map(|p| p.n_out).max().unwrap_or(0) as usize;
+        let max_k_in = all.clone().map(|p| p.k_in).max().unwrap_or(0) as usize;
         let max_rank = all.map(|p| p.max_rank).max().unwrap_or(0) as usize;
         let cap = max_tokens() as usize;
+        // `delta` is the router expand scratch (`[cap, max_n_out]`) AND, for the
+        // decode expert down-fold, the packed `[n_slots, k_in]` post-swiglu `x`
+        // recompute scratch — size it for the wider of the two so a model whose
+        // `moe_intermediate_size` (k_in) exceeds `hidden` (n_out) still fits.
+        let delta_cols = max_n_out.max(max_k_in).max(1);
         let xa = gpu.alloc(cap * max_rank.max(1) * 2)?;
-        let delta = gpu.alloc(cap * max_n_out.max(1) * 2)?;
+        let delta = gpu.alloc(cap * delta_cols * 2)?;
         gpu.memset(xa, 0, cap * max_rank.max(1) * 2)?;
-        gpu.memset(delta, 0, cap * max_n_out.max(1) * 2)?;
+        gpu.memset(delta, 0, cap * delta_cols * 2)?;
         // Build the device-side per-expert down-fold route: dense [n_experts]
         // u64 A/B pointer tables + f32 scale table, indexed by expert id (0 =
         // unadapted). Load-time-fixed addresses -> stable capture args. `None`
@@ -113,7 +119,7 @@ impl MoeLayer {
              scratch={:.2} MiB",
             router.is_some(),
             experts.pairs.len(),
-            (cap * (max_rank.max(1) + max_n_out.max(1)) * 2) as f64 / (1024.0 * 1024.0),
+            (cap * (max_rank.max(1) + delta_cols) * 2) as f64 / (1024.0 * 1024.0),
         );
         self.lora = Some(MoeLoraWeights {
             router,
@@ -278,6 +284,103 @@ impl MoeLayer {
             te,
             stream,
         )
+    }
+
+    /// SOLID Incr-4: fold the routed-expert down_proj LoRA deltas onto the
+    /// slot-major decode `expert_down_out` (`[n_slots, hidden]`), IN PLACE and
+    /// BEFORE `moe_weighted_sum_blend` (so the router weight multiplies
+    /// base+delta — same ordering as the prefill fold). `n_slots =
+    /// num_tokens*top_k` flat `(token, slot)` rows; `indices_dev` is the same
+    /// `[n_slots]` u32 expert-id array the fused expert GEMV routed on.
+    ///
+    /// `x = silu(gate)*up` is recomputed into the fixed `l.delta` scratch via the
+    /// EXISTING `moe_silu_mul` kernel (`self.moe_act_mul` — the SAME handle +
+    /// ±10 swiglu clamp + BF16 round the prefill fold's `x` uses), so the folded
+    /// delta is BF16-ULP identical to `apply_expert_lora_prefill_down`. The fold
+    /// itself is `moe_lora_gather_bgmv` — the unsorted, expert-gather analogue of
+    /// the prefill `moe_lora_grouped_down`, sharing its byte-identical reduction
+    /// body. Zero-overhead when off (`self.lora == None` early-return); a
+    /// router-only adapter (`expert_route == None`) also no-ops here.
+    ///
+    /// `row_adapter` is the device `[num_tokens]` i32 per-row base map (`< 0` =
+    /// base skip) or `DevicePtr::NULL` to fold every row on the single-active
+    /// homogeneous path — the caller (a genuine single-token decode) passes NULL
+    /// and relies on `moe_route_gate` for the request-granularity opt-out (`Skip`
+    /// folds nothing; `Refuse` bails). CUDA-graph-capture legal: all args are
+    /// pointer/value-stable, and the launch shape is exact per captured graph.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn apply_expert_lora_decode_down(
+        &self,
+        expert_gate_out: DevicePtr,
+        expert_up_out: DevicePtr,
+        expert_down_out: DevicePtr,
+        indices_dev: DevicePtr,
+        n_slots: u32,
+        top_k: u32,
+        row_adapter: DevicePtr,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        let Some(ref l) = self.lora else { return Ok(()) };
+        let Some(ref route) = l.expert_route else {
+            return Ok(()); // router-only adapter: no expert down fold
+        };
+        // Request-granularity opt-out (base / non-active pays nothing; a mixed /
+        // non-active batch REFUSES loudly rather than mis-fold one adapter onto
+        // rows it does not own). Byte-identical base decode preserved.
+        if !self.moe_route_gate(ctx, "expert-down-decode")? {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            n_slots <= l.cap,
+            "MoE expert LoRA decode down-fold: n_slots ({n_slots}) exceeds LoRA scratch cap \
+             ({}); raise ATLAS_LORA_EXPERT_MAX_TOKENS to >= num_tokens*top_k.",
+            l.cap
+        );
+        // x = silu(gate)*up -> BF16 into l.delta (prefill's EXACT boundary: same
+        // kernel, same clamp, same round). Packed [n_slots, k_in] contiguous.
+        ops::moe_silu_mul(
+            ctx.gpu,
+            self.moe_act_mul,
+            expert_gate_out,
+            expert_up_out,
+            l.delta,
+            n_slots * route.k_in,
+            stream,
+        )?;
+        ops::moe_lora_gather_bgmv(
+            ctx.gpu,
+            &l.kernels,
+            route,
+            l.delta,
+            expert_down_out,
+            indices_dev,
+            row_adapter,
+            l.xa,
+            n_slots,
+            top_k,
+            stream,
+        )
+    }
+
+    /// Narrow decode guard used by paths that now fold the expert down_proj
+    /// delta: bail ONLY when a ROUTER LoRA delta is installed and this request
+    /// routes to it (`route != Skip`). The decode gate GEMV does not fold the
+    /// router delta (routing would diverge from prefill), so an adapter with a
+    /// `router` pair must still refuse on decode until the router fold lands. A
+    /// no-op when no MoE LoRA / no router pair is present, or on a base (`Skip`)
+    /// batch — so down-only adapters decode through the new fold.
+    pub(crate) fn reject_decode_router_lora(&self, ctx: &ForwardContext, path: &str) -> Result<()> {
+        let Some(ref l) = self.lora else { return Ok(()) };
+        if l.router.is_some() && !matches!(ctx.moe_lora_route, MoeLoraRoute::Skip) {
+            anyhow::bail!(
+                "MoE router LoRA delta is not folded on the {path} decode path (the decode gate \
+                 GEMV would diverge from prefill routing); refusing rather than serving a \
+                 mis-routed token. Restrict target_modules to expert down_proj, or wait for the \
+                 decode router fold."
+            );
+        }
+        Ok(())
     }
 
     /// Phase-1 guard: the decode/verify MoE forward paths do not yet fold the

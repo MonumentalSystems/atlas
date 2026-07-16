@@ -159,6 +159,104 @@ pub fn moe_lora_grouped_down(
 /// `worst_case_m_tiles = ceil(total_expanded/64)` sizing.
 pub const MLG_M_TILE: u32 = 64;
 
+/// PURE (GPU-free, unit-tested): the exact `(shrink, expand)` grid triples for
+/// the decode gather-fold, given the route dims and the flat row count. Each is
+/// `[ceil(out/4), n_slots, 1]` with a `(256,1,1)` block (one 64-lane group per
+/// output, `N_PER_BLOCK = 4`). `n_slots` is a host constant per captured graph,
+/// so the shape is EXACT (no worst-case tiles) and capture-stable.
+pub fn gather_bgmv_grids(max_rank: u32, n_out: u32, n_slots: u32) -> ([u32; 3], [u32; 3]) {
+    use spark_runtime::kernel_args::div_ceil;
+    (
+        [div_ceil(max_rank, 4), n_slots, 1],
+        [div_ceil(n_out, 4), n_slots, 1],
+    )
+}
+
+/// PURE: the owning token index of a flat `(token, slot)` row — mirrors the
+/// kernel's `row / top_k` so the per-token `row_adapter` gather is verifiable.
+pub fn gather_row_token(row: u32, top_k: u32) -> u32 {
+    row / top_k
+}
+
+/// SOLID Incr-4: launch the DECODE-path MoE expert down fold. The unsorted,
+/// slot-major analogue of [`moe_lora_grouped_down`] — instead of an
+/// `expert_offsets` prefix sum over sorted rows, each flat `(token, slot)` row
+/// gathers its expert from `indices[row]` (the same `indices_dev` the fused
+/// expert GEMV routed on) and its base/adapt decision from
+/// `row_adapter[row / top_k]` (`< 0` = base skip, or `DevicePtr::NULL` to fold
+/// every row on the single-active-adapter path).
+///
+/// `x` = the post-swiglu activations (`silu(gate)*up`, produced by the caller's
+/// `moe_silu_mul` launch into a packed `[n_slots, k_in]` BF16 scratch — the SAME
+/// kernel + BF16 round the prefill fold uses, so the delta is BF16-ULP identical
+/// to prefill). `base_out` = the slot-major `expert_down_out` (`[n_slots, n_out]`
+/// BF16, folded IN PLACE before `moe_weighted_sum_blend`, so the router weight
+/// multiplies base+delta). `xa` = the fixed-address `[n_slots, max_rank]` BF16
+/// shrink scratch. The grid is EXACT (`n_slots` is a host constant per captured
+/// graph) — no worst-case tiles — and all args are pointer/value-stable, so the
+/// launch captures cleanly.
+///
+/// ARG ORDER is in lockstep with `moe_lora_gather_bgmv.cu` (cuLaunchKernel is
+/// type-blind; keep both in sync).
+#[allow(clippy::too_many_arguments)]
+pub fn moe_lora_gather_bgmv(
+    gpu: &dyn GpuBackend,
+    kernels: &LoraKernels,
+    route: &MoeExpertRoute,
+    x: DevicePtr,           // [n_slots, k_in] BF16 (silu(gate)*up)
+    base_out: DevicePtr,    // [n_slots, n_out] BF16 = expert_down_out, folded in place
+    indices: DevicePtr,     // [n_slots] u32 = indices_dev (expert id per flat slot)
+    row_adapter: DevicePtr, // [num_tokens] i32 (<0 skip) or DevicePtr::NULL (fold all)
+    xa: DevicePtr,          // [n_slots, max_rank] BF16 scratch (fixed address)
+    n_slots: u32,           // num_tokens * top_k
+    top_k: u32,
+    stream: u64,
+) -> Result<()> {
+    use spark_runtime::kernel_args::KernelLaunch;
+
+    anyhow::ensure!(
+        kernels.moe_gather_shrink_k.0 != 0 && kernels.moe_gather_expand_fold_k.0 != 0,
+        "moe_lora_gather_bgmv kernels unresolved (module `moe_lora_gather_bgmv` missing \
+         from the compiled kernel set — CUDA build required)"
+    );
+    let (shrink_grid, expand_grid) = gather_bgmv_grids(route.max_rank, route.n_out, n_slots);
+
+    // Kernel 1: shrink — xa[n_slots, max_rank] = x @ A_e^T.
+    // grid = (ceil(max_rank/4), n_slots, 1)  block = (256,1,1).
+    KernelLaunch::new(gpu, kernels.moe_gather_shrink_k)
+        .grid(shrink_grid)
+        .block([256, 1, 1])
+        .arg_ptr(x)
+        .arg_ptr(indices)
+        .arg_ptr(row_adapter)
+        .arg_ptr(route.a_table)
+        .arg_ptr(xa)
+        .arg_u32(n_slots)
+        .arg_u32(top_k)
+        .arg_u32(route.n_experts)
+        .arg_u32(route.max_rank)
+        .arg_u32(route.k_in)
+        .launch(stream)?;
+
+    // Kernel 2: expand + fold — base_out += scale_e * (xa @ B_e^T).
+    // grid = (ceil(n_out/4), n_slots, 1)  block = (256,1,1).
+    KernelLaunch::new(gpu, kernels.moe_gather_expand_fold_k)
+        .grid(expand_grid)
+        .block([256, 1, 1])
+        .arg_ptr(xa)
+        .arg_ptr(indices)
+        .arg_ptr(row_adapter)
+        .arg_ptr(route.b_table)
+        .arg_ptr(route.scale_table)
+        .arg_ptr(base_out)
+        .arg_u32(n_slots)
+        .arg_u32(top_k)
+        .arg_u32(route.n_experts)
+        .arg_u32(route.n_out)
+        .arg_u32(route.max_rank)
+        .launch(stream)
+}
+
 #[cfg(test)]
 #[path = "moe_lora_grouped_tests.rs"]
 mod tests;

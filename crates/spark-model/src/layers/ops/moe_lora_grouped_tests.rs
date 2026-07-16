@@ -5,7 +5,7 @@
 //! fold. No GPU: verifies dense placement, unadapted `0` sentinels, table
 //! length, and the router-only (empty) case.
 
-use super::{ExpertTables, pack_expert_tables};
+use super::{ExpertTables, gather_bgmv_grids, gather_row_token, pack_expert_tables};
 
 #[test]
 fn empty_entries_none() {
@@ -54,4 +54,40 @@ fn table_length_is_max_id_plus_one() {
     assert_eq!(t.a.len(), 8);
     assert_eq!(t.a[7], 1);
     assert_eq!(t.a[..7], [0u64; 7]);
+}
+
+// ── SOLID Incr-4 decode gather-fold planner ──────────────────────────────────
+
+#[test]
+fn gather_grids_single_token_decode() {
+    // Qwen3.6-A3B decode: top_k=8, max_rank=16, inter=768, hidden=4096.
+    // n_slots = 1*top_k = 8. Shrink outputs max_rank, expand outputs hidden.
+    let (shrink, expand) = gather_bgmv_grids(16, 4096, 8);
+    assert_eq!(shrink, [4, 8, 1]); // ceil(16/4)=4 rank groups, 8 flat rows
+    assert_eq!(expand, [1024, 8, 1]); // ceil(4096/4)=1024 hidden groups
+}
+
+#[test]
+fn gather_grids_verify_flat_rows() {
+    // K=3 verify: n_slots = 3*top_k. Grid.y scales with flat (token,slot) rows;
+    // grid.x is unchanged (per-output, independent of row count).
+    let (shrink, expand) = gather_bgmv_grids(32, 4096, 24);
+    assert_eq!(shrink, [8, 24, 1]);
+    assert_eq!(expand, [1024, 24, 1]);
+}
+
+#[test]
+fn gather_grids_rank_not_multiple_of_four_rounds_up() {
+    // A padded rank of 6 still covers all outputs (ceil, not floor).
+    let (shrink, _) = gather_bgmv_grids(6, 512, 8);
+    assert_eq!(shrink[0], 2); // ceil(6/4) = 2
+}
+
+#[test]
+fn row_token_decomposition_matches_kernel() {
+    // token = row / top_k, mirroring the kernel's per-token row_adapter gather.
+    assert_eq!(gather_row_token(0, 8), 0);
+    assert_eq!(gather_row_token(7, 8), 0); // last slot of token 0
+    assert_eq!(gather_row_token(8, 8), 1); // first slot of token 1
+    assert_eq!(gather_row_token(23, 8), 2); // K=3 verify, token 2
 }

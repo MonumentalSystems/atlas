@@ -31,8 +31,22 @@ impl MoeLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<DevicePtr> {
-        // Feature-1 phase-1: decode does not yet fold the expert/router delta.
-        self.reject_decode_lora(ctx, "forward")?;
+        // SOLID Incr-4: a genuine single-token decode (num_seqs == 1) folds the
+        // routed expert down_proj LoRA delta below (before the wsum blend). The
+        // multi-seq per-token reuse of this fn (num_seqs > 1 — decode_batch's
+        // per-token MoE loop, or the attention layers' per-token FFN) shares a
+        // `padded_n` CUDA graph across mixed-batch transitions, so host-gating
+        // the fold there is capture-unsafe (a Fold-captured graph could replay
+        // onto a later base-containing batch): keep the loud refusal until the
+        // device per-row `row_adapter` map is plumbed.
+        let single_seq_decode = ctx.attn_metadata.as_ref().map_or(1, |m| m.num_seqs) <= 1;
+        if single_seq_decode {
+            // Down-only adapters now fold; only an installed ROUTER delta (never
+            // folded at decode) still refuses.
+            self.reject_decode_router_lora(ctx, "forward")?;
+        } else {
+            self.reject_decode_lora(ctx, "forward")?;
+        }
         // ── Phase 2.7 Tier C: Frankenstein decode-via-prefill dispatch ──
         // For DFlash capture layers only, when `ATLAS_FRANKENSTEIN_DECODE_VIA_PREFILL=1`
         // is set, route this layer's single-token MoE through `forward_prefill(M=1)`,
@@ -481,6 +495,29 @@ impl MoeLayer {
                     stream,
                 )
             })?;
+        }
+
+        // SOLID Incr-4 decode expert down-fold: land the routed-expert down_proj
+        // LoRA delta into `expert_down_out` (slot-major [top_k, hidden]) IN PLACE,
+        // recomputing `x = silu(gate)*up` from the still-materialized
+        // `expert_gate_out`/`expert_up_out`. Must run BEFORE `moe_weighted_sum_blend`
+        // (so the router weight scales base+delta) AND before the EP zero-temp
+        // memset below (which reuses `expert_gate_out` as scratch). NULL
+        // row_adapter: a genuine single-token decode is one homogeneous request —
+        // `moe_route_gate` (Fold/Skip/Refuse) is the per-request opt-out. No-op
+        // when no MoE LoRA / no expert adapter is installed (base byte-identical).
+        if single_seq_decode {
+            self.apply_expert_lora_decode_down(
+                expert_gate_out,
+                expert_up_out,
+                expert_down_out,
+                indices_dev,
+                top_k,
+                top_k,
+                DevicePtr::NULL,
+                ctx,
+                stream,
+            )?;
         }
 
         if tracing::enabled!(tracing::Level::DEBUG) && !ctx.graph_capture {

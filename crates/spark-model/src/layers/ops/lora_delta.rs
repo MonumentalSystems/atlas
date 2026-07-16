@@ -29,6 +29,13 @@ pub struct LoraKernels {
     /// launcher bails loudly rather than dispatching a null handle.
     pub moe_down_shrink_k: KernelHandle,
     pub moe_down_expand_fold_k: KernelHandle,
+    /// SOLID Incr-4 DECODE-path MoE expert down_proj fold: shrink then
+    /// expand+fold, keyed on expert via the per-slot `indices` array (the
+    /// unsorted slot-major analogue of `moe_down_*_k`). Module
+    /// "moe_lora_gather_bgmv" (stem == module). `KernelHandle(0)` on miss (e.g.
+    /// non-CUDA builds) — the launcher bails loudly rather than dispatching null.
+    pub moe_gather_shrink_k: KernelHandle,
+    pub moe_gather_expand_fold_k: KernelHandle,
 }
 
 impl LoraKernels {
@@ -49,6 +56,16 @@ impl LoraKernels {
                 gpu,
                 "moe_lora_grouped_down",
                 "moe_lora_grouped_down_expand_fold",
+            ),
+            moe_gather_shrink_k: crate::layers::try_kernel(
+                gpu,
+                "moe_lora_gather_bgmv",
+                "moe_lora_gather_bgmv_shrink",
+            ),
+            moe_gather_expand_fold_k: crate::layers::try_kernel(
+                gpu,
+                "moe_lora_gather_bgmv",
+                "moe_lora_gather_bgmv_expand_fold",
             ),
         })
     }
