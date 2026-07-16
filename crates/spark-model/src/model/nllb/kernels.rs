@@ -39,6 +39,12 @@ pub(super) struct NllbKernels {
     /// full vocab + the top-K `(value, token)` pairs (shrinks the per-step D2H
     /// from `B*vocab` to `B*K`).
     pub beam_topk: KernelHandle,
+    // ── vocab-extending PEFT trainable_tokens overlay ──
+    /// Override the input-embedding row for adapter-changed tokens (post-embed,
+    /// pre-scale).
+    pub embed_overlay: KernelHandle,
+    /// Recompute the tied lm_head logits for adapter-changed vocab columns.
+    pub lmhead_overlay: KernelHandle,
 }
 
 impl NllbKernels {
@@ -60,6 +66,8 @@ impl NllbKernels {
             gather: gpu.kernel("nllb_encoder", "nllb_gather_batched")?,
             add_row: gpu.kernel("nllb_encoder", "nllb_add_row_bf16")?,
             beam_topk: gpu.kernel("nllb_encoder", "nllb_beam_topk")?,
+            embed_overlay: gpu.kernel("nllb_encoder", "nllb_embed_overlay_bf16")?,
+            lmhead_overlay: gpu.kernel("nllb_encoder", "nllb_lmhead_overlay_bf16")?,
         })
     }
 }

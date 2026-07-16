@@ -34,6 +34,8 @@ mod kv;
 mod lang;
 mod lora;
 mod model_impl;
+mod token_adapter;
+mod token_overlay;
 mod util;
 
 pub use lang::NllbLang;
@@ -164,7 +166,14 @@ impl NllbGpuModel {
         gpu.copy_h2d(util::bf16_bytes(&pos_host), pos_table)?;
 
         let lora = match lora_dir {
-            Some(dir) => Some(NllbLora::load(dir, gpu.as_ref(), cache_rows)?),
+            Some(dir) => Some(NllbLora::load(
+                dir,
+                gpu.as_ref(),
+                cache_rows,
+                embed_table,
+                vocab,
+                d,
+            )?),
             None => None,
         };
 
