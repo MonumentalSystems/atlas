@@ -64,7 +64,8 @@ extern "C" __global__ void moe_lora_gather_bgmv_shrink(
     unsigned int top_k,                         // slots per token (row / top_k = token)
     unsigned int n_experts,                     // A/B/scale table length (max adapted id + 1)
     unsigned int max_rank,                      // output dim (== A padded row count)
-    unsigned int k_in                           // contraction dim (== moe_intermediate_size)
+    unsigned int k_in,                          // contraction dim (down: moe_intermediate_size; gate/up: hidden)
+    unsigned int x_gather                       // 0: x row = flat slot (down); 1: x row = token = row/top_k (gate/up)
 ) {
     const unsigned int row = blockIdx.y;
     if (row >= n_slots) return;
@@ -84,7 +85,12 @@ extern "C" __global__ void moe_lora_gather_bgmv_shrink(
     const unsigned int n = blockIdx.x * GBGMV_N_PER_BLOCK + local_out;  // which xa element
     if (n >= max_rank) return;
 
-    const __nv_bfloat16* Arow = x + (unsigned long long)row * k_in;    // [k_in]
+    // down: x = the packed per-slot post-swiglu activation, so the x-row IS the
+    // flat slot `row`. gate/up: x = the per-TOKEN `expert_input` (one row shared by
+    // all top_k slots), so read the owning token `row / top_k` (already computed
+    // above for the row_adapter check). down path (x_gather==0) stays bit-identical.
+    const unsigned int x_row = x_gather ? (row / top_k) : row;
+    const __nv_bfloat16* Arow = x + (unsigned long long)x_row * k_in;  // [k_in]
     const __nv_bfloat16* Brow = A_base + (unsigned long long)n * k_in; // [k_in]
 
     float acc = 0.0f;

@@ -40,13 +40,16 @@ impl MoeLayer {
         // onto a later base-containing batch): keep the loud refusal until the
         // device per-row `row_adapter` map is plumbed.
         let single_seq_decode = ctx.attn_metadata.as_ref().map_or(1, |m| m.num_seqs) <= 1;
-        if single_seq_decode {
-            // Down-only adapters now fold; only an installed ROUTER delta (never
-            // folded at decode) still refuses.
-            self.reject_decode_router_lora(ctx, "forward")?;
-        } else {
+        if !single_seq_decode {
+            // Multi-seq per-token reuse shares a `padded_n` CUDA graph across mixed
+            // base/adapter batches, so host-gating a fold there is capture-unsafe:
+            // keep the loud refusal until the device per-row `row_adapter` map lands.
             self.reject_decode_lora(ctx, "forward")?;
         }
+        // Single-seq decode: the router delta folds onto `gate_logits` before top-k
+        // (below), and the routed-expert gate/up/down deltas fold onto their
+        // intermediates — no bail. A `Refuse`/mixed batch still bails inside each
+        // fold's `moe_route_gate`, preserving per-row adapter-identity protection.
         // ── Phase 2.7 Tier C: Frankenstein decode-via-prefill dispatch ──
         // For DFlash capture layers only, when `ATLAS_FRANKENSTEIN_DECODE_VIA_PREFILL=1`
         // is set, route this layer's single-token MoE through `forward_prefill(M=1)`,
@@ -138,6 +141,16 @@ impl MoeLayer {
                     )
                 }
             })?;
+
+            // Feature-1: fold the router `mlp.gate` LoRA delta onto `gate_logits`
+            // BEFORE top-k — the exact decode mirror of the prefill router fold
+            // (`apply_router_lora_prefill` is n-generic; here n=1). Device-clean
+            // (no D2H) so it captures cleanly. No-op unless a router delta is
+            // installed; `Refuse` bails inside the hook. Works for both the
+            // NVFP4-gate and dense-gate branches (same `gate_logits` output).
+            if single_seq_decode {
+                self.apply_router_lora_prefill(router_in, gate_logits, 1, ctx, stream)?;
+            }
 
             prof!("topk", {
                 if let Some(tid2eid) = self.tid2eid_dev {
@@ -316,6 +329,19 @@ impl MoeLayer {
                     stream,
                 )
             })?;
+            if single_seq_decode {
+                self.apply_expert_lora_decode_gateup(
+                    expert_gate_out,
+                    expert_up_out,
+                    expert_input,
+                    indices_dev,
+                    top_k,
+                    top_k,
+                    DevicePtr::NULL,
+                    ctx,
+                    stream,
+                )?;
+            }
             prof!("exp_silu_down_bf16", {
                 ops::moe_expert_silu_down_shared_bf16(
                     ctx.gpu,
@@ -365,6 +391,19 @@ impl MoeLayer {
                 )
             })?;
 
+            if single_seq_decode {
+                self.apply_expert_lora_decode_gateup(
+                    expert_gate_out,
+                    expert_up_out,
+                    expert_input,
+                    indices_dev,
+                    top_k,
+                    top_k,
+                    DevicePtr::NULL,
+                    ctx,
+                    stream,
+                )?;
+            }
             // FP8 path: fused silu+down
             prof!("exp_silu_down_fp8", {
                 ops::moe_expert_silu_down_shared_fp8(
@@ -401,6 +440,7 @@ impl MoeLayer {
                     h,
                     inter,
                     top_k,
+                    single_seq_decode,
                     stream,
                 )
             })?;
@@ -430,6 +470,20 @@ impl MoeLayer {
                     stream,
                 )
             })?;
+
+            if single_seq_decode {
+                self.apply_expert_lora_decode_gateup(
+                    expert_gate_out,
+                    expert_up_out,
+                    expert_input,
+                    indices_dev,
+                    top_k,
+                    top_k,
+                    DevicePtr::NULL,
+                    ctx,
+                    stream,
+                )?;
+            }
 
             if tracing::enabled!(tracing::Level::DEBUG) && !ctx.graph_capture {
                 ctx.gpu.synchronize(stream)?;

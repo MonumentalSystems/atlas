@@ -87,9 +87,13 @@ pub struct ExpertTables {
     pub n_experts: u32,
 }
 
-/// Launch the device-side grouped down fold. `x` = post-SiLU sorted activations
-/// (`[te, k_in]` BF16), `base_out` = sorted `expert_down_out` (`[te, n_out]`
-/// BF16, folded IN PLACE), `expert_offsets` = the device `[num_experts+1]` i32
+/// Launch the device-side grouped fold. Down (`x_gather==0`): `x` = post-SiLU
+/// sorted activations (`[te, k_in]` BF16), `base_out` = sorted `expert_down_out`.
+/// Gate/up (`x_gather==1`): `x` = the TOKEN-MAJOR `expert_input` (`[num_tokens,
+/// k_in=hidden]` BF16, gathered per sorted row via `sorted_token_ids`), `base_out`
+/// = sorted `expert_gate_out`/`expert_up_out` (`[te, n_out=inter]`). In both,
+/// `base_out` is `[te, n_out]` BF16 folded IN PLACE, `expert_offsets` = the device
+/// `[num_experts+1]` i32
 /// prefix sum, `sorted_token_ids` = the device `[te]` i32 sorted-row→token map,
 /// `moe_row_adapter` = `[num_tokens]` i32 device map (`< 0` = base skip) or
 /// `DevicePtr::NULL` for the single-active-adapter path, `xa` = the fixed-address
@@ -109,6 +113,7 @@ pub fn moe_lora_grouped_down(
     moe_row_adapter: DevicePtr, // [num_tokens] i32 DEVICE or NULL
     xa: DevicePtr,              // [te, max_rank] BF16 scratch (fixed address)
     te: u32,
+    x_gather: u32,             // 0: x row = sorted row r (down); 1: x row = sorted_token_ids[r] (gate/up)
     stream: u64,
 ) -> Result<()> {
     use spark_runtime::kernel_args::{KernelLaunch, div_ceil};
@@ -134,6 +139,7 @@ pub fn moe_lora_grouped_down(
         .arg_u32(route.n_experts)
         .arg_u32(route.max_rank)
         .arg_u32(route.k_in)
+        .arg_u32(x_gather)
         .launch(stream)?;
 
     // Kernel 2: expand + fold — base_out += scale_e * (xa @ B_e^T).
@@ -210,6 +216,7 @@ pub fn moe_lora_gather_bgmv(
     xa: DevicePtr,          // [n_slots, max_rank] BF16 scratch (fixed address)
     n_slots: u32,           // num_tokens * top_k
     top_k: u32,
+    x_gather: u32,          // 0: x row = flat slot (down); 1: x row = token = row/top_k (gate/up)
     stream: u64,
 ) -> Result<()> {
     use spark_runtime::kernel_args::KernelLaunch;
@@ -236,6 +243,7 @@ pub fn moe_lora_gather_bgmv(
         .arg_u32(route.n_experts)
         .arg_u32(route.max_rank)
         .arg_u32(route.k_in)
+        .arg_u32(x_gather)
         .launch(stream)?;
 
     // Kernel 2: expand + fold — base_out += scale_e * (xa @ B_e^T).

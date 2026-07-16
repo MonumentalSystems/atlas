@@ -411,6 +411,7 @@ impl MoeLayer {
 mod dump;
 mod forward;
 mod lora;
+mod lora_gateup;
 pub(crate) use lora::MoeLoraWeights;
 mod forward_atomic_c4;
 mod forward_batched;

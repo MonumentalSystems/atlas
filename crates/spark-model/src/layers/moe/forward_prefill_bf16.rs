@@ -222,6 +222,19 @@ impl MoeLayer {
                 max_m_tiles,
                 stream,
             )?;
+            // Feature-1: fold gate/up_proj deltas onto the sorted BF16
+            // `expert_gate_out`/`expert_up_out` BEFORE `silu_mul` (x = token-major
+            // `input`). Same device kernel + sorted layout as the nvfp4 path.
+            self.apply_expert_lora_prefill_gateup(
+                expert_gate_out,
+                expert_up_out,
+                input,
+                expert_offsets,
+                sorted_token_ids,
+                total_expanded,
+                ctx,
+                stream,
+            )?;
             ops::silu_mul(
                 ctx.gpu,
                 self.moe_act_mul,

@@ -271,9 +271,10 @@ pub struct ForwardContext<'a> {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum MoeLoraRoute {
     /// Single-request pass whose request owns the installed active MoE adapter:
-    /// FOLD. Also the back-compat default for paths that predate per-request
-    /// routing (decode/verify never reach the fold — `reject_decode_lora` bails
-    /// first — so their value is inert).
+    /// FOLD. Genuine single-seq decode now folds the router + expert gate/up/down
+    /// deltas at this altitude (mirroring prefill); the remaining back-compat
+    /// paths (multi-seq / verify) still bail via `reject_decode_lora` before the
+    /// fold, so their `Fold` value is inert there. Also the default.
     #[default]
     Fold,
     /// Single-request pass that is base (`adapter_slot < 0`, no adapter) or

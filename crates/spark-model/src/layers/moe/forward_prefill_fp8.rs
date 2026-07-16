@@ -491,6 +491,24 @@ impl MoeLayer {
             ctx.gpu.free(tt_gu)?;
         }
 
+        // Feature-1: fold gate/up_proj deltas onto the sorted BF16
+        // `expert_gate_out`/`expert_up_out` BEFORE either silu_mul below. ONE point
+        // covers both the W8A8 and worklist fp8 branches (both left sorted BF16
+        // gate/up). x = BF16 `input` (NOT `input_fp8` — mirror the down-fold
+        // precedent of folding BF16 deltas onto the BF16 intermediates).
+        if max_m_tiles > 0 {
+            self.apply_expert_lora_prefill_gateup(
+                expert_gate_out,
+                expert_up_out,
+                input,
+                expert_offsets,
+                sorted_token_ids,
+                total_expanded,
+                ctx,
+                stream,
+            )?;
+        }
+
         // 6. Activation+mul + down GEMM
         let expert_down_out = ctx.buffers.expert_down_out();
         if force_w8a8 && max_m_tiles > 0 {

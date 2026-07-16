@@ -61,7 +61,8 @@ extern "C" __global__ void moe_lora_grouped_down_shrink(
     __nv_bfloat16* __restrict__ xa,                  // [te, max_rank] BF16 (out, row-major)
     unsigned int num_experts,
     unsigned int max_rank,                           // output dim (== A padded row count)
-    unsigned int k_in                                // contraction dim
+    unsigned int k_in,                               // contraction dim
+    unsigned int x_gather                            // 0: x row = sorted row r (down); 1: x row = sorted_token_ids[r] (gate/up)
 ) {
     const unsigned int e = blockIdx.z;
     if (e >= num_experts) return;
@@ -97,7 +98,13 @@ extern "C" __global__ void moe_lora_grouped_down_shrink(
         if (moe_row_adapter != nullptr && moe_row_adapter[sorted_token_ids[r]] < 0) {
             continue;
         }
-        const __nv_bfloat16* Arow = x + (unsigned long long)r * k_in;  // [k_in]
+        // down: x is already the sorted post-SiLU activation, so the x-row IS the
+        // sorted row r. gate/up: x is the TOKEN-MAJOR `expert_input`, so gather the
+        // owning token via sorted_token_ids[r] (the same map the base gate/up GEMM
+        // fuses). The expand stage still keys xa/base_out by r, so only this read
+        // changes — the down path (x_gather==0) stays bit-identical.
+        const int x_row = x_gather ? sorted_token_ids[r] : r;
+        const __nv_bfloat16* Arow = x + (unsigned long long)x_row * k_in;  // [k_in]
         const uint4* A_vec = (const uint4*)Arow;
 
         float acc = 0.0f;
