@@ -287,6 +287,14 @@ pub struct TransformerModel {
     /// pool's active one. `i32::MIN` marks a mixed-adapter decode batch (per-token
     /// `seq_slot` routing deferred to SOLID Incr-4) ⇒ the hooks skip.
     pub(super) overlay_route_slot: std::sync::atomic::AtomicI32,
+    /// Feature-1 per-decode MoE route, stamped from the decode batch's adapter
+    /// slots at each `Model::{decode,decode_batch,mixed_forward}` entry (the
+    /// decode/verify `ForwardContext`s read it instead of a hardcoded `Fold`).
+    /// A pure-base decode batch resolves to `Skip` so base requests decode
+    /// normally even while an adapter is resident; any adapter-using row makes
+    /// the batch `Fold`/`Refuse`, which `reject_decode_lora` turns into a loud
+    /// bail (the decode-fold is SOLID Incr-4). Encoded 0=Skip 1=Fold 2=Refuse.
+    pub(super) decode_moe_route: std::sync::atomic::AtomicI32,
 }
 
 /// Pinned host memory staging buffer with reusable metadata Vecs.

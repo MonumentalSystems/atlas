@@ -17,7 +17,7 @@ impl MoeLayer {
         stream: u64,
     ) -> Result<()> {
         // Feature-1 phase-1: batched decode does not yet fold the expert delta.
-        self.reject_decode_lora("forward_batched")?;
+        self.reject_decode_lora(ctx, "forward_batched")?;
         let h = ctx.config.hidden_size as u32;
         let inter = ctx.config.moe_intermediate_size as u32;
         let num_experts = ctx.config.num_experts as u32;

@@ -82,6 +82,7 @@ impl Model for TransformerModel {
     }
     fn decode(&self, token: u32, seq: &mut SequenceState, _stream: u64) -> Result<DevicePtr> {
         self.stamp_overlay_route(seq.adapter_slot);
+        self.stamp_decode_moe_single(seq.adapter_slot);
         self.decode_dispatch(token, seq, _stream)
     }
     fn decode_batch(
@@ -91,6 +92,7 @@ impl Model for TransformerModel {
         stream: u64,
     ) -> Result<DevicePtr> {
         self.stamp_overlay_route_batch(seqs);
+        self.stamp_decode_moe_batch(seqs);
         self.decode_batch_dispatch(tokens, seqs, stream)
     }
     fn mixed_forward(
@@ -108,6 +110,8 @@ impl Model for TransformerModel {
         // overlay hooks skip (per-token seq_slot routing is SOLID Incr-4).
         self.overlay_route_slot
             .store(i32::MIN, std::sync::atomic::Ordering::Relaxed);
+        // Decode portion: Skip only if every decode seq is base, else refuse.
+        self.stamp_decode_moe_batch(decode_seqs);
         self.mixed_forward_dispatch(
             decode_tokens,
             decode_seqs,

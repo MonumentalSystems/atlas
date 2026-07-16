@@ -69,6 +69,53 @@ impl TransformerModel {
         crate::lora::resolve_moe_lora_route(adapter_slot, active, has)
     }
 
+    /// Read the per-decode MoE route stamped at the `Model` entry (decode/verify
+    /// `ForwardContext`s use this instead of a hardcoded `Fold`).
+    pub(crate) fn decode_moe_route(&self) -> crate::layer::MoeLoraRoute {
+        match self
+            .decode_moe_route
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            0 => crate::layer::MoeLoraRoute::Skip,
+            2 => crate::layer::MoeLoraRoute::Refuse,
+            _ => crate::layer::MoeLoraRoute::Fold,
+        }
+    }
+
+    fn store_decode_moe_route(&self, route: crate::layer::MoeLoraRoute) {
+        let v = match route {
+            crate::layer::MoeLoraRoute::Skip => 0,
+            crate::layer::MoeLoraRoute::Fold => 1,
+            crate::layer::MoeLoraRoute::Refuse => 2,
+        };
+        self.decode_moe_route
+            .store(v, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Stamp the per-decode MoE route from a single request's `adapter_slot`.
+    pub(crate) fn stamp_decode_moe_single(&self, adapter_slot: i32) {
+        self.store_decode_moe_route(self.moe_lora_route(adapter_slot));
+    }
+
+    /// Stamp from a decode batch: `Skip` only when EVERY sequence is base (so
+    /// base requests decode normally even while an adapter is resident); any
+    /// adapter-using row makes the batch `Fold`, which `reject_decode_lora`
+    /// turns into a loud bail (per-row decode fold is SOLID Incr-4). Empty batch
+    /// resolves to `Skip`.
+    pub(crate) fn stamp_decode_moe_batch(&self, seqs: &[&mut crate::traits::SequenceState]) {
+        let all_skip = seqs.iter().all(|s| {
+            matches!(
+                self.moe_lora_route(s.adapter_slot),
+                crate::layer::MoeLoraRoute::Skip
+            )
+        });
+        self.store_decode_moe_route(if all_skip {
+            crate::layer::MoeLoraRoute::Skip
+        } else {
+            crate::layer::MoeLoraRoute::Fold
+        });
+    }
+
     pub fn set_lora_weights(&mut self, mut lora: Option<crate::lora::LoraWeights>) -> Result<()> {
         if let Some(ref lw) = lora {
             // eager-on-rotate: ONLY the global rotate/swap re-point path forces

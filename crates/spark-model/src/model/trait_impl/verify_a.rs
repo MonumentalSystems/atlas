@@ -144,7 +144,7 @@ impl TransformerModel {
                         gdn_exact_replay: false,
                         token_ids: None,
                         routed_lora_layers: None, // #30: verify decode; no prefill route.
-                        moe_lora_route: crate::layer::MoeLoraRoute::Fold, // verify: reject_decode_lora guards.
+                        moe_lora_route: self.decode_moe_route(), // route-aware: base(Skip) decodes; adapter refuses
                     };
 
                     let h_t = hidden.offset(t * h * fp32);
@@ -175,7 +175,7 @@ impl TransformerModel {
                     gdn_exact_replay: false,
                     token_ids: None,
                     routed_lora_layers: None, // #30: verify decode; no prefill route.
-                    moe_lora_route: crate::layer::MoeLoraRoute::Fold, // verify: reject_decode_lora guards.
+                    moe_lora_route: self.decode_moe_route(), // route-aware: base(Skip) decodes; adapter refuses
                 };
 
                 layer.decode_batched(

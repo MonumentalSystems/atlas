@@ -284,12 +284,18 @@ impl MoeLayer {
     /// expert/router delta (unsorted per-token top-k dispatch). Rather than
     /// silently serve wrong output, REFUSE when an expert adapter is installed.
     /// A no-op when no MoE LoRA is present (base decode byte-identical).
-    pub(crate) fn reject_decode_lora(&self, path: &str) -> Result<()> {
-        if self.lora.is_some() {
+    pub(crate) fn reject_decode_lora(&self, ctx: &ForwardContext, path: &str) -> Result<()> {
+        // Route-aware: bail ONLY when this decode actually routes to the adapter
+        // (Fold/Refuse). A pure-base decode batch (Skip) has no delta to fold, so
+        // base requests decode normally even while an adapter is resident — the
+        // decode route is stamped per batch at the Model entry
+        // (`stamp_decode_moe_*`). The per-row decode fold is SOLID Incr-4.
+        if self.lora.is_some() && !matches!(ctx.moe_lora_route, MoeLoraRoute::Skip) {
             anyhow::bail!(
                 "MoE LoRA (Feature-1) is prefill-only in phase 1; the {path} decode/verify \
-                 path does not yet fold the expert/router delta. Use the adapter for \
-                 prefill-logit scoring, or wait for the phase-1 decode-fold followup."
+                 path does not yet fold the expert/router delta for an adapter-routed request. \
+                 Use the adapter for prefill-logit scoring, or wait for the decode-fold followup \
+                 (docs/design/lora-solid.md Incr-4)."
             );
         }
         Ok(())

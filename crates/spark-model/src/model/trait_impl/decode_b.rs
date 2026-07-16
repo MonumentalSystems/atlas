@@ -384,7 +384,7 @@ impl TransformerModel {
             token_ids: None,
             // #30: decode never routes prefill — installed-pair/bgmv path only.
             routed_lora_layers: None,
-            moe_lora_route: crate::layer::MoeLoraRoute::Fold, // decode: reject_decode_lora guards.
+            moe_lora_route: self.decode_moe_route(), // route-aware: base(Skip) decodes; adapter refuses
         };
 
         let prefill_ctx = ForwardContext {
