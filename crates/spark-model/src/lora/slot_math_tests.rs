@@ -285,14 +285,10 @@ fn select_routed_pair_by_global_index_and_module() {
     let v = dummy_pair(200, 1024, 512);
     let o = dummy_pair(300, 2048, 1024);
     layers[3] = Some(LoraLayerWeights {
-        layer_idx: 3,
-        q_proj: None,
         k_proj: Some(k),
         v_proj: Some(v),
         o_proj: Some(o),
-        gate_proj: None,
-        up_proj: None,
-        down_proj: None,
+        ..LoraLayerWeights::empty(3)
     });
 
     // Right pair for the adapted (layer, module) triples.

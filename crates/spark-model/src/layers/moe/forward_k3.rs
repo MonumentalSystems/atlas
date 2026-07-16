@@ -15,6 +15,8 @@ impl MoeLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        // Feature-1 phase-1: decode does not yet fold the expert delta.
+        self.reject_decode_lora("forward_k3")?;
         // BF16 (FP8-dequant-on-load) experts have no fused batch3 kernel.
         // The FP8 batch3 branch below would read expert weights that were
         // FREED at dequant-load → garbage MTP-verify logits → degenerate

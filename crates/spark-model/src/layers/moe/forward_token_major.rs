@@ -23,6 +23,8 @@ impl MoeLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        // Feature-1 phase-1: decode does not yet fold the expert delta.
+        self.reject_decode_lora("forward_token_major_decode")?;
         let has_shared = self.weights.shared_expert.gate_proj.weight.0 != 0
             && self.weights.shared_expert.up_proj.weight.0 != 0
             && self.weights.shared_expert.down_proj.weight.0 != 0;

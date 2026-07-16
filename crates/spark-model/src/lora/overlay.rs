@@ -175,9 +175,9 @@ impl OverlayTensors {
 /// accepts `trainable_token_indices` / `modules_to_save` `{embed_tokens,
 /// lm_head}`; [`classify_overlay_key`] recognizes the `token_adapter` /
 /// full-save / `lora_embedding` spellings), and the overlay row-selection math
-/// + CUDA kernels (`kernels/gb10/common/token_overlay.cu`) are in tree. The
-/// device-side build + forward application (device pointer tables + embed/
-/// lm_head hooks) is the CUDA-verified flip that lands next.
+/// and CUDA kernels (`kernels/gb10/common/token_overlay.cu`) are in tree. The
+/// device-side build and forward application (device pointer tables and
+/// `embed_tokens` / `lm_head` hooks) is the CUDA-verified flip that lands next.
 ///
 /// Until that flip, an adapter carrying overlay tensors is rejected by NAME
 /// rather than silently applied as a no-op (a silently-inert overlay is a

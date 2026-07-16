@@ -42,90 +42,6 @@ fn check_family(cfg: &ModelConfig) -> Result<()> {
     Ok(())
 }
 
-/// Classify + audit one adapter's tensors (unconsumed key = fatal; pair
-/// completeness; A=[r,in]/B=[out,r] shapes; every `target_modules` entry
-/// matched). Returns the (layer, module) → [a_key, b_key] map used to pack.
-fn audit_adapter(
-    adapter_store: &WeightStore,
-    peft: &PeftAdapterConfig,
-    cfg: &ModelConfig,
-    max_lora_rank: usize,
-) -> Result<BTreeMap<(usize, LoraModule), [Option<String>; 2]>> {
-    validate_peft_config(peft, max_lora_rank)?;
-
-    // 1) classify EVERY adapter tensor — any unclassifiable/unsupported key
-    //    is a hard error, which IS the "unconsumed adapter tensors fatal"
-    //    audit direction.
-    let mut found: BTreeMap<(usize, LoraModule), [Option<String>; 2]> = BTreeMap::new();
-    let mut overlay = OverlayTensors::default();
-    for name in adapter_store.names() {
-        // Feature 2: token-overlay tensors (`…token_adapter.*`, bare
-        // `modules_to_save` `.weight`, `lora_embedding_*`) are intercepted
-        // ABOVE `classify_key` so its lora_A/lora_B suffix gate never
-        // mis-rejects them. Collected here, applied by the token-overlay path.
-        if let Some(t) = classify_overlay_key(name) {
-            overlay.insert(t, name)?;
-            continue;
-        }
-        let (layer, module, ab) = classify_key(name, cfg)?;
-        let entry = found.entry((layer, module)).or_default();
-        let slot = &mut entry[ab as usize];
-        if slot.is_some() {
-            bail!(
-                "REJECT[duplicate-tensor]: two tensors map to layer {layer} \
-                 {module:?} lora_{ab:?}"
-            );
-        }
-        *slot = Some(name.to_string());
-    }
-    reject_pending_overlay(&overlay)?;
-    if found.is_empty() {
-        bail!("REJECT[empty-adapter]: no lora_A/lora_B tensors in adapter");
-    }
-
-    // 2) pair completeness + shape audit. PEFT shapes: A=[r, in], B=[out, r].
-    for ((layer, module), pair) in &found {
-        let [Some(a_key), Some(b_key)] = pair else {
-            bail!(
-                "REJECT[unpaired-tensor]: layer {layer} {module:?} has only \
-                 one of lora_A/lora_B"
-            );
-        };
-        let (out_dim, in_dim) = module.dims(cfg);
-        let a = adapter_store.get(a_key)?; // hard-fail get
-        let b = adapter_store.get(b_key)?;
-        if a.shape != vec![peft.r, in_dim] {
-            bail!(
-                "REJECT[shape-mismatch]: '{a_key}' is {:?}, expected [{}, {}] \
-                 (r, in_dim)",
-                a.shape,
-                peft.r,
-                in_dim
-            );
-        }
-        if b.shape != vec![out_dim, peft.r] {
-            bail!(
-                "REJECT[shape-mismatch]: '{b_key}' is {:?}, expected [{}, {}] \
-                 (out_dim, r)",
-                b.shape,
-                out_dim,
-                peft.r
-            );
-        }
-    }
-
-    // 3) other audit direction: every target_modules entry matched ≥1 pair.
-    for t in &peft.target_modules {
-        let last = t.rsplit('.').next().unwrap_or(t);
-        if !found.keys().any(|(_, m)| m.peft_name() == last) {
-            bail!(
-                "REJECT[unmatched-target]: target_modules entry '{t}' matched \
-                 no adapter tensor on any full-attention layer"
-            );
-        }
-    }
-    Ok(found)
-}
 
 /// Pack one already-audited adapter into pool `slot` (byte sub-region at base
 /// `slot * pool_slot_bytes`). The intra-slot walk (layer asc ×
@@ -156,16 +72,7 @@ fn pack_slot(
     let mut slot_ptrs: BTreeMap<(usize, LoraModule), (u64, u64)> = BTreeMap::new();
     let mut off = slot * slot_bytes; // slot base offset
     for layer_idx in full_attention_layers(cfg) {
-        let mut lw = LoraLayerWeights {
-            layer_idx,
-            q_proj: None,
-            k_proj: None,
-            v_proj: None,
-            o_proj: None,
-            gate_proj: None,
-            up_proj: None,
-            down_proj: None,
-        };
+        let mut lw = LoraLayerWeights::empty(layer_idx);
         let mut any = false;
         for module in LoraModule::ALL {
             let (out_dim, in_dim) = module.dims(cfg);
@@ -273,28 +180,50 @@ pub fn load_lora_adapters_multi(
 
     // Audit every adapter up front (each gets its own classify/shape/target
     // audit + rank<=max_lora_rank check) before touching VRAM.
-    let mut audited: Vec<BTreeMap<(usize, LoraModule), [Option<String>; 2]>> =
-        Vec::with_capacity(adapters.len());
+    let mut audited: Vec<AuditedAdapter> = Vec::with_capacity(adapters.len());
     for a in adapters {
         audited.push(audit_adapter(a.store, &a.peft, cfg, max_lora_rank)?);
     }
+
+    // Feature-1: separate expert/router pool bytes, summed across adapters from
+    // the AUDITED key set. Sized at the (lower) expert rank cap.
+    let expert_rank = max_lora_expert_rank();
+    let expert_total: usize = adapters
+        .iter()
+        .zip(&audited)
+        .map(|(_, au)| {
+            let (ek, rl) = expert_pack::key_lists(&au.router, &au.experts);
+            expert_router_bytes(cfg, &ek, &rl, expert_rank)
+        })
+        .sum();
 
     // VRAM preflight, then one fixed-address pool alloc for ALL slots, zeroed
     // once (pad rows/cols and unpacked slots stay 0 = padded-K correctness).
     let pool_bytes = pool_slot_bytes(cfg, max_lora_rank) * max_loras;
     let free = gpu.free_memory()?;
-    if pool_bytes * 2 > free {
+    if (pool_bytes + expert_total) * 2 > free {
         bail!(
-            "OOM pre-flight (LoRA pool): {:.1} MiB pool ({} slots × padded A/B) \
-             would leave < 1× headroom of {:.1} MiB free; every pool byte comes \
-             directly out of the KV-cache budget on GB10 unified memory",
+            "OOM pre-flight (LoRA pool): {:.1} MiB attn pool ({} slots) + {:.1} MiB \
+             expert/router pool would leave < 1× headroom of {:.1} MiB free; every \
+             pool byte comes directly out of the KV-cache budget on GB10 unified memory",
             pool_bytes as f64 / (1024.0 * 1024.0),
             max_loras,
+            expert_total as f64 / (1024.0 * 1024.0),
             free as f64 / (1024.0 * 1024.0),
         );
     }
     let pool = gpu.alloc(pool_bytes)?;
     gpu.memset(pool, 0, pool_bytes)?;
+    // One shared, zeroed expert/router pool (pad rows/cols stay 0). Allocated
+    // only when some adapter actually targets experts/router.
+    let expert_pool = if expert_total > 0 {
+        let ep = gpu.alloc(expert_total)?;
+        gpu.memset(ep, 0, expert_total)?;
+        Some(ep)
+    } else {
+        None
+    };
+    let mut expert_off = 0usize;
 
     // Pack each adapter into its slot; accumulate per-(layer,module) [max_loras]
     // pointer arrays for the post-pass table build.
@@ -302,17 +231,40 @@ pub fn load_lora_adapters_multi(
     let mut a_tabs: BTreeMap<(usize, LoraModule), Vec<u64>> = BTreeMap::new();
     let mut b_tabs: BTreeMap<(usize, LoraModule), Vec<u64>> = BTreeMap::new();
     for (k, a) in adapters.iter().enumerate() {
-        let (layers, slot_ptrs) = pack_slot(
+        let (mut layers, slot_ptrs) = pack_slot(
             k,
             &a.name,
             a.store,
             &a.peft,
-            &audited[k],
+            &audited[k].attn,
             cfg,
             gpu,
             pool,
             max_lora_rank,
         )?;
+        // Feature-1: pack this adapter's router + routed-expert pairs into the
+        // shared expert pool (fills layers[l].router / layers[l].experts).
+        if let Some(ep) = expert_pool {
+            let packed = expert_pack::pack_into(
+                &mut layers,
+                a.store,
+                &a.peft,
+                &audited[k].router,
+                &audited[k].experts,
+                cfg,
+                gpu,
+                ep,
+                expert_rank,
+                &mut expert_off,
+            )?;
+            if packed > 0 {
+                tracing::info!(
+                    "LoRA: slot {k} '{}' packed {packed} router/expert pair(s) \
+                     (expert_rank={expert_rank})",
+                    a.name
+                );
+            }
+        }
         for ((layer, module), (a_ptr, b_ptr)) in slot_ptrs {
             a_tabs
                 .entry((layer, module))
@@ -376,6 +328,7 @@ pub fn load_lora_adapters_multi(
     // Parallel [max_loras] f32 scale table (per-slot scale, 0.0 for unpacked
     // slots) — the bgmv fold reads scale_table[seq_slot] in fp32. Same
     // load-time-fixed pattern as the a/b tables.
+    debug_assert_eq!(expert_off, expert_total, "expert pool filled exactly");
     let scale_vals = scale_table_values(adapters, max_loras);
     let scale_bytes: Vec<u8> = scale_vals.iter().flat_map(|s| s.to_le_bytes()).collect();
     let scale_table = gpu.alloc(scale_bytes.len())?;
@@ -388,6 +341,8 @@ pub fn load_lora_adapters_multi(
         max_loras,
         pool,
         pool_bytes,
+        expert_pool,
+        expert_pool_bytes: expert_total,
         slots,
         active: 0,
         tables,
@@ -439,7 +394,14 @@ pub fn pack_store_into_slot(
         );
     }
     validate_peft_config(peft, lw.max_rank)?;
-    let found = audit_adapter(store, peft, cfg, lw.max_rank)?;
+    let audited = audit_adapter(store, peft, cfg, lw.max_rank)?;
+    if expert_pack::present(&audited.router, &audited.experts) {
+        bail!(
+            "LoRA disk swap REFUSED: adapter '{name}' carries router/expert deltas \
+             (Feature-1); runtime slot-swap of the expert pool is a phase-2 followup"
+        );
+    }
+    let found = audited.attn;
     let slot_bytes = pool_slot_bytes(cfg, lw.max_rank);
     gpu.memset(
         DevicePtr(lw.pool.0 + (slot * slot_bytes) as u64),

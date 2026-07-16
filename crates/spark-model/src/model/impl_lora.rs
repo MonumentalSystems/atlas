@@ -175,6 +175,22 @@ impl TransformerModel {
                 None
             };
             attn.set_lora_weights(attn_weights, ffn_weights)?;
+            // Feature-1: install router + routed-expert deltas onto this layer's
+            // MoE FFN (correctness-first side-path). Only when the adapter carries
+            // them (ATLAS_LORA_EXPERTS=1); base MoE is byte-identical otherwise.
+            if layer_weights.router.is_some()
+                || layer_weights
+                    .experts
+                    .as_ref()
+                    .is_some_and(|e| !e.is_empty())
+            {
+                attn.set_moe_lora_weights(
+                    layer_weights.router,
+                    layer_weights.experts.clone().unwrap_or_default(),
+                    kernels,
+                    self.gpu.as_ref(),
+                )?;
+            }
             installed += 1;
         }
         Ok(installed)

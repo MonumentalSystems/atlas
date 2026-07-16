@@ -197,6 +197,11 @@ impl MoeLayer {
         super::dump::dump_gate_logits(ctx.gpu, stream, gate_logits, n, num_experts)?;
         prof_step!("gate_gemm");
 
+        // Feature-1: fold the router (`mlp.gate`) LoRA delta onto the routing
+        // logits BEFORE top-k (reproduces PEFT `mlp.gate`). No-op unless a router
+        // delta is installed (ATLAS_LORA_EXPERTS=1).
+        self.apply_router_lora_prefill(router_in, gate_logits, n, ctx, stream)?;
+
         // 2. Batched topK dispatch. DeepSeek-V3 / MiniMax-M2 use sigmoid
         //    + correction bias (detected via `correction_bias_dev`);
         //    every other model takes the softmax path (no behavior
@@ -345,6 +350,19 @@ impl MoeLayer {
             stream,
         )?;
         let expert_down_out = ctx.buffers.expert_down_out();
+
+        // Feature-1: fold the routed-expert down_proj LoRA deltas onto the sorted
+        // `expert_down_out` BEFORE the unpermute + weighted reduce, so the router
+        // weight multiplies base+delta (PEFT semantics). x = the post-SiLU sorted
+        // activations. No-op unless routed-expert deltas are installed.
+        self.apply_expert_lora_prefill_down(
+            ctx.buffers.expert_gate_out(),
+            expert_down_out,
+            expert_offsets,
+            num_experts,
+            ctx,
+            stream,
+        )?;
 
         // 7. Unpermute + weighted reduce: scatter sorted outputs to token order
         let output = ctx.buffers.moe_output();

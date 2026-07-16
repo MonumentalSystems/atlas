@@ -371,6 +371,13 @@ pub struct MoeLayer {
     // path. Used to test whether the kernel choice is the dominant cause
     // of low DFlash drafter acceptance on FP4/FP8 targets.
     pub is_dflash_capture_layer: bool,
+    /// Feature-1 (MoE expert + router LoRA): this layer's installed router +
+    /// routed-expert deltas + apply scratch. `None` = no adapter / feature off
+    /// → the base MoE path is byte-identical. Set by
+    /// [`MoeLayer::set_lora_weights`] (`moe/lora.rs`); applied in the prefill
+    /// forward. Decode/verify paths are a phase-1 followup (they REFUSE rather
+    /// than silently drop the delta — see `reject_decode_lora`).
+    pub(crate) lora: Option<MoeLoraWeights>,
 }
 
 impl MoeLayer {
@@ -403,6 +410,8 @@ impl MoeLayer {
 // ── Sub-files (split for ≤500 LoC) ────────────────────────────────────────
 mod dump;
 mod forward;
+mod lora;
+pub(crate) use lora::MoeLoraWeights;
 mod forward_atomic_c4;
 mod forward_batched;
 mod forward_ep;

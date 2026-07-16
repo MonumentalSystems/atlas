@@ -31,6 +31,8 @@ impl MoeLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<DevicePtr> {
+        // Feature-1 phase-1: decode does not yet fold the expert/router delta.
+        self.reject_decode_lora("forward")?;
         // ── Phase 2.7 Tier C: Frankenstein decode-via-prefill dispatch ──
         // For DFlash capture layers only, when `ATLAS_FRANKENSTEIN_DECODE_VIA_PREFILL=1`
         // is set, route this layer's single-token MoE through `forward_prefill(M=1)`,

@@ -377,6 +377,12 @@ fn validate_target_module(entry: &str) -> Result<()> {
         "embed_tokens" | "lm_head" => {
             bail!("REJECT(embedding): target module '{leaf}' is unsupported in v0")
         }
+        // Feature-1: the MoE router (`mlp.gate`, leaf `gate` — DISTINCT from the
+        // dense `gate_proj`). Expert projections (`mlp.experts.N.gate_proj`) share
+        // the dense leaves already in the allow-list. The runtime key gate
+        // (`classify_key`) + `ATLAS_LORA_EXPERTS` are the authority on whether the
+        // routed-expert / router path is actually loaded.
+        "gate" => Ok(()),
         m if PEFT_SUPPORTED_TARGET_MODULES.contains(&m) => Ok(()),
         other => bail!(
             "REJECT(unknown_module): target module '{other}' is not in the v0 allow-list \

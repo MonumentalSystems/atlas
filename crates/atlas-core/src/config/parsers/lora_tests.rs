@@ -100,6 +100,21 @@ fn gdn_module_rejected_named() {
 }
 
 #[test]
+fn router_gate_target_accepted() {
+    // Feature-1: the MoE router leaf `gate` (DISTINCT from `gate_proj`) is
+    // accepted by the config gate; the runtime key gate + ATLAS_LORA_EXPERTS
+    // decide whether it actually loads.
+    let mut j = base_json();
+    j["target_modules"] = serde_json::json!(["gate"]);
+    let cfg = parse_peft_adapter_config(&j.to_string()).unwrap();
+    assert_eq!(cfg.target_modules, vec!["gate"]);
+    // Full-path router entry validates on its leaf too.
+    let mut j = base_json();
+    j["target_modules"] = serde_json::json!(["model.layers.3.mlp.gate"]);
+    assert!(parse_peft_adapter_config(&j.to_string()).is_ok());
+}
+
+#[test]
 fn all_linear_rejected_named() {
     let mut j = base_json();
     j["target_modules"] = serde_json::json!("all-linear");

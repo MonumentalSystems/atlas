@@ -18,6 +18,8 @@ impl MoeLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        // Feature-1 phase-1: decode does not yet fold the expert delta.
+        self.reject_decode_lora("forward_k2")?;
         // BF16 (FP8-dequant-on-load) experts. The FP8/NVFP4 batch2 branches
         // below read expert weights that were FREED at dequant-load, so they
         // must NOT run for a dequanted model. When the fused BF16 batch2

@@ -40,6 +40,8 @@ fn adapter_names_and_slot_resolve() {
         max_loras: 8,
         pool: DevicePtr(0),
         pool_bytes: 0,
+        expert_pool: None,
+        expert_pool_bytes: 0,
         slots: vec![mk_slot("alpha"), mk_slot("beta")],
         active: 0,
         tables: BTreeMap::new(),
@@ -93,6 +95,8 @@ fn slot_generation_bump_freshens_adapter_id() {
         max_loras: 4,
         pool: DevicePtr(0),
         pool_bytes: 0,
+        expert_pool: None,
+        expert_pool_bytes: 0,
         slots: vec![AdapterSlot {
             name: "sol".into(),
             adapter_config: peft.clone(),
@@ -143,6 +147,8 @@ fn ref_count_acquire_release_balance_and_busy_gate() {
         max_loras: 4,
         pool: DevicePtr(0),
         pool_bytes: 0,
+        expert_pool: None,
+        expert_pool_bytes: 0,
         slots: vec![mk_slot("alpha"), mk_slot("beta")],
         active: 1, // active != 0 so we can prove `-1 -> active` resolution
         tables: BTreeMap::new(),
