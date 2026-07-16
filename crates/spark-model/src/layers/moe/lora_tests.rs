@@ -6,7 +6,8 @@
 //! = num_experts, decode down x-recompute = moe_inter); gate/up's `k_in=hidden`
 //! must NOT size it. GPU-free (pure function).
 
-use super::{lora_delta_cols, router_expert_entry};
+use super::super::lora_router::router_expert_entry;
+use super::lora_delta_cols;
 use crate::layers::ops::lora_delta::LoraPair;
 use crate::layers::ops::moe_lora_grouped::pack_expert_tables;
 use crate::weight_map::DenseWeight;
