@@ -204,6 +204,23 @@ impl Model for NllbGpuModel {
 
     fn compact_sequence(&self, seq: &mut SequenceState, new_slot: usize) -> Result<()> {
         let old = seq.slot_idx;
+        if old == new_slot {
+            return Ok(());
+        }
+        // Slot migration is an ownership TRANSFER, not a free. The scheduler's
+        // two-phase retire compaction (`compact_survivors_into_range`) moves this
+        // live survivor onto `new_slot`, a slot freed by a retiring sequence and
+        // therefore ON the free-list. Claim it exclusively or the next
+        // `alloc_sequence` would `claim()` the same slot and `kv.insert` would
+        // clobber this survivor's KV — two live sequences sharing one KV entry
+        // (garbled decode), then "no KV state for slot" when one frees. Release
+        // the vacated `old` slot exactly once so it can be reused. Mirrors the
+        // reference model's `compact_sequence` (trait_impl/sequence.rs).
+        {
+            let mut slots = self.slots.lock().unwrap();
+            slots.claim_specific(new_slot);
+            slots.release(old);
+        }
         let mut map = self.kv.lock().unwrap();
         if let Some(kv) = map.remove(&old) {
             map.insert(new_slot, kv);
