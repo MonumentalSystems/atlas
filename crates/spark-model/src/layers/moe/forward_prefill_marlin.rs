@@ -48,6 +48,44 @@ impl MoeLayer {
             return Ok(false);
         }
 
+        // Decode profiling normally records only the complete MoE sublayer.
+        // Keep this opt-in timing split out of CUDA graphs so it can identify
+        // which Marlin stage remains on the C=8 critical path without
+        // changing the captured production graph.
+        let marlin_profile = std::env::var("ATLAS_MARLIN_MOE_PROFILE").ok().as_deref() == Some("1")
+            && !ctx.graph_capture;
+        let mut profile_t0 = if marlin_profile {
+            ctx.gpu.synchronize(stream)?;
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+        macro_rules! profile_stage {
+            ($label:literal) => {
+                if let Some(t0) = profile_t0.take() {
+                    ctx.gpu.synchronize(stream)?;
+                    tracing::info!(
+                        "ATLAS_MARLIN_MOE_PROFILE N={n} [{}]: {}us",
+                        $label,
+                        t0.elapsed().as_micros()
+                    );
+                    profile_t0 = Some(std::time::Instant::now());
+                }
+            };
+        }
+        macro_rules! profile_finish {
+            ($label:literal) => {
+                if let Some(t0) = profile_t0.take() {
+                    ctx.gpu.synchronize(stream)?;
+                    tracing::info!(
+                        "ATLAS_MARLIN_MOE_PROFILE N={n} [{}]: {}us",
+                        $label,
+                        t0.elapsed().as_micros()
+                    );
+                }
+            };
+        }
+
         // Worst case is 64 routes selecting 64 distinct experts: 64 padded
         // blocks x 8 rows = 512 sorted ids and 64 expert ids.
         let metadata = ctx.buffers.gate_logits();
@@ -55,6 +93,7 @@ impl MoeLayer {
         let experts = metadata.offset(512 * 4);
         let padded = experts.offset(64 * 4);
         ops::marlin_moe::align(indices, sorted, experts, padded, n, stream)?;
+        profile_stage!("align");
 
         let w13_out = marlin.w13_out;
         ops::marlin_moe::gemm(
@@ -76,10 +115,12 @@ impl MoeLayer {
             marlin.workspace,
             stream,
         )?;
+        profile_stage!("w13");
 
         let routes = n * 8;
         let activation = ctx.buffers.expert_gate_out();
         ops::marlin_moe::silu_mul(w13_out, activation, routes, 512, stream)?;
+        profile_stage!("silu_mul");
         let expert_out = ctx.buffers.expert_down_out();
         ops::marlin_moe::gemm(
             activation,
@@ -100,6 +141,7 @@ impl MoeLayer {
             marlin.workspace,
             stream,
         )?;
+        profile_stage!("w2");
 
         // A shared expert scheduled on `prefill_stream` must join the main
         // capture before the fused blend consumes its output. Besides being
@@ -128,6 +170,7 @@ impl MoeLayer {
             n,
             stream,
         )?;
+        profile_finish!("blend");
         tracing::trace!("ATLAS_MOE_MARLIN: dispatched N={n} through two grouped GEMMs");
         Ok(true)
     }
