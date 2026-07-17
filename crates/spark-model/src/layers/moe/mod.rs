@@ -424,6 +424,8 @@ impl MoeLayer {
 // ── Sub-files (split for ≤500 LoC) ────────────────────────────────────────
 mod b12x_scales;
 mod b12x_weights;
+#[cfg(test)]
+mod decode_worklist;
 mod dump;
 mod forward;
 mod lora;
