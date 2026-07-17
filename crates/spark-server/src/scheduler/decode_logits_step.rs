@@ -15,6 +15,14 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
+/// Parallel host sampling toggle (ATLAS_PARALLEL_SAMPLE, default ON). Set to
+/// "0" to force the serial per-seq sampling path — an escape hatch for the
+/// telemetry-ordering caveat above, or for A/B measurement of the rayon win.
+fn parallel_sample_enabled() -> bool {
+    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| std::env::var("ATLAS_PARALLEL_SAMPLE").as_deref() != Ok("0"))
+}
+
 /// DIAG (ATLAS_DECODE_TIMING=1): localize the host-path decode cost. Splits the
 /// per-token wall into `copy` (D2H of the full 248k-vocab logits + the GPU
 /// forward-wait absorbed by that sync) vs `sample` (the host scalar loops over
@@ -152,7 +160,8 @@ pub fn process_decode_logits(
             // is also gated off when the opt-in `ATLAS_LOGIT_DUMP` diagnostic is
             // active, since its shared per-step record would interleave across
             // workers.
-            let parallel_sample = n > 1 && !super::logit_dump::enabled();
+            let parallel_sample =
+                n > 1 && !super::logit_dump::enabled() && parallel_sample_enabled();
             let sample_one = |i: usize, a: &mut ActiveSeq| {
                 process_seq_logits(
                     model,
