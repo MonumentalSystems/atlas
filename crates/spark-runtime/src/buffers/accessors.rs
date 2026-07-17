@@ -85,6 +85,15 @@ impl BufferArena {
     pub fn expert_down_out(&self) -> DevicePtr {
         self.expert_down_out
     }
+    /// Device work-list for compact NVFP4 MoE decode. Each entry is an
+    /// `(expert_id, packed_m_n_tile)` pair of u32 values.
+    pub fn moe_decode_worklist(&self) -> DevicePtr {
+        self.moe_decode_worklist
+    }
+    /// Device-side number of valid compact MoE work-list entries.
+    pub fn moe_decode_worklist_count(&self) -> DevicePtr {
+        self.moe_decode_worklist_count
+    }
     /// Split-K decode attention workspace (F32 partials).
     /// GDN FLA chunked-prefill scratch base (W|U|S|uc sub-divided by the caller).
     /// `DevicePtr::NULL` unless this is a 128-dim-linear-head GDN model.

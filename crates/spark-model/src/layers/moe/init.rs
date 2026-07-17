@@ -116,6 +116,16 @@ impl MoeLayer {
                 .kernel("moe_w4a16", "moe_w4a16_grouped_gemm_ptrtable_t_k64")?,
             moe_fused_gate_up_t: gpu.kernel("moe_w4a16", "moe_w4a16_fused_gate_up_t")?,
             moe_fused_gate_up_t_k64: gpu.kernel("moe_w4a16", "moe_w4a16_fused_gate_up_t_k64")?,
+            moe_grouped_gemm_t_k64_worklist: super::super::try_kernel(
+                gpu,
+                "moe_w4a16",
+                "moe_w4a16_grouped_gemm_ptrtable_t_k64_worklist",
+            ),
+            moe_fused_gate_up_t_k64_worklist: super::super::try_kernel(
+                gpu,
+                "moe_w4a16",
+                "moe_w4a16_fused_gate_up_t_k64_worklist",
+            ),
             // ARM-2 Phase-K native-MXFP4 (E8M0) prefill variants — try_kernel:
             // only the deepseek-v4-flash target's moe_w4a16 module ships them.
             moe_grouped_gemm_e8m0: super::super::try_kernel(

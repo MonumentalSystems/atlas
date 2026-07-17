@@ -36,6 +36,11 @@ impl MoeLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<bool> {
+        // The compact NVFP4 experiment owns the routed grouped path. It is
+        // explicitly opt-in and returns to Marlin whenever it cannot run.
+        if super::forward_prefill_compact::compact_nvfp4_decode_enabled() {
+            return Ok(false);
+        }
         let Some(marlin) = self.marlin.as_ref() else {
             return Ok(false);
         };

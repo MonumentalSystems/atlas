@@ -311,6 +311,12 @@ pub struct MoeLayer {
     // Launched on the SAME stream as the grouped GEMM (read-after-write of
     // total_tiles). Handle may be 0 on older images.
     moe_build_tile_worklist_k: KernelHandle,
+    /// Compact NVFP4 decode K64 down-projection kernel. It consumes the
+    /// on-device work-list and is intentionally opt-in while parity is proven.
+    moe_grouped_gemm_t_k64_worklist: KernelHandle,
+    /// Compact NVFP4 decode K64 fused gate/up kernel, sharing the same
+    /// device-resident work-list ABI as the down projection.
+    moe_fused_gate_up_t_k64_worklist: KernelHandle,
     // W8A8 + FP32 epilogue MoE GEMM (vLLM-equivalent). Opt-in via
     // ATLAS_FP8_W8A8=1. Requires per-token-quanted A_fp8 + a_scale.
     moe_w8a8_grouped_gemm_k: KernelHandle,
@@ -436,6 +442,7 @@ mod forward_phase;
 mod forward_prefill;
 mod forward_prefill_b12x;
 mod forward_prefill_bf16;
+mod forward_prefill_compact;
 mod forward_prefill_fp8;
 mod forward_prefill_marlin;
 mod forward_prefill_phase;

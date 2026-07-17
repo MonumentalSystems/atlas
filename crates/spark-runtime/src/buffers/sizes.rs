@@ -33,6 +33,12 @@ pub struct BufferSizes {
     pub expert_gate_out: usize,
     pub expert_up_out: usize,
     pub expert_down_out: usize,
+    /// Decode-only NVFP4 MoE work-list: `(expert, packed_tile)` u32 pairs.
+    /// Sized for eight concurrent tokens, top-k routes, and 16 combined
+    /// gate/up or down N-tiles; the list is reused for both projections.
+    pub moe_decode_worklist: usize,
+    /// Device-side count for `moe_decode_worklist` (one i32).
+    pub moe_decode_worklist_count: usize,
     pub splitk_workspace: usize,
     /// GDN FLA chunked-prefill scratch (single buffer, sub-divided W|U|S|uc).
     /// 0 unless the model is a 128-dim-linear-head GDN model (ATLAS_GDN_FLA path).
@@ -122,6 +128,14 @@ impl BufferSizes {
         let qkv_dim = (q_heads * q_proj_mul + 2 * kv_heads) * hd;
 
         let top_k = config.num_experts_per_tok;
+        // The compact decode path is intentionally bounded to C<=8. Each
+        // routed assignment can own up to 16 N-tiles (2*inter gate/up or
+        // hidden down), and each entry contains two u32 words.
+        let moe_decode_worklist = if config.num_experts > 0 && top_k > 0 {
+            8 * top_k * 16 * 2 * 4
+        } else {
+            256
+        };
 
         // Scratch layout (two users, take max):
         //
@@ -384,6 +398,8 @@ impl BufferSizes {
             expert_gate_out,
             expert_up_out,
             expert_down_out,
+            moe_decode_worklist,
+            moe_decode_worklist_count: 4,
             splitk_workspace,
             gdn_fla_scratch,
             ssd_scratch,
@@ -446,6 +462,8 @@ impl BufferSizes {
             + self.expert_gate_out
             + self.expert_up_out
             + self.expert_down_out
+            + self.moe_decode_worklist
+            + self.moe_decode_worklist_count
             + self.splitk_workspace
             + self.gdn_fla_scratch
             + self.ssd_scratch

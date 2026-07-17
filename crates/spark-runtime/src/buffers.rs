@@ -68,6 +68,10 @@ pub struct BufferArena {
     expert_up_out: DevicePtr,
     /// Expert down projection output: [k2 * top_k, hidden_size] BF16.
     expert_down_out: DevicePtr,
+    /// Decode-only NVFP4 grouped-MoE device work-list.
+    moe_decode_worklist: DevicePtr,
+    /// Number of valid entries in `moe_decode_worklist`, written on device.
+    moe_decode_worklist_count: DevicePtr,
     /// Split-K decode attention workspace: partials from split CTAs (F32).
     splitk_workspace: DevicePtr,
     /// Grouped O-projection latent: [M, o_groups*o_lora_rank] BF16 (V4-Flash).
@@ -150,6 +154,8 @@ impl BufferArena {
         let expert_gate_out = gpu.alloc(sizes.expert_gate_out)?;
         let expert_up_out = gpu.alloc(sizes.expert_up_out)?;
         let expert_down_out = gpu.alloc(sizes.expert_down_out)?;
+        let moe_decode_worklist = gpu.alloc(sizes.moe_decode_worklist)?;
+        let moe_decode_worklist_count = gpu.alloc(sizes.moe_decode_worklist_count)?;
         let splitk_workspace = gpu.alloc(sizes.splitk_workspace)?;
         let o_latent = gpu.alloc(sizes.o_latent)?;
         // Zero-filled "weight" for unweighted RMSNorm under the offset-from-1
@@ -244,6 +250,8 @@ impl BufferArena {
             expert_gate_out,
             expert_up_out,
             expert_down_out,
+            moe_decode_worklist,
+            moe_decode_worklist_count,
             splitk_workspace,
             o_latent,
             norm_unit_w,

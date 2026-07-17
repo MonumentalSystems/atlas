@@ -40,6 +40,8 @@ fn test_buffer_arena_alloc() {
 
     assert!(!arena.hidden_states().is_null());
     assert!(!arena.logits().is_null());
+    assert!(!arena.moe_decode_worklist().is_null());
+    assert!(!arena.moe_decode_worklist_count().is_null());
     assert_eq!(arena.max_batch_tokens(), 128);
     // 27 allocations: main's 18 (12 data + 1 scratch + 3 expert + 2 splitk)
     // plus 9 added by the V4 foundation atop main:
@@ -54,8 +56,14 @@ fn test_buffer_arena_alloc() {
     //     allocated unconditionally even for models without hash routing).
     // plus 2 added by the Holo-3.1/Ornith GB10 enablement (buffers.rs):
     //   - fp8_act + fp8_act_scale (persistent FP8 prefill-projection scratch,
-    //     allocated unconditionally). 27 + 2 = 29.
-    assert_eq!(gpu.alloc_count(), 29);
+    //     allocated unconditionally), plus 2 compact-MoE decode worklist
+    //     buffers. 27 + 2 + 2 = 31.
+    assert_eq!(gpu.alloc_count(), 31);
+    // C<=8 compact decode: 8 tokens × top-k routes × 16 N-tiles × 2 u32 words.
+    assert_eq!(
+        arena.sizes().moe_decode_worklist,
+        8 * cfg.num_experts_per_tok * 16 * 2 * 4
+    );
 }
 
 #[test]

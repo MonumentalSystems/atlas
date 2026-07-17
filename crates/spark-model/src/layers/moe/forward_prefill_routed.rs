@@ -124,6 +124,21 @@ impl MoeLayer {
             ctx.gpu
                 .memset_async(ctx.buffers.expert_down_out(), 0, down_bytes, stream)?;
         }
+        if self.try_compact_nvfp4_decode(
+            expert_input,
+            expert_offsets,
+            sorted_token_ids,
+            n,
+            h,
+            inter,
+            num_experts,
+            top_k,
+            ctx,
+            stream,
+        )? {
+            prof_step!("compact_nvfp4_worklist");
+            return Ok(());
+        }
         if max_m_tiles > 0 {
             if let (Some(gp), Some(up)) = (&self.gate_ptrs_t, &self.up_ptrs_t) {
                 if self.experts_scale_kind == crate::weight_map::WeightQuantFormat::Mxfp4E8m0 {
