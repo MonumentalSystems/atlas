@@ -27,6 +27,14 @@ use crate::speculative::DraftProposer;
 use crate::traits::{ChunkedPrefillPageMetadata, Model, SequenceState};
 use crate::weight_map::{DenseWeight, MtpWeights, QuantizedWeight};
 
+fn decode_checkpoint_interval(value: Option<&str>) -> Option<usize> {
+    match value.and_then(|raw| raw.parse::<usize>().ok()) {
+        Some(0) => None,
+        Some(interval) => Some(interval),
+        None => Some(4),
+    }
+}
+
 impl TransformerModel {
     /// #155 iter3: save a block-aligned Marconi SSM snapshot DURING decode so
     /// the next turn's warm hit restores from decode-produced state near the
@@ -47,11 +55,13 @@ impl TransformerModel {
         }
         // Block-count between decode checkpoints. Env-tunable (no rebuild) so
         // the cadence/drift tradeoff can be swept; default 4 blocks = 64 tok.
-        let interval = std::env::var("ATLAS_DECODE_CKPT_BLOCKS")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .filter(|&v| v > 0)
-            .unwrap_or(4);
+        // An explicit zero disables intermediate snapshots for clean decode
+        // overhead measurement; finish-leaf snapshots remain unchanged.
+        let Some(interval) =
+            decode_checkpoint_interval(std::env::var("ATLAS_DECODE_CKPT_BLOCKS").ok().as_deref())
+        else {
+            return;
+        };
         let mut kv = self.kv_cache.lock();
         let bs = kv.block_size();
         // Derive the block count from tokens.len() (what we slice + cache),
@@ -249,5 +259,22 @@ impl TransformerModel {
             }
         }
         saved
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::decode_checkpoint_interval;
+
+    #[test]
+    fn checkpoint_interval_zero_disables_intermediate_saves() {
+        assert_eq!(decode_checkpoint_interval(Some("0")), None);
+    }
+
+    #[test]
+    fn checkpoint_interval_defaults_and_accepts_positive_values() {
+        assert_eq!(decode_checkpoint_interval(None), Some(4));
+        assert_eq!(decode_checkpoint_interval(Some("6")), Some(6));
+        assert_eq!(decode_checkpoint_interval(Some("invalid")), Some(4));
     }
 }
