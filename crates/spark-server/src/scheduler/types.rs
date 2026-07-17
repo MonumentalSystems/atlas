@@ -13,9 +13,9 @@ use std::time::Instant;
 use anyhow::Result;
 use spark_model::traits::SequenceState;
 
+use crate::api::inference_types::RepetitionDetectionParams;
 use crate::api::{InferenceRequest, InferenceResponse, StreamEvent};
 use crate::grammar::GrammarState;
-use crate::openai::RepetitionDetectionParams;
 
 /// Shared queue between receiver thread and scheduler.
 pub(super) struct PendingQueue {
@@ -174,6 +174,13 @@ pub(super) struct ActiveSeq {
     pub thinking_tokens: u32,
     /// When true, the next decode step must produce the `</think>` token.
     pub force_end_thinking: bool,
+    /// Whether the `</think>` that closed the current thinking span was
+    /// FORCE-INJECTED (budget exhaustion or thinking-loop watchdog) rather
+    /// than emitted by the model. Captured at the `</think>` commit; read
+    /// by the post-think EOS guard, which must only fire on watchdog
+    /// recoveries — a naturally closed think followed by a short answer
+    /// ends the turn like vLLM does.
+    pub think_force_closed: bool,
     /// Decode-step counter incremented while `force_end_thinking` is
     /// armed but the injection is deferred (waiting for a sentence-
     /// boundary token or fence close). Reset to 0 on the false→true
@@ -422,6 +429,7 @@ pub(super) struct SwappedSeq {
     pub spontaneous_think_budget: u32,
     pub thinking_tokens: u32,
     pub force_end_thinking: bool,
+    pub think_force_closed: bool,
     pub sentence_defer_count: u32,
     pub consecutive_confident: u32,
     pub in_code_fence: bool,

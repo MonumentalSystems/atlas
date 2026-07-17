@@ -191,6 +191,9 @@ pub fn emit_token(a: &mut ActiveSeq, tok: u32, logprobs: Option<crate::api::Toke
     if a.inside_thinking {
         if a.think_end_token == Some(tok) {
             a.inside_thinking = false;
+            // Sticky twin of the decode-path capture — see
+            // decode_logits_step (post-think EOS guard).
+            a.think_force_closed = a.force_end_thinking;
             a.force_end_thinking = false;
             a.sentence_defer_count = 0;
             a.think_ended = true;

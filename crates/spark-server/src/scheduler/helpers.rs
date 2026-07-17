@@ -509,7 +509,7 @@ pub fn detect_thinking_token_loop(tokens: &[u32]) -> bool {
 /// without per-request configuration are byte-identical to before.
 pub fn detect_thinking_token_loop_with(
     tokens: &[u32],
-    override_: Option<crate::openai::RepetitionDetectionParams>,
+    override_: Option<crate::api::inference_types::RepetitionDetectionParams>,
 ) -> bool {
     let (period_min, period_max, min_repeats) = match override_ {
         Some(p) => (
@@ -553,7 +553,7 @@ pub fn detect_content_token_loop(tokens: &[u32]) -> bool {
 /// constants. See [`detect_thinking_token_loop_with`] for rationale.
 pub fn detect_content_token_loop_with(
     tokens: &[u32],
-    override_: Option<crate::openai::RepetitionDetectionParams>,
+    override_: Option<crate::api::inference_types::RepetitionDetectionParams>,
 ) -> bool {
     let (period_min, period_max, min_repeats) = match override_ {
         Some(p) => (
@@ -600,7 +600,7 @@ pub fn detect_content_token_loop_normalized(tokens: &[u32], mask: &[bool]) -> bo
 pub fn detect_content_token_loop_normalized_with(
     tokens: &[u32],
     mask: &[bool],
-    override_: Option<crate::openai::RepetitionDetectionParams>,
+    override_: Option<crate::api::inference_types::RepetitionDetectionParams>,
 ) -> bool {
     let n = tokens.len();
     if n < CONTENT_LOOP_MIN_TOKENS as usize {

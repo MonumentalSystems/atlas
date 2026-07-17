@@ -225,6 +225,7 @@ pub fn swap_out_sequence(
         content_tokens: a.content_tokens,
         prose_tokens_since_last_tool: a.prose_tokens_since_last_tool,
         think_watchdog_fires: a.think_watchdog_fires,
+        think_force_closed: a.think_force_closed,
         rollback_count: a.rollback_count,
         tool_call_start_token: a.tool_call_start_token,
         tool_call_opened: a.tool_call_opened,
@@ -324,6 +325,7 @@ pub fn resume_swapped_seq(
         content_tokens: 0,
         prose_tokens_since_last_tool: 0,
         think_watchdog_fires: s.think_watchdog_fires,
+        think_force_closed: s.think_force_closed,
         rollback_count: s.rollback_count,
         // Decode-rollback SSM snapshots are GPU-resident and not part of
         // the disk swap image — a resumed sequence starts with an empty

@@ -32,7 +32,7 @@ pub async fn list_models(State(state): State<Arc<AppState>>) -> Json<ModelListRe
         data.push(ModelInfo {
             id: adapter.clone(),
             object: "model".to_string(),
-            created: crate::openai::unix_timestamp(),
+            created: crate::ids::unix_timestamp(),
             owned_by: "atlas-spark".to_string(),
         });
     }
@@ -49,14 +49,14 @@ pub async fn list_models(State(state): State<Arc<AppState>>) -> Json<ModelListRe
         data.push(ModelInfo {
             id: name.clone(),
             object: "model".to_string(),
-            created: crate::openai::unix_timestamp(),
+            created: crate::ids::unix_timestamp(),
             owned_by: "atlas-spark".to_string(),
         });
     }
     data.push(ModelInfo {
         id: state.model_name.clone(),
         object: "model".to_string(),
-        created: crate::openai::unix_timestamp(),
+        created: crate::ids::unix_timestamp(),
         owned_by: "atlas-spark".to_string(),
     });
     Json(ModelListResponse {
@@ -79,7 +79,7 @@ pub async fn get_model(
         Json(serde_json::json!({
             "id": model_id,
             "object": "model",
-            "created": crate::openai::unix_timestamp(),
+            "created": crate::ids::unix_timestamp(),
             "owned_by": "atlas-spark",
         }))
         .into_response()

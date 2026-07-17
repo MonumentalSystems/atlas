@@ -881,10 +881,11 @@ pub(crate) async fn serve(mut args: cli::ServeArgs) -> Result<()> {
             b
         },
         disable_thinking: args.disable_thinking,
-        default_chat_template_kwargs: args
+        default_thinking: args
             .default_chat_template_kwargs
-            .as_ref()
-            .and_then(|s| crate::openai::ChatTemplateKwargs::from_json(s)),
+            .as_deref()
+            .map(parse_default_thinking)
+            .unwrap_or_default(),
         response_store,
         rate_limiter,
         conversation_store,
@@ -902,6 +903,41 @@ pub(crate) async fn serve(mut args: cli::ServeArgs) -> Result<()> {
     // 9-11. Build router + start HTTP server (extracted: serve_router.rs).
     crate::main_modules::serve_router::build_and_serve(state, model_ready, &args.bind, args.port)
         .await
+}
+
+/// Parse the vLLM-style `--default-chat-template-kwargs` JSON
+/// (`{"enable_thinking":bool,"thinking_budget":u32}`) into the neutral
+/// thinking directive. The CLI is its own edge: the JSON shape is parsed
+/// here, not in the openai wire module. Mapping matches the
+/// `chat_template_kwargs` rung of the request-body ladder: an explicit
+/// budget wins, then the enable flag; unknown/empty JSON → Unspecified
+/// (with a warning — the old code ignored bad JSON silently).
+fn parse_default_thinking(s: &str) -> crate::ir::ThinkingDirective {
+    use crate::ir::ThinkingDirective;
+
+    #[derive(serde::Deserialize)]
+    struct Kwargs {
+        enable_thinking: Option<bool>,
+        thinking_budget: Option<u32>,
+    }
+
+    if s.trim().is_empty() {
+        return ThinkingDirective::Unspecified;
+    }
+    let kw: Kwargs = match serde_json::from_str(s) {
+        Ok(kw) => kw,
+        Err(e) => {
+            tracing::warn!("--default-chat-template-kwargs is not valid JSON ({e}); ignoring");
+            return ThinkingDirective::Unspecified;
+        }
+    };
+    match (kw.thinking_budget, kw.enable_thinking) {
+        (Some(b), _) if b > 0 => ThinkingDirective::On { budget: Some(b) },
+        (Some(_), _) => ThinkingDirective::Off,
+        (None, Some(true)) => ThinkingDirective::On { budget: None },
+        (None, Some(false)) => ThinkingDirective::Off,
+        (None, None) => ThinkingDirective::Unspecified,
+    }
 }
 
 /// Resolve `--require-auth` / `--auth-tokens-file` / `--auth-token` into an

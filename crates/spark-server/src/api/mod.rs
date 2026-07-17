@@ -62,6 +62,7 @@ mod tests;
 // `compact_messages` whose handler is wired directly in serve_router).
 pub use chat::chat_completions;
 pub(crate) use chat::chat_completions_inner;
+pub(crate) use chat::{ChatOutcome, ResponseEcho};
 #[allow(unused_imports)]
 pub use compact::compact_messages;
 pub use completions::completions;

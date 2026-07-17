@@ -10,14 +10,12 @@ use axum::response::{IntoResponse, Json, Response};
 use std::sync::Arc;
 
 use crate::AppState;
-use crate::openai::{
-    CompletionChoice, CompletionRequest, CompletionResponse, RepetitionDetectionParams, Usage,
-};
+use crate::openai::{CompletionChoice, CompletionRequest, CompletionResponse, Usage};
 
 use super::compact::openai_error_response;
 use super::completions_logprobs::build_completion_logprobs;
 use super::inference_impl::strip_stop_sequences;
-use super::inference_types::InferenceRequest;
+use super::inference_types::{InferenceRequest, RepetitionDetectionParams};
 use super::strip::strip_thinking_tags;
 
 /// Sampling/request parameters resolved once by the handler and shared

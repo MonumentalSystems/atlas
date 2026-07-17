@@ -253,6 +253,9 @@ pub fn process_decode_logits(
         if a.inside_thinking {
             if think_end_token == Some(tok) {
                 a.inside_thinking = false;
+                // Sticky: was THIS close force-injected? Read by the
+                // post-think EOS guard below.
+                a.think_force_closed = a.force_end_thinking;
                 a.force_end_thinking = false;
                 a.sentence_defer_count = 0;
                 a.consecutive_confident = 0;
@@ -541,8 +544,10 @@ pub fn process_decode_logits(
         // MTP-verify emit path (`emit_step.rs`) has no such guard, which is why
         // MTP-on stopped here while MTP-off leaked; this restores parity.
         let tools_armed = a.require_tool_call || a.tool_request;
-        let post_think_suppresses_eos =
-            tools_armed && a.think_ended && post_think_content_tokens < POST_THINK_MIN_CONTENT;
+        let post_think_suppresses_eos = tools_armed
+            && a.think_ended
+            && a.think_force_closed
+            && post_think_content_tokens < POST_THINK_MIN_CONTENT;
         let suppress_eos = grammar_suppresses_eos
             || legacy_suppresses_eos
             || min_tokens_suppresses
