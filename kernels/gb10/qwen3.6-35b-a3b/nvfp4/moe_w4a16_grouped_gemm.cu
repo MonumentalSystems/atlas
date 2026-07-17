@@ -750,7 +750,10 @@ extern "C" __global__ void moe_w4a16_grouped_gemm_ptrtable_t_k64_worklist(
 // Replaces moe_w4a16_fused_gate_up_t for both gate+up projections
 // when K=h=2048 (64 → 32 K-steps, zero pipeline stall).
 // ═══════════════════════════════════════════════════════════════════
-extern "C" __global__ void moe_w4a16_fused_gate_up_t_k64(
+// Share the established K64 math between dense prefill and compact decode.
+// The work-list wrapper below changes only CTA selection, so its output can be
+// compared directly with the dense fused gate/up kernel.
+__device__ __forceinline__ void moe_w4a16_fused_gate_up_t_k64_impl(
     const __nv_bfloat16* __restrict__ A,
     const unsigned long long* __restrict__ gate_packed_ptrs,
     const unsigned long long* __restrict__ gate_scale_ptrs,
@@ -764,9 +767,11 @@ extern "C" __global__ void moe_w4a16_fused_gate_up_t_k64(
     const int* __restrict__ sorted_token_ids,
     unsigned int num_experts,
     unsigned int N,
-    unsigned int K
+    unsigned int K,
+    unsigned int expert_id,
+    unsigned int cta_m_local,
+    unsigned int global_n
 ) {
-    const unsigned int expert_id = blockIdx.z;
     if (expert_id >= num_experts) return;
 
     const int m_start = expert_offsets[expert_id];
@@ -774,10 +779,8 @@ extern "C" __global__ void moe_w4a16_fused_gate_up_t_k64(
     const int M_expert = m_end - m_start;
     if (M_expert <= 0) return;
 
-    const int cta_m_local = blockIdx.y * M_TILE;
     if (cta_m_local >= M_expert) return;
 
-    const unsigned int global_n = blockIdx.x * N_TILE_LG;
     const bool is_up = (global_n >= N);
     const unsigned int cta_n = is_up ? (global_n - N) : global_n;
 
@@ -806,13 +809,13 @@ extern "C" __global__ void moe_w4a16_fused_gate_up_t_k64(
     const unsigned int group_id = lane_id >> 2;
     const unsigned int tid = lane_id & 3;
 
-    __shared__ __nv_bfloat16 smem_A_fgu64[2][M_TILE][K_STEP_T64 + PAD_T64];
-    __shared__ unsigned char smem_Bp_fgu64[2][K_STEP_T64 / 2][N_TILE_LG + BP_PAD];
-    __shared__ unsigned char smem_Bs_fgu64[2][K_STEP_T64 / GROUP_SIZE][N_TILE_LG + BP_PAD];
+    static __shared__ __nv_bfloat16 smem_A_fgu64[2][M_TILE][K_STEP_T64 + PAD_T64];
+    static __shared__ unsigned char smem_Bp_fgu64[2][K_STEP_T64 / 2][N_TILE_LG + BP_PAD];
+    static __shared__ unsigned char smem_Bs_fgu64[2][K_STEP_T64 / GROUP_SIZE][N_TILE_LG + BP_PAD];
     // B_fp8 row stride 80 bytes → zero smem bank conflicts (see K64_DEQUANT comment above).
-    __shared__ unsigned char smem_B_fp8_fgu64[N_TILE_LG][K_STEP_T64 + 16];
-    __shared__ float smem_LUT_fgu64[16];
-    __shared__ int smem_tok_fgu64[M_TILE];
+    static __shared__ unsigned char smem_B_fp8_fgu64[N_TILE_LG][K_STEP_T64 + 16];
+    static __shared__ float smem_LUT_fgu64[16];
+    static __shared__ int smem_tok_fgu64[M_TILE];
 
     if (threadIdx.x < 16) smem_LUT_fgu64[threadIdx.x] = E2M1_LUT_MOE[threadIdx.x];
     if (threadIdx.x < M_TILE) {
@@ -996,6 +999,64 @@ extern "C" __global__ void moe_w4a16_fused_gate_up_t_k64(
         if (r0v && c1 < N) C[r0*N+c1] = __float2bfloat16(acc[nt][1]);
         if (r1v && c0 < N) C[r1*N+c0] = __float2bfloat16(acc[nt][2]);
         if (r1v && c1 < N) C[r1*N+c1] = __float2bfloat16(acc[nt][3]);
+    }
+}
+
+extern "C" __global__ void moe_w4a16_fused_gate_up_t_k64(
+    const __nv_bfloat16* __restrict__ A,
+    const unsigned long long* __restrict__ gate_packed_ptrs,
+    const unsigned long long* __restrict__ gate_scale_ptrs,
+    const float* __restrict__ gate_scale2_vals,
+    const unsigned long long* __restrict__ up_packed_ptrs,
+    const unsigned long long* __restrict__ up_scale_ptrs,
+    const float* __restrict__ up_scale2_vals,
+    __nv_bfloat16* __restrict__ C_gate,
+    __nv_bfloat16* __restrict__ C_up,
+    const int* __restrict__ expert_offsets,
+    const int* __restrict__ sorted_token_ids,
+    unsigned int num_experts,
+    unsigned int N,
+    unsigned int K
+) {
+    moe_w4a16_fused_gate_up_t_k64_impl(
+        A, gate_packed_ptrs, gate_scale_ptrs, gate_scale2_vals, up_packed_ptrs,
+        up_scale_ptrs, up_scale2_vals, C_gate, C_up, expert_offsets,
+        sorted_token_ids, num_experts, N, K, blockIdx.z, blockIdx.y * M_TILE,
+        blockIdx.x * N_TILE_LG);
+}
+
+// Device-resident work-list counterpart of the K64 fused gate/up GEMM. Build
+// with `n_tiles = ceil(2 * N / 128)`: n-tiles [0, ceil(N/128)) select gate,
+// and the remaining tiles select up, exactly matching the dense launch.
+extern "C" __global__ void moe_w4a16_fused_gate_up_t_k64_worklist(
+    const __nv_bfloat16* __restrict__ A,
+    const unsigned long long* __restrict__ gate_packed_ptrs,
+    const unsigned long long* __restrict__ gate_scale_ptrs,
+    const float* __restrict__ gate_scale2_vals,
+    const unsigned long long* __restrict__ up_packed_ptrs,
+    const unsigned long long* __restrict__ up_scale_ptrs,
+    const float* __restrict__ up_scale2_vals,
+    __nv_bfloat16* __restrict__ C_gate,
+    __nv_bfloat16* __restrict__ C_up,
+    const int* __restrict__ expert_offsets,
+    const int* __restrict__ sorted_token_ids,
+    unsigned int num_experts,
+    unsigned int N,
+    unsigned int K,
+    const unsigned int* __restrict__ worklist,
+    const int* __restrict__ total_tiles
+) {
+    const int tile_count = total_tiles[0];
+    for (unsigned int work = blockIdx.x; work < static_cast<unsigned int>(tile_count);
+         work += gridDim.x) {
+        const unsigned int expert_id = worklist[work * 2];
+        const unsigned int packed_tile = worklist[work * 2 + 1];
+        const unsigned int cta_m_local = (packed_tile >> 6) * M_TILE;
+        const unsigned int global_n = (packed_tile & 63u) * N_TILE_LG;
+        moe_w4a16_fused_gate_up_t_k64_impl(
+            A, gate_packed_ptrs, gate_scale_ptrs, gate_scale2_vals, up_packed_ptrs,
+            up_scale_ptrs, up_scale2_vals, C_gate, C_up, expert_offsets,
+            sorted_token_ids, num_experts, N, K, expert_id, cta_m_local, global_n);
     }
 }
 
