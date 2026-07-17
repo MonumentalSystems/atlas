@@ -115,8 +115,9 @@ pub struct AttnMetadataDev {
     /// kernel skips the row); `>= 0` = fold the installed active adapter's
     /// per-expert delta on that row. Built by
     /// [`crate::lora::build_moe_row_adapter_decode`] and uploaded each decode
-    /// step to a stable address (the metadata `+160` gap), so the batched fold
-    /// stays inside the captured decode graph and is route-agnostic across
+    /// step to a stable address (a dedicated fixed-address buffer,
+    /// `TransformerModel::moe_row_adapter_buf`, alloc'd once at init), so the
+    /// batched fold stays inside the captured decode graph and is route-agnostic across
     /// replays (base rows no-op individually). `DevicePtr(0)` when no adapter is
     /// resident and on every non-batched path (the fold hooks then fall back to
     /// the request-granularity `moe_route_gate`). NOT the `seq_slot` buffer —

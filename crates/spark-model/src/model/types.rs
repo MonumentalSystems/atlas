@@ -234,6 +234,16 @@ pub struct TransformerModel {
     /// GPU buffer for ssm_state_clamp_norm_fused's pointer table `[num_ssm_layers]`.
     pub(super) ssm_norm_ptrs_buf: DevicePtr,
 
+    /// SOLID Incr-4: dedicated persistent GPU buffer for the batched-decode MoE
+    /// per-row fold map `[max_batch_size]` i32 (`< 0` = base skip, `>= 0` = fold
+    /// the active adapter). Allocated ONCE at init (fixed device address),
+    /// refreshed per decode step via copy_h2d_async — graph-capture-safe exactly
+    /// like the GDN buffers, and now DISTINCT from the old +160 metadata gap so
+    /// seq_slot@+128 reclaims its full +128..+256 range (concurrent-LoRA decode
+    /// cap 8 → 32). Always allocated (cheap, max_batch_size·4 B); never touched
+    /// when self.lora is None (upload_moe_row_adapter returns DevicePtr(0)).
+    pub(super) moe_row_adapter_buf: DevicePtr,
+
     // ── Two-phase SSM prefill buffers ──
     // These hold GDN inputs/outputs for the full sequence, allowing the GDN
     // recurrence to run in a single kernel launch while GEMM projections are

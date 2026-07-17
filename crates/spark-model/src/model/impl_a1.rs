@@ -269,6 +269,15 @@ impl TransformerModel {
         // EP command buffer for token broadcast (4 bytes, u32)
         let ep_cmd_buf = gpu.alloc(4)?;
 
+        // SOLID Incr-4: dedicated fixed-address buffer for the batched-decode MoE
+        // per-row fold map. max_batch_size i32 rows (e.g. 32·4 = 128 B). Allocated
+        // unconditionally like ep_cmd_buf/mtp_hidden_save — self.lora is populated
+        // post-construction (set_lora_weights), so we can't gate on it here, and
+        // the cost is negligible. Fixed address → graph-safe; contents copied per
+        // decode step. Moving the map off the +160 metadata gap frees seq_slot to
+        // reclaim +128..+256, lifting the concurrent-LoRA decode cap from 8 to 32.
+        let moe_row_adapter_buf = gpu.alloc(max_batch_size.max(1) * 4)?;
+
         // Secondary stream + event for pipelining checkpoint D2D with MTP propose.
         let secondary_stream = gpu.create_stream()?;
         let secondary_event = gpu.create_event()?;
@@ -524,6 +533,7 @@ impl TransformerModel {
             ssm_checkpoint_interval,
             ssm_state_norm_kernel: ssm_norm_k,
             ssm_norm_ptrs_buf: ssm_norm_ptrs,
+            moe_row_adapter_buf,
             gdn_buf_qkv: gdn_qkv,
             gdn_buf_gate_beta: gdn_gate_beta,
             gdn_buf_out: gdn_out,

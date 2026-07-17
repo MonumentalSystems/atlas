@@ -135,3 +135,27 @@ fn decode_map_padding_widths() {
         assert!(map[1..].iter().all(|&v| v == -1));
     }
 }
+
+#[test]
+fn decode_map_mixed_batch_16_exact() {
+    // SOLID Incr-4 cap 8 → 32: with moe_row_adapter relocated to its own buffer,
+    // batch 16 folds cleanly. active adapter = slot 2. Interleave active/base
+    // rows (13 real + 3 pad → padded_n 16). Active rows carry 2 (>=0 => fold);
+    // base rows AND pad rows carry -1 (per-row skip stays exact — base rows in a
+    // mixed batch must NOT fold the adapter).
+    let slots = [2, -1, 2, 2, -1, -1, 2, -1, 2, 2, -1, 2, -1];
+    let map = build_moe_row_adapter_decode(&slots, 16, 2, true);
+    let expect = vec![2, -1, 2, 2, -1, -1, 2, -1, 2, 2, -1, 2, -1, -1, -1, -1];
+    assert_eq!(map, expect);
+    assert_eq!(map.len(), 16);
+}
+
+#[test]
+fn decode_map_full_cap_32_all_active() {
+    // At the new cap (padded_n = 32) every real row folds; the builder produces
+    // a full-width [32] map with no collision (the +160-gap squat is gone).
+    let slots = [0i32; 32];
+    let map = build_moe_row_adapter_decode(&slots, 32, 0, true);
+    assert_eq!(map, vec![0i32; 32]);
+    assert_eq!(map.len(), 32);
+}
