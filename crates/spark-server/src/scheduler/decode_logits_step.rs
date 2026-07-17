@@ -134,23 +134,52 @@ pub fn process_decode_logits(
                 tool_call_end_token,
             };
             let t_sample = std::time::Instant::now();
-            let sampled: Vec<(u32, Option<crate::api::TokenLogprobs>)> = active
-                .iter_mut()
-                .enumerate()
-                .map(|(i, a)| {
-                    process_seq_logits(
-                        model,
-                        a,
-                        &buf,
-                        i,
-                        vocab_size,
-                        elem_bytes,
-                        logits_fp32,
-                        &ctx,
-                        adaptive_sampling,
-                    )
-                })
-                .collect();
+            // Per-sequence host sampling is independent: each call reads a
+            // disjoint `buf` slice, mutates its own `ActiveSeq`, uses a
+            // per-thread `SEQ_F32_SCRATCH`, and advances a per-seq seed. The
+            // collect is order-preserving, so the emitted tokens are identical
+            // to the serial path. (Process-global sampler telemetry —
+            // `sampler::LAST_ENTROPY`, the AdaDec/B1 diagnostics — is
+            // synchronized but last-write-wins across workers, so those
+            // best-effort gauges may report an arbitrary in-step sequence's
+            // value under n>1; token output is unaffected.) Each
+            // call scans the full ~250k vocab (BF16→FP32 expand + penalties +
+            // argmax), the dominant host-path cost at n>=2. Fan out across the
+            // rayon pool ONLY for n>1: at n=1 (the common single-stream /
+            // opencode host path) the serial path avoids rayon's dispatch
+            // overhead. `process_seq_logits` touches no GPU state (its `_model`
+            // arg is unused), so no CUDA calls cross threads. The parallel path
+            // is also gated off when the opt-in `ATLAS_LOGIT_DUMP` diagnostic is
+            // active, since its shared per-step record would interleave across
+            // workers.
+            let parallel_sample = n > 1 && !super::logit_dump::enabled();
+            let sample_one = |i: usize, a: &mut ActiveSeq| {
+                process_seq_logits(
+                    model,
+                    a,
+                    &buf,
+                    i,
+                    vocab_size,
+                    elem_bytes,
+                    logits_fp32,
+                    &ctx,
+                    adaptive_sampling,
+                )
+            };
+            let sampled: Vec<(u32, Option<crate::api::TokenLogprobs>)> = if parallel_sample {
+                use rayon::prelude::*;
+                active
+                    .par_iter_mut()
+                    .enumerate()
+                    .map(|(i, a)| sample_one(i, a))
+                    .collect()
+            } else {
+                active
+                    .iter_mut()
+                    .enumerate()
+                    .map(|(i, a)| sample_one(i, a))
+                    .collect()
+            };
             decode_timing_record(copy_us, t_sample.elapsed().as_micros() as u64);
             // Return the staging buffer for reuse next token (its capacity is
             // preserved). The error path above intentionally drops it — that is
