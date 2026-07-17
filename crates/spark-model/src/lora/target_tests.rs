@@ -40,7 +40,8 @@ fn expert_layer_adapted_experts_sorted_deduped() {
         .insert((5, ExpertProj::Gate), dummy_pair(1, 2048, 512));
     el.pairs
         .insert((5, ExpertProj::Down), dummy_pair(2, 512, 2048));
-    el.pairs.insert((2, ExpertProj::Up), dummy_pair(3, 2048, 512));
+    el.pairs
+        .insert((2, ExpertProj::Up), dummy_pair(3, 2048, 512));
     assert_eq!(el.adapted_experts(), vec![2, 5]);
     assert_eq!(el.pair(5, ExpertProj::Gate).map(|p| p.a.weight.0), Some(1));
     assert!(el.pair(5, ExpertProj::Up).is_none());

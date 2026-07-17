@@ -13,6 +13,8 @@
 
 #[path = "ops/activations.rs"]
 mod activations;
+#[path = "ops/b12x_flashinfer.rs"]
+pub mod b12x_flashinfer;
 #[path = "ops/dispatch_helpers.rs"]
 mod dispatch_helpers;
 #[path = "ops/dispatch_proj.rs"]
@@ -49,7 +51,8 @@ mod kv_cache_fp8k;
 mod kv_cache_turbok;
 #[path = "ops/lora_delta.rs"]
 pub mod lora_delta;
-pub mod token_overlay;
+#[path = "ops/marlin_moe.rs"]
+pub mod marlin_moe;
 #[path = "ops/moe_atomic_c4.rs"]
 mod moe_atomic_c4;
 #[path = "ops/moe_expert.rs"]
@@ -106,6 +109,7 @@ mod ssm_mamba;
 mod ssm_preproc;
 #[path = "ops/ssm_ssd.rs"]
 mod ssm_ssd;
+pub mod token_overlay;
 
 pub use activations::*;
 pub use dispatch_helpers::*;

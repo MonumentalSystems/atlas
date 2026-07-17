@@ -179,7 +179,19 @@ impl Qwen3SsmLayer {
                 // overhead per layer dominates at small N. The real fix for
                 // this launch overhead is CUDA graphs for n>=2, not MoE
                 // batching (graphs capture these per-token launches for free).
-                if std::env::var("ATLAS_MOE_GROUPED_DECODE").ok().as_deref() == Some("1") {
+                if self.ffn.try_marlin_decode(normed_base, n, ctx, stream)?
+                    || self.ffn.try_b12x_decode(normed_base, n, ctx, stream)?
+                {
+                    let moe_out = ctx.buffers.moe_output();
+                    ops::residual_add(
+                        ctx.gpu,
+                        self.residual_add_k,
+                        hidden,
+                        moe_out,
+                        (n * h) as u32,
+                        stream,
+                    )?;
+                } else if std::env::var("ATLAS_MOE_GROUPED_DECODE").ok().as_deref() == Some("1") {
                     // Grouped-GEMM MoE over all N tokens (each expert read once).
                     // Only sensible under CUDA graphs, where the sort/permute
                     // launch overhead that made this a loss is captured for free.

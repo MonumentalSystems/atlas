@@ -169,7 +169,10 @@ impl TransformerModel {
         let lora_eager = self.lora.is_some() && crate::lora::lora_eager_env();
         let use_graphs = !ms_profile
             && !lora_eager
-            && std::env::var("ATLAS_DECODE_GRAPHS_MULTISEQ").ok().as_deref() == Some("1");
+            && std::env::var("ATLAS_DECODE_GRAPHS_MULTISEQ")
+                .ok()
+                .as_deref()
+                == Some("1");
 
         // Graph key / capture bucket (must stay stable across replays).
         let padded_n = [2, 4, 8].iter().copied().find(|&s| s >= n).unwrap_or(n);
@@ -177,7 +180,11 @@ impl TransformerModel {
         // Eager (graphs off, single-rank) runs EXACTLY n lanes, dropping wasted
         // compute on dummy padded lanes at C=3,5,6,7. EP/graphs keep padded_n
         // (EP: per-token NCCL all_reduce count must match across ranks).
-        let eff_n = if !use_graphs && self.comm.is_none() { n } else { padded_n };
+        let eff_n = if !use_graphs && self.comm.is_none() {
+            n
+        } else {
+            padded_n
+        };
 
         // ── Phase 1: Pre-graph (runs every step, NOT captured) ──
 

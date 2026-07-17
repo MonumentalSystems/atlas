@@ -507,6 +507,9 @@ pub fn run(
             let dflash_spec_think = *DFLASH_SPEC_THINK.get_or_init(|| {
                 std::env::var("ATLAS_DFLASH_SPEC_THINK").ok().as_deref() == Some("1")
             });
+            let mtp_batch_enabled = std::env::var("ATLAS_MTP_BATCH_VERIFY")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
             if use_ngram_speculative && active.len() == 1 && active[0].grammar_state.is_none() {
                 // N-gram speculative: CPU proposer + CUDA-graphed K=2 verify.
                 if let Some(ref mut proposer) = ngram_proposer {
@@ -517,112 +520,31 @@ pub fn run(
                 // Self-speculative: draft via layer-skipping, verify with full model.
                 step_self_spec(&*model, &mut active, num_drafts, &verify_ctx);
             } else if use_mtp
-                && active.len() == 1
-                && (
-                    // SPEC_THINK: speculate everywhere EXCEPT the first
-                    // `dflash_resume_guard` generated tokens — every observed
-                    // T=0 flip (2026-07-07/08) fires within ~7 tokens of spec
-                    // ENTRY (sequence start or post-think resume); serial-
-                    // decoding the entry window dodges the divergence while
-                    // leaving the body speculated.
-                    (dflash_spec_think
-                        && active[0].output_tokens.len() as u32 >= dflash_resume_guard)
-                        || (!active[0].inside_thinking
-                            && active[0].post_think_emitted >= dflash_resume_guard)
-                )
-                && !active[0].suppress_tool_call
-                && !active[0].disable_mtp
+                && ((active.len() == 1
+                    && (
+                        // SPEC_THINK: speculate everywhere EXCEPT the first
+                        // `dflash_resume_guard` generated tokens — every observed
+                        // T=0 flip (2026-07-07/08) fires within ~7 tokens of spec
+                        // ENTRY (sequence start or post-think resume); serial-
+                        // decoding the entry window dodges the divergence while
+                        // leaving the body speculated.
+                        (dflash_spec_think
+                            && active[0].output_tokens.len() as u32 >= dflash_resume_guard)
+                            || (!active[0].inside_thinking
+                                && active[0].post_think_emitted >= dflash_resume_guard)
+                    )
+                    && !active[0].suppress_tool_call
+                    && !active[0].disable_mtp)
+                    || (mtp_batch_enabled
+                        && active.len() > 1
+                        && active.iter().all(|a| {
+                            !a.inside_thinking
+                                && a.post_think_emitted >= dflash_resume_guard
+                                && !a.suppress_tool_call
+                                && !a.disable_mtp
+                        })))
             {
-                // Throughput-aware MTP gate: while still measuring, run the
-                // step type the gate asks for and time it. Both step types emit
-                // real, correct tokens (MTP verify and plain decode are greedy-
-                // equivalent), so the measurement window does not waste work.
-                //
-                // The verify/decode multiplier is DEPTH-DEPENDENT (weight-bound
-                // at short context vs KV/SSM-bound at depth — see mtp_gate module
-                // docs), so a decision is only valid for the regime it was
-                // measured in: re-open measurement when the live depth leaves it.
-                if let Some(gate) = mtp_gate.as_mut() {
-                    gate.maybe_remeasure(active[0].seq.seq_len);
-                }
-                if let Some(gate) = mtp_gate.as_mut().filter(|g| g.is_measuring()) {
-                    gate.note_depth(active[0].seq.seq_len);
-                    match gate.next_step() {
-                        mtp_gate::GateStep::MeasureDecode => {
-                            let t0 = std::time::Instant::now();
-                            step_decode_only(
-                                &*model,
-                                &mut active,
-                                think_end_token,
-                                think_start_token,
-                                code_fence_token,
-                                tool_call_start_token,
-                                tool_call_end_token,
-                                adaptive_sampling,
-                            );
-                            mtp_gate
-                                .as_mut()
-                                .expect("gate present")
-                                .record_decode(t0.elapsed());
-                        }
-                        mtp_gate::GateStep::MeasureVerify => {
-                            // Only a true verify forward (drafts already
-                            // proposed) is a representative sample; a bootstrap-
-                            // only step proposes the first draft and is skipped.
-                            let had_draft = !active[0].pending_drafts.is_empty();
-                            let t0 = std::time::Instant::now();
-                            step_mtp(
-                                &*model,
-                                &mut active,
-                                num_drafts,
-                                &verify_ctx,
-                                dflash_verify_raw_argmax,
-                            );
-                            if had_draft {
-                                mtp_gate
-                                    .as_mut()
-                                    .expect("gate present")
-                                    .record_verify(t0.elapsed());
-                            }
-                        }
-                    }
-                    // One-time transition work for a freshly-reached DISABLE:
-                    // drop pending drafts and order the draft-head state resync
-                    // before the next plain decode reads it. NOT permanent —
-                    // `maybe_remeasure` above re-opens measurement when the
-                    // depth regime changes, so MTP can come back exactly where
-                    // it pays (deep agentic contexts).
-                    if mtp_gate
-                        .as_mut()
-                        .and_then(mtp_gate::MtpGate::take_fresh_decision)
-                        == Some(mtp_gate::GateDecision::DisableMtp)
-                    {
-                        for a in active.iter_mut() {
-                            a.pending_drafts.clear();
-                        }
-                        if let Err(e) = model.sync_secondary() {
-                            tracing::error!("mtp-gate→decode sync_secondary: {e:#}");
-                        }
-                    }
-                } else if mtp_gate
-                    .as_ref()
-                    .is_some_and(|g| g.decision() == Some(mtp_gate::GateDecision::DisableMtp))
-                {
-                    // Measured net-negative in the CURRENT depth regime: plain
-                    // decode. Consulted every step (not a latched kill switch)
-                    // so the regime re-measurement above can flip it back.
-                    step_decode_only(
-                        &*model,
-                        &mut active,
-                        think_end_token,
-                        think_start_token,
-                        code_fence_token,
-                        tool_call_start_token,
-                        tool_call_end_token,
-                        adaptive_sampling,
-                    );
-                } else {
-                    // MTP wins in this regime (or no gate): speculative decode.
+                if active.len() > 1 {
                     step_mtp(
                         &*model,
                         &mut active,
@@ -630,6 +552,105 @@ pub fn run(
                         &verify_ctx,
                         dflash_verify_raw_argmax,
                     );
+                } else {
+                    // Throughput-aware MTP gate: while still measuring, run the
+                    // step type the gate asks for and time it. Both step types emit
+                    // real, correct tokens (MTP verify and plain decode are greedy-
+                    // equivalent), so the measurement window does not waste work.
+                    //
+                    // The verify/decode multiplier is DEPTH-DEPENDENT (weight-bound
+                    // at short context vs KV/SSM-bound at depth — see mtp_gate module
+                    // docs), so a decision is only valid for the regime it was
+                    // measured in: re-open measurement when the live depth leaves it.
+                    if let Some(gate) = mtp_gate.as_mut() {
+                        gate.maybe_remeasure(active[0].seq.seq_len);
+                    }
+                    if let Some(gate) = mtp_gate.as_mut().filter(|g| g.is_measuring()) {
+                        gate.note_depth(active[0].seq.seq_len);
+                        match gate.next_step() {
+                            mtp_gate::GateStep::MeasureDecode => {
+                                let t0 = std::time::Instant::now();
+                                step_decode_only(
+                                    &*model,
+                                    &mut active,
+                                    think_end_token,
+                                    think_start_token,
+                                    code_fence_token,
+                                    tool_call_start_token,
+                                    tool_call_end_token,
+                                    adaptive_sampling,
+                                );
+                                mtp_gate
+                                    .as_mut()
+                                    .expect("gate present")
+                                    .record_decode(t0.elapsed());
+                            }
+                            mtp_gate::GateStep::MeasureVerify => {
+                                // Only a true verify forward (drafts already
+                                // proposed) is a representative sample; a bootstrap-
+                                // only step proposes the first draft and is skipped.
+                                let had_draft = !active[0].pending_drafts.is_empty();
+                                let t0 = std::time::Instant::now();
+                                step_mtp(
+                                    &*model,
+                                    &mut active,
+                                    num_drafts,
+                                    &verify_ctx,
+                                    dflash_verify_raw_argmax,
+                                );
+                                if had_draft {
+                                    mtp_gate
+                                        .as_mut()
+                                        .expect("gate present")
+                                        .record_verify(t0.elapsed());
+                                }
+                            }
+                        }
+                        // One-time transition work for a freshly-reached DISABLE:
+                        // drop pending drafts and order the draft-head state resync
+                        // before the next plain decode reads it. NOT permanent —
+                        // `maybe_remeasure` above re-opens measurement when the
+                        // depth regime changes, so MTP can come back exactly where
+                        // it pays (deep agentic contexts).
+                        if mtp_gate
+                            .as_mut()
+                            .and_then(mtp_gate::MtpGate::take_fresh_decision)
+                            == Some(mtp_gate::GateDecision::DisableMtp)
+                        {
+                            for a in active.iter_mut() {
+                                a.pending_drafts.clear();
+                            }
+                            if let Err(e) = model.sync_secondary() {
+                                tracing::error!("mtp-gate→decode sync_secondary: {e:#}");
+                            }
+                        }
+                    } else if mtp_gate
+                        .as_ref()
+                        .is_some_and(|g| g.decision() == Some(mtp_gate::GateDecision::DisableMtp))
+                    {
+                        // Measured net-negative in the CURRENT depth regime: plain
+                        // decode. Consulted every step (not a latched kill switch)
+                        // so the regime re-measurement above can flip it back.
+                        step_decode_only(
+                            &*model,
+                            &mut active,
+                            think_end_token,
+                            think_start_token,
+                            code_fence_token,
+                            tool_call_start_token,
+                            tool_call_end_token,
+                            adaptive_sampling,
+                        );
+                    } else {
+                        // MTP wins in this regime (or no gate): speculative decode.
+                        step_mtp(
+                            &*model,
+                            &mut active,
+                            num_drafts,
+                            &verify_ctx,
+                            dflash_verify_raw_argmax,
+                        );
+                    }
                 }
             } else {
                 // Batch decode (no MTP). Clear stale drafts when transitioning out of MTP mode.

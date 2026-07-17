@@ -61,6 +61,12 @@ impl MoeLayer {
             pre_expert_norm_k: rms_norm_k,
             dense_gemv: gpu.kernel("gemv", "dense_gemv_bf16")?,
             w4a16_gemv: gpu.kernel("w4a16_gemv", "w4a16_gemv")?,
+            w4a16_gemv_batch16: super::super::try_kernel(gpu, "w4a16_gemv", "w4a16_gemv_batch16"),
+            w4a16_gemm_router_m16n8: super::super::try_kernel(
+                gpu,
+                "w4a16",
+                "w4a16_gemm_router_m16n8",
+            ),
             w4a16_gemm: gpu.kernel("w4a16", "w4a16_gemm")?,
             dense_gemm: gpu.kernel("gemm", "dense_gemm_bf16")?,
             // FP32 gate path (ATLAS_FP32_GATE) — optional; KernelHandle(0) if the
@@ -405,6 +411,9 @@ impl MoeLayer {
             moe_permute_tokens_k: super::super::try_kernel(gpu, "moe", "moe_permute_tokens"),
             // Phase 2.7 Tier C — set by loader after construction (qwen35.rs).
             is_dflash_capture_layer: false,
+            // Built later by the Qwen3.6 loader once transposed scale tables exist.
+            b12x: None,
+            marlin: None,
             lora: None,
             correction_bias_dev: weights_correction_bias,
             // `moe_topk_sig` is only registered for sigmoid-gated MoE models

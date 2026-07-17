@@ -81,6 +81,7 @@ pub(super) fn run_batched_mixed_step(
                 chunk_start: p.chunk_offset,
                 chunk_len: chunk_lens[i],
                 is_last_chunk: is_last_flags[i],
+                logits_rows: 1,
             })
             .collect();
         model.mixed_forward_batch(

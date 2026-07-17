@@ -67,15 +67,27 @@ pub(crate) fn audit_adapter(
         match target {
             LoraTarget::Attn(module) => {
                 let entry = found.entry((layer, module)).or_default();
-                set_ab(&mut entry[ab as usize], name, &format!("layer {layer} {module:?}"))?;
+                set_ab(
+                    &mut entry[ab as usize],
+                    name,
+                    &format!("layer {layer} {module:?}"),
+                )?;
             }
             LoraTarget::Router => {
                 let entry = router.entry(layer).or_default();
-                set_ab(&mut entry[ab as usize], name, &format!("layer {layer} router"))?;
+                set_ab(
+                    &mut entry[ab as usize],
+                    name,
+                    &format!("layer {layer} router"),
+                )?;
             }
             LoraTarget::Expert { n, proj } => {
                 let entry = experts.entry((layer, n, proj)).or_default();
-                set_ab(&mut entry[ab as usize], name, &format!("layer {layer} expert {n} {proj:?}"))?;
+                set_ab(
+                    &mut entry[ab as usize],
+                    name,
+                    &format!("layer {layer} expert {n} {proj:?}"),
+                )?;
             }
         }
     }
@@ -90,7 +102,9 @@ pub(crate) fn audit_adapter(
     // 2) attention pair completeness + shape audit. PEFT: A=[r, in], B=[out, r].
     for ((layer, module), pair) in &found {
         let [Some(a_key), Some(b_key)] = pair else {
-            bail!("REJECT[unpaired-tensor]: layer {layer} {module:?} has only one of lora_A/lora_B");
+            bail!(
+                "REJECT[unpaired-tensor]: layer {layer} {module:?} has only one of lora_A/lora_B"
+            );
         };
         let (out_dim, in_dim) = module.dims(cfg);
         let a = adapter_store.get(a_key)?; // hard-fail get
@@ -98,13 +112,17 @@ pub(crate) fn audit_adapter(
         if a.shape != vec![peft.r, in_dim] {
             bail!(
                 "REJECT[shape-mismatch]: '{a_key}' is {:?}, expected [{}, {}] (r, in_dim)",
-                a.shape, peft.r, in_dim
+                a.shape,
+                peft.r,
+                in_dim
             );
         }
         if b.shape != vec![out_dim, peft.r] {
             bail!(
                 "REJECT[shape-mismatch]: '{b_key}' is {:?}, expected [{}, {}] (out_dim, r)",
-                b.shape, out_dim, peft.r
+                b.shape,
+                out_dim,
+                peft.r
             );
         }
     }
@@ -129,5 +147,10 @@ pub(crate) fn audit_adapter(
             );
         }
     }
-    Ok(AuditedAdapter { attn: found, router, experts, overlay })
+    Ok(AuditedAdapter {
+        attn: found,
+        router,
+        experts,
+        overlay,
+    })
 }

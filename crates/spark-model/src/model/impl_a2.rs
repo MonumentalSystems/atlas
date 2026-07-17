@@ -76,11 +76,20 @@ impl TransformerModel {
 
         let meta = seq.chunked_prefill_meta.as_mut().unwrap();
         if meta.block_capacity < required_blocks {
-            bail!(
-                "chunked prefill metadata capacity {} < required {} blocks",
-                meta.block_capacity,
-                required_blocks,
-            );
+            // Decode-time continuation prefill (batched K=4 verify) extends a
+            // sequence beyond the prompt-sized table allocated at prefill. The
+            // table is host-owned metadata: after growth the next upload writes
+            // the complete current block table, so no device-side contents need
+            // to be preserved. Grow geometrically to avoid reallocating every
+            // few speculative steps on a long generation.
+            let new_capacity = required_blocks
+                .max(meta.block_capacity.saturating_mul(2))
+                .max(1);
+            let new_table = self.gpu.alloc(new_capacity * std::mem::size_of::<u32>())?;
+            self.gpu.free(meta.block_table)?;
+            meta.block_table = new_table;
+            meta.block_capacity = new_capacity;
+            meta.uploaded_blocks = 0;
         }
         Ok(meta)
     }

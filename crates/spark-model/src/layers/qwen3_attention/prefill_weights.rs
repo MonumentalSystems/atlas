@@ -185,9 +185,7 @@ impl Qwen3AttentionLayer {
         if let Some(crate::layers::FfnComponent::Moe(m)) = &mut self.moe_ffn {
             return m.set_lora_weights(router, experts, kernels, gpu);
         }
-        anyhow::bail!(
-            "LoRA: router/expert deltas installed on a layer with no MoE FFN component"
-        )
+        anyhow::bail!("LoRA: router/expert deltas installed on a layer with no MoE FFN component")
     }
 
     /// Transpose FP8 weights for fast prefill (`w8a16_gemm_t`: coalesced

@@ -349,6 +349,16 @@ pub(super) fn load_layers(
             moe_layer.build_cutlass_grouped_sfb(gpu, config, stream)?;
         }
 
+        // FlashInfer b12x fused MoE uses the same fully-resident transposed tables
+        // to build its contiguous NVFP4 weights. Keep it explicit until decode A/B
+        // proves the dynamic kernel is a win at C=4/C=8.
+        if std::env::var("ATLAS_MOE_B12X").ok().as_deref() == Some("1") {
+            moe_layer.build_b12x_weights(gpu, config, stream)?;
+        }
+        if std::env::var("ATLAS_MOE_MARLIN").ok().as_deref() == Some("1") {
+            moe_layer.build_marlin_weights(gpu, config, stream)?;
+        }
+
         // ATLAS_FP8_DEQUANT_MOE_TO_BF16: dequant FP8 experts to BF16 at load,
         // route MoE through the BF16 grouped GEMM + fused-decode kernels.
         // Eliminates the per-layer 0.989 FP8 cosine ceiling. Memory cost:

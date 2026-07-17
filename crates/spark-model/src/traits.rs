@@ -40,6 +40,9 @@ pub struct PrefillSlice<'a> {
     /// Whether this is the final chunk for this stream (controls whether
     /// the model emits last-token logits for sampling).
     pub is_last_chunk: bool,
+    /// Number of trailing chunk rows whose logits the caller needs. Ordinary
+    /// prefill uses one; speculative verification uses K candidate rows.
+    pub logits_rows: usize,
 }
 
 /// Result of a fully-batched mixed forward pass: M decode tokens + N prefill

@@ -164,7 +164,19 @@ impl Qwen3AttentionLayer {
             // dominates). Each forward() writes moe_output[0]; consume it
             // immediately before the next iteration overwrites it.
             let normed_base = fwd.buffers.norm_output();
-            if std::env::var("ATLAS_MOE_BATCHED_DECODE").ok().as_deref() == Some("1") {
+            if self.ffn.try_marlin_decode(normed_base, n, fwd, stream)?
+                || self.ffn.try_b12x_decode(normed_base, n, fwd, stream)?
+            {
+                let moe_out = fwd.buffers.moe_output();
+                ops::residual_add(
+                    fwd.gpu,
+                    self.residual_add_k,
+                    hidden,
+                    moe_out,
+                    (n * h) as u32,
+                    stream,
+                )?;
+            } else if std::env::var("ATLAS_MOE_BATCHED_DECODE").ok().as_deref() == Some("1") {
                 // Batched MoE decode over all N tokens (mirrors the SSM multi-seq
                 // path): the routed per-token expert kernels run under one call so
                 // the Feature-1 LoRA fold (which the per-token `forward` refuses

@@ -151,7 +151,17 @@ impl MoeLayer {
         // e.g. Qwen3-VL-30B which has no shared_expert_intermediate_size).
         // Launching kernels with N=0 produces CUDA_ERROR_INVALID_VALUE (grid.x=0).
         let has_shared = shared_inter > 0;
-        let use_overlap = false; // disabled: dual-stream contention worsens LPDDR5X bandwidth
+        // The Marlin C=4..8 route owns a layer-local W13 output buffer, so it
+        // can safely overlap the shared expert with routed work. Marlin itself
+        // remains opt-in; this overlap can be disabled for A/B with
+        // `ATLAS_MOE_MARLIN_SHARED_OVERLAP=0`.
+        let use_overlap = !ctx.profile
+            && self.marlin.is_some()
+            && (4..=8).contains(&num_tokens)
+            && std::env::var("ATLAS_MOE_MARLIN_SHARED_OVERLAP")
+                .ok()
+                .as_deref()
+                != Some("0");
         let aux = if use_overlap {
             self.prefill_stream
         } else {
@@ -192,17 +202,55 @@ impl MoeLayer {
                 stream,
             )?;
         } else if let Some(ref nvfp4) = self.gate_nvfp4 {
-            ops::w4a16_gemm(
-                ctx.gpu,
-                self.w4a16_gemm,
-                router_in,
-                nvfp4,
-                gate_logits,
-                n,
-                num_experts,
-                h,
-                stream,
-            )?;
+            let use_marlin_gate_mma = self.marlin.is_some()
+                && self.w4a16_gemm_router_m16n8.0 != 0
+                && (4..=8).contains(&num_tokens)
+                && std::env::var("ATLAS_MOE_MARLIN_GATE_MMA").ok().as_deref() == Some("1");
+            // At C=4..8 the generic W4A16 GEMM launches four 64-row tiles
+            // for only a handful of router rows. This weight-stationary GEMV
+            // computes all rows per load instead. Keep the path independently
+            // gated until exact greedy output has been checked against GEMM.
+            let use_marlin_gate_gemv = self.marlin.is_some()
+                && self.w4a16_gemv_batch16.0 != 0
+                && (4..=8).contains(&num_tokens)
+                && std::env::var("ATLAS_MOE_MARLIN_GATE_GEMV").ok().as_deref() == Some("1");
+            if use_marlin_gate_mma {
+                ops::w4a16_gemm_router_m16n8(
+                    ctx.gpu,
+                    self.w4a16_gemm_router_m16n8,
+                    router_in,
+                    nvfp4,
+                    gate_logits,
+                    n,
+                    num_experts,
+                    h,
+                    stream,
+                )?;
+            } else if use_marlin_gate_gemv {
+                ops::w4a16_gemv_batchm(
+                    ctx.gpu,
+                    self.w4a16_gemv_batch16,
+                    router_in,
+                    nvfp4,
+                    gate_logits,
+                    n,
+                    num_experts,
+                    h,
+                    stream,
+                )?;
+            } else {
+                ops::w4a16_gemm(
+                    ctx.gpu,
+                    self.w4a16_gemm,
+                    router_in,
+                    nvfp4,
+                    gate_logits,
+                    n,
+                    num_experts,
+                    h,
+                    stream,
+                )?;
+            }
         } else {
             ops::dense_gemm(
                 ctx.gpu,
@@ -306,107 +354,129 @@ impl MoeLayer {
         super::dump::dump_expert_ids(ctx.gpu, stream, indices_dev, weights_dev, n, top_k)?;
         prof_step!("topk");
 
-        // 3. Sort tokens by expert → L2-optimized ordering.
-        let te = total_expanded as usize;
-        let ne = num_experts as usize;
-        let sorted_token_ids = gate_logits;
-        let sorted_expert_ids = gate_logits.offset(te * 4);
-        let expert_offsets = gate_logits.offset(te * 4 * 2);
-        let token_to_perm = gate_logits.offset(te * 4 * 2 + (ne + 1) * 4);
-        ops::moe_sort_by_expert(
-            ctx.gpu,
-            self.moe_sort_by_expert,
-            indices_dev,
-            sorted_token_ids,
-            sorted_expert_ids,
-            expert_offsets,
-            token_to_perm,
-            total_expanded,
-            num_experts,
-            top_k,
-            stream,
-        )?;
-        prof_step!("sort");
-
-        // 3.5. Pre-expert norm: norm the input for expert dispatch (Gemma-4 26B).
-        // Router already used the raw input for routing; now norm for experts.
-        // IMPORTANT: write to scratch (ssm_deinterleaved), NOT in-place — `input` is
-        // the residual and must be preserved for the subsequent residual add.
-        let expert_input = if let Some(ref norm_w) = self.pre_expert_norm {
-            let normed_buf = ctx.buffers.ssm_deinterleaved();
-            let n_tokens = num_tokens as u32;
-            let eps = ctx.config.rms_norm_eps as f32;
-            ops::rms_norm(
-                ctx.gpu,
-                self.pre_expert_norm_k,
+        let output = ctx.buffers.moe_output();
+        let used_marlin =
+            self.try_marlin_prefill(input, indices_dev, weights_dev, output, n, ctx, stream)?;
+        let used_b12x = if used_marlin {
+            false
+        } else {
+            self.try_b12x_prefill(
                 input,
-                norm_w,
-                normed_buf,
-                n_tokens,
-                h,
-                eps,
+                indices_dev,
+                weights_dev,
+                output,
+                n,
+                num_tokens,
+                ctx,
+                stream,
+            )?
+        };
+        if used_marlin {
+            prof_step!("marlin_moe");
+        } else if used_b12x {
+            prof_step!("b12x_moe");
+        } else {
+            // 3. Sort tokens by expert → L2-optimized ordering.
+            let te = total_expanded as usize;
+            let ne = num_experts as usize;
+            let sorted_token_ids = gate_logits;
+            let sorted_expert_ids = gate_logits.offset(te * 4);
+            let expert_offsets = gate_logits.offset(te * 4 * 2);
+            let token_to_perm = gate_logits.offset(te * 4 * 2 + (ne + 1) * 4);
+            ops::moe_sort_by_expert(
+                ctx.gpu,
+                self.moe_sort_by_expert,
+                indices_dev,
+                sorted_token_ids,
+                sorted_expert_ids,
+                expert_offsets,
+                token_to_perm,
+                total_expanded,
+                num_experts,
+                top_k,
                 stream,
             )?;
-            normed_buf
-        } else {
-            input
-        };
-        prof_step!("pre_expert_norm");
+            prof_step!("sort");
 
-        // 4-6. Routed grouped-GEMM phase (grid sizing → grouped gate+up
-        // GEMM → SiLU → grouped down GEMM). Hoisted to forward_prefill_routed.rs
-        // to keep this file under the 500 LoC cap; behavior identical.
-        self.run_routed_grouped_gemm(
-            expert_input,
-            expert_offsets,
-            sorted_token_ids,
-            n,
-            h,
-            inter,
-            num_experts,
-            top_k,
-            num_tokens,
-            ne,
-            &mut t0,
-            ctx,
-            stream,
-        )?;
-        let expert_down_out = ctx.buffers.expert_down_out();
+            // 3.5. Pre-expert norm: norm the input for expert dispatch (Gemma-4 26B).
+            // Router already used the raw input for routing; now norm for experts.
+            // IMPORTANT: write to scratch (ssm_deinterleaved), NOT in-place — `input` is
+            // the residual and must be preserved for the subsequent residual add.
+            let expert_input = if let Some(ref norm_w) = self.pre_expert_norm {
+                let normed_buf = ctx.buffers.ssm_deinterleaved();
+                let n_tokens = num_tokens as u32;
+                let eps = ctx.config.rms_norm_eps as f32;
+                ops::rms_norm(
+                    ctx.gpu,
+                    self.pre_expert_norm_k,
+                    input,
+                    norm_w,
+                    normed_buf,
+                    n_tokens,
+                    h,
+                    eps,
+                    stream,
+                )?;
+                normed_buf
+            } else {
+                input
+            };
+            prof_step!("pre_expert_norm");
 
-        // Feature-1: fold the routed-expert down_proj LoRA deltas onto the sorted
-        // `expert_down_out` BEFORE the unpermute + weighted reduce, so the router
-        // weight multiplies base+delta (PEFT semantics). x = the post-SiLU sorted
-        // activations. No-op unless routed-expert deltas are installed.
-        self.apply_expert_lora_prefill_down(
-            ctx.buffers.expert_gate_out(),
-            expert_down_out,
-            expert_offsets,
-            sorted_token_ids,
-            total_expanded,
-            ctx,
-            stream,
-        )?;
+            // 4-6. Routed grouped-GEMM phase (grid sizing → grouped gate+up
+            // GEMM → SiLU → grouped down GEMM). Hoisted to forward_prefill_routed.rs
+            // to keep this file under the 500 LoC cap; behavior identical.
+            self.run_routed_grouped_gemm(
+                expert_input,
+                expert_offsets,
+                sorted_token_ids,
+                n,
+                h,
+                inter,
+                num_experts,
+                top_k,
+                num_tokens,
+                ne,
+                &mut t0,
+                ctx,
+                stream,
+            )?;
+            let expert_down_out = ctx.buffers.expert_down_out();
 
-        // 7. Unpermute + weighted reduce: scatter sorted outputs to token order
-        let output = ctx.buffers.moe_output();
-        ops::moe_unpermute_reduce_indexed(
-            ctx.gpu,
-            self.moe_unpermute_reduce,
-            expert_down_out,
-            output,
-            token_to_perm,
-            weights_dev,
-            h,
-            n,
-            top_k,
-            stream,
-        )?;
+            // Feature-1: fold the routed-expert down_proj LoRA deltas onto the sorted
+            // `expert_down_out` BEFORE the unpermute + weighted reduce, so the router
+            // weight multiplies base+delta (PEFT semantics). x = the post-SiLU sorted
+            // activations. No-op unless routed-expert deltas are installed.
+            self.apply_expert_lora_prefill_down(
+                ctx.buffers.expert_gate_out(),
+                expert_down_out,
+                expert_offsets,
+                sorted_token_ids,
+                total_expanded,
+                ctx,
+                stream,
+            )?;
+
+            // 7. Unpermute + weighted reduce: scatter sorted outputs to token order
+            ops::moe_unpermute_reduce_indexed(
+                ctx.gpu,
+                self.moe_unpermute_reduce,
+                expert_down_out,
+                output,
+                token_to_perm,
+                weights_dev,
+                h,
+                n,
+                top_k,
+                stream,
+            )?;
+        }
 
         // 8. Blend shared expert: output += sigmoid(dot(input, gate)) * shared
         // Skip when has_shared == false (no shared expert in this model config).
         // EP fix: defer shared expert blend until AFTER all-reduce to avoid doubling.
         let is_ep_prefill = ctx.comm.is_some() && ctx.config.ep_world_size > 1;
-        if has_shared && !is_ep_prefill {
+        if has_shared && !is_ep_prefill && !used_marlin {
             let shared_down_out = ctx.buffers.attn_output();
             if use_overlap {
                 ctx.gpu.stream_wait_event(stream, self.event_b)?;

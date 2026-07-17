@@ -42,7 +42,6 @@ fn check_family(cfg: &ModelConfig) -> Result<()> {
     Ok(())
 }
 
-
 /// Pack one already-audited adapter into pool `slot` (byte sub-region at base
 /// `slot * pool_slot_bytes`). The intra-slot walk (layer asc ×
 /// [`LoraModule::ALL`] × A-then-B, A contiguous, B row-repacked stride r →

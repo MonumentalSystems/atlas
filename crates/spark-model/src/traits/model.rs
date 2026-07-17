@@ -503,6 +503,26 @@ pub trait Model: Send + Sync {
         stream: u64,
     ) -> Result<[u32; 4]>;
 
+    /// Batched K=4 verification for concurrent speculative lanes. Implementors
+    /// may use a C×K forward; the default preserves correctness by replaying
+    /// the established per-lane graphed verifier.
+    fn decode_verify_batch_k4(
+        &self,
+        tokens: &[[u32; 4]],
+        seqs: &mut [&mut SequenceState],
+        stream: u64,
+    ) -> Result<Vec<[u32; 4]>> {
+        anyhow::ensure!(
+            tokens.len() == seqs.len(),
+            "verify batch token/state mismatch"
+        );
+        tokens
+            .iter()
+            .zip(seqs.iter_mut())
+            .map(|(t, seq)| self.decode_verify_graphed_k4(t, seq, stream))
+            .collect()
+    }
+
     /// DFlash K=γ graphed verify (γ+1 tokens). Specialization of the K=2/3/4
     /// pattern for arbitrary K. Default impl falls back to eager
     /// `decode_verify`. Models can override for CUDA-graph speedup keyed by

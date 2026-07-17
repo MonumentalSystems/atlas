@@ -105,7 +105,11 @@ fn short_prefill_slot_rows_map_to_owning_token() {
     for top_k in [1u32, 2, 8] {
         for t in 0..64u32 {
             for s in 0..top_k {
-                assert_eq!(gather_row_token(t * top_k + s, top_k), t, "t={t} s={s} k={top_k}");
+                assert_eq!(
+                    gather_row_token(t * top_k + s, top_k),
+                    t,
+                    "t={t} s={s} k={top_k}"
+                );
             }
         }
     }

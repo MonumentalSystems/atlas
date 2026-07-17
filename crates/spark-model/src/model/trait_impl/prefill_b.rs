@@ -31,6 +31,7 @@ mod batch_kernel_tests;
 mod batched_layer;
 mod embed_chunk;
 mod finalize_last;
+mod finalize_rows;
 mod forward_layers;
 mod h_state_ptrs;
 mod prefix_lookup;

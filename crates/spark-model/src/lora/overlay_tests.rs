@@ -13,11 +13,17 @@ fn classifies_trainable_tokens_pair() {
     let delta = "base_model.model.model.embed_tokens.token_adapter.trainable_tokens_delta";
     assert_eq!(
         classify_overlay_key(base),
-        Some(OverlayTensor { module: OverlayModule::EmbedTokens, kind: OverlayTensorKind::Base })
+        Some(OverlayTensor {
+            module: OverlayModule::EmbedTokens,
+            kind: OverlayTensorKind::Base
+        })
     );
     assert_eq!(
         classify_overlay_key(delta),
-        Some(OverlayTensor { module: OverlayModule::EmbedTokens, kind: OverlayTensorKind::Delta })
+        Some(OverlayTensor {
+            module: OverlayModule::EmbedTokens,
+            kind: OverlayTensorKind::Delta
+        })
     );
 }
 
@@ -26,13 +32,20 @@ fn classifies_lm_head_and_multimodal_prefix() {
     let lm = "base_model.model.lm_head.token_adapter.base_layer.weight";
     assert_eq!(
         classify_overlay_key(lm),
-        Some(OverlayTensor { module: OverlayModule::LmHead, kind: OverlayTensorKind::Base })
+        Some(OverlayTensor {
+            module: OverlayModule::LmHead,
+            kind: OverlayTensorKind::Base
+        })
     );
     // multimodal wrapper adds a `.language_model.` segment.
-    let mm = "base_model.model.model.language_model.embed_tokens.token_adapter.trainable_tokens_delta";
+    let mm =
+        "base_model.model.model.language_model.embed_tokens.token_adapter.trainable_tokens_delta";
     assert_eq!(
         classify_overlay_key(mm),
-        Some(OverlayTensor { module: OverlayModule::EmbedTokens, kind: OverlayTensorKind::Delta })
+        Some(OverlayTensor {
+            module: OverlayModule::EmbedTokens,
+            kind: OverlayTensorKind::Delta
+        })
     );
 }
 
@@ -40,11 +53,17 @@ fn classifies_lm_head_and_multimodal_prefix() {
 fn classifies_modules_to_save_full_weight() {
     assert_eq!(
         classify_overlay_key("base_model.model.model.embed_tokens.weight"),
-        Some(OverlayTensor { module: OverlayModule::EmbedTokens, kind: OverlayTensorKind::FullSave })
+        Some(OverlayTensor {
+            module: OverlayModule::EmbedTokens,
+            kind: OverlayTensorKind::FullSave
+        })
     );
     assert_eq!(
         classify_overlay_key("base_model.model.lm_head.weight"),
-        Some(OverlayTensor { module: OverlayModule::LmHead, kind: OverlayTensorKind::FullSave })
+        Some(OverlayTensor {
+            module: OverlayModule::LmHead,
+            kind: OverlayTensorKind::FullSave
+        })
     );
 }
 
@@ -89,7 +108,10 @@ fn overlay_tensors_collects_and_rejects_dupes() {
     assert!(!t.is_empty());
     assert_eq!(t.embed_base.as_deref(), Some(base));
     // duplicate role → hard error.
-    let err = t.insert(classify_overlay_key(base).unwrap(), base).unwrap_err().to_string();
+    let err = t
+        .insert(classify_overlay_key(base).unwrap(), base)
+        .unwrap_err()
+        .to_string();
     assert!(err.contains("REJECT[duplicate-overlay-tensor]"), "{err}");
 }
 
@@ -121,13 +143,20 @@ fn clamp_skips_vocab_extension_tail() {
 
 #[test]
 fn clamp_rejects_index_beyond_adapter() {
-    let err = clamp_trainable_to_vocab(&[500], 105, 100).unwrap_err().to_string();
-    assert!(err.contains("REJECT[trainable-index-out-of-adapter]"), "{err}");
+    let err = clamp_trainable_to_vocab(&[500], 105, 100)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("REJECT[trainable-index-out-of-adapter]"),
+        "{err}"
+    );
 }
 
 #[test]
 fn clamp_rejects_descending_kept_prefix() {
-    let err = clamp_trainable_to_vocab(&[42, 10], 200, 200).unwrap_err().to_string();
+    let err = clamp_trainable_to_vocab(&[42, 10], 200, 200)
+        .unwrap_err()
+        .to_string();
     assert!(err.contains("REJECT[trainable-order]"), "{err}");
 }
 
@@ -170,7 +199,10 @@ fn lora_embedding_hits_tier2_reject() {
     let k = "base_model.model.model.embed_tokens.lora_embedding_A";
     t.insert(classify_overlay_key(k).unwrap(), k).unwrap();
     let err = reject_pending_overlay(&t).unwrap_err().to_string();
-    assert!(err.contains("REJECT[lora-embedding-unimplemented]"), "{err}");
+    assert!(
+        err.contains("REJECT[lora-embedding-unimplemented]"),
+        "{err}"
+    );
 }
 
 #[test]

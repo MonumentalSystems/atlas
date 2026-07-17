@@ -43,7 +43,10 @@ fn router_entry_is_expert_zero_from_pair() {
     // The router pair maps to a single (expert_id=0, a, b, scale) entry — the
     // router owns the only slot of the degenerate 1-"expert" gather table.
     let rp = dummy_router_pair(0xA000, 0xB000, 0.5, 16);
-    assert_eq!(router_expert_entry(&rp), (0u16, 0xA000u64, 0xB000u64, 0.5f32));
+    assert_eq!(
+        router_expert_entry(&rp),
+        (0u16, 0xA000u64, 0xB000u64, 0.5f32)
+    );
 }
 
 #[test]
@@ -72,7 +75,10 @@ fn full_adapter_takes_max_of_router_and_down() {
 #[test]
 fn router_only_is_num_experts() {
     // No Down pair -> only the router expand consumes delta.
-    assert_eq!(lora_delta_cols(Some(NUM_EXPERTS), None), NUM_EXPERTS as usize);
+    assert_eq!(
+        lora_delta_cols(Some(NUM_EXPERTS), None),
+        NUM_EXPERTS as usize
+    );
 }
 
 #[test]

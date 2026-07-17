@@ -188,7 +188,6 @@ impl TransformerModel {
                 ssm.conv_state_intermediates.clear();
             }
         }
-
         // Invalidate cached CUDA graphs that reference this sequence's slot
         // — the graph was captured with this slot's KV/SSM pointers baked in,
         // and replaying after the slot is freed would read stale data.
@@ -203,12 +202,15 @@ impl TransformerModel {
                 seq.slot_idx
             );
         }
-        // batch_decode_graphs is keyed by padded_n, not slot — but the captured
-        // graphs DO contain per-slot SSM pointers from the active set at capture
-        // time. Drop them all (they'll be re-captured on next batched decode).
-        for (_, graph) in self.batch_decode_graphs.lock().drain() {
-            if let Err(e) = self.gpu.destroy_graph(graph) {
-                tracing::error!("free_sequence: destroy_graph(batch_decode_graphs entry): {e:#}");
+        // Single-rank retirement compacts slots before replay; EP retains slots,
+        // so only EP invalidates padded batch graphs.
+        if self.comm.is_some() {
+            for (_, graph) in self.batch_decode_graphs.lock().drain() {
+                if let Err(e) = self.gpu.destroy_graph(graph) {
+                    tracing::error!(
+                        "free_sequence: destroy_graph(batch_decode_graphs entry): {e:#}"
+                    );
+                }
             }
         }
         // Verify graphs are now slot-keyed (sibling of decode_graph fix).
@@ -251,14 +253,12 @@ impl TransformerModel {
                 }
             }
         }
-
         // Free proposer state (KV cache blocks + per-seq device buffers).
         if let Some(ref proposer) = self.proposer
             && let Some(ref mut pstate) = seq.proposer_state
         {
             proposer.free_state(self.gpu.as_ref(), pstate.as_mut())?;
         }
-
         self.free_chunked_prefill_meta(seq)?;
 
         Ok(())

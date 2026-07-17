@@ -33,11 +33,9 @@ impl TransformerModel {
     /// streams. Cheap upfront check — caller (dispatch) falls back to
     /// per-stream when false.
     pub(in crate::model) fn kernel_batched_eligible(&self, streams: &[PrefillSlice<'_>]) -> bool {
-        // Fix #4 (mixed-length cache + co-dispatch silent failure): when the
-        // prefix cache is active a co-dispatched batch can contain streams with
-        // DIFFERENT cache-hit depths (the first arrival recomputes →
-        // effective_seq_len_start=0; later arrivals restore the just-saved
-        // snapshot → effective_seq_len_start>0). The kernel-batched PHASE A
+        // Fix #4 (mixed-length cache + co-dispatch silent failure): a chunk-0
+        // cache lookup can give co-dispatched streams DIFFERENT effective
+        // starts. The kernel-batched PHASE A
         // mutates each stream IN ORDER (snapshot restore into the SSM pool slot,
         // KV block alloc, kv_valid_tokens/seq_len) BEFORE it discovers the
         // effective_seq_len_start mismatch and bails Err — leaving streams
@@ -45,17 +43,16 @@ impl TransformerModel {
         // on those dirty seqs (double snapshot-restore / double block-alloc),
         // and any surfaced Err drops ALL streams in the scheduler
         // (run_batched_prefill.rs: every stream marked failed → client sees a
-        // connection reset, server survives). Route cache-possible batches
-        // STRAIGHT to the per-stream loop (batch.rs:199) on pristine seqs — that
-        // loop is structurally equivalent to the proven single-stream cache path
-        // (prefill_chunk_dispatch) and already handles hits correctly, with
-        // per-stream logits rows (fix #1). NoPrefixCaching::is_active()==false,
-        // so no-cache co-dispatch (the +35% PHASE-C scaling) and the cold path
-        // stay byte-identical — the gate only fires when a real radix cache holds
-        // refs. Trade: cold requests under active caching lose kernel-batched
-        // co-dispatch, but with caching on most requests hit and a hit's
-        // processed suffix is tiny, so the co-dispatch scaling is moot.
-        if self.prefix_cache.is_active() {
+        // connection reset, server survives). A continuation after the inherited
+        // Marconi skip is different: `prefill_b_prefix_lookup` performs no radix
+        // lookup there and every lane computes its supplied suffix. That is the
+        // shape used by batched speculative verification (C lanes × K tokens), so
+        // permit it even when prefix caching is enabled.
+        if self.prefix_cache.is_active()
+            && streams
+                .iter()
+                .any(|s| s.chunk_start == 0 || s.chunk_start < s.seq.marconi_skip_to)
+        {
             return false;
         }
         let varlen = varlen_prefill_enabled();

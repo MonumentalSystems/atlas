@@ -91,6 +91,11 @@ pub struct MoeLayer {
     pre_expert_norm_k: spark_runtime::gpu::KernelHandle,
     dense_gemv: KernelHandle,
     w4a16_gemv: KernelHandle,
+    /// C=5..8 NVFP4 router gate: one weight pass serves every token.
+    /// Optional because older kernel targets may not export the batch-16 entry.
+    w4a16_gemv_batch16: KernelHandle,
+    /// Experimental C=4..8 router MMA path using the baseline's math.
+    w4a16_gemm_router_m16n8: KernelHandle,
     w4a16_gemm: KernelHandle,
     dense_gemm: KernelHandle,
     /// FP32-output router GEMM + FP32-input top-K for the ATLAS_FP32_GATE path.
@@ -371,6 +376,11 @@ pub struct MoeLayer {
     // path. Used to test whether the kernel choice is the dominant cause
     // of low DFlash drafter acceptance on FP4/FP8 targets.
     pub is_dflash_capture_layer: bool,
+    /// FlashInfer b12x fused-MoE weights. `None` means unavailable or ineligible.
+    /// Built only for fully resident NVFP4 experts behind `ATLAS_MOE_B12X=1`.
+    pub(crate) b12x: Option<b12x_weights::B12xMoeWeights>,
+    /// vLLM-compatible Marlin W4A16 MoE weights for NVIDIA Qwen3.6-35B.
+    pub(crate) marlin: Option<marlin_weights::MarlinMoeWeights>,
     /// Feature-1 (MoE expert + router LoRA): this layer's installed router +
     /// routed-expert deltas + apply scratch. `None` = no adapter / feature off
     /// → the base MoE path is byte-identical. Set by
@@ -408,11 +418,15 @@ impl MoeLayer {
 }
 
 // ── Sub-files (split for ≤500 LoC) ────────────────────────────────────────
+mod b12x_scales;
+mod b12x_weights;
 mod dump;
 mod forward;
 mod lora;
 mod lora_gateup;
 mod lora_router;
+mod marlin_scales;
+mod marlin_weights;
 pub(crate) use lora::MoeLoraWeights;
 mod forward_atomic_c4;
 mod forward_batched;
@@ -422,8 +436,10 @@ mod forward_k2;
 mod forward_k3;
 mod forward_phase;
 mod forward_prefill;
+mod forward_prefill_b12x;
 mod forward_prefill_bf16;
 mod forward_prefill_fp8;
+mod forward_prefill_marlin;
 mod forward_prefill_phase;
 mod forward_prefill_routed;
 mod forward_token_major;
@@ -434,4 +450,5 @@ mod init;
 #[cfg(test)]
 mod mod_tests;
 mod ptr_table_build;
+pub(crate) use b12x_weights::B12xMoeWeights;
 pub(crate) use ptr_table_build::*;

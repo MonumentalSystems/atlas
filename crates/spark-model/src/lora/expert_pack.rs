@@ -105,7 +105,14 @@ pub(crate) fn validate_shapes(
 ) -> Result<()> {
     for (layer, pair) in router {
         let (out, inp) = router_dims(cfg);
-        check_shape(store, peft, pair, &format!("router(layer {layer})"), out, inp)?;
+        check_shape(
+            store,
+            peft,
+            pair,
+            &format!("router(layer {layer})"),
+            out,
+            inp,
+        )?;
     }
     for ((layer, n, proj), pair) in experts {
         let (out, inp) = proj.dims(cfg, *layer);
@@ -154,7 +161,10 @@ fn check_shape(
 }
 
 /// Sizing key-lists for [`expert_router_bytes`] over one adapter's audit.
-pub(crate) fn key_lists(router: &RouterMap, experts: &ExpertMap) -> (Vec<(usize, ExpertProj)>, Vec<usize>) {
+pub(crate) fn key_lists(
+    router: &RouterMap,
+    experts: &ExpertMap,
+) -> (Vec<(usize, ExpertProj)>, Vec<usize>) {
     let ek = experts.keys().map(|(l, _, p)| (*l, *p)).collect();
     let rl = router.keys().copied().collect();
     (ek, rl)
@@ -231,24 +241,32 @@ pub(crate) fn pack_into(
     };
 
     for (layer, pair) in router {
-        let [Some(a_key), Some(b_key)] = pair else { continue };
+        let [Some(a_key), Some(b_key)] = pair else {
+            continue;
+        };
         let (out_dim, in_dim) = router_dims(cfg);
         let a_ptr = DevicePtr(pool.0 + *off as u64);
         let b_ptr = DevicePtr(pool.0 + (*off + max_rank * in_dim * BF16_BYTES) as u64);
         *off += (max_rank * in_dim + out_dim * max_rank) * BF16_BYTES;
-        let lp = pack_pair(store, a_key, b_key, peft, out_dim, in_dim, max_rank, gpu, a_ptr, b_ptr)?;
+        let lp = pack_pair(
+            store, a_key, b_key, peft, out_dim, in_dim, max_rank, gpu, a_ptr, b_ptr,
+        )?;
         ensure(layers, *layer);
         layers[*layer].as_mut().unwrap().router = Some(lp);
         packed += 1;
     }
 
     for ((layer, n, proj), pair) in experts {
-        let [Some(a_key), Some(b_key)] = pair else { continue };
+        let [Some(a_key), Some(b_key)] = pair else {
+            continue;
+        };
         let (out_dim, in_dim) = proj.dims(cfg, *layer);
         let a_ptr = DevicePtr(pool.0 + *off as u64);
         let b_ptr = DevicePtr(pool.0 + (*off + max_rank * in_dim * BF16_BYTES) as u64);
         *off += (max_rank * in_dim + out_dim * max_rank) * BF16_BYTES;
-        let lp = pack_pair(store, a_key, b_key, peft, out_dim, in_dim, max_rank, gpu, a_ptr, b_ptr)?;
+        let lp = pack_pair(
+            store, a_key, b_key, peft, out_dim, in_dim, max_rank, gpu, a_ptr, b_ptr,
+        )?;
         ensure(layers, *layer);
         let el = layers[*layer]
             .as_mut()

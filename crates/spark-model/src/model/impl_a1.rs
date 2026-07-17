@@ -452,8 +452,7 @@ impl TransformerModel {
         let has_fp8_calibration = config.fp8_kv_calibration_tokens > 0
             && kv_cache.dtype() == spark_runtime::kv_cache::KvCacheDtype::Fp8;
         // Feature-2 overlay kernels: resolve before `gpu` is moved into Self.
-        let overlay_kernels =
-            crate::layers::ops::token_overlay::OverlayKernels::new(gpu.as_ref());
+        let overlay_kernels = crate::layers::ops::token_overlay::OverlayKernels::new(gpu.as_ref());
         Ok(Self {
             config,
             embed_tokens,

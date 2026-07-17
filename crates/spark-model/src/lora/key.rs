@@ -97,7 +97,9 @@ pub fn classify_key(key: &str, cfg: &ModelConfig) -> Result<(usize, LoraTarget, 
         "mlp.gate" => LoraTarget::Router,
         // Feature-1: a routed expert projection `mlp.experts.{N}.{proj}`.
         // Every unsupported spelling is a NAMED reject (never a silent skip).
-        t if t.starts_with("mlp.experts.") => classify_expert_tail(key, &t["mlp.experts.".len()..], cfg)?,
+        t if t.starts_with("mlp.experts.") => {
+            classify_expert_tail(key, &t["mlp.experts.".len()..], cfg)?
+        }
         t if t.starts_with("linear_attn.") => bail!(
             "REJECT[gdn-target]: '{key}' — GDN/linear-attention projections \
              (in_proj_qkv / in_proj_z / in_proj_a / in_proj_b / out_proj) are \
@@ -149,9 +151,9 @@ fn classify_expert_tail(key: &str, rest: &str, cfg: &ModelConfig) -> Result<Lora
              Feature-1 phase 3; export per-expert mlp.experts.{{N}}.{{proj}} tensors"
         )
     })?;
-    let n: usize = n_str
-        .parse()
-        .map_err(|_| anyhow!("REJECT[malformed-expert-index]: '{key}' — '{n_str}' is not an index"))?;
+    let n: usize = n_str.parse().map_err(|_| {
+        anyhow!("REJECT[malformed-expert-index]: '{key}' — '{n_str}' is not an index")
+    })?;
     if n >= cfg.num_experts {
         bail!(
             "REJECT[expert-out-of-range]: '{key}' targets expert {n} \

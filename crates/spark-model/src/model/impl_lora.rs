@@ -299,9 +299,9 @@ impl TransformerModel {
                 || layer_weights.gate_proj.is_some()
                 || layer_weights.up_proj.is_some()
                 || layer_weights.down_proj.is_some();
-            let any = layer.as_any_mut().ok_or_else(|| {
-                anyhow::anyhow!("LoRA: adapted layer {idx} is not downcastable")
-            })?;
+            let any = layer
+                .as_any_mut()
+                .ok_or_else(|| anyhow::anyhow!("LoRA: adapted layer {idx} is not downcastable"))?;
             // Full-attention layer: attention + dense-FFN + MoE. Linear-attention
             // (GDN/SSM) layer: MoE ONLY — its attention projections are rejected at
             // classify, but its MoE FFN exists on every layer, so a real all-layer

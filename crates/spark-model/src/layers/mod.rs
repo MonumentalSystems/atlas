@@ -160,6 +160,32 @@ impl FfnComponent {
         }
     }
 
+    pub fn try_b12x_decode(
+        &self,
+        input: DevicePtr,
+        num_tokens: usize,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<bool> {
+        match self {
+            Self::Moe(m) => m.try_b12x_decode(input, num_tokens, ctx, stream),
+            Self::Dense(_) | Self::None => Ok(false),
+        }
+    }
+
+    pub fn try_marlin_decode(
+        &self,
+        input: DevicePtr,
+        num_tokens: usize,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<bool> {
+        match self {
+            Self::Moe(m) => m.try_marlin_decode(input, num_tokens, ctx, stream),
+            Self::Dense(_) | Self::None => Ok(false),
+        }
+    }
+
     pub fn forward_atomic_c4_decode(
         &self,
         input: DevicePtr,

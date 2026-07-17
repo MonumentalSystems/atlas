@@ -274,6 +274,139 @@ pub fn step_mtp(
     }
 
     // ── Phase B: Verify with pipelined checkpoint ──
+    // C×4 fast path: only the strict greedy/no-processor cohort may use the
+    // Q12 verifier today. A partial accept is restored to the pre-verify
+    // checkpoint and re-run through the established single-lane verifier,
+    // because Q12's GDN pass does not yet materialize the per-token SSM
+    // intermediate states that partial commit needs. Full accepts retain the
+    // batched final state and avoid the replay entirely.
+    let batch_k4_eligible = std::env::var("ATLAS_MTP_BATCH_VERIFY")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+        && !dflash_verify_raw_argmax
+        && !model.is_ep()
+        && verify_idxs.len() >= 2
+        && num_drafts >= 3
+        && verify_idxs.iter().all(|&idx| {
+            let a = &active[idx];
+            a.pending_drafts.len() == 3
+                && a.temperature == 0.0
+                && a.grammar_state.is_none()
+                && a.top_logprobs.is_none()
+                && a.repetition_penalty == 1.0
+                && a.presence_penalty == 0.0
+                && a.frequency_penalty == 0.0
+                && a.lz_penalty == 0.0
+                && a.dry_multiplier == 0.0
+        });
+    if batch_k4_eligible {
+        if let Err(e) = model.sync_secondary() {
+            tracing::error!("batched K4 sync_secondary: {e:#}");
+        } else {
+            // Speculative accepts advance sequences by different amounts. Keep
+            // batching the same-position cohorts instead of dropping the whole
+            // C×K path as soon as one lane has a partial accept. The Q12
+            // batched-attention metadata still has a scalar `seq_lens_start`,
+            // hence grouping is the correctness boundary until it grows a
+            // per-lane start vector.
+            let mut cohorts: std::collections::BTreeMap<usize, Vec<usize>> =
+                std::collections::BTreeMap::new();
+            for &idx in &verify_idxs {
+                cohorts
+                    .entry(active[idx].seq.seq_len)
+                    .or_default()
+                    .push(idx);
+            }
+            let mut batched = std::collections::BTreeSet::new();
+            for (_, idxs) in cohorts.into_iter().filter(|(_, idxs)| idxs.len() >= 2) {
+                let tokens: Vec<[u32; 4]> = idxs
+                    .iter()
+                    .map(|&idx| {
+                        let a = &active[idx];
+                        [
+                            a.last_token,
+                            a.pending_drafts[0],
+                            a.pending_drafts[1],
+                            a.pending_drafts[2],
+                        ]
+                    })
+                    .collect();
+                let t_verify = Instant::now();
+                let results = {
+                    let mut seqs: Vec<&mut SequenceState> = active
+                        .iter_mut()
+                        .enumerate()
+                        .filter(|(idx, _)| idxs.contains(idx))
+                        .map(|(_, a)| &mut a.seq)
+                        .collect();
+                    model.decode_verify_batch_k4(&tokens, &mut seqs, 0)
+                };
+                match results {
+                    Ok(results) if results.len() == idxs.len() => {
+                        for ((idx, tokens), raw) in idxs.into_iter().zip(tokens).zip(results) {
+                            let a = &mut active[idx];
+                            let drafts = std::mem::take(&mut a.pending_drafts);
+                            if raw[..3] == drafts[..] {
+                                finish_k4_verify(
+                                    model,
+                                    a,
+                                    &drafts,
+                                    num_drafts,
+                                    verify_ctx,
+                                    false,
+                                    tokens,
+                                    raw,
+                                    t_verify.elapsed().as_micros(),
+                                );
+                            } else {
+                                a.seq.seq_len -= 4;
+                                a.seq.tokens.truncate(a.seq.tokens.len() - 4);
+                                if let Err(e) = model.commit_verify_state_async(&mut a.seq, 0, 4) {
+                                    tracing::error!("batched K4 rollback: {e:#}");
+                                    a.finished = true;
+                                } else if let Err(e) = model.sync_secondary() {
+                                    tracing::error!("batched K4 rollback sync: {e:#}");
+                                    a.finished = true;
+                                } else {
+                                    step_verify_k4(
+                                        model, a, &drafts, num_drafts, verify_ctx, false,
+                                    );
+                                }
+                            }
+                            batched.insert(idx);
+                        }
+                    }
+                    Ok(_) => tracing::error!("batched K4 verifier returned wrong lane count"),
+                    Err(e) => tracing::error!("batched K4 verifier failed: {e:#}"),
+                }
+            }
+            // Cohorts with one sequence retain the established graphed path.
+            for &idx in &verify_idxs {
+                if batched.contains(&idx) {
+                    continue;
+                }
+                let a = &mut active[idx];
+                let mut drafts: Vec<u32> = std::mem::take(&mut a.pending_drafts);
+                if drafts.is_empty() {
+                    continue;
+                }
+                if let Some(ref mut gs) = a.grammar_state {
+                    let kept = truncate_drafts_at_grammar_boundary(gs, &drafts);
+                    if kept < drafts.len() {
+                        drafts.truncate(kept);
+                    }
+                }
+                if drafts.len() >= 3 {
+                    step_verify_k4(model, a, &drafts, num_drafts, verify_ctx, false);
+                } else if drafts.len() >= 2 {
+                    step_verify_k3(model, a, &drafts, num_drafts, verify_ctx, false);
+                } else if !drafts.is_empty() {
+                    step_verify_k2(model, a, &drafts, num_drafts, verify_ctx, false);
+                }
+            }
+            return;
+        }
+    }
     for &idx in &verify_idxs {
         let a = &mut active[idx];
         let mut drafts: Vec<u32> = std::mem::take(&mut a.pending_drafts);

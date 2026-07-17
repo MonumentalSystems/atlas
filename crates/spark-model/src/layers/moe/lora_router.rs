@@ -32,7 +32,10 @@ impl MoeLayer {
     /// Build the degenerate 1-entry expert route (expert 0 == the router pair) so
     /// the batched decode router fold reuses `moe_lora_gather_bgmv` verbatim.
     /// `k_in=hidden`, `n_out=num_experts`, `max_rank=router rank`.
-    pub(super) fn build_router_route(rp: &LoraPair, gpu: &dyn GpuBackend) -> Result<MoeExpertRoute> {
+    pub(super) fn build_router_route(
+        rp: &LoraPair,
+        gpu: &dyn GpuBackend,
+    ) -> Result<MoeExpertRoute> {
         let tables = pack_expert_tables(&[router_expert_entry(rp)])
             .expect("single entry => pack_expert_tables returns Some");
         let up = |vals: &[u8]| -> Result<DevicePtr> {
@@ -68,13 +71,26 @@ impl MoeLayer {
         ctx: &crate::layer::ForwardContext,
         stream: u64,
     ) -> Result<()> {
-        let Some(ref l) = self.lora else { return Ok(()) };
-        let Some(ref rp) = l.router else { return Ok(()) };
+        let Some(ref l) = self.lora else {
+            return Ok(());
+        };
+        let Some(ref rp) = l.router else {
+            return Ok(());
+        };
         if !self.moe_route_gate(ctx, "router")? {
             return Ok(());
         }
         apply_router_lora(
-            ctx.gpu, &l.kernels, rp, router_in, gate_logits, n, l.cap, l.xa, l.delta, stream,
+            ctx.gpu,
+            &l.kernels,
+            rp,
+            router_in,
+            gate_logits,
+            n,
+            l.cap,
+            l.xa,
+            l.delta,
+            stream,
         )
     }
 
@@ -98,7 +114,9 @@ impl MoeLayer {
         ctx: &crate::layer::ForwardContext,
         stream: u64,
     ) -> Result<()> {
-        let Some(ref l) = self.lora else { return Ok(()) };
+        let Some(ref l) = self.lora else {
+            return Ok(());
+        };
         let Some(ref rr) = l.router_route else {
             return Ok(()); // router-less adapter: nothing to fold on the logits
         };

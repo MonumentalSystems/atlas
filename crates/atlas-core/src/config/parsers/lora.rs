@@ -185,7 +185,11 @@ pub fn parse_peft_adapter_config(json: &str) -> Result<PeftAdapterConfig> {
 
     // `target_parameters` (fused expert LoRA) is deferred — never silently
     // dropped (no `deny_unknown_fields` would otherwise swallow it).
-    if raw.target_parameters.as_ref().is_some_and(|v| !v.is_empty()) {
+    if raw
+        .target_parameters
+        .as_ref()
+        .is_some_and(|v| !v.is_empty())
+    {
         bail!(
             "REJECT(target_parameters): fused-parameter LoRA {:?} (routed MoE experts) \
              is deferred to Feature 1 phase 3",
@@ -247,7 +251,9 @@ pub fn parse_peft_adapter_config(json: &str) -> Result<PeftAdapterConfig> {
 /// anything else by name — full-weight replacement of arbitrary modules is
 /// unsupported. Returns the accepted leaves.
 fn partition_modules_to_save(mods: Option<&[String]>) -> Result<Vec<String>> {
-    let Some(mods) = mods else { return Ok(Vec::new()) };
+    let Some(mods) = mods else {
+        return Ok(Vec::new());
+    };
     let mut accepted = Vec::new();
     for m in mods {
         let leaf = m.rsplit('.').next().unwrap_or(m);

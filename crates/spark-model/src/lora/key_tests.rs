@@ -169,13 +169,20 @@ fn classify_key_maps_experts_and_router() {
         )
     );
     assert_eq!(
-        classify_key("base_model.model.model.layers.0.mlp.gate.lora_B.weight", &cfg).unwrap(),
+        classify_key(
+            "base_model.model.model.layers.0.mlp.gate.lora_B.weight",
+            &cfg
+        )
+        .unwrap(),
         (0, LoraTarget::Router, AdapterAb::B)
     );
     // But an ATTENTION target on that same linear-attention layer stays rejected.
     assert!(
-        classify_key("base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight", &cfg)
-            .is_err()
+        classify_key(
+            "base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight",
+            &cfg
+        )
+        .is_err()
     );
 
     // Named rejects (never a silent skip):

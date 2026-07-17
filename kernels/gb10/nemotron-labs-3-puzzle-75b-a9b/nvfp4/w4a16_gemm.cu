@@ -990,16 +990,11 @@ void w4a16_gemm_t_m128(
     __nv_bfloat16* __restrict__ C,
     unsigned int M, unsigned int N, unsigned int K
 ) {
-    // Grid axes are SWAPPED relative to the other GEMMs: blockIdx.x is the
-    // M-block, blockIdx.y is the N-block.
-    //
-    // Every m-block re-reads the whole B panel for its n-column. With n on the
-    // fast axis, the 8 m-blocks sharing a B panel are scheduled ~141 blocks
-    // apart, so the panel is evicted from L2 between them and B is fetched from
-    // DRAM 8x (~20 GB across the 112 calls in one 1k prefill). Putting m on the
-    // fast axis makes those 8 blocks co-resident, so 7 of the 8 reads hit L2.
-    const unsigned int cta_n  = blockIdx.y * N_TILE_LG;
-    const unsigned int cta_m  = blockIdx.x * (2 * M_TILE);  // base row for this block
+    // GRID CONTRACT — N is the fast axis, matching the shared
+    // `ops::w4a16_gemm_n128_m128` launcher and every other model target.
+    // An M-fast schedule must use a separately named kernel and launcher.
+    const unsigned int cta_n  = blockIdx.x * N_TILE_LG;
+    const unsigned int cta_m  = blockIdx.y * (2 * M_TILE);  // base row for this block
     if (cta_m >= M) return;
 
     const unsigned int warp_id = threadIdx.x / 32;

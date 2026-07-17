@@ -255,6 +255,89 @@ extern "C" __global__ void w4a16_gemm(
     }
 }
 
+// Decode-router specialization of w4a16_gemm for M<=16, N_TILE=8.
+// It preserves the baseline kernel's BF16 staging and its first warp's MMA
+// fragments, but exposes 32 CTAs for a 256-expert router at C=8.
+extern "C" __global__ void w4a16_gemm_router_m16n8(
+    const __nv_bfloat16* __restrict__ A,
+    const unsigned char* __restrict__ B_packed,
+    const unsigned char* __restrict__ B_scale,
+    const float scale2,
+    __nv_bfloat16* __restrict__ C,
+    unsigned int M, unsigned int N, unsigned int K
+) {
+    constexpr unsigned int M_TILE_ROUTER = 16;
+    constexpr unsigned int N_TILE_ROUTER = 8;
+    const unsigned int cta_n = blockIdx.x * N_TILE_ROUTER;
+    const unsigned int lane_id = threadIdx.x % 32;
+    const unsigned int group_id = lane_id >> 2;
+    const unsigned int tid = lane_id & 3;
+    const unsigned int half_K = K / 2;
+    const unsigned int num_groups = K / GROUP_SIZE;
+    constexpr unsigned int a_stride = K_STEP + PAD;
+    constexpr unsigned int b_stride = N_TILE_ROUTER + PAD;
+
+    __shared__ __nv_bfloat16 smem_A[M_TILE_ROUTER][K_STEP + PAD];
+    __shared__ __nv_bfloat16 smem_B[K_STEP][N_TILE_ROUTER + PAD];
+    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    for (unsigned int k_base = 0; k_base < K; k_base += K_STEP) {
+        for (unsigned int idx = threadIdx.x; idx < M_TILE_ROUTER * K_STEP; idx += blockDim.x) {
+            unsigned int row = idx / K_STEP;
+            unsigned int col = idx % K_STEP;
+            smem_A[row][col] = (row < M) ? A[row * K + k_base + col] : __float2bfloat16(0.0f);
+        }
+        if (threadIdx.x < K_STEP * N_TILE_ROUTER) {
+            unsigned int k = threadIdx.x / N_TILE_ROUTER;
+            unsigned int n = threadIdx.x % N_TILE_ROUTER;
+            unsigned int gn = cta_n + n;
+            if (gn < N) {
+                unsigned int gk = k_base + k;
+                unsigned char packed_byte = B_packed[(unsigned long long)gn * half_K + gk / 2];
+                unsigned int nibble = (gk & 1) ? (packed_byte >> 4) : (packed_byte & 0xF);
+                unsigned char sb = B_scale[(unsigned long long)gn * num_groups + gk / GROUP_SIZE];
+                __nv_fp8_e4m3 fp8; *(unsigned char*)&fp8 = sb;
+#if defined(__SCALE__)
+                smem_B[k][n] = __float2bfloat16(E2M1_LUT[nibble] * scl_fp8(sb) * scale2);
+#else
+                smem_B[k][n] = __float2bfloat16(E2M1_LUT[nibble] * (float)fp8 * scale2);
+#endif
+            } else {
+                smem_B[k][n] = __float2bfloat16(0.0f);
+            }
+        }
+        __syncthreads();
+        if (threadIdx.x < 32) {
+            const unsigned short* sA = (const unsigned short*)smem_A;
+            const unsigned short* sB = (const unsigned short*)smem_B;
+            unsigned int fr0 = group_id, fr1 = fr0 + 8;
+            unsigned int fc0 = tid * 2, fc1 = fc0 + 8;
+            unsigned int a0 = *(const unsigned int*)&sA[fr0 * a_stride + fc0];
+            unsigned int a1 = *(const unsigned int*)&sA[fr1 * a_stride + fc0];
+            unsigned int a2 = *(const unsigned int*)&sA[fr0 * a_stride + fc1];
+            unsigned int a3 = *(const unsigned int*)&sA[fr1 * a_stride + fc1];
+            unsigned int nc = group_id, k0 = tid * 2, k1 = k0 + 8;
+            unsigned int b0 = ((unsigned int)sB[(k0 + 1) * b_stride + nc] << 16)
+                | (unsigned int)sB[k0 * b_stride + nc];
+            unsigned int b1 = ((unsigned int)sB[(k1 + 1) * b_stride + nc] << 16)
+                | (unsigned int)sB[k1 * b_stride + nc];
+            asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};"
+                :"=f"(acc[0]),"=f"(acc[1]),"=f"(acc[2]),"=f"(acc[3])
+                :"r"(a0),"r"(a1),"r"(a2),"r"(a3),"r"(b0),"r"(b1),
+                 "f"(acc[0]),"f"(acc[1]),"f"(acc[2]),"f"(acc[3]));
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x < 32) {
+        unsigned int c0 = cta_n + tid * 2, c1 = c0 + 1;
+        unsigned int r0 = group_id, r1 = r0 + 8;
+        if (r0 < M && c0 < N) C[r0 * N + c0] = __float2bfloat16(acc[0]);
+        if (r0 < M && c1 < N) C[r0 * N + c1] = __float2bfloat16(acc[1]);
+        if (r1 < M && c0 < N) C[r1 * N + c0] = __float2bfloat16(acc[2]);
+        if (r1 < M && c1 < N) C[r1 * N + c1] = __float2bfloat16(acc[3]);
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════════
 // cp.async 2-stage double-buffered transposed GEMM.
 //

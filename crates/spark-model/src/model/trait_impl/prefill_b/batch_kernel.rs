@@ -64,6 +64,10 @@ impl TransformerModel {
         let n = streams.len();
         let chunk_len = streams[0].chunk_len;
         let is_last_chunk = streams[0].is_last_chunk;
+        let logits_rows = streams[0].logits_rows;
+        if logits_rows == 0 || streams.iter().any(|s| s.logits_rows != logits_rows) {
+            anyhow::bail!("kernel-batched: logits_rows must be a shared non-zero value");
+        }
         let h = self.config.hidden_size;
         let dtype_bytes = 2usize;
         let varlen = varlen_prefill_enabled();
@@ -464,32 +468,19 @@ impl TransformerModel {
                 .extend_from_slice(&tokens[chunk_start..chunk_start + cl]);
             seq.seq_len = chunk_start + cl;
 
-            let logits = if is_last_chunk {
-                self.prefill_b_finalize_last_at(
-                    tokens,
-                    seq,
-                    &mut kv_cache,
-                    chunk_start,
-                    cl,
-                    m.proc_count,
-                    // hidden_stream_offset_tokens = proc_off[b] (Σ proc_count of
-                    // prior streams, the cu_seqlens layout) — NOT cu_off[b].
-                    // finalize reads last_token = proc_off + proc_count - 1.
-                    m.proc_off,
-                    b,
-                    stream,
-                )?
-            } else {
-                self.prefill_b_save_checkpoint(
-                    tokens,
-                    seq,
-                    &mut kv_cache,
-                    chunk_start,
-                    cl,
-                    stream,
-                )?;
-                DevicePtr::NULL
-            };
+            let logits = self.prefill_b_finalize_batch_stream(
+                tokens,
+                seq,
+                &mut kv_cache,
+                chunk_start,
+                cl,
+                m.proc_count,
+                m.proc_off,
+                b * logits_rows,
+                logits_rows,
+                is_last_chunk,
+                stream,
+            )?;
             logits_out.push(logits);
         }
 

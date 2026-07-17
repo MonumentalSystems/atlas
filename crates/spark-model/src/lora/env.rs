@@ -56,7 +56,8 @@ pub fn lora_peer_env() -> Option<String> {
 pub fn lora_experts_env() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
-        std::env::var("ATLAS_LORA_EXPERTS").is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        std::env::var("ATLAS_LORA_EXPERTS")
+            .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
     })
 }
 
