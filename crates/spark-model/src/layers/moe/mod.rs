@@ -317,6 +317,12 @@ pub struct MoeLayer {
     /// Compact NVFP4 decode K64 fused gate/up kernel, sharing the same
     /// device-resident work-list ABI as the down projection.
     moe_fused_gate_up_t_k64_worklist: KernelHandle,
+    /// Builds unpadded 1..8-row routed groups for the fixed-grid decode path.
+    moe_build_decode_worklist_c8_k: KernelHandle,
+    /// Weight-stationary fixed-grid gate/up consumer for those routed groups.
+    moe_decode_persistent_gate_up_c8_k: KernelHandle,
+    /// Weight-stationary fixed-grid down consumer with fused SiLU activation.
+    moe_decode_persistent_down_c8_k: KernelHandle,
     // W8A8 + FP32 epilogue MoE GEMM (vLLM-equivalent). Opt-in via
     // ATLAS_FP8_W8A8=1. Requires per-token-quanted A_fp8 + a_scale.
     moe_w8a8_grouped_gemm_k: KernelHandle,

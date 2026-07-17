@@ -126,6 +126,21 @@ impl MoeLayer {
                 "moe_w4a16",
                 "moe_w4a16_fused_gate_up_t_k64_worklist",
             ),
+            moe_build_decode_worklist_c8_k: super::super::try_kernel(
+                gpu,
+                "moe_decode_worklist",
+                "moe_build_decode_worklist_c8",
+            ),
+            moe_decode_persistent_gate_up_c8_k: super::super::try_kernel(
+                gpu,
+                "moe_decode_persistent",
+                "moe_decode_persistent_gate_up_c8",
+            ),
+            moe_decode_persistent_down_c8_k: super::super::try_kernel(
+                gpu,
+                "moe_decode_persistent",
+                "moe_decode_persistent_down_c8",
+            ),
             // ARM-2 Phase-K native-MXFP4 (E8M0) prefill variants — try_kernel:
             // only the deepseek-v4-flash target's moe_w4a16 module ships them.
             moe_grouped_gemm_e8m0: super::super::try_kernel(

@@ -55,6 +55,8 @@ pub mod lora_delta;
 pub mod marlin_moe;
 #[path = "ops/moe_atomic_c4.rs"]
 mod moe_atomic_c4;
+#[path = "ops/moe_decode_persistent.rs"]
+mod moe_decode_persistent;
 #[path = "ops/moe_expert.rs"]
 mod moe_expert;
 #[path = "ops/moe_expert_more.rs"]
@@ -131,6 +133,7 @@ pub use kv_cache::*;
 pub use kv_cache_fp8k::*;
 pub use kv_cache_turbok::*;
 pub use moe_atomic_c4::*;
+pub use moe_decode_persistent::*;
 pub use moe_expert::*;
 pub use moe_expert_more::*;
 pub use moe_gate::*;
