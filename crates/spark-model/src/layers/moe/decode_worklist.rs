@@ -10,6 +10,9 @@
 /// Maximum number of routed rows owned by one decode worker group.
 pub(crate) const MAX_DECODE_GROUP_ROWS: usize = 8;
 
+/// Low bits reserved for a group's live-row count in the CUDA worklist ABI.
+pub(crate) const DECODE_WORKLIST_ROWS_BITS: u32 = 4;
+
 /// One contiguous expert-major slice of the decode worklist.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct DecodeExpertGroup {
@@ -80,6 +83,18 @@ impl DecodeWorklist {
     /// Total live rows. This is exactly the flattened route count.
     pub fn live_rows(&self) -> usize {
         self.sorted_routes.len()
+    }
+
+    /// Two-word CUDA descriptor consumed by the fixed-grid decode worker.
+    ///
+    /// `word0` is the expert id and `word1` packs the sorted-route start with
+    /// the number of live rows.  This must remain in lockstep with
+    /// `moe_build_decode_worklist_c8`.
+    pub fn cuda_descriptor(group: DecodeExpertGroup) -> [u32; 2] {
+        [
+            group.expert_id,
+            (group.route_start << DECODE_WORKLIST_ROWS_BITS) | u32::from(group.rows),
+        ]
     }
 }
 
@@ -169,5 +184,17 @@ mod tests {
         assert_eq!(plan.live_rows(), 64);
         assert_eq!(plan.groups.len(), 57);
         assert!(plan.groups.iter().all(|group| group.rows <= 2));
+    }
+
+    #[test]
+    fn cuda_descriptor_preserves_live_route_extent() {
+        let descriptor = DecodeWorklist::cuda_descriptor(DecodeExpertGroup {
+            expert_id: 255,
+            route_start: 63,
+            rows: 1,
+        });
+        assert_eq!(descriptor, [255, 1_009]);
+        assert_eq!(descriptor[1] >> DECODE_WORKLIST_ROWS_BITS, 63);
+        assert_eq!(descriptor[1] & ((1 << DECODE_WORKLIST_ROWS_BITS) - 1), 1);
     }
 }
