@@ -15,6 +15,11 @@ vLLM's dispatcher. It is deliberately off by default: a changed tile/reduction
 order is not covered by Atlas's greedy-output parity contract. Promote it only
 after an explicit parity and target-workload benchmark gate.
 
+`ATLAS_MARLIN_VLLM_FULL_SHARED=1` is a separate BPS=1 launch-policy probe. It
+matches vLLM's full opt-in dynamic-shared-memory reservation while retaining
+Atlas's 128×128 tile and arithmetic. It is also default-off pending the same
+target-workload gate.
+
 Build in the CUDA 13.2 Atlas container, with a vLLM source checkout mounted at
 `/vllm`:
 

@@ -80,6 +80,15 @@ bool vllm_auto_config_enabled() {
   return value != nullptr && value[0] == '1' && value[1] == '\0';
 }
 
+// vLLM reserves the complete opt-in shared-memory region for a one-CTA-per-SM
+// Marlin launch, even though the kernel's calculated cache requirement is
+// smaller. Keep Atlas's compact reservation as the default until the target
+// workload validates this cache-carveout policy.
+bool vllm_full_shared_enabled() {
+  const char* value = std::getenv("ATLAS_MARLIN_VLLM_FULL_SHARED");
+  return value != nullptr && value[0] == '1' && value[1] == '\0';
+}
+
 // Build vLLM's block-aligned route metadata for M<=8, top_k=8, E=256.
 // One CTA is intentional: this is a tiny, graph-captured control kernel and
 // the serial prefix sum avoids an additional scan launch.
@@ -241,6 +250,8 @@ extern "C" int atlas_marlin_moe_init() {
     // Match vLLM's dispatcher: it deliberately reserves this amount of
     // dynamic shared memory to enforce the chosen persistent CTA count.
     g_shared = blocks_per_sm > 1 ? max_shared / blocks_per_sm - 1024 : max_shared;
+  } else if (vllm_full_shared_enabled()) {
+    g_shared = max_shared;
   }
 
   bool configured = false;
