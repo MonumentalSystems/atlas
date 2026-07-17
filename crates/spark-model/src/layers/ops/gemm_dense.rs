@@ -171,33 +171,6 @@ pub fn w4a16_gemm(
         .launch(stream)
 }
 
-/// W4A16 decode-router GEMM with the baseline kernel's BF16 MMA math.
-#[allow(clippy::too_many_arguments)]
-pub fn w4a16_gemm_router_m16n8(
-    gpu: &dyn GpuBackend,
-    kernel: KernelHandle,
-    input: DevicePtr,
-    weight: &QuantizedWeight,
-    output: DevicePtr,
-    m: u32,
-    n: u32,
-    k: u32,
-    stream: u64,
-) -> Result<()> {
-    KernelLaunch::new(gpu, kernel)
-        .grid([div_ceil(n, 8), 1, 1])
-        .block([128, 1, 1])
-        .arg_ptr(input)
-        .arg_ptr(weight.weight)
-        .arg_ptr(weight.weight_scale)
-        .arg_f32(weight.weight_scale_2)
-        .arg_ptr(output)
-        .arg_u32(m)
-        .arg_u32(n)
-        .arg_u32(k)
-        .launch(stream)
-}
-
 /// W4A16 GEMM with N_TILE=128: same kernel signature, wider N tile.
 ///
 /// Grid: (ceil(N/128), ceil(M/64), 1)  Block: (128, 1, 1)

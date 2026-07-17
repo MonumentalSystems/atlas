@@ -202,10 +202,6 @@ impl MoeLayer {
                 stream,
             )?;
         } else if let Some(ref nvfp4) = self.gate_nvfp4 {
-            let use_marlin_gate_mma = self.marlin.is_some()
-                && self.w4a16_gemm_router_m16n8.0 != 0
-                && (4..=8).contains(&num_tokens)
-                && std::env::var("ATLAS_MOE_MARLIN_GATE_MMA").ok().as_deref() == Some("1");
             // At C=4..8 the generic W4A16 GEMM launches four 64-row tiles
             // for only a handful of router rows. This weight-stationary GEMV
             // computes all rows per load instead. Keep the path independently
@@ -214,19 +210,7 @@ impl MoeLayer {
                 && self.w4a16_gemv_batch16.0 != 0
                 && (4..=8).contains(&num_tokens)
                 && std::env::var("ATLAS_MOE_MARLIN_GATE_GEMV").ok().as_deref() == Some("1");
-            if use_marlin_gate_mma {
-                ops::w4a16_gemm_router_m16n8(
-                    ctx.gpu,
-                    self.w4a16_gemm_router_m16n8,
-                    router_in,
-                    nvfp4,
-                    gate_logits,
-                    n,
-                    num_experts,
-                    h,
-                    stream,
-                )?;
-            } else if use_marlin_gate_gemv {
+            if use_marlin_gate_gemv {
                 ops::w4a16_gemv_batchm(
                     ctx.gpu,
                     self.w4a16_gemv_batch16,

@@ -94,8 +94,6 @@ pub struct MoeLayer {
     /// C=5..8 NVFP4 router gate: one weight pass serves every token.
     /// Optional because older kernel targets may not export the batch-16 entry.
     w4a16_gemv_batch16: KernelHandle,
-    /// Experimental C=4..8 router MMA path using the baseline's math.
-    w4a16_gemm_router_m16n8: KernelHandle,
     w4a16_gemm: KernelHandle,
     dense_gemm: KernelHandle,
     /// FP32-output router GEMM + FP32-input top-K for the ATLAS_FP32_GATE path.

@@ -62,11 +62,6 @@ impl MoeLayer {
             dense_gemv: gpu.kernel("gemv", "dense_gemv_bf16")?,
             w4a16_gemv: gpu.kernel("w4a16_gemv", "w4a16_gemv")?,
             w4a16_gemv_batch16: super::super::try_kernel(gpu, "w4a16_gemv", "w4a16_gemv_batch16"),
-            w4a16_gemm_router_m16n8: super::super::try_kernel(
-                gpu,
-                "w4a16",
-                "w4a16_gemm_router_m16n8",
-            ),
             w4a16_gemm: gpu.kernel("w4a16", "w4a16_gemm")?,
             dense_gemm: gpu.kernel("gemm", "dense_gemm_bf16")?,
             // FP32 gate path (ATLAS_FP32_GATE) — optional; KernelHandle(0) if the
