@@ -9,6 +9,7 @@
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
+#include <cstdlib>
 #include <cstdint>
 
 #define MARLIN_NAMESPACE_NAME atlas_marlin_moe
@@ -17,18 +18,16 @@
 
 namespace {
 
-using AtlasMarlinKernel = decltype(
-    atlas_marlin_moe::Marlin<vllm::kBFloat16.id(), vllm::kFE2M1f.id(),
-                             vllm::kBFloat16.id(), vllm::kFE4M3fn.id(), 256,
-                             1, 8, 8, true, 4, 1, false>);
-
-constexpr int kThreads = 256;
 constexpr int kThreadN = 128;
 constexpr int kThreadK = 128;
 constexpr int kStages = 4;
 int g_sms = 0;
 int g_blocks = 0;
+int g_shared = 0;
 int g_init_status = 1;
+
+enum class MarlinVariant { k128x128, k64x128, k128x64 };
+MarlinVariant g_variant = MarlinVariant::k128x128;
 
 // Exact cache-size calculation from vLLM's Marlin dispatcher for
 // m_block_size=8, BF16 activations, NVFP4 weights, group_size=16.
@@ -42,6 +41,43 @@ constexpr int marlin_cache_bytes() {
   constexpr int tmp = b > red + bias ? b : red + bias;
   constexpr int scales = (kThreadK / 16) * kThreadN * 2 * kStages;
   return meta + a + tmp + scales;
+}
+
+template <int ThreadK, int ThreadN>
+constexpr int marlin_cache_bytes_for() {
+  constexpr int tb_m = 16;
+  constexpr int meta = tb_m * 16;
+  constexpr int a = kStages * tb_m * ThreadK * 2;
+  constexpr int b = kStages * (ThreadK * ThreadN / 8) * 4;
+  constexpr int red = tb_m * (ThreadN + 8) * 2;
+  constexpr int bias = ThreadN * 2;
+  constexpr int tmp = b > red + bias ? b : red + bias;
+  constexpr int scales = (ThreadK / 16) * ThreadN * 2 * kStages;
+  return meta + a + tmp + scales;
+}
+
+template <typename Kernel>
+int vllm_blocks_per_sm(Kernel kernel, int threads, int cache_bytes,
+                       int max_shared) {
+  cudaFuncAttributes attr{};
+  if (cudaFuncGetAttributes(&attr, kernel) != cudaSuccess) return 0;
+  constexpr int kMaxRegistersPerSm = 255 * 1024;
+  const int register_bytes = (attr.numRegs > 0 ? attr.numRegs : 1) * threads * 4;
+  const int register_limit = kMaxRegistersPerSm / register_bytes;
+  const int shared_limit = max_shared / (cache_bytes + 1536);
+  const int allowed = register_limit < shared_limit ? register_limit : shared_limit;
+  return allowed < 1 ? 1 : (allowed > 4 ? 4 : allowed);
+}
+
+template <typename Kernel>
+bool set_dynamic_shared(Kernel kernel, int shared) {
+  return cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                              shared) == cudaSuccess;
+}
+
+bool vllm_auto_config_enabled() {
+  const char* value = std::getenv("ATLAS_MARLIN_VLLM_AUTO_CONFIG");
+  return value != nullptr && value[0] == '1' && value[1] == '\0';
 }
 
 // Build vLLM's block-aligned route metadata for M<=8, top_k=8, E=256.
@@ -168,21 +204,69 @@ extern "C" int atlas_marlin_moe_init() {
           cudaSuccess) {
     return 1;
   }
-  const int shared = marlin_cache_bytes();
-  if (shared > max_shared) return 2;
-  auto kernel = atlas_marlin_moe::Marlin<
+  const auto kernel_128x128 = atlas_marlin_moe::Marlin<
       vllm::kBFloat16.id(), vllm::kFE2M1f.id(), vllm::kBFloat16.id(),
       vllm::kFE4M3fn.id(), 256, 1, 8, 8, true, 4, 1, false>;
-  if (cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                           shared) != cudaSuccess) {
+  const int cache_128x128 = marlin_cache_bytes_for<128, 128>();
+  if (cache_128x128 > max_shared) return 2;
+
+  g_variant = MarlinVariant::k128x128;
+  int blocks_per_sm = 1;
+  g_shared = cache_128x128;
+  if (vllm_auto_config_enabled()) {
+    const auto kernel_64x128 = atlas_marlin_moe::Marlin<
+        vllm::kBFloat16.id(), vllm::kFE2M1f.id(), vllm::kBFloat16.id(),
+        vllm::kFE4M3fn.id(), 128, 1, 8, 4, true, 4, 1, false>;
+    const auto kernel_128x64 = atlas_marlin_moe::Marlin<
+        vllm::kBFloat16.id(), vllm::kFE2M1f.id(), vllm::kBFloat16.id(),
+        vllm::kFE4M3fn.id(), 128, 1, 4, 8, true, 4, 1, false>;
+
+    const int blocks_128x128 = vllm_blocks_per_sm(
+        kernel_128x128, 256, cache_128x128, max_shared);
+    const int blocks_64x128 = vllm_blocks_per_sm(
+        kernel_64x128, 128, marlin_cache_bytes_for<64, 128>(), max_shared);
+    const int blocks_128x64 = vllm_blocks_per_sm(
+        kernel_128x64, 128, marlin_cache_bytes_for<128, 64>(), max_shared);
+    if (blocks_128x128 > blocks_per_sm) {
+      blocks_per_sm = blocks_128x128;
+    }
+    if (blocks_64x128 > blocks_per_sm) {
+      g_variant = MarlinVariant::k64x128;
+      blocks_per_sm = blocks_64x128;
+    }
+    if (blocks_128x64 > blocks_per_sm) {
+      g_variant = MarlinVariant::k128x64;
+      blocks_per_sm = blocks_128x64;
+    }
+    // Match vLLM's dispatcher: it deliberately reserves this amount of
+    // dynamic shared memory to enforce the chosen persistent CTA count.
+    g_shared = blocks_per_sm > 1 ? max_shared / blocks_per_sm - 1024 : max_shared;
+  }
+
+  bool configured = false;
+  switch (g_variant) {
+    case MarlinVariant::k128x128:
+      configured = set_dynamic_shared(kernel_128x128, g_shared);
+      break;
+    case MarlinVariant::k64x128:
+      configured = set_dynamic_shared(
+          atlas_marlin_moe::Marlin<vllm::kBFloat16.id(), vllm::kFE2M1f.id(),
+                                   vllm::kBFloat16.id(), vllm::kFE4M3fn.id(),
+                                   128, 1, 8, 4, true, 4, 1, false>,
+          g_shared);
+      break;
+    case MarlinVariant::k128x64:
+      configured = set_dynamic_shared(
+          atlas_marlin_moe::Marlin<vllm::kBFloat16.id(), vllm::kFE2M1f.id(),
+                                   vllm::kBFloat16.id(), vllm::kFE4M3fn.id(),
+                                   128, 1, 4, 8, true, 4, 1, false>,
+          g_shared);
+      break;
+  }
+  if (!configured) {
     return 3;
   }
-  // vLLM's fixed 128x128 Marlin specialization explicitly selects
-  // blocks_per_sm=1.  The C_tmp reduction layout and shared-memory budget are
-  // derived from that contract, so do not replace it with an occupancy query:
-  // a larger grid changes both the persistent reduction topology and cache
-  // budget rather than merely filling idle hardware.
-  g_blocks = g_sms;
+  g_blocks = g_sms * blocks_per_sm;
   g_init_status = 0;
   return 0;
 }
@@ -251,22 +335,45 @@ extern "C" int atlas_marlin_moe_gemm(
 
   cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
   if (g_init_status != 0 || g_blocks <= 0) return 2;
-  const int shared = marlin_cache_bytes();
-  auto kernel = atlas_marlin_moe::Marlin<
-      vllm::kBFloat16.id(), vllm::kFE2M1f.id(), vllm::kBFloat16.id(),
-      vllm::kFE4M3fn.id(), 256, 1, 8, 8, true, 4, 1, false>;
-
-  kernel<<<g_blocks, kThreads, shared, stream>>>(
-      static_cast<const int4*>(a_bf16), static_cast<const int4*>(weights),
-      static_cast<int4*>(output_bf16), static_cast<int4*>(reduce_tmp_f32),
-      nullptr, nullptr, static_cast<const int4*>(scales_e4m3),
-      static_cast<const float*>(global_scales_f32), nullptr, nullptr,
-      static_cast<const int32_t*>(sorted_token_ids),
-      static_cast<const int32_t*>(expert_ids),
-      static_cast<const int32_t*>(num_tokens_post_padded),
-      static_cast<const float*>(topk_weights_f32), top_k,
-      mul_topk_weights != 0, size_k / 16, size_m, size_n, size_k,
-      static_cast<int*>(workspace), false, false, true);
+  const auto launch = [&](auto kernel, int threads) {
+    kernel<<<g_blocks, threads, g_shared, stream>>>(
+        static_cast<const int4*>(a_bf16), static_cast<const int4*>(weights),
+        static_cast<int4*>(output_bf16), static_cast<int4*>(reduce_tmp_f32),
+        nullptr, nullptr, static_cast<const int4*>(scales_e4m3),
+        static_cast<const float*>(global_scales_f32), nullptr, nullptr,
+        static_cast<const int32_t*>(sorted_token_ids),
+        static_cast<const int32_t*>(expert_ids),
+        static_cast<const int32_t*>(num_tokens_post_padded),
+        static_cast<const float*>(topk_weights_f32), top_k,
+        mul_topk_weights != 0, size_k / 16, size_m, size_n, size_k,
+        static_cast<int*>(workspace), false, false, true);
+  };
+  switch (g_variant) {
+    case MarlinVariant::k128x128:
+      launch(atlas_marlin_moe::Marlin<vllm::kBFloat16.id(),
+                                      vllm::kFE2M1f.id(),
+                                      vllm::kBFloat16.id(),
+                                      vllm::kFE4M3fn.id(), 256, 1, 8, 8, true,
+                                      4, 1, false>,
+             256);
+      break;
+    case MarlinVariant::k64x128:
+      launch(atlas_marlin_moe::Marlin<vllm::kBFloat16.id(),
+                                      vllm::kFE2M1f.id(),
+                                      vllm::kBFloat16.id(),
+                                      vllm::kFE4M3fn.id(), 128, 1, 8, 4, true,
+                                      4, 1, false>,
+             128);
+      break;
+    case MarlinVariant::k128x64:
+      launch(atlas_marlin_moe::Marlin<vllm::kBFloat16.id(),
+                                      vllm::kFE2M1f.id(),
+                                      vllm::kBFloat16.id(),
+                                      vllm::kFE4M3fn.id(), 128, 1, 4, 8, true,
+                                      4, 1, false>,
+             128);
+      break;
+  }
   return cudaGetLastError() == cudaSuccess ? 0 : 3;
 }
 
