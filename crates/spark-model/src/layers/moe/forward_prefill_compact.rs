@@ -7,11 +7,29 @@
 
 use super::*;
 
-pub(super) fn compact_nvfp4_decode_enabled() -> bool {
-    std::env::var("ATLAS_MOE_NVFP4_COMPACT_DECODE")
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CompactMode {
+    Both,
+    GateUp,
+    Down,
+}
+
+fn compact_nvfp4_decode_mode() -> Option<CompactMode> {
+    match std::env::var("ATLAS_MOE_NVFP4_COMPACT_DECODE")
         .ok()
         .as_deref()
-        == Some("1")
+    {
+        Some("1" | "both") => Some(CompactMode::Both),
+        // Diagnostic modes compare one compact stage against the established
+        // dense K64 sibling without changing the rest of the MoE math.
+        Some("gateup") => Some(CompactMode::GateUp),
+        Some("down") => Some(CompactMode::Down),
+        _ => None,
+    }
+}
+
+pub(super) fn compact_nvfp4_decode_enabled() -> bool {
+    compact_nvfp4_decode_mode().is_some()
 }
 
 impl MoeLayer {
@@ -29,8 +47,10 @@ impl MoeLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<bool> {
-        if !compact_nvfp4_decode_enabled()
-            || !(4..=8).contains(&n)
+        let Some(mode) = compact_nvfp4_decode_mode() else {
+            return Ok(false);
+        };
+        if !(4..=8).contains(&n)
             || n.saturating_mul(top_k) > 64
             || self.lora.is_some()
             || self.pre_expert_norm.is_some()
@@ -53,42 +73,65 @@ impl MoeLayer {
         let up_out = ctx.buffers.expert_up_out();
         let down_out = ctx.buffers.expert_down_out();
 
-        // Gate/up uses a single combined [0, 2*inter) N-space. The existing
-        // builder's NULL-pointer filtering uses gate weights; NVFP4 gate and
-        // up tables are local together for the single-GPU decode path.
-        ops::moe_build_tile_worklist(
-            ctx.gpu,
-            self.moe_build_tile_worklist_k,
-            expert_offsets,
-            gate.packed_ptrs,
-            worklist,
-            total_tiles,
-            num_experts,
-            (2 * inter).div_ceil(128),
-            64,
-            stream,
-        )?;
-        ops::moe_w4a16_fused_gate_up_k64_worklist(
-            ctx.gpu,
-            self.moe_fused_gate_up_t_k64_worklist,
-            expert_input,
-            gate.packed_ptrs,
-            gate.scale_ptrs,
-            gate.scale2_vals,
-            up.packed_ptrs,
-            up.scale_ptrs,
-            up.scale2_vals,
-            gate_out,
-            up_out,
-            expert_offsets,
-            sorted_token_ids,
-            num_experts,
-            inter,
-            h,
-            worklist,
-            total_tiles,
-            stream,
-        )?;
+        if mode != CompactMode::Down {
+            // Gate/up uses a single combined [0, 2*inter) N-space. The
+            // builder's NULL-pointer filtering uses gate weights; NVFP4 gate
+            // and up tables are local together for single-GPU decode.
+            ops::moe_build_tile_worklist(
+                ctx.gpu,
+                self.moe_build_tile_worklist_k,
+                expert_offsets,
+                gate.packed_ptrs,
+                worklist,
+                total_tiles,
+                num_experts,
+                (2 * inter).div_ceil(128),
+                64,
+                stream,
+            )?;
+            ops::moe_w4a16_fused_gate_up_k64_worklist(
+                ctx.gpu,
+                self.moe_fused_gate_up_t_k64_worklist,
+                expert_input,
+                gate.packed_ptrs,
+                gate.scale_ptrs,
+                gate.scale2_vals,
+                up.packed_ptrs,
+                up.scale_ptrs,
+                up.scale2_vals,
+                gate_out,
+                up_out,
+                expert_offsets,
+                sorted_token_ids,
+                num_experts,
+                inter,
+                h,
+                worklist,
+                total_tiles,
+                stream,
+            )?;
+        } else {
+            ops::moe_w4a16_fused_gate_up_k64_n128(
+                ctx.gpu,
+                self.moe_fused_gate_up_t_k64,
+                expert_input,
+                gate.packed_ptrs,
+                gate.scale_ptrs,
+                gate.scale2_vals,
+                up.packed_ptrs,
+                up.scale_ptrs,
+                up.scale2_vals,
+                gate_out,
+                up_out,
+                expert_offsets,
+                sorted_token_ids,
+                num_experts,
+                inter,
+                h,
+                1,
+                stream,
+            )?;
+        }
         ops::silu_mul(
             ctx.gpu,
             self.moe_act_mul,
@@ -99,35 +142,54 @@ impl MoeLayer {
             stream,
         )?;
 
-        ops::moe_build_tile_worklist(
-            ctx.gpu,
-            self.moe_build_tile_worklist_k,
-            expert_offsets,
-            down.packed_ptrs,
-            worklist,
-            total_tiles,
-            num_experts,
-            h.div_ceil(128),
-            64,
-            stream,
-        )?;
-        ops::moe_w4a16_grouped_gemm_k64_worklist(
-            ctx.gpu,
-            self.moe_grouped_gemm_t_k64_worklist,
-            gate_out,
-            down.packed_ptrs,
-            down.scale_ptrs,
-            down.scale2_vals,
-            down_out,
-            expert_offsets,
-            DevicePtr::NULL,
-            num_experts,
-            h,
-            inter,
-            worklist,
-            total_tiles,
-            stream,
-        )?;
+        if mode != CompactMode::GateUp {
+            ops::moe_build_tile_worklist(
+                ctx.gpu,
+                self.moe_build_tile_worklist_k,
+                expert_offsets,
+                down.packed_ptrs,
+                worklist,
+                total_tiles,
+                num_experts,
+                h.div_ceil(128),
+                64,
+                stream,
+            )?;
+            ops::moe_w4a16_grouped_gemm_k64_worklist(
+                ctx.gpu,
+                self.moe_grouped_gemm_t_k64_worklist,
+                gate_out,
+                down.packed_ptrs,
+                down.scale_ptrs,
+                down.scale2_vals,
+                down_out,
+                expert_offsets,
+                DevicePtr::NULL,
+                num_experts,
+                h,
+                inter,
+                worklist,
+                total_tiles,
+                stream,
+            )?;
+        } else {
+            ops::moe_w4a16_grouped_gemm_ptrtable_n128(
+                ctx.gpu,
+                self.moe_grouped_gemm_t_k64,
+                gate_out,
+                down.packed_ptrs,
+                down.scale_ptrs,
+                down.scale2_vals,
+                down_out,
+                expert_offsets,
+                DevicePtr::NULL,
+                num_experts,
+                h,
+                inter,
+                1,
+                stream,
+            )?;
+        }
         Ok(true)
     }
 }
