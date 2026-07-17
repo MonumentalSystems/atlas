@@ -446,7 +446,11 @@ extern "C" __global__ void moe_w4a16_grouped_gemm_ptrtable_t(
 #define K_STEP_T64 64
 #define PAD_T64 8  // (64+8)*2 = 144 bytes, 144%16 = 0 ✓
 
-extern "C" __global__ void moe_w4a16_grouped_gemm_ptrtable_t_k64(
+// The K64 numerical body is shared by the existing dense launch and the
+// decode-only compact work-list launch below. Keeping one body is important:
+// the compact scheduling experiment must change CTA selection only, not the
+// FP8 conversion, MMA order, or BF16 stores used by the established route.
+__device__ __forceinline__ void moe_w4a16_grouped_gemm_ptrtable_t_k64_impl(
     const __nv_bfloat16* __restrict__ A,
     const unsigned long long* __restrict__ B_packed_ptrs,
     const unsigned long long* __restrict__ B_scale_ptrs,
@@ -456,9 +460,11 @@ extern "C" __global__ void moe_w4a16_grouped_gemm_ptrtable_t_k64(
     const int* __restrict__ sorted_token_ids,
     unsigned int num_experts,
     unsigned int N,
-    unsigned int K
+    unsigned int K,
+    unsigned int expert_id,
+    unsigned int cta_m_local,
+    unsigned int cta_n
 ) {
-    const unsigned int expert_id = blockIdx.z;
     if (expert_id >= num_experts) return;
 
     const int m_start = expert_offsets[expert_id];
@@ -466,11 +472,9 @@ extern "C" __global__ void moe_w4a16_grouped_gemm_ptrtable_t_k64(
     const int M_expert = m_end - m_start;
     if (M_expert <= 0) return;
 
-    const int cta_m_local = blockIdx.y * M_TILE;
     if (cta_m_local >= M_expert) return;
 
     const unsigned int cta_m = m_start + cta_m_local;
-    const unsigned int cta_n = blockIdx.x * N_TILE_LG;
 
     const unsigned char* B_expert = (const unsigned char*)B_packed_ptrs[expert_id];
     const unsigned char* S_expert = (const unsigned char*)B_scale_ptrs[expert_id];
@@ -487,12 +491,12 @@ extern "C" __global__ void moe_w4a16_grouped_gemm_ptrtable_t_k64(
     // B_fp8 padding: row stride 80 bytes (K64+16) gives zero bank conflicts.
     // Without pad: 64-byte rows (16 banks/row) → 4-way conflicts for nc spaced 2 apart.
     // With pad: 80-byte rows (20 banks/row) → nc*20 % 32 hits all distinct banks for nc=0..7.
-    __shared__ __nv_bfloat16 smem_A_k64[2][M_TILE][K_STEP_T64 + PAD_T64];
-    __shared__ unsigned char smem_Bp_k64[2][K_STEP_T64 / 2][N_TILE_LG + BP_PAD];
-    __shared__ unsigned char smem_Bs_k64[2][K_STEP_T64 / GROUP_SIZE][N_TILE_LG + BP_PAD];
-    __shared__ unsigned char smem_B_fp8_k64[N_TILE_LG][K_STEP_T64 + 16];
-    __shared__ float smem_LUT_k64[16];
-    __shared__ int smem_tok_k64[M_TILE];
+    static __shared__ __nv_bfloat16 smem_A_k64[2][M_TILE][K_STEP_T64 + PAD_T64];
+    static __shared__ unsigned char smem_Bp_k64[2][K_STEP_T64 / 2][N_TILE_LG + BP_PAD];
+    static __shared__ unsigned char smem_Bs_k64[2][K_STEP_T64 / GROUP_SIZE][N_TILE_LG + BP_PAD];
+    static __shared__ unsigned char smem_B_fp8_k64[N_TILE_LG][K_STEP_T64 + 16];
+    static __shared__ float smem_LUT_k64[16];
+    static __shared__ int smem_tok_k64[M_TILE];
 
     if (threadIdx.x < 16) smem_LUT_k64[threadIdx.x] = E2M1_LUT_MOE[threadIdx.x];
     if (threadIdx.x < M_TILE) {
@@ -683,6 +687,60 @@ extern "C" __global__ void moe_w4a16_grouped_gemm_ptrtable_t_k64(
         if (r0v && c1 < N) C[r0*N+c1] = __float2bfloat16(acc[nt][1]);
         if (r1v && c0 < N) C[r1*N+c0] = __float2bfloat16(acc[nt][2]);
         if (r1v && c1 < N) C[r1*N+c1] = __float2bfloat16(acc[nt][3]);
+    }
+}
+
+// Dense prefill fallback. Its launch geometry is unchanged; it exists as a
+// thin wrapper so the compact decode path shares the exact same math body.
+extern "C" __global__ void moe_w4a16_grouped_gemm_ptrtable_t_k64(
+    const __nv_bfloat16* __restrict__ A,
+    const unsigned long long* __restrict__ B_packed_ptrs,
+    const unsigned long long* __restrict__ B_scale_ptrs,
+    const float* __restrict__ scale2_vals,
+    __nv_bfloat16* __restrict__ C,
+    const int* __restrict__ expert_offsets,
+    const int* __restrict__ sorted_token_ids,
+    unsigned int num_experts,
+    unsigned int N,
+    unsigned int K
+) {
+    moe_w4a16_grouped_gemm_ptrtable_t_k64_impl(
+        A, B_packed_ptrs, B_scale_ptrs, scale2_vals, C, expert_offsets,
+        sorted_token_ids, num_experts, N, K, blockIdx.z, blockIdx.y * M_TILE,
+        blockIdx.x * N_TILE_LG);
+}
+
+// Decode-only compact work-list launch. `worklist` is produced on-device by
+// `moe_build_tile_worklist`; each entry is (expert_id, (m_tile << 6) | n_tile)
+// where m_tile uses this kernel's M_TILE=64 and n_tile uses N_TILE_LG=128.
+//
+// The grid intentionally strides over device-resident `total_tiles`: no D2H
+// count read, no host-side expert list, and no launch over all 256 experts.
+// Launch with a fixed persistent grid and keep it on the builder's stream.
+extern "C" __global__ void moe_w4a16_grouped_gemm_ptrtable_t_k64_worklist(
+    const __nv_bfloat16* __restrict__ A,
+    const unsigned long long* __restrict__ B_packed_ptrs,
+    const unsigned long long* __restrict__ B_scale_ptrs,
+    const float* __restrict__ scale2_vals,
+    __nv_bfloat16* __restrict__ C,
+    const int* __restrict__ expert_offsets,
+    const int* __restrict__ sorted_token_ids,
+    unsigned int num_experts,
+    unsigned int N,
+    unsigned int K,
+    const unsigned int* __restrict__ worklist,
+    const int* __restrict__ total_tiles
+) {
+    const int tile_count = total_tiles[0];
+    for (unsigned int work = blockIdx.x; work < static_cast<unsigned int>(tile_count);
+         work += gridDim.x) {
+        const unsigned int expert_id = worklist[work * 2];
+        const unsigned int packed_tile = worklist[work * 2 + 1];
+        const unsigned int cta_m_local = (packed_tile >> 6) * M_TILE;
+        const unsigned int cta_n = (packed_tile & 63u) * N_TILE_LG;
+        moe_w4a16_grouped_gemm_ptrtable_t_k64_impl(
+            A, B_packed_ptrs, B_scale_ptrs, scale2_vals, C, expert_offsets,
+            sorted_token_ids, num_experts, N, K, expert_id, cta_m_local, cta_n);
     }
 }
 
