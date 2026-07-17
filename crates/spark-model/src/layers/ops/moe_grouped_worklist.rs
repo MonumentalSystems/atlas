@@ -10,7 +10,11 @@ use anyhow::Result;
 use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 use spark_runtime::kernel_args::KernelLaunch;
 
-const COMPACT_GRID_CTAS: u32 = 256;
+// Gate/up has K=2048 and up to 512 active work-items at C=8. Launch enough
+// resident CTAs to expose all of them; serial worklist striding left the
+// long-K kernel under-occupied. Down has K=512 and benefits from fewer CTAs.
+const COMPACT_GATE_UP_GRID_CTAS: u32 = 1024;
+const COMPACT_DOWN_GRID_CTAS: u32 = 256;
 const COMPACT_BLOCK_THREADS: u32 = 128;
 
 #[allow(clippy::too_many_arguments)]
@@ -36,7 +40,7 @@ pub fn moe_w4a16_fused_gate_up_k64_worklist(
     stream: u64,
 ) -> Result<()> {
     KernelLaunch::new(gpu, kernel)
-        .grid([COMPACT_GRID_CTAS, 1, 1])
+        .grid([COMPACT_GATE_UP_GRID_CTAS, 1, 1])
         .block([COMPACT_BLOCK_THREADS, 1, 1])
         .arg_ptr(a)
         .arg_ptr(gate_packed_ptrs)
@@ -76,7 +80,7 @@ pub fn moe_w4a16_grouped_gemm_k64_worklist(
     stream: u64,
 ) -> Result<()> {
     KernelLaunch::new(gpu, kernel)
-        .grid([COMPACT_GRID_CTAS, 1, 1])
+        .grid([COMPACT_DOWN_GRID_CTAS, 1, 1])
         .block([COMPACT_BLOCK_THREADS, 1, 1])
         .arg_ptr(a)
         .arg_ptr(packed_ptrs)
