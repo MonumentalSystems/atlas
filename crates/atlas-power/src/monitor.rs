@@ -49,6 +49,14 @@ pub(crate) struct Shared {
     inflight: AtomicU64,
     /// Time-weighted concurrency integral (in-flight × microseconds).
     inflight_integral_us: AtomicU64,
+    /// Measured marginal energy the node actually spent while ≥1 request was
+    /// in flight (microjoules): ∫ max(0, P_node − P_idle) dt over busy time.
+    /// The denominator of the continuous conservation invariant.
+    marginal_spent_uj: AtomicU64,
+    /// Sum of marginal energy attributed OUT to requests (microjoules). Should
+    /// track `marginal_spent_uj` within tolerance — if apportionment shares
+    /// sum to 1 per unit energy, Σ attributed == marginal spent.
+    attributed_uj: AtomicU64,
     quality: SampleQuality,
 }
 
@@ -68,6 +76,8 @@ impl Shared {
             idle_uw: AtomicU64::new(NONE_U64),
             inflight: AtomicU64::new(0),
             inflight_integral_us: AtomicU64::new(0),
+            marginal_spent_uj: AtomicU64::new(0),
+            attributed_uj: AtomicU64::new(0),
             quality,
         }
     }
@@ -99,23 +109,29 @@ impl Shared {
         let now_uw = (watts * 1_000_000.0).max(0.0) as u64;
         self.last_uw.store(now_uw, Ordering::Relaxed);
 
-        // Trapezoidal integration of sys_total watts → node microjoules.
+        let inflight = self.inflight.load(Ordering::Relaxed);
+        let idle_uw = self.idle_uw.load(Ordering::Relaxed);
+
+        // Trapezoidal integration of sys_total watts → node microjoules, and
+        // (while busy) the measured marginal energy above idle.
         if let Some(pw) = prev_uw {
             if dt_s > 0.0 {
                 let avg_uw = (pw + now_uw) as f64 / 2.0;
-                let d_uj = (avg_uw * dt_s) as u64;
-                self.node_uj.fetch_add(d_uj, Ordering::Relaxed);
+                self.node_uj.fetch_add((avg_uw * dt_s) as u64, Ordering::Relaxed);
                 self.samples.fetch_add(1, Ordering::Relaxed);
+                if inflight > 0 && idle_uw != NONE_U64 {
+                    let marg = (avg_uw - idle_uw as f64).max(0.0) * dt_s;
+                    self.marginal_spent_uj.fetch_add(marg as u64, Ordering::Relaxed);
+                }
             }
         }
 
         // Idle calibration: only when nothing is in flight.
-        if self.inflight.load(Ordering::Relaxed) == 0 {
-            let cur = self.idle_uw.load(Ordering::Relaxed);
-            let next = if cur == NONE_U64 {
+        if inflight == 0 {
+            let next = if idle_uw == NONE_U64 {
                 now_uw
             } else {
-                (cur as f64 * (1.0 - IDLE_ALPHA) + now_uw as f64 * IDLE_ALPHA) as u64
+                (idle_uw as f64 * (1.0 - IDLE_ALPHA) + now_uw as f64 * IDLE_ALPHA) as u64
             };
             self.idle_uw.store(next, Ordering::Relaxed);
         }
@@ -145,6 +161,22 @@ impl Shared {
         }
     }
 
+    /// Record marginal joules attributed out to a request (for the invariant).
+    pub(crate) fn record_attributed(&self, joules: f64) {
+        if joules > 0.0 {
+            self.attributed_uj
+                .fetch_add((joules * 1_000_000.0) as u64, Ordering::Relaxed);
+        }
+    }
+
+    /// `(attributed_joules, marginal_spent_joules)` since startup.
+    pub(crate) fn invariant_totals(&self) -> (f64, f64) {
+        (
+            self.attributed_uj.load(Ordering::Relaxed) as f64 / 1_000_000.0,
+            self.marginal_spent_uj.load(Ordering::Relaxed) as f64 / 1_000_000.0,
+        )
+    }
+
     pub(crate) fn descriptor(&self) -> &SourceDescriptor {
         &self.descriptor
     }
@@ -171,6 +203,30 @@ pub(crate) struct MonitorSnapshot {
     pub inflight_integral_us: u64,
     pub inflight: u64,
 }
+
+/// Best-effort: pin the sampler thread to the highest-index CPU so it stays
+/// off the low-numbered cores the inference runtime hammers, keeping the act
+/// of measuring from perturbing the thing measured. Non-fatal — a failure
+/// (restricted cpuset, cgroup) just leaves the thread unpinned.
+#[cfg(target_os = "linux")]
+fn pin_off_hot_cores() {
+    // SAFETY: sysconf + CPU_* + sched_setaffinity on the calling thread (pid 0);
+    // all args are validated and errors are ignored.
+    unsafe {
+        let n = libc::sysconf(libc::_SC_NPROCESSORS_ONLN);
+        if n <= 1 {
+            return;
+        }
+        let cpu = (n - 1) as usize;
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        libc::CPU_ZERO(&mut set);
+        libc::CPU_SET(cpu, &mut set);
+        let _ = libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set);
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn pin_off_hot_cores() {}
 
 fn store_opt(slot: &AtomicU64, v: Option<u64>) {
     slot.store(v.unwrap_or(NONE_U64), Ordering::Relaxed);
@@ -201,6 +257,7 @@ impl PowerMonitor {
         let handle = std::thread::Builder::new()
             .name("atlas-power".to_string())
             .spawn(move || {
+                pin_off_hot_cores();
                 let mut prev_uw: Option<u64> = None;
                 let mut last = Instant::now();
                 while !stop2.load(Ordering::Relaxed) {
@@ -231,6 +288,17 @@ impl PowerMonitor {
     /// Current estimated node idle power (watts); 0.0 until calibrated.
     pub fn p_idle_watts(&self) -> f64 {
         self.shared.p_idle_watts()
+    }
+
+    /// Continuous conservation self-check since startup:
+    /// `(attributed_joules, marginal_spent_joules, ratio)`. `ratio` → 1.0 when
+    /// apportionment conserves the measured marginal energy; sustained drift
+    /// beyond a tolerance means the attribution engine has silently broken.
+    /// `ratio` is 1.0 before any busy time is measured.
+    pub fn invariant(&self) -> (f64, f64, f64) {
+        let (attributed, spent) = self.shared.invariant_totals();
+        let ratio = if spent > 0.0 { attributed / spent } else { 1.0 };
+        (attributed, spent, ratio)
     }
 
     pub(crate) fn shared(&self) -> Arc<Shared> {

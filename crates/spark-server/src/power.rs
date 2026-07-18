@@ -16,9 +16,11 @@
 
 use std::sync::Arc;
 
+use std::sync::atomic::Ordering;
+
 use atlas_power::{Policy, PowerMonitor, PowerSource, PowerSpan, SampleQuality, SpbmSource};
 use lazy_static::lazy_static;
-use prometheus::{Counter, register_counter};
+use prometheus::{Counter, Gauge, register_counter, register_gauge};
 
 use crate::api::chat::ChatOutcome;
 
@@ -35,6 +37,14 @@ lazy_static! {
     static ref POWER_JOULES_GROSS: Counter = register_counter!(
         "atlas_power_joules_gross_total",
         "Sum of gross node-wide joules over measured request windows"
+    )
+    .unwrap();
+    /// Continuous conservation self-check: Σ(attributed marginal) ÷ measured
+    /// marginal energy spent while busy. Should hover near 1.0; sustained
+    /// drift means the attribution engine has silently broken.
+    static ref POWER_INVARIANT_RATIO: Gauge = register_gauge!(
+        "atlas_power_invariant_ratio",
+        "Ratio of attributed marginal joules to measured marginal joules spent"
     )
     .unwrap();
 }
@@ -82,20 +92,49 @@ impl PowerHandle {
         }))
     }
 
-    /// Begin a per-request measurement window.
-    pub fn begin(&self) -> PowerSpan {
-        self.monitor.begin_span()
+    /// Begin a per-request measurement window. Returns the span and the
+    /// generated-token counter value at entry (the denominator baseline for
+    /// the work-weighted share).
+    pub fn begin(&self) -> (PowerSpan, u64) {
+        (self.monitor.begin_span(), tokens_now())
     }
 
     /// Close the window, update the Prometheus counters, and return the
     /// report as a JSON value ready to drop into the response. `None` when
     /// the source is not measured (defensive; `init` already guarantees it).
-    fn finish_report(&self, span: &PowerSpan) -> Option<serde_json::Value> {
-        let report = span.finish(None, self.default_policy, self.node_id.clone())?;
+    ///
+    /// `work_share` is this request's fraction of tokens generated across all
+    /// requests during its window — `Some` selects [`Policy::WorkWeighted`]
+    /// (auto-upgraded to Exclusive when the request owned the node alone);
+    /// `None` falls back to the configured default policy.
+    fn finish_report(&self, span: &PowerSpan, work_share: Option<f64>) -> Option<serde_json::Value> {
+        let policy = if work_share.is_some() {
+            Policy::WorkWeighted
+        } else {
+            self.default_policy
+        };
+        let report = span.finish(work_share, policy, self.node_id.clone())?;
         POWER_JOULES_ATTRIBUTED.inc_by(report.joules_marginal);
         POWER_JOULES_GROSS.inc_by(report.joules_gross);
+        POWER_INVARIANT_RATIO.set(self.monitor.invariant().2);
         serde_json::to_value(&report).ok()
     }
+}
+
+/// Current monotonic generated-token count (0 when the counter is untouched).
+fn tokens_now() -> u64 {
+    crate::metrics::GENERATED_TOKENS.load(Ordering::Relaxed)
+}
+
+/// This request's work share = its tokens ÷ all tokens generated during its
+/// window. `None` when nothing was counted (avoids a divide-by-zero and lets
+/// attribution fall back honestly).
+fn work_share(start_tokens: u64, request_tokens: usize) -> Option<f64> {
+    let window = tokens_now().saturating_sub(start_tokens);
+    if window == 0 || request_tokens == 0 {
+        return None;
+    }
+    Some((request_tokens as f64 / window as f64).clamp(0.0, 1.0))
 }
 
 /// Whether a request opted into power metadata via `X-Atlas-Power: 1`
@@ -118,13 +157,15 @@ pub fn header_requests_power(headers: &axum::http::HeaderMap) -> bool {
 /// documented follow-up.
 pub fn attach_power(
     mut outcome: ChatOutcome,
-    span: Option<(Arc<PowerHandle>, PowerSpan)>,
+    span: Option<(Arc<PowerHandle>, PowerSpan, u64)>,
 ) -> ChatOutcome {
-    if let Some((handle, span)) = span
+    if let Some((handle, span, start_tokens)) = span
         && let ChatOutcome::Blocking(ir) = &mut outcome
-        && let Some(v) = handle.finish_report(&span)
     {
-        ir.power = Some(v);
+        let share = work_share(start_tokens, ir.usage.completion_tokens);
+        if let Some(v) = handle.finish_report(&span, share) {
+            ir.power = Some(v);
+        }
     }
     outcome
 }
@@ -171,6 +212,22 @@ mod tests {
         assert!(!header_requests_power(&h));
         h.insert("x-atlas-power", "yes".parse().unwrap());
         assert!(!header_requests_power(&h)); // only 1/true gate the field
+    }
+
+    #[test]
+    fn work_share_math() {
+        // request generated 40 of 100 tokens in its window → 0.4 share.
+        crate::metrics::GENERATED_TOKENS.store(100, Ordering::Relaxed);
+        assert_eq!(work_share(0, 40), Some(0.4));
+        // no tokens counted in the window → no share (honest fallback).
+        crate::metrics::GENERATED_TOKENS.store(60, Ordering::Relaxed);
+        assert_eq!(work_share(60, 40), None);
+        // request with zero output tokens → no share.
+        crate::metrics::GENERATED_TOKENS.store(100, Ordering::Relaxed);
+        assert_eq!(work_share(60, 0), None);
+        // share is clamped to 1.0 even if bookkeeping undercounts the window.
+        crate::metrics::GENERATED_TOKENS.store(70, Ordering::Relaxed);
+        assert_eq!(work_share(60, 40), Some(1.0));
     }
 
     #[test]

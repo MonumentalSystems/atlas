@@ -100,7 +100,7 @@ impl PowerSpan {
             samples_in_window,
         };
 
-        Some(attribute(AttributionInput {
+        let report = attribute(AttributionInput {
             duration_s,
             gross_joules,
             p_idle_watts: self.shared.p_idle_watts(),
@@ -110,7 +110,10 @@ impl PowerSpan {
             measured,
             source,
             node_id,
-        }))
+        });
+        // Feed the continuous conservation invariant.
+        self.shared.record_attributed(report.joules_marginal);
+        Some(report)
     }
 
     /// Recover concurrency stats over the window. Mean is time-weighted from
@@ -252,6 +255,13 @@ mod tests {
         assert!((r.measured.pkg_joules.unwrap() - 50.0).abs() < 1e-6);
         assert!(r.estimated);
         assert_eq!(r.node_id.as_deref(), Some("gx10"));
+
+        // Conservation invariant: the marginal energy measured while busy
+        // (~100 J above the 30 W idle) equals what was attributed out.
+        let (attributed, spent, ratio) = m.invariant();
+        assert!((spent - 100.0).abs() < 6.0, "spent {spent}");
+        assert!((attributed - 100.0).abs() < 6.0, "attributed {attributed}");
+        assert!((ratio - 1.0).abs() < 0.1, "ratio {ratio}");
     }
 
     #[test]

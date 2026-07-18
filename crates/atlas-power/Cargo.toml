@@ -10,6 +10,11 @@ description = "Atlas native per-request power/energy attribution (GB10 spbm ener
 [dependencies]
 serde = { workspace = true }
 
+# Linux-only: best-effort CPU affinity for the sampler thread (pin it off the
+# hot inference cores so measurement doesn't perturb the thing measured).
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 serde_json = { workspace = true }
 

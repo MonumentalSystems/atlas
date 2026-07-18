@@ -116,7 +116,10 @@ pub async fn chat_completions(
         .power
         .as_ref()
         .filter(|_| crate::power::header_requests_power(&headers))
-        .map(|h| (h.clone(), h.begin()));
+        .map(|h| {
+            let (span, start_tokens) = h.begin();
+            (h.clone(), span, start_tokens)
+        });
 
     let outcome = chat_completions_inner(state.clone(), req_ctx, req.into(), dump_seq).await;
 
