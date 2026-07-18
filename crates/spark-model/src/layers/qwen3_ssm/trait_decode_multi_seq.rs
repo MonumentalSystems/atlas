@@ -179,7 +179,24 @@ impl Qwen3SsmLayer {
                 // overhead per layer dominates at small N. The real fix for
                 // this launch overhead is CUDA graphs for n>=2, not MoE
                 // batching (graphs capture these per-token launches for free).
-                if std::env::var("ATLAS_MOE_GROUPED_DECODE").ok().as_deref() == Some("1") {
+                if self.ffn.is_dense() {
+                    // Dense FFN (e.g. Qwen3.6-27B): the per-token forward() loop
+                    // below re-reads the gate/up + down weights n times;
+                    // forward_batched reads each weight ONCE (a GEMM over all n
+                    // tokens). Measured 21.7 -> 52.7 tok/s at C=8 on the 27B.
+                    // MoE keeps the per-token loop (grouped-GEMM's sort/permute
+                    // is a net loss at small N — see the note above).
+                    self.ffn.forward_batched(normed_base, n, ctx, stream)?;
+                    let moe_out = ctx.buffers.moe_output();
+                    ops::residual_add(
+                        ctx.gpu,
+                        self.residual_add_k,
+                        hidden,
+                        moe_out,
+                        (n * h) as u32,
+                        stream,
+                    )?;
+                } else if std::env::var("ATLAS_MOE_GROUPED_DECODE").ok().as_deref() == Some("1") {
                     // Grouped-GEMM MoE over all N tokens (each expert read once).
                     // Only sensible under CUDA graphs, where the sort/permute
                     // launch overhead that made this a loss is captured for free.
