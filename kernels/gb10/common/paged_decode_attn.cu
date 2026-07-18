@@ -547,3 +547,295 @@ extern "C" __global__ void paged_decode_attn_reduce(
         o32[i] = lo | (hi << 16);
     }
 }
+
+// ============================================================================
+// GQA-group-packed MMA flash-decode — Increment 1 (non-split, writes O direct).
+//
+// One CTA owns ONE kv-head for ONE sequence and computes attention for all
+// `group = num_q_heads / num_kv_heads` q-heads of that kv-head as the M-rows of
+// a tensor-core MMA (mma.sync.m16n8k16.bf16). This kills the `group`-fold
+// redundant KV read of the scalar per-q-head `paged_decode_attn`.
+//
+//   Grid:  (num_kv_heads, 1, num_seqs)   Block: (128,1,1) = 4 warps
+//   head_dim == 256 only (compile-guarded below); group must be <= 8.
+//
+// Warp partition: the attended KV range [window_start, seq_len) is split into
+// GQA_MMA_WARPS contiguous stripes (one per warp, scalar-style). Each warp
+// computes the FULL attention (all 8 group rows, all 256 head_dim) over its
+// stripe, holding a partial online-softmax state (m, l, O) in registers; the
+// 4 partials are tree-merged per-row across warps in the epilogue.
+//
+// Numerics track the scalar `paged_decode_attn` golden reference exactly where
+// possible: f32 S accumulation, f32 scale-after-dot (inv_sqrt_d), __expf, m
+// init = -1e30f, l>0 guards, single bf16 output round, identical window clamps.
+// Two accepted, bounded divergences: (a) MMA reorders the head-dim / position
+// sums (still f32, with --fmad=false), (b) P is rounded to bf16 before the P·V
+// MMA. Bit-exactness is NOT expected; the microtest gates on max-abs error and
+// argmax-flip count, not equality.
+// ============================================================================
+#if HDIM == 256
+
+#define GQA_MMA_WARPS 4
+#define GQA_MMA_STEP  16   // KV positions per MMA step per warp (2 n8-tiles)
+
+// Manual m16n8k16 fragment MMA — same idiom as w8a16_gemm.cu:66 (g=lane>>2,
+// t=lane&3). D[16][8] += A[16][16] * B[16][8], f32 accumulate, bf16 operands.
+__device__ __forceinline__ void gqa_mma_m16n8k16(
+    float& d0, float& d1, float& d2, float& d3,
+    unsigned int a0, unsigned int a1, unsigned int a2, unsigned int a3,
+    unsigned int b0, unsigned int b1
+) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+        "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};"
+        : "=f"(d0), "=f"(d1), "=f"(d2), "=f"(d3)
+        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1),
+          "f"(d0), "f"(d1), "f"(d2), "f"(d3)
+    );
+}
+
+__device__ __forceinline__ unsigned int gqa_pack_bf16x2_f(float a, float b) {
+    unsigned int lo = (unsigned int)__bfloat16_as_ushort(__float2bfloat16(a));
+    unsigned int hi = (unsigned int)__bfloat16_as_ushort(__float2bfloat16(b));
+    return lo | (hi << 16);
+}
+
+__device__ __forceinline__ unsigned int gqa_pack_bf16x2_raw(__nv_bfloat16 a, __nv_bfloat16 b) {
+    unsigned int lo = (unsigned int)__bfloat16_as_ushort(a);
+    unsigned int hi = (unsigned int)__bfloat16_as_ushort(b);
+    return lo | (hi << 16);
+}
+
+extern "C" __global__ void paged_decode_attn_gqa_mma(
+    const __nv_bfloat16* __restrict__ Q,          // [num_seqs, num_q_heads, head_dim]
+    const __nv_bfloat16* __restrict__ K_cache,    // [num_blocks, block_size, num_kv_heads, head_dim]
+    const __nv_bfloat16* __restrict__ V_cache,    // [num_blocks, block_size, num_kv_heads, head_dim]
+    __nv_bfloat16* __restrict__ O,                // [num_seqs, num_q_heads, head_dim]
+    const int* __restrict__ block_tables,         // [num_seqs, max_blocks_per_seq]
+    const int* __restrict__ seq_lens,             // [num_seqs]
+    const unsigned int max_blocks_per_seq,
+    const unsigned int num_q_heads,
+    const unsigned int num_kv_heads,
+    const unsigned int head_dim,
+    const unsigned int block_size,
+    const float inv_sqrt_d,
+    const unsigned int q_stride,                  // query.stride(0) in elements
+    const unsigned int sliding_window             // dispatch only calls with 0 (full attn)
+) {
+    static_assert(HDIM == 256, "paged_decode_attn_gqa_mma is specialized for head_dim=256");
+
+    const unsigned int kv_head = blockIdx.x;
+    const unsigned int seq_idx = blockIdx.z;
+    const unsigned int tidx    = threadIdx.x;
+    const unsigned int warp_id = tidx / WARP_SIZE;
+    const unsigned int lane_id = tidx % WARP_SIZE;
+    const unsigned int g = lane_id >> 2;   // 0..7 -> q-row within group (frag row)
+    const unsigned int t = lane_id & 3;    // 0..3 -> frag col quad
+
+    if (kv_head >= num_kv_heads) return;
+
+    const unsigned int seq_len = (unsigned int)seq_lens[seq_idx];
+    if (seq_len == 0) return;
+
+    const unsigned int group = num_q_heads / num_kv_heads;   // 8 for qwen3.6-35b
+    const unsigned int window_start =
+        (sliding_window > 0 && seq_len > sliding_window) ? (seq_len - sliding_window) : 0u;
+
+    // sQ: 8 fragment rows (rows >= group zeroed). Padded to cut bank conflicts.
+    const int PADQ = 8;
+    __shared__ __nv_bfloat16 sQ[8][HDIM + PADQ];
+    // Per-row (m,l) and per-row full O for the 4-warp epilogue tree-merge.
+    __shared__ float smem_m[GQA_MMA_WARPS][8];
+    __shared__ float smem_l[GQA_MMA_WARPS][8];
+    __shared__ float smem_o[GQA_MMA_WARPS][8][HDIM];
+
+    // Cooperative Q load: rows [0,group) from global (honoring q_stride), rows
+    // [group,8) zeroed so dead fragment rows contribute nothing.
+    for (unsigned int idx = tidx; idx < 8u * (HDIM / 2); idx += blockDim.x) {
+        unsigned int r = idx / (HDIM / 2);
+        unsigned int c = idx % (HDIM / 2);   // u32 column; dim = c*2
+        unsigned int val = 0u;
+        if (r < group) {
+            const unsigned int* qsrc = (const unsigned int*)(Q
+                + (unsigned long long)seq_idx * q_stride
+                + (unsigned long long)(kv_head * group + r) * head_dim);
+            val = qsrc[c];
+        }
+        *(unsigned int*)&sQ[r][c * 2] = val;
+    }
+    __syncthreads();
+
+    const int* my_block_table = block_tables + (unsigned long long)seq_idx * max_blocks_per_seq;
+
+    // Warp KV stripe over the ATTENDED range (scalar-style contiguous split).
+    const unsigned int attended = seq_len - window_start;
+    const unsigned int chunk = (attended + GQA_MMA_WARPS - 1) / GQA_MMA_WARPS;
+    unsigned int my_start = window_start + warp_id * chunk;
+    unsigned int my_end = my_start + chunk;
+    if (my_end > seq_len) my_end = seq_len;
+    if (my_start > seq_len) my_start = seq_len;
+
+    // Online-softmax state for this warp's row g (m_run/l_run redundant across t).
+    float m_run = -1e30f;
+    float l_run = 0.0f;
+    const unsigned int NT = HDIM / 8;   // 32 head_dim n8-tiles
+    // Only the 2 real C regs per n8-tile are live (row g). The MMA writes 4 C
+    // regs, but the g+8 rows are structurally zero (A rows g+8 are 0), so their
+    // outputs are parked in two reused throwaway regs that stay 0 — halving the
+    // O accumulator footprint from 128 to 64 registers.
+    float O_accum[HDIM / 8][2];
+    #pragma unroll
+    for (unsigned int nt = 0; nt < NT; nt++) {
+        O_accum[nt][0] = 0.0f; O_accum[nt][1] = 0.0f;
+    }
+    float dead2 = 0.0f, dead3 = 0.0f;   // g+8 rows; remain 0 across all MMAs
+
+    for (unsigned int p0 = my_start; p0 < my_end; p0 += GQA_MMA_STEP) {
+        const unsigned int valid = (my_end - p0) < GQA_MMA_STEP ? (my_end - p0) : GQA_MMA_STEP;
+
+        // --- (1) S = Q · K^T for 16 positions -> two n8-tiles (lo: 0..7, hi: 8..15)
+        // B(K) position provided by THIS lane's fragment column = n8*8 + g.
+        const __nv_bfloat16* kp_lo = (0u * 8 + g) < valid
+            ? paged_kv_ptr(K_cache, my_block_table, p0 + (0u * 8 + g), block_size, num_kv_heads, head_dim, kv_head)
+            : nullptr;
+        const __nv_bfloat16* kp_hi = (1u * 8 + g) < valid
+            ? paged_kv_ptr(K_cache, my_block_table, p0 + (1u * 8 + g), block_size, num_kv_heads, head_dim, kv_head)
+            : nullptr;
+
+        float S_lo[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        float S_hi[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        #pragma unroll
+        for (unsigned int kk = 0; kk < HDIM / 16; kk++) {
+            const unsigned int a0 = *(const unsigned int*)&sQ[g][kk * 16 + t * 2];
+            const unsigned int a2 = *(const unsigned int*)&sQ[g][kk * 16 + t * 2 + 8];
+            // a1/a3 = dead fragment rows (g+8); literal 0 lets nvcc fold them.
+            unsigned int b0_lo = 0, b1_lo = 0, b0_hi = 0, b1_hi = 0;
+            if (kp_lo) {
+                b0_lo = *(const unsigned int*)(kp_lo + kk * 16 + t * 2);
+                b1_lo = *(const unsigned int*)(kp_lo + kk * 16 + t * 2 + 8);
+            }
+            if (kp_hi) {
+                b0_hi = *(const unsigned int*)(kp_hi + kk * 16 + t * 2);
+                b1_hi = *(const unsigned int*)(kp_hi + kk * 16 + t * 2 + 8);
+            }
+            gqa_mma_m16n8k16(S_lo[0], S_lo[1], S_lo[2], S_lo[3], a0, 0u, a2, 0u, b0_lo, b1_lo);
+            gqa_mma_m16n8k16(S_hi[0], S_hi[1], S_hi[2], S_hi[3], a0, 0u, a2, 0u, b0_hi, b1_hi);
+        }
+
+        // f32 scale AFTER the dot (scalar order). Frag col c0/c1 = local pos t*2/t*2+1.
+        float s0 = S_lo[0] * inv_sqrt_d;   // local pos t*2
+        float s1 = S_lo[1] * inv_sqrt_d;   // local pos t*2+1
+        float s2 = S_hi[0] * inv_sqrt_d;   // local pos 8+t*2
+        float s3 = S_hi[1] * inv_sqrt_d;   // local pos 8+t*2+1
+        if ((t * 2)         >= valid) s0 = -1e30f;
+        if ((t * 2 + 1)     >= valid) s1 = -1e30f;
+        if ((8 + t * 2)     >= valid) s2 = -1e30f;
+        if ((8 + t * 2 + 1) >= valid) s3 = -1e30f;
+
+        // --- (2) online softmax (per row g; quad-reduce across the 4 t-lanes)
+        float tmax = fmaxf(fmaxf(s0, s1), fmaxf(s2, s3));
+        tmax = fmaxf(tmax, __shfl_xor_sync(0xffffffff, tmax, 1));
+        tmax = fmaxf(tmax, __shfl_xor_sync(0xffffffff, tmax, 2));
+        float m_new = fmaxf(m_run, tmax);
+        float scale = __expf(m_run - m_new);
+        #pragma unroll
+        for (unsigned int nt = 0; nt < NT; nt++) {
+            O_accum[nt][0] *= scale;
+            O_accum[nt][1] *= scale;
+        }
+        l_run *= scale;
+        float p0v = __expf(s0 - m_new);
+        float p1v = __expf(s1 - m_new);
+        float p2v = __expf(s2 - m_new);
+        float p3v = __expf(s3 - m_new);
+        float psum = p0v + p1v + p2v + p3v;
+        psum += __shfl_xor_sync(0xffffffff, psum, 1);
+        psum += __shfl_xor_sync(0xffffffff, psum, 2);
+        l_run += psum;
+        m_run = m_new;
+
+        // --- (3) P · V  (P->bf16, register-chained C->A; N = head_dim in n8 tiles)
+        const unsigned int a0m = gqa_pack_bf16x2_f(p0v, p1v);   // K-cols t*2, t*2+1
+        const unsigned int a2m = gqa_pack_bf16x2_f(p2v, p3v);   // K-cols t*2+8, t*2+9
+        // V base ptrs for the 4 positions this lane contracts over (dim added below).
+        const __nv_bfloat16* vlo0 = (t * 2)         < valid
+            ? paged_kv_ptr(V_cache, my_block_table, p0 + (t * 2),         block_size, num_kv_heads, head_dim, kv_head) : nullptr;
+        const __nv_bfloat16* vlo1 = (t * 2 + 1)     < valid
+            ? paged_kv_ptr(V_cache, my_block_table, p0 + (t * 2 + 1),     block_size, num_kv_heads, head_dim, kv_head) : nullptr;
+        const __nv_bfloat16* vhi0 = (8 + t * 2)     < valid
+            ? paged_kv_ptr(V_cache, my_block_table, p0 + (8 + t * 2),     block_size, num_kv_heads, head_dim, kv_head) : nullptr;
+        const __nv_bfloat16* vhi1 = (8 + t * 2 + 1) < valid
+            ? paged_kv_ptr(V_cache, my_block_table, p0 + (8 + t * 2 + 1), block_size, num_kv_heads, head_dim, kv_head) : nullptr;
+        #pragma unroll
+        for (unsigned int nt = 0; nt < NT; nt++) {
+            const unsigned int ncol = nt * 8 + g;   // head_dim column
+            __nv_bfloat16 zero = __float2bfloat16(0.0f);
+            __nv_bfloat16 v_lo0 = vlo0 ? vlo0[ncol] : zero;
+            __nv_bfloat16 v_lo1 = vlo1 ? vlo1[ncol] : zero;
+            __nv_bfloat16 v_hi0 = vhi0 ? vhi0[ncol] : zero;
+            __nv_bfloat16 v_hi1 = vhi1 ? vhi1[ncol] : zero;
+            const unsigned int b0 = gqa_pack_bf16x2_raw(v_lo0, v_lo1);   // pos t*2, t*2+1
+            const unsigned int b1 = gqa_pack_bf16x2_raw(v_hi0, v_hi1);   // pos t*2+8, t*2+9
+            gqa_mma_m16n8k16(O_accum[nt][0], O_accum[nt][1], dead2, dead3,
+                             a0m, 0u, a2m, 0u, b0, b1);
+        }
+    }
+
+    // === Epilogue: stage per-warp (m,l,O) then 2-round per-row tree-merge ===
+    smem_m[warp_id][g] = m_run;   // written by all t; identical value across the quad
+    smem_l[warp_id][g] = l_run;
+    #pragma unroll
+    for (unsigned int nt = 0; nt < NT; nt++) {
+        smem_o[warp_id][g][nt * 8 + t * 2]     = O_accum[nt][0];
+        smem_o[warp_id][g][nt * 8 + t * 2 + 1] = O_accum[nt][1];
+    }
+    __syncthreads();
+
+    #pragma unroll
+    for (unsigned int stride = GQA_MMA_WARPS / 2; stride > 0; stride >>= 1) {
+        if (warp_id < stride) {
+            const unsigned int other = warp_id + stride;
+            float lw = smem_l[other][g];
+            if (lw > 0.0f) {
+                float mw = smem_m[other][g];
+                float my_m = smem_m[warp_id][g];
+                float my_l = smem_l[warp_id][g];
+                float m_new = fmaxf(my_m, mw);
+                float scale_me = __expf(my_m - m_new);
+                float scale_w = __expf(mw - m_new);
+                #pragma unroll
+                for (unsigned int nt = 0; nt < NT; nt++) {
+                    unsigned int c0 = nt * 8 + t * 2;
+                    unsigned int c1 = nt * 8 + t * 2 + 1;
+                    smem_o[warp_id][g][c0] = smem_o[warp_id][g][c0] * scale_me + smem_o[other][g][c0] * scale_w;
+                    smem_o[warp_id][g][c1] = smem_o[warp_id][g][c1] * scale_me + smem_o[other][g][c1] * scale_w;
+                }
+                if (t == 0) {
+                    smem_l[warp_id][g] = my_l * scale_me + lw * scale_w;
+                    smem_m[warp_id][g] = m_new;
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    // Warp 0 normalizes (O*(1/l)), single bf16 round, writes O[seq, kv_head*group+g, :].
+    if (warp_id == 0 && g < group) {
+        float final_l = smem_l[0][g];
+        float inv_l = (final_l > 0.0f) ? (1.0f / final_l) : 0.0f;
+        const unsigned int q_head = kv_head * group + g;
+        unsigned int* o32 = (unsigned int*)(O + (unsigned long long)seq_idx * num_q_heads * head_dim
+                                              + (unsigned long long)q_head * head_dim);
+        #pragma unroll
+        for (unsigned int nt = 0; nt < NT; nt++) {
+            unsigned int dim = nt * 8 + t * 2;   // even -> adjacent pair packs to one u32
+            float v0 = smem_o[0][g][dim]     * inv_l;
+            float v1 = smem_o[0][g][dim + 1] * inv_l;
+            unsigned int lo = (unsigned int)__bfloat16_as_ushort(__float2bfloat16(v0));
+            unsigned int hi = (unsigned int)__bfloat16_as_ushort(__float2bfloat16(v1));
+            o32[dim / 2] = lo | (hi << 16);
+        }
+    }
+}
+
+#endif  // HDIM == 256

@@ -377,4 +377,56 @@ pub fn paged_decode_attn_reduce_bf16(
         .launch(stream)
 }
 
+/// GQA-group-packed MMA flash-decode (BF16 KV, Increment 1: non-split).
+///
+/// One CTA owns one kv-head for one sequence and computes attention for all
+/// `group = num_q_heads / num_kv_heads` q-heads via tensor-core MMA, writing the
+/// final normalized BF16 output directly to `output` (num_splits is 1 — no
+/// workspace / reduce). Gated by the caller on head_dim==256 && sliding==0.
+///
+/// Kernel: `paged_decode_attn_gqa_mma(Q, K_cache, V_cache, O, block_tables,
+///          seq_lens, max_blocks_per_seq, num_q_heads, num_kv_heads, head_dim,
+///          block_size, inv_sqrt_d, q_stride, sliding_window)`
+/// Grid: (num_kv_heads, 1, num_seqs)  Block: (128, 1, 1)
+#[allow(clippy::too_many_arguments)]
+pub fn paged_decode_attn_gqa_mma(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    q: DevicePtr,
+    k_cache: DevicePtr,
+    v_cache: DevicePtr,
+    output: DevicePtr,
+    block_tables: DevicePtr,
+    seq_lens: DevicePtr,
+    max_blocks_per_seq: u32,
+    num_seqs: u32,
+    num_q_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    block_size: u32,
+    inv_sqrt_d: f32,
+    q_stride: u32,
+    sliding_window: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([num_kv_heads, 1, num_seqs])
+        .block([128, 1, 1])
+        .arg_ptr(q)
+        .arg_ptr(k_cache)
+        .arg_ptr(v_cache)
+        .arg_ptr(output)
+        .arg_ptr(block_tables)
+        .arg_ptr(seq_lens)
+        .arg_u32(max_blocks_per_seq)
+        .arg_u32(num_q_heads)
+        .arg_u32(num_kv_heads)
+        .arg_u32(head_dim)
+        .arg_u32(block_size)
+        .arg_f32(inv_sqrt_d)
+        .arg_u32(q_stride)
+        .arg_u32(sliding_window)
+        .launch(stream)
+}
+
 // ── SSM / Convolution ──────────────────────────────────────────────

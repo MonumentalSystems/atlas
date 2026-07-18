@@ -126,6 +126,10 @@ name = "inferspark_attn_fp8_microtest"
 required-features = ["cuda", "gpu-examples"]
 
 [[example]]
+name = "gqa_mma_attn_microtest"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
 name = "moe_shared_microtest"
 required-features = ["cuda", "gpu-examples"]
 

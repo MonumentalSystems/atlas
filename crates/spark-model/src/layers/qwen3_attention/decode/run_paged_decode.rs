@@ -534,6 +534,43 @@ impl Qwen3AttentionLayer {
                 // with no split-K.
                 let hd512 = head_dim > 256 && self.paged_decode_512_k.0 != 0;
 
+                // ATLAS_ATTN_GQA_MMA (default OFF, cached at init): GQA-group-packed
+                // MMA flash-decode (Increment 1: non-split, kernel writes O directly).
+                // Only engages for head_dim==256, full attention (sliding==0),
+                // group>=2, block_size%16==0, and the handle loaded. Otherwise falls
+                // through to the UNCHANGED scalar / split-KV plumbing below.
+                let gqa_mma = self.attn_gqa_mma
+                    && sliding == 0
+                    && head_dim == 256
+                    && !hd512
+                    && block_size % 16 == 0
+                    && num_kv_heads > 0
+                    && (num_q_heads / num_kv_heads) >= 2
+                    && self.paged_decode_gqa_mma_k.0 != 0;
+
+                if gqa_mma {
+                    return ops::paged_decode_attn_gqa_mma(
+                        gpu,
+                        self.paged_decode_gqa_mma_k,
+                        q,
+                        kv_cache.k_pool_ptr(self.attn_layer_idx),
+                        kv_cache.v_pool_ptr(self.attn_layer_idx),
+                        output,
+                        block_table,
+                        seq_lens,
+                        max_blocks_per_seq,
+                        num_seqs,
+                        num_q_heads,
+                        num_kv_heads,
+                        head_dim,
+                        block_size,
+                        inv_sqrt_d,
+                        q_stride,
+                        sliding,
+                        stream,
+                    );
+                }
+
                 // ATLAS_ATTN_BF16_SPLITK (default OFF, cached at init): validate
                 // the split-KV workspace + reduce + dispatch plumbing with the
                 // dormant scalar BF16 split/reduce pair (trusted numerics) before

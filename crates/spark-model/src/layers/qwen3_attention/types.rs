@@ -183,6 +183,11 @@ pub struct Qwen3AttentionLayer {
     /// decode arm wakes the dormant scalar split-KV + reduce pair. Read once at
     /// construction so no env read occurs inside CUDA-graph capture.
     pub(super) attn_bf16_splitk: bool,
+    /// Cached ATLAS_ATTN_GQA_MMA flag (default false). When set (and head_dim==256,
+    /// full attention, group>=2, handle loaded), the BF16 decode arm routes to the
+    /// GQA-group-packed MMA flash-decode kernel. Read once at construction so no
+    /// env read occurs inside CUDA-graph capture.
+    pub(super) attn_gqa_mma: bool,
     /// HDIM=512 paged decode kernel for Gemma-4 full-attention layers
     pub(super) paged_decode_512_k: KernelHandle,
     /// MLA absorbed paged decode kernel (HDIM=320).

@@ -258,6 +258,11 @@ impl Qwen3AttentionLayer {
             // plumbing with trusted numerics before the MMA kernel exists. Read
             // once here so no host-side env read happens inside CUDA-graph capture.
             attn_bf16_splitk: std::env::var("ATLAS_ATTN_BF16_SPLITK").is_ok(),
+            // ATLAS_ATTN_GQA_MMA (default OFF): route the BF16 decode arm to the
+            // GQA-group-packed MMA flash-decode kernel (Increment 1: non-split).
+            // Read once here so no host-side env read happens inside CUDA-graph
+            // capture; the dispatch site further gates on head_dim/sliding/handle.
+            attn_gqa_mma: std::env::var("ATLAS_ATTN_GQA_MMA").is_ok(),
             paged_decode_512_k: match kv_dtype {
                 // Bf16KTurbo3V: no HDIM=512 variant yet — dispatch site checks
                 // `paged_decode_512_k.0 != 0` so leaving handle 0 keeps the
