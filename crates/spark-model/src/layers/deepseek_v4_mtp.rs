@@ -303,6 +303,7 @@ impl DeepseekV4MtpHead {
             max_blocks_per_seq: max_blocks,
             num_seqs: 1,
             seq_slot: spark_runtime::gpu::DevicePtr(0),
+            moe_row_adapter: spark_runtime::gpu::DevicePtr::NULL,
         };
 
         // The body's hash-MoE (if any) reads the decode token id from
@@ -334,6 +335,7 @@ impl DeepseekV4MtpHead {
             gdn_exact_replay: false,
             token_ids: ctx.token_ids,
             routed_lora_layers: None, // #30: MTP draft body; no prefill LoRA route.
+            moe_lora_route: crate::layer::MoeLoraRoute::Skip, // MTP draft body: no lora installed here; Skip = no fold (safe/inert)
         };
 
         // `decode_inner_hc` reads the persistent multi-stream state from

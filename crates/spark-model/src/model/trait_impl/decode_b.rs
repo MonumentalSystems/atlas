@@ -360,6 +360,8 @@ impl TransformerModel {
             max_blocks_per_seq: prefill_seq.block_table.len() as u32,
             num_seqs: 1,
             seq_slot: prefill_seq_slot,
+            // Prefilling seq in the mixed batch: MoE fold via the request gate.
+            moe_row_adapter: spark_runtime::gpu::DevicePtr::NULL,
         };
 
         // ── 5. Build decode layer states ──
@@ -384,6 +386,7 @@ impl TransformerModel {
             token_ids: None,
             // #30: decode never routes prefill — installed-pair/bgmv path only.
             routed_lora_layers: None,
+            moe_lora_route: self.decode_moe_route(), // route-aware: base(Skip) decodes; adapter refuses
         };
 
         let prefill_ctx = ForwardContext {
@@ -399,7 +402,12 @@ impl TransformerModel {
             // #30: the fused (SLAI) prefill portion routes by the prefilling
             // seq's slot (None unless it routes to a non-active slot).
             routed_lora_layers: self.routed_slot_layers(prefill_seq.adapter_slot),
+            moe_lora_route: self.moe_lora_route(prefill_seq.adapter_slot),
         };
+
+        // Refuse a non-active-adapter decode row host-side (mirrors
+        // decode_batch_compute_main); base + active rows in the mixed batch fold fine.
+        self.reject_decode_moe_refuse(&decode_ctx, "mixed_forward decode")?;
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             // 6a. Decode: N sequences × 1 token each on hidden[0..padded_n*H)

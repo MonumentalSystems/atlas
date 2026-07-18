@@ -113,11 +113,22 @@ impl TransformerModel {
             .copy_h2d_async(&bt_bytes, meta_base.offset(768), stream)?;
 
         // M2 per-request LoRA routing: upload the per-seq adapter-slot buffer to
-        // the unused metadata gap at meta_base+128 (positions occupy +0..+32 at
-        // padded_n<=8; slots begin at +256 — so +128 never overlaps). Fixed
-        // address, per-step contents → graph-safe. `DevicePtr(0)` when no
-        // adapter is resident (the bgmv apply sites then no-op).
+        // the metadata gap at meta_base+128. With moe_row_adapter relocated to its
+        // own buffer, seq_slot owns the full +128..+256 i32 range (32 rows);
+        // positions occupy +0..+128 and slots begin at +256 — so +128 never
+        // overlaps up to padded_n=32. Fixed address, per-step contents →
+        // graph-safe. `DevicePtr(0)` when no adapter is resident (the bgmv apply
+        // sites then no-op).
         let seq_slot = self.upload_seq_slots(seqs, padded_n, meta_base.offset(128), stream)?;
+        // SOLID Incr-4: the batched-decode MoE per-row fold map, in its own
+        // dedicated persistent buffer `self.moe_row_adapter_buf` (alloc'd once at
+        // init — NO LONGER the +160 metadata gap, which frees seq_slot to reclaim
+        // +128..+256 and lifts the concurrent-LoRA decode cap from 8 to 32). Fixed
+        // address, per-step contents → graph-safe + route-agnostic. `DevicePtr(0)`
+        // when no adapter is resident (the MoE fold hooks then take the
+        // request-granularity gate). Distinct from `seq_slot` (MoE `-1 = base`).
+        let moe_row_adapter =
+            self.upload_moe_row_adapter(seqs, padded_n, self.moe_row_adapter_buf, stream)?;
 
         Ok(AttnMetadataDev {
             positions: meta_base,
@@ -129,6 +140,7 @@ impl TransformerModel {
             max_blocks_per_seq: max_blocks,
             num_seqs: padded_n as u32,
             seq_slot,
+            moe_row_adapter,
         })
     }
 
@@ -150,6 +162,49 @@ impl TransformerModel {
         };
         let adapter_slots: Vec<i32> = seqs.iter().map(|s| s.adapter_slot).collect();
         let host = crate::lora::build_seq_slot_host(&adapter_slots, padded_n, active);
+        let bytes: Vec<u8> = host.iter().flat_map(|v| v.to_le_bytes()).collect();
+        self.gpu.copy_h2d_async(&bytes, dst, stream)?;
+        Ok(dst)
+    }
+
+    /// SOLID Incr-4: build + upload the `[padded_n]` i32 per-row MoE adapter map
+    /// (MoE semantics: `< 0` = base skip, `>= 0` = fold the active adapter) to
+    /// `dst`, the batched-decode fold's fixed-address kernel arg. Returns `dst`
+    /// when an adapter pool is resident (so the gather-BGMV fold reads it) or
+    /// `DevicePtr(0)` when there is no LoRA (the fold hooks then take the
+    /// installed-request gate — byte-identical base decode). A `Refuse` batch is
+    /// rejected BEFORE this is called (`decode_batch_compute_main` pre-lookup
+    /// guard), so every row here is Fold (active) or Skip (base). Resolution +
+    /// pad handling live in the unit-tested pure
+    /// [`crate::lora::build_moe_row_adapter_decode`].
+    fn upload_moe_row_adapter(
+        &self,
+        seqs: &[&mut SequenceState],
+        padded_n: usize,
+        dst: DevicePtr,
+        stream: u64,
+    ) -> Result<DevicePtr> {
+        let active = match self.lora.as_ref() {
+            Some(lw) => lw.active as i32,
+            None => return Ok(DevicePtr(0)),
+        };
+        // Metadata-layout constraint (post-relocation): moe_row_adapter now has
+        // its OWN dedicated buffer (self.moe_row_adapter_buf), so the old +160 gap
+        // is freed and seq_slot@+128 reclaims its full +128..+256 i32 range. The
+        // binding cap is now the shared decode-metadata layout itself:
+        // positions@+0..+128 (32 u32), seq_slot@+128..+256 (32 i32),
+        // slot@+256..+512 (32 i64) all saturate at padded_n=32 (see the algebraic
+        // proof in slot_math_tests.rs + the K/m<=32 guards in verify_*.rs). Refuse
+        // LOUDLY beyond that rather than clobber attention routing / metadata.
+        anyhow::ensure!(
+            padded_n <= 32,
+            "concurrent LoRA decode is limited to batch<=32 (shared decode \
+             metadata layout: positions/seq_slot/slot each hold 32 rows); got \
+             padded_n={padded_n}. Use --max-num-seqs <=32 with a resident MoE \
+             adapter."
+        );
+        let adapter_slots: Vec<i32> = seqs.iter().map(|s| s.adapter_slot).collect();
+        let host = crate::lora::build_moe_row_adapter_decode(&adapter_slots, padded_n, active, true);
         let bytes: Vec<u8> = host.iter().flat_map(|v| v.to_le_bytes()).collect();
         self.gpu.copy_h2d_async(&bytes, dst, stream)?;
         Ok(dst)
@@ -290,6 +345,10 @@ impl TransformerModel {
 
         // Per-request routing slots at the +128 gap (see upload_batch_metadata_fixed).
         let seq_slot = self.upload_seq_slots(seqs, padded_n, meta_base.offset(128), stream)?;
+        // SOLID Incr-4 batched-decode MoE per-row fold map in the dedicated
+        // moe_row_adapter_buf (fixed address, not the +160 gap).
+        let moe_row_adapter =
+            self.upload_moe_row_adapter(seqs, padded_n, self.moe_row_adapter_buf, stream)?;
 
         Ok(AttnMetadataDev {
             positions: meta_base,
@@ -301,6 +360,7 @@ impl TransformerModel {
             max_blocks_per_seq: max_blocks,
             num_seqs: padded_n as u32,
             seq_slot,
+            moe_row_adapter,
         })
     }
 
@@ -372,6 +432,7 @@ impl TransformerModel {
                 // #30: forward the parent's routing (None on this decode-profiling
                 // path, but never silently drop it if a prefill ever re-wraps).
                 routed_lora_layers: ctx.routed_lora_layers,
+                moe_lora_route: ctx.moe_lora_route,
             }
         };
 
@@ -552,6 +613,8 @@ impl TransformerModel {
             max_blocks_per_seq: max_blocks,
             num_seqs: 1,
             seq_slot,
+            // Single-seq draft: the fold hooks use the request gate (NULL map).
+            moe_row_adapter: DevicePtr::NULL,
         };
 
         let ctx = ForwardContext {
@@ -565,6 +628,7 @@ impl TransformerModel {
             gdn_exact_replay: false,
             token_ids: None,
             routed_lora_layers: None, // #30: offline single-seq decode; no prefill route.
+            moe_lora_route: self.decode_moe_route(), // route-aware: base(Skip) skips fold, adapter folds (single-seq reject lifted)
         };
 
         // Eager layer loop: skip SSM layers, run attention layers only

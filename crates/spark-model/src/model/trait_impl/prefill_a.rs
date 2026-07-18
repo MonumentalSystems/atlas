@@ -366,6 +366,7 @@ impl TransformerModel {
             max_blocks_per_seq: seq.block_table.len() as u32,
             num_seqs: 1,
             seq_slot,
+            moe_row_adapter: spark_runtime::gpu::DevicePtr::NULL,
         };
 
         let ctx = ForwardContext {
@@ -384,6 +385,7 @@ impl TransformerModel {
             token_ids: Some(self.buffers.token_ids()),
             // #30: request slot pairs (None unless routing to a non-active slot).
             routed_lora_layers: self.routed_slot_layers(seq.adapter_slot),
+            moe_lora_route: self.moe_lora_route(seq.adapter_slot),
         };
 
         // ── 4. Forward through all layers ──

@@ -38,6 +38,7 @@ pub(crate) mod ssm_pool;
 pub(crate) mod ssm_snapshot;
 pub(crate) mod ssm_snapshot_spill;
 pub(crate) mod ssm_tier;
+pub(crate) mod token_overlay;
 pub(crate) mod trait_impl;
 pub(crate) mod types;
 
