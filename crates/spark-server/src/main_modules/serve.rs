@@ -896,6 +896,8 @@ pub(crate) async fn serve(mut args: cli::ServeArgs) -> Result<()> {
         promotion,
         promoted_slots: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
         lora_disk_stageable,
+        #[cfg(feature = "power_attribution")]
+        power: crate::power::PowerHandle::init(),
     });
 
     serve_phases::log_behavior_audit(&args, &ptx_set);

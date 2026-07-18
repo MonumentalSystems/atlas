@@ -23,6 +23,12 @@ pub struct ChatResponse {
     /// encoders read the first choice.
     pub choices: Vec<Choice>,
     pub usage: Usage,
+    /// Opt-in per-request power/energy metadata (the `atlas-power`
+    /// `PowerReport`, pre-serialized to JSON). `None` unless the
+    /// `power_attribution` feature is on, enabled, and the request sent
+    /// `X-Atlas-Power: 1`. Carried as an opaque `Value` so the IR and the
+    /// wire types need no dependency on `atlas-power`.
+    pub power: Option<serde_json::Value>,
 }
 
 /// One generated choice.

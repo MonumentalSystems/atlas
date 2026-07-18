@@ -29,6 +29,11 @@ metal = [
     "spark-storage/metal",
     "spark-comm/metal",
 ]
+# `power_attribution` adds opt-in per-request energy metadata sourced from
+# the GB10 `spbm` hardware energy counters. Self-contained to spark-server
+# (pulls in the std-only `atlas-power` crate); non-GB10 / non-feature builds
+# carry literally zero cost. See `src/power/`.
+power_attribution = ["dep:atlas-power"]
 
 [[bin]]
 name = "spark"
@@ -37,6 +42,9 @@ path = "src/main.rs"
 [dependencies]
 atlas-core = { workspace = true }
 atlas-kernels = { workspace = true }
+# Optional: only linked when the `power_attribution` feature is on. std-only,
+# no CUDA — the GB10 spbm energy-counter reader + attribution engine.
+atlas-power = { workspace = true, optional = true }
 # `default-features = false` on path-deps so the metal feature actually
 # disables the cuda default that each downstream crate inherits.
 spark-runtime = { path = "../spark-runtime", default-features = false }

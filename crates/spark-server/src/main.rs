@@ -45,6 +45,8 @@ mod model_resolver;
 mod moe_quality;
 mod ngram;
 mod openai;
+#[cfg(feature = "power_attribution")]
+mod power;
 mod rate_limiter;
 pub mod reasoning_parser;
 mod refusal;

@@ -1,0 +1,17 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+[package]
+name = "atlas-power"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Atlas native per-request power/energy attribution (GB10 spbm energy counters)"
+
+[dependencies]
+serde = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+
+[lints]
+workspace = true
