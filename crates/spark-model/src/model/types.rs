@@ -68,6 +68,15 @@ pub struct TransformerModel {
     pub(super) w4a16_gemv_logits_kernel: KernelHandle, // FP32 output for LM head
     pub(super) w4a16_gemm_kernel: KernelHandle,
     pub(super) w4a16_gemv_batch2_kernel: KernelHandle,
+    /// Batched (M<=16) NVFP4 GEMV for the LM head — reads the ~254 MB vocab
+    /// weight ONCE for all decode rows, vs the tiled `w4a16_gemm` that the C=8
+    /// profile showed at ~14% of the decode step. `KernelHandle(0)` on images
+    /// that predate the kernel → tiled fallback.
+    pub(super) w4a16_gemv_batch16_kernel: KernelHandle,
+    /// `ATLAS_LMHEAD_BATCH_GEMV=1`: route the NVFP4 LM head through
+    /// `w4a16_gemv_batch16` when `eff_n<=16`. Reduction order differs from the
+    /// tiled MMA (ULP logit shift → greedy re-baselined + soaked), so default OFF.
+    pub(super) lmhead_batch_gemv: bool,
     /// FP8 E4M3 LUT GEMV (M=1) for the FP8 LM head. Only used when
     /// `lm_head_fp8.is_some()`; loaded unconditionally (cheap handle) so the
     /// dispatch in `lm_head` / batched-decode / verify can reference it.
