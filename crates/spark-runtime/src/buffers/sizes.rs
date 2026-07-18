@@ -224,10 +224,16 @@ impl BufferSizes {
         let mamba2_d_inner = config.mamba2_d_inner();
         let max_dim = h.max(mamba2_d_inner);
 
-        // Split-K decode workspace: NUM_SMS * (head_dim + 2) * sizeof(f32).
+        // Split-K decode workspace: NUM_SMS * gqa_group * (head_dim + 2) * f32.
         // Partials from split CTAs are stored as [o[head_dim], m, l] per split.
-        // Total slots = num_seqs * num_splits ≤ NUM_SMS, so this is constant ~48 KB.
-        let splitk_workspace = 48 * (hd + 2) * 4;
+        // The scalar per-q-head split path writes one slot per CTA (≤ NUM_SMS).
+        // A GQA-group-packed split CTA (GQA-MMA path) emits `gqa_group = nq/nkv`
+        // slots per CTA at the same per-q-head addresses the scalar splits use,
+        // so the buffer must be scaled by `gqa_group` to avoid OOB device writes.
+        // Sizing for the group-packed worst case is safe for the scalar path too
+        // (it simply writes into a now-larger buffer).
+        let gqa_group = (q_heads / kv_heads).max(1);
+        let splitk_workspace = 48 * gqa_group * (hd + 2) * 4;
 
         // The residual stream is always BF16.
         let residual_elem = bf16;

@@ -527,36 +527,105 @@ impl Qwen3AttentionLayer {
                 }
             }
             KvCacheDtype::Bf16 => {
-                // BF16 paged decode — no Split-K (not implemented for BF16 yet)
-                // Use HDIM=512 kernel for Gemma-4 full-attention layers (head_dim > 256)
-                let kernel = if head_dim > 256 && self.paged_decode_512_k.0 != 0 {
-                    self.paged_decode_512_k
-                } else {
-                    self.paged_decode_k
-                };
                 // Gemma-4 sliding layers attend only to the last `window_size`
                 // KV positions; full layers (and all non-Gemma-4 models) pass 0.
                 let sliding = self.sliding_window.unwrap_or(0);
-                ops::paged_decode_attn_bf16(
-                    gpu,
-                    kernel,
-                    q,
-                    kv_cache.k_pool_ptr(self.attn_layer_idx),
-                    kv_cache.v_pool_ptr(self.attn_layer_idx),
-                    output,
-                    block_table,
-                    seq_lens,
-                    max_blocks_per_seq,
-                    num_seqs,
-                    num_q_heads,
-                    num_kv_heads,
-                    head_dim,
-                    block_size,
-                    inv_sqrt_d,
-                    q_stride,
-                    sliding,
-                    stream,
-                )
+                // HDIM=512 (Gemma-4 full-attention) uses the scalar 512 kernel
+                // with no split-K.
+                let hd512 = head_dim > 256 && self.paged_decode_512_k.0 != 0;
+
+                // ATLAS_ATTN_BF16_SPLITK (default OFF, cached at init): validate
+                // the split-KV workspace + reduce + dispatch plumbing with the
+                // dormant scalar BF16 split/reduce pair (trusted numerics) before
+                // the GQA-MMA kernel exists. Only engages when the flag is set,
+                // full attention (sliding==0), the standard HDIM path, and both
+                // split handles loaded. num_splits derives from split_ref_seqs
+                // (determinism pin), computed exactly as the fp8 arm does.
+                let use_splitk = self.attn_bf16_splitk
+                    && sliding == 0
+                    && !hd512
+                    && self.paged_decode_splitk_k.is_some()
+                    && self.paged_decode_reduce_k.is_some();
+
+                let num_splits = if use_splitk {
+                    let current_ctas = num_q_heads * super::super::split_ref_seqs(num_seqs);
+                    if current_ctas >= NUM_SMS {
+                        1u32
+                    } else {
+                        NUM_SMS / current_ctas
+                    }
+                } else {
+                    1u32
+                };
+
+                if use_splitk && num_splits > 1 {
+                    let splitk_k = self
+                        .paged_decode_splitk_k
+                        .expect("BF16 split-K kernel required for ATLAS_ATTN_BF16_SPLITK");
+                    let reduce_k = self
+                        .paged_decode_reduce_k
+                        .expect("BF16 reduce kernel required for ATLAS_ATTN_BF16_SPLITK");
+                    ops::paged_decode_attn_splitk_bf16(
+                        gpu,
+                        splitk_k,
+                        q,
+                        kv_cache.k_pool_ptr(self.attn_layer_idx),
+                        kv_cache.v_pool_ptr(self.attn_layer_idx),
+                        workspace,
+                        block_table,
+                        seq_lens,
+                        max_blocks_per_seq,
+                        num_q_heads,
+                        num_kv_heads,
+                        head_dim,
+                        block_size,
+                        inv_sqrt_d,
+                        num_splits,
+                        q_stride,
+                        num_seqs,
+                        stream,
+                    )?;
+                    ops::paged_decode_attn_reduce_bf16(
+                        gpu,
+                        reduce_k,
+                        workspace,
+                        output,
+                        seq_lens,
+                        num_q_heads,
+                        head_dim,
+                        num_splits,
+                        num_seqs,
+                        stream,
+                    )
+                } else {
+                    // UNCHANGED default scalar path (flag off, or num_splits==1).
+                    // Use HDIM=512 kernel for Gemma-4 full-attention layers.
+                    let kernel = if hd512 {
+                        self.paged_decode_512_k
+                    } else {
+                        self.paged_decode_k
+                    };
+                    ops::paged_decode_attn_bf16(
+                        gpu,
+                        kernel,
+                        q,
+                        kv_cache.k_pool_ptr(self.attn_layer_idx),
+                        kv_cache.v_pool_ptr(self.attn_layer_idx),
+                        output,
+                        block_table,
+                        seq_lens,
+                        max_blocks_per_seq,
+                        num_seqs,
+                        num_q_heads,
+                        num_kv_heads,
+                        head_dim,
+                        block_size,
+                        inv_sqrt_d,
+                        q_stride,
+                        sliding,
+                        stream,
+                    )
+                }
             }
             _ => {
                 // FP8 paged decode. Split count from configured max batch

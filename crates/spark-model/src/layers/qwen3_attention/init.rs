@@ -244,6 +244,20 @@ impl Qwen3AttentionLayer {
                 "tq_plus_innerq_apply_k",
             ),
             paged_decode_k: gpu.kernel(decode_mod, decode_fn)?,
+            // GQA-group-packed MMA flash-decode split kernel. Non-required: the
+            // kernel does not exist yet, so try_kernel returns Handle(0) (the
+            // dispatch site guards on `.0 != 0`). Wired ahead of the kernel so
+            // Increment-0 plumbing lands without a later struct change.
+            paged_decode_gqa_mma_k: super::super::try_kernel(
+                gpu,
+                "paged_decode",
+                "paged_decode_attn_gqa_mma",
+            ),
+            // ATLAS_ATTN_BF16_SPLITK (default OFF): wake the dormant scalar BF16
+            // split-KV + reduce pair to validate the workspace/reduce/dispatch
+            // plumbing with trusted numerics before the MMA kernel exists. Read
+            // once here so no host-side env read happens inside CUDA-graph capture.
+            attn_bf16_splitk: std::env::var("ATLAS_ATTN_BF16_SPLITK").is_ok(),
             paged_decode_512_k: match kv_dtype {
                 // Bf16KTurbo3V: no HDIM=512 variant yet — dispatch site checks
                 // `paged_decode_512_k.0 != 0` so leaving handle 0 keeps the
@@ -359,6 +373,12 @@ impl Qwen3AttentionLayer {
                 KvCacheDtype::Nvfp4 => {
                     Some(gpu.kernel("paged_decode_nvfp4", "paged_decode_attn_splitk_nvfp4")?)
                 }
+                // BF16 split-K uses the dormant scalar split kernel in the
+                // `paged_decode` module (behind ATLAS_ATTN_BF16_SPLITK). Loading
+                // the correct-dtype handle here (was falling into the `_` fp8 arm).
+                KvCacheDtype::Bf16 => {
+                    Some(gpu.kernel("paged_decode", "paged_decode_attn_splitk")?)
+                }
                 KvCacheDtype::Turbo3
                 | KvCacheDtype::Turbo4
                 | KvCacheDtype::Turbo8
@@ -376,6 +396,12 @@ impl Qwen3AttentionLayer {
             paged_decode_reduce_k: match kv_dtype {
                 KvCacheDtype::Nvfp4 => {
                     Some(gpu.kernel("paged_decode_nvfp4", "paged_decode_attn_reduce_nvfp4")?)
+                }
+                // BF16 reduce (now with the seq_lens zero-len guard) in the
+                // `paged_decode` module. Load the correct-dtype handle here
+                // (was falling into the `_` fp8 arm → wrong-dtype reduce).
+                KvCacheDtype::Bf16 => {
+                    Some(gpu.kernel("paged_decode", "paged_decode_attn_reduce")?)
                 }
                 KvCacheDtype::Turbo3
                 | KvCacheDtype::Turbo4

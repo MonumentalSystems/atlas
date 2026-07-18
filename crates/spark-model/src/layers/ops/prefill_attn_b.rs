@@ -292,4 +292,89 @@ pub fn paged_decode_attn_reduce_fp8(
         .launch(stream)
 }
 
+/// Split-K paged decode attention (BF16 KV cache — dormant scalar path).
+///
+/// Wakes `paged_decode_attn_splitk` in the `paged_decode` module behind the
+/// ATLAS_ATTN_BF16_SPLITK flag. Mirrors the fp8 split wrapper but drops
+/// k_scale/v_scale/cache_stride — the BF16 kernel computes the page stride
+/// internally (`block_size * num_kv_heads * head_dim`).
+///
+/// Kernel: `paged_decode_attn_splitk(Q, K_cache, V_cache, workspace,
+///          block_tables, seq_lens, max_blocks_per_seq, num_q_heads,
+///          num_kv_heads, head_dim, block_size, inv_sqrt_d, num_splits, q_stride)`
+/// Grid: (num_q_heads, num_splits, num_seqs)  Block: (256, 1, 1)
+#[allow(clippy::too_many_arguments)]
+pub fn paged_decode_attn_splitk_bf16(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    q: DevicePtr,
+    k_cache: DevicePtr,
+    v_cache: DevicePtr,
+    workspace: DevicePtr,
+    block_tables: DevicePtr,
+    seq_lens: DevicePtr,
+    max_blocks_per_seq: u32,
+    num_q_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    block_size: u32,
+    inv_sqrt_d: f32,
+    num_splits: u32,
+    q_stride: u32,
+    num_seqs: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([num_q_heads, num_splits, num_seqs])
+        .block([256, 1, 1])
+        .arg_ptr(q)
+        .arg_ptr(k_cache)
+        .arg_ptr(v_cache)
+        .arg_ptr(workspace)
+        .arg_ptr(block_tables)
+        .arg_ptr(seq_lens)
+        .arg_u32(max_blocks_per_seq)
+        .arg_u32(num_q_heads)
+        .arg_u32(num_kv_heads)
+        .arg_u32(head_dim)
+        .arg_u32(block_size)
+        .arg_f32(inv_sqrt_d)
+        .arg_u32(num_splits)
+        .arg_u32(q_stride)
+        .launch(stream)
+}
+
+/// Reduce split-K partials into final BF16 output (BF16 variant).
+///
+/// The reduce is producer-/quantization-agnostic; the BF16 twin now takes the
+/// `seq_lens` zero-length guard (matching fp8/nvfp4).
+///
+/// Kernel: `paged_decode_attn_reduce(workspace, O, seq_lens, num_q_heads,
+///          head_dim, num_splits)`
+/// Grid: (num_q_heads, num_seqs, 1)  Block: (32, 1, 1)
+#[allow(clippy::too_many_arguments)]
+pub fn paged_decode_attn_reduce_bf16(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    workspace: DevicePtr,
+    output: DevicePtr,
+    seq_lens: DevicePtr,
+    num_q_heads: u32,
+    head_dim: u32,
+    num_splits: u32,
+    num_seqs: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([num_q_heads, num_seqs, 1])
+        .block([32, 1, 1])
+        .arg_ptr(workspace)
+        .arg_ptr(output)
+        .arg_ptr(seq_lens)
+        .arg_u32(num_q_heads)
+        .arg_u32(head_dim)
+        .arg_u32(num_splits)
+        .launch(stream)
+}
+
 // ── SSM / Convolution ──────────────────────────────────────────────

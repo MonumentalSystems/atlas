@@ -486,10 +486,14 @@ extern "C" __global__ void paged_decode_attn_splitk(
     }
 }
 
-// Reduction kernel — identical to inferspark_decode_reduce (reuse is fine)
+// Reduction kernel — identical to inferspark_decode_reduce (reuse is fine).
+// `seq_lens` guard mirrors the fp8/nvfp4 reduce twins: a zero-length (padded /
+// empty) sequence slot must be skipped so stale workspace is never normalized
+// into O.
 extern "C" __global__ void paged_decode_attn_reduce(
     const float* __restrict__ workspace,
     __nv_bfloat16* __restrict__ O,
+    const int* __restrict__ seq_lens,
     const unsigned int num_q_heads,
     const unsigned int head_dim,
     const unsigned int num_splits
@@ -501,6 +505,7 @@ extern "C" __global__ void paged_decode_attn_reduce(
     const unsigned int vec_offset = lane_id * VEC_BF16;
 
     if (q_head >= num_q_heads) return;
+    if (seq_lens[seq_idx] == 0) return;
 
     unsigned int ws_stride = (head_dim + 2);
     const float* ws_head = workspace + ((unsigned long long)seq_idx * num_q_heads + q_head) * num_splits * ws_stride;
