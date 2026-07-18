@@ -1,17 +1,23 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! Correctness oracle for `paged_decode_attn_gqa_mma` — the GQA-group-packed
-//! MMA flash-decode kernel (Increment 1, non-split) — against the scalar
-//! `paged_decode_attn` golden reference on IDENTICAL paged inputs.
+//! Correctness oracle for the GQA-group-packed MMA flash-decode kernels against
+//! the scalar `paged_decode_attn` golden reference on IDENTICAL paged inputs.
+//!
+//! Three kernels are compared per seq_len:
+//!   * scalar `paged_decode_attn`                          (golden reference)
+//!   * `paged_decode_attn_gqa_mma`                         (Inc1, non-split)
+//!   * `paged_decode_attn_gqa_mma_splitk` + `..._reduce`   (Inc2/3, num_splits=3)
+//! The split path is checked against BOTH the scalar reference AND the non-split
+//! MMA — this catches split-range / reduce / workspace-addressing bugs.
 //!
 //! Model facts (Qwen3.6-35B BF16 KV): head_dim=256, q_heads=16, kv_heads=2,
 //! GQA group=8, block_size=16, full attention (sliding=0). For each seq_len in
 //! {16, 31, 64, 100} it builds synthetic Q/K/V + a (reversed) block table,
-//! launches BOTH kernels, and reports per-(q_head,dim) max-abs error and the
+//! launches all kernels, and reports per-(q_head,dim) max-abs error and the
 //! argmax-flip count of O.
 //!
-//! Bit-exactness is impossible (MMA reorders sums; P is bf16). PASS gate:
-//!   max-abs error < 2^-6 relative to max|O_scalar|  AND  0 argmax flips.
+//! Bit-exactness is impossible (MMA reorders sums; P is bf16). PASS gate (each
+//! comparison): max-abs error < 2^-6 relative to max|O_scalar| AND 0 argmax flips.
 //!
 //! Usage: cargo run --release -p spark-model --example gqa_mma_attn_microtest \
 //!          --features cuda,gpu-examples -- [seed]
@@ -27,6 +33,9 @@ const NQ: usize = 16;
 const NKV: usize = 2;
 const BLOCK_SIZE: usize = 16;
 const REL_GATE: f32 = 1.0 / 64.0; // 2^-6
+const NUM_SPLITS_TEST: u32 = 3; // force split-KV (mirrors 48/(2*8) at C=8)
+// Dynamic smem for the split-KV kernel: sQ 4224 + m 128 + l 128 + pool 67584.
+const GQA_MMA_SPLITK_SMEM: u32 = 72_064;
 
 struct Rng(u64);
 impl Rng {
@@ -80,10 +89,14 @@ fn main() -> Result<()> {
     let stream = gpu.create_stream()?;
     let scalar_k = gpu.kernel("paged_decode", "paged_decode_attn")?;
     let gqa_k = gpu.kernel("paged_decode", "paged_decode_attn_gqa_mma")?;
+    let split_k = gpu.kernel("paged_decode", "paged_decode_attn_gqa_mma_splitk")?;
+    let reduce_k = gpu.kernel("paged_decode", "paged_decode_attn_reduce")?;
 
     let mut all_pass = true;
     for &seq_len in &[16usize, 31, 64, 100] {
-        let pass = run_one(gpu, stream, scalar_k, gqa_k, seq_len, inv_sqrt_d, seed)?;
+        let pass = run_one(
+            gpu, stream, scalar_k, gqa_k, split_k, reduce_k, seq_len, inv_sqrt_d, seed,
+        )?;
         all_pass &= pass;
     }
 
@@ -96,12 +109,45 @@ fn main() -> Result<()> {
     }
 }
 
+/// Per-(q_head,dim) max-abs error, reference magnitude, and argmax-flip count
+/// over dims, between two bf16-bit output tensors laid out `[NQ][HDIM]`.
+fn compare(reference: &[u16], test: &[u16]) -> (f32, f32, usize) {
+    let mut max_abs = 0f32;
+    let mut max_ref = 0f32;
+    let mut argmax_flips = 0usize;
+    for h in 0..NQ {
+        let base = h * HDIM;
+        let (mut am_r, mut am_t) = (0usize, 0usize);
+        let (mut mv_r, mut mv_t) = (f32::MIN, f32::MIN);
+        for d in 0..HDIM {
+            let rv = bf16_bits_to_f32(reference[base + d]);
+            let tv = bf16_bits_to_f32(test[base + d]);
+            max_abs = max_abs.max((rv - tv).abs());
+            max_ref = max_ref.max(rv.abs());
+            if rv > mv_r {
+                mv_r = rv;
+                am_r = d;
+            }
+            if tv > mv_t {
+                mv_t = tv;
+                am_t = d;
+            }
+        }
+        if am_r != am_t {
+            argmax_flips += 1;
+        }
+    }
+    (max_abs, max_ref, argmax_flips)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_one(
     gpu: &dyn GpuBackend,
     stream: u64,
     scalar_k: spark_runtime::gpu::KernelHandle,
     gqa_k: spark_runtime::gpu::KernelHandle,
+    split_k: spark_runtime::gpu::KernelHandle,
+    reduce_k: spark_runtime::gpu::KernelHandle,
     seq_len: usize,
     inv_sqrt_d: f32,
     seed: u64,
@@ -157,6 +203,10 @@ fn run_one(
     let slp = upload(gpu, &i32s_to_le(&seq_lens))?;
     let o_scalar = gpu.alloc(num_seqs * NQ * HDIM * 2)?;
     let o_gqa = gpu.alloc(num_seqs * NQ * HDIM * 2)?;
+    let o_split = gpu.alloc(num_seqs * NQ * HDIM * 2)?;
+    // Split-KV workspace: [num_seqs, NQ, num_splits, HDIM+2] f32.
+    let ns = NUM_SPLITS_TEST as usize;
+    let workspace = gpu.alloc(num_seqs * NQ * ns * (HDIM + 2) * 4)?;
 
     // Scalar reference: grid (NQ, num_seqs, 1), block (256,1,1).
     KernelLaunch::new(gpu, scalar_k)
@@ -197,45 +247,66 @@ fn run_one(
         .arg_u32(q_stride as u32)
         .arg_u32(0)
         .launch(stream)?;
+
+    // Split-KV: grid (NKV, num_splits, num_seqs), block (128,1,1), dynamic smem.
+    // Writes un-normalized (O,m,l) partials to `workspace`.
+    KernelLaunch::new(gpu, split_k)
+        .grid([NKV as u32, NUM_SPLITS_TEST, num_seqs as u32])
+        .block([128, 1, 1])
+        .shared_mem(GQA_MMA_SPLITK_SMEM)
+        .arg_ptr(qp)
+        .arg_ptr(kp)
+        .arg_ptr(vp)
+        .arg_ptr(o_split) // used only when num_splits==1; harmless here
+        .arg_ptr(workspace)
+        .arg_ptr(btp)
+        .arg_ptr(slp)
+        .arg_u32(max_blocks_per_seq as u32)
+        .arg_u32(NQ as u32)
+        .arg_u32(NKV as u32)
+        .arg_u32(HDIM as u32)
+        .arg_u32(BLOCK_SIZE as u32)
+        .arg_f32(inv_sqrt_d)
+        .arg_u32(NUM_SPLITS_TEST)
+        .arg_u32(q_stride as u32)
+        .arg_u32(0) // sliding_window = 0
+        .launch(stream)?;
+
+    // Reduce: grid (NQ, num_seqs, 1), block (32,1,1). Combines splits -> o_split.
+    KernelLaunch::new(gpu, reduce_k)
+        .grid([NQ as u32, num_seqs as u32, 1])
+        .block([32, 1, 1])
+        .arg_ptr(workspace)
+        .arg_ptr(o_split)
+        .arg_ptr(slp)
+        .arg_u32(NQ as u32)
+        .arg_u32(HDIM as u32)
+        .arg_u32(NUM_SPLITS_TEST)
+        .launch(stream)?;
     gpu.synchronize(stream)?;
 
     let os = download_bf16(gpu, o_scalar, num_seqs * NQ * HDIM)?;
     let og = download_bf16(gpu, o_gqa, num_seqs * NQ * HDIM)?;
+    let osp = download_bf16(gpu, o_split, num_seqs * NQ * HDIM)?;
 
-    // Per-(q_head,dim) max-abs error + relative; argmax flip count over dims.
-    let mut max_abs = 0f32;
-    let mut max_ref = 0f32;
-    let mut argmax_flips = 0usize;
-    for h in 0..NQ {
-        let base = h * HDIM;
-        let (mut am_s, mut am_g) = (0usize, 0usize);
-        let (mut mv_s, mut mv_g) = (f32::MIN, f32::MIN);
-        for d in 0..HDIM {
-            let sv = bf16_bits_to_f32(os[base + d]);
-            let gv = bf16_bits_to_f32(og[base + d]);
-            max_abs = max_abs.max((sv - gv).abs());
-            max_ref = max_ref.max(sv.abs());
-            if sv > mv_s {
-                mv_s = sv;
-                am_s = d;
-            }
-            if gv > mv_g {
-                mv_g = gv;
-                am_g = d;
-            }
-        }
-        if am_s != am_g {
-            argmax_flips += 1;
-        }
+    // Three comparisons: MMA vs scalar, split vs scalar, split vs non-split MMA.
+    let mut pass = true;
+    for (label, refo, testo) in [
+        ("mma  vs scalar", &os, &og),
+        ("split vs scalar", &os, &osp),
+        ("split vs mma   ", &og, &osp),
+    ] {
+        let (max_abs, max_ref, flips) = compare(refo, testo);
+        let rel = if max_ref > 0.0 { max_abs / max_ref } else { max_abs };
+        let ok = rel < REL_GATE && flips == 0;
+        pass &= ok;
+        println!(
+            "seq_len={seq_len:>3} blocks={num_blocks:>2} splits={NUM_SPLITS_TEST}  {label}  max_abs={max_abs:.3e}  rel={rel:.3e} (gate {REL_GATE:.3e})  argmax_flips={flips}/{NQ}  => {}",
+            if ok { "PASS" } else { "FAIL" }
+        );
     }
-    let rel = if max_ref > 0.0 { max_abs / max_ref } else { max_abs };
-    let pass = rel < REL_GATE && argmax_flips == 0;
-    println!(
-        "seq_len={seq_len:>3} blocks={num_blocks:>2}  max_abs={max_abs:.3e}  rel={rel:.3e} (gate {REL_GATE:.3e})  argmax_flips={argmax_flips}/{NQ}  => {}",
-        if pass { "PASS" } else { "FAIL" }
-    );
 
-    for p in [qp, kp, vp, btp, slp, o_scalar, o_gqa] {
+    for p in [qp, kp, vp, btp, slp, o_scalar, o_gqa, o_split, workspace] {
         gpu.free(p).ok();
     }
     Ok(pass)

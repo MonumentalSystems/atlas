@@ -253,6 +253,13 @@ impl Qwen3AttentionLayer {
                 "paged_decode",
                 "paged_decode_attn_gqa_mma",
             ),
+            // Split-KV GQA-MMA kernel (Increments 2+3). Non-required: try_kernel
+            // returns Handle(0) if absent (dispatch guards on `.0 != 0`).
+            paged_decode_gqa_mma_splitk_k: super::super::try_kernel(
+                gpu,
+                "paged_decode",
+                "paged_decode_attn_gqa_mma_splitk",
+            ),
             // ATLAS_ATTN_BF16_SPLITK (default OFF): wake the dormant scalar BF16
             // split-KV + reduce pair to validate the workspace/reduce/dispatch
             // plumbing with trusted numerics before the MMA kernel exists. Read

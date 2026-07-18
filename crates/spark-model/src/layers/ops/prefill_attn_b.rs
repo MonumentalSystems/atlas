@@ -429,4 +429,70 @@ pub fn paged_decode_attn_gqa_mma(
         .launch(stream)
 }
 
+/// GQA-group-packed MMA flash-decode split-KV (BF16 KV, Increments 2 + 3).
+///
+/// One CTA owns one kv-head, for one KV-split, for one sequence. Grid
+/// `(num_kv_heads, num_splits, num_seqs)`, block 128. When `num_splits == 1` the
+/// kernel normalizes and writes `output` directly (no reduce needed); when
+/// `num_splits > 1` it writes un-normalized `(O, m, l)` partials to `workspace`
+/// (layout `[num_seqs, num_q_heads, num_splits, head_dim+2]`, identical to the
+/// scalar split path), to be combined by `paged_decode_attn_reduce_bf16`.
+///
+/// Uses 72,064 B of dynamic shared memory (>48 KB → the registry auto-opts-in
+/// via `cuFuncSetAttribute(MAX_DYNAMIC_SHARED_SIZE_BYTES)`): sQ + m/l scalars +
+/// a pool unioned between the double-buffered staged-V tiles (loop) and the
+/// 4-warp O merge scratch (epilogue).
+///
+/// Kernel: `paged_decode_attn_gqa_mma_splitk(Q, K_cache, V_cache, O, workspace,
+///          block_tables, seq_lens, max_blocks_per_seq, num_q_heads,
+///          num_kv_heads, head_dim, block_size, inv_sqrt_d, num_splits,
+///          q_stride, sliding_window)`
+#[allow(clippy::too_many_arguments)]
+pub fn paged_decode_attn_gqa_mma_splitk(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    q: DevicePtr,
+    k_cache: DevicePtr,
+    v_cache: DevicePtr,
+    output: DevicePtr,
+    workspace: DevicePtr,
+    block_tables: DevicePtr,
+    seq_lens: DevicePtr,
+    max_blocks_per_seq: u32,
+    num_seqs: u32,
+    num_q_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    block_size: u32,
+    inv_sqrt_d: f32,
+    num_splits: u32,
+    q_stride: u32,
+    sliding_window: u32,
+    stream: u64,
+) -> Result<()> {
+    // Dynamic smem: sQ 4224 + m 128 + l 128 + pool 67584 = 72064 B (HDIM=256).
+    const GQA_MMA_SPLITK_SMEM: u32 = 72_064;
+    KernelLaunch::new(gpu, kernel)
+        .grid([num_kv_heads, num_splits, num_seqs])
+        .block([128, 1, 1])
+        .shared_mem(GQA_MMA_SPLITK_SMEM)
+        .arg_ptr(q)
+        .arg_ptr(k_cache)
+        .arg_ptr(v_cache)
+        .arg_ptr(output)
+        .arg_ptr(workspace)
+        .arg_ptr(block_tables)
+        .arg_ptr(seq_lens)
+        .arg_u32(max_blocks_per_seq)
+        .arg_u32(num_q_heads)
+        .arg_u32(num_kv_heads)
+        .arg_u32(head_dim)
+        .arg_u32(block_size)
+        .arg_f32(inv_sqrt_d)
+        .arg_u32(num_splits)
+        .arg_u32(q_stride)
+        .arg_u32(sliding_window)
+        .launch(stream)
+}
+
 // ── SSM / Convolution ──────────────────────────────────────────────
