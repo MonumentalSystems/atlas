@@ -75,7 +75,22 @@ impl Qwen3SsmLayer {
         // verify — 2026-07-02 flagship gate). Mirrors the M<=4 dispatch in
         // trait_decode_multi_seq/ssm_batched.rs: one weight pass via
         // `w8a16_gemv_batch4`, per-token `w8a16_gemv` when it isn't linked.
-        if (num_tokens == 2 || num_tokens == 3)
+        if let Some(ref q2) = self.qkvz_q2 {
+            // Tier-1c keep-packed Q2_0: per-token 2-bit fused-qkvz GEMV. Bonsai
+            // (dense qwen35) has no MTP, so this batched path is only reached
+            // under multi-token verify — a per-token loop is bit-identical to
+            // the M=1 decode GEMV and needs no batched packed kernel.
+            for t in 0..num_tokens {
+                ops::q2_0_gemv_vec(
+                    ctx.gpu,
+                    self.q2_0_gemv_k,
+                    normed.offset(t * h * bf16),
+                    q2,
+                    proj_dst.offset(t * qkvz_size * bf16),
+                    stream,
+                )?;
+            }
+        } else if (num_tokens == 2 || num_tokens == 3)
             && let Some(ref fp8) = self.qkvz_fp8w
         {
             if self.w8a16_gemv_batch4_k.0 != 0 {

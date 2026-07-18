@@ -92,6 +92,22 @@ pub struct BufferSizes {
     /// positions/slots/block_table region. 0 (→ NULL) when no adapter
     /// (adapter_max_rank == 0).
     pub lora_seq_slot: usize,
+    /// Native keep-packed Q2_0 prefill transient-dequant scratch
+    /// (`ATLAS_GGUF_NATIVE_Q2=1`). ONE persistent BF16 `[N,K]` buffer sized to
+    /// the LARGEST keep-packed projection, REUSED for every per-projection
+    /// dequant so prefill stops doing a per-matmul cuMemAlloc +
+    /// cuStreamSynchronize + cuMemFree (the multi-second fixed cost behind the
+    /// 3.7 s / 28-token TTFT regression). 0 (→ NULL) unless the flag is set.
+    pub q2_dequant_scratch: usize,
+    /// Native Q2_0 MMQ prefill q8_1 activation scratch (`ATLAS_GGUF_NATIVE_Q2_MMQ=1`).
+    /// ONE persistent q8_1_mmq buffer (`m*kpad*4 + 1MB`) shared by every kept-packed
+    /// projection (FFN gate/up/down, attn q/k/v/o, GDN qkvz): each seam quantizes
+    /// its BF16 activation into this buffer then runs the packed MMQ GEMM — so the
+    /// 2-bit weight is never dequantized to a BF16 scratch (kills the ~2s dequant
+    /// tax AND the shared-`q2_dequant_scratch` co-dispatch race). Sized to the
+    /// widest projection K = max(hidden, intermediate, q_heads*head_dim).
+    /// 0 (→ NULL) unless the MMQ sub-flag is set.
+    pub q2_act_q8: usize,
 }
 
 impl BufferSizes {
@@ -287,6 +303,18 @@ impl BufferSizes {
             0
         };
 
+        // Native keep-packed Q2_0 prefill transient-dequant scratch (Tier-1,
+        // ATLAS_GGUF_NATIVE_Q2=1). ONE persistent BF16 `[N,K]` buffer sized to
+        // the LARGEST keep-packed projection, reused for every per-projection
+        // dequant so prefill stops doing a per-matmul cuMemAlloc +
+        // cuStreamSynchronize + cuMemFree (a multi-second FIXED cost — 3.7 s
+        // TTFT even on a 28-token prompt, independent of prompt length). The
+        // dequant kernel writes N*K BF16 elems into the front and the
+        // same-stream GEMM consumes them before the next projection dequants.
+        // Native keep-packed Q2_0 prefill scratch (Tier-1 transient-dequant +
+        // Tier-2 MMQ q8_1 activation); env-gated, 0 unless the flags are set.
+        let (q2_dequant_scratch, q2_act_q8) = super::sizes_q2::q2_scratch_sizes(config, m, h, hd);
+
         // Dense-FFN activation-quant scratch, shared across all layers (SSOT).
         // Sized for the largest projection K = max(hidden, intermediate); the
         // dense_ffn prefill paths pass `h.max(inter)` to the requant kernels.
@@ -422,6 +450,8 @@ impl BufferSizes {
             lora_delta,
             lora_hact,
             lora_seq_slot,
+            q2_dequant_scratch,
+            q2_act_q8,
         }
     }
 
@@ -462,5 +492,7 @@ impl BufferSizes {
             + self.lora_delta
             + self.lora_hact
             + self.lora_seq_slot
+            + self.q2_dequant_scratch
+            + self.q2_act_q8
     }
 }

@@ -39,6 +39,10 @@ mod gemm_fp4;
 mod gemm_fp8_prefill;
 #[path = "ops/gemm_quant.rs"]
 mod gemm_quant;
+#[path = "ops/gemv_q2.rs"]
+mod gemv_q2;
+#[path = "ops/gemv_q2_vec.rs"]
+mod gemv_q2_vec;
 #[path = "ops/hyper_connection.rs"]
 mod hyper_connection;
 #[path = "ops/kv_cache.rs"]
@@ -85,6 +89,7 @@ mod prefill_attn_main_b;
 #[path = "ops/prefill_attn_turbok.rs"]
 mod prefill_attn_turbok;
 mod q4k_mmq;
+mod q2_0_mmq;
 #[path = "ops/quant_dispatch.rs"]
 mod quant_dispatch;
 #[path = "ops/sampling.rs"]
@@ -117,6 +122,8 @@ pub use gemm_dense_int8::*;
 pub use gemm_fp4::*;
 pub use gemm_fp8_prefill::*;
 pub use gemm_quant::*;
+pub use gemv_q2::*;
+pub use gemv_q2_vec::*;
 pub use hyper_connection::*;
 pub use kv_cache::*;
 pub use kv_cache_fp8k::*;
@@ -140,6 +147,7 @@ pub use prefill_attn_fp8k::*;
 pub use prefill_attn_main_a::*;
 pub use prefill_attn_main_b::*;
 pub use prefill_attn_turbok::*;
+pub use q2_0_mmq::*;
 pub use q4k_mmq::*;
 pub use quant_dispatch::*;
 pub use sampling::*;
