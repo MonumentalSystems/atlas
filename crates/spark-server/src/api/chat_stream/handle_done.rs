@@ -226,6 +226,9 @@ pub(super) fn handle_done(
         reason: crate::ir::FinishReason::from(fr),
         usage,
         token_ids: state.take_ids_if(ctx.req_return_token_ids),
+        // Populated (when enabled + requested) by the OpenAI streaming
+        // wrapper in `crate::power::attach_power` as the delta flows out.
+        power: None,
     });
 
     // Metrics.

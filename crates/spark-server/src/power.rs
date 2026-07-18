@@ -19,6 +19,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use atlas_power::{Policy, PowerMonitor, PowerSource, PowerSpan, SampleQuality, SpbmSource};
+use futures::StreamExt;
 use lazy_static::lazy_static;
 use prometheus::{Counter, Gauge, register_counter, register_gauge};
 
@@ -150,24 +151,56 @@ pub fn header_requests_power(headers: &axum::http::HeaderMap) -> bool {
         .unwrap_or(false)
 }
 
-/// Attach an opt-in power report to a completed blocking response.
+/// Attach an opt-in power report to a completed response.
 ///
-/// A no-op for streaming / HTTP outcomes (the span is simply dropped, which
-/// balances the in-flight count). Streaming power attribution is a
-/// documented follow-up.
+/// - **Blocking**: finish the span now and stash the report on the IR.
+/// - **Streaming**: wrap the delta stream so the span is finished as the
+///   terminal `Finish` delta flows out, and the report rides the final usage
+///   chunk. If the stream is dropped early (client disconnect, error) the
+///   span drops with the wrapper and the in-flight count still balances.
+/// - **HTTP**: the span is simply dropped.
 pub fn attach_power(
-    mut outcome: ChatOutcome,
+    outcome: ChatOutcome,
     span: Option<(Arc<PowerHandle>, PowerSpan, u64)>,
 ) -> ChatOutcome {
-    if let Some((handle, span, start_tokens)) = span
-        && let ChatOutcome::Blocking(ir) = &mut outcome
-    {
-        let share = work_share(start_tokens, ir.usage.completion_tokens);
-        if let Some(v) = handle.finish_report(&span, share) {
-            ir.power = Some(v);
+    let Some((handle, span, start_tokens)) = span else {
+        return outcome;
+    };
+    match outcome {
+        ChatOutcome::Blocking(mut ir) => {
+            let share = work_share(start_tokens, ir.usage.completion_tokens);
+            if let Some(v) = handle.finish_report(&span, share) {
+                ir.power = Some(v);
+            }
+            ChatOutcome::Blocking(ir)
         }
+        ChatOutcome::Streaming(deltas) => {
+            let mut span = Some(span);
+            let wrapped = deltas.map(move |delta| match delta {
+                crate::ir::StreamDelta::Finish {
+                    reason,
+                    usage,
+                    token_ids,
+                    power: _,
+                } => {
+                    let power = span.take().and_then(|sp| {
+                        let share = work_share(start_tokens, usage.completion_tokens);
+                        handle.finish_report(&sp, share)
+                    });
+                    crate::ir::StreamDelta::Finish {
+                        reason,
+                        usage,
+                        token_ids,
+                        power,
+                    }
+                }
+                other => other,
+            });
+            ChatOutcome::Streaming(Box::pin(wrapped))
+        }
+        // HTTP (error/fast-fail) — span drops here, balancing in-flight.
+        other => other,
     }
-    outcome
 }
 
 fn env_truthy(key: &str) -> bool {
