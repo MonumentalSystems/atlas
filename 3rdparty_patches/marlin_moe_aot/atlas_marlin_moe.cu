@@ -90,46 +90,66 @@ bool vllm_full_shared_enabled() {
 }
 
 // Build vLLM's block-aligned route metadata for M<=8, top_k=8, E=256.
-// One CTA is intentional: this is a tiny, graph-captured control kernel and
-// the serial prefix sum avoids an additional scan launch.
+// One CTA, 256 threads (one per expert). The former version ran the entire
+// count/scan/pad-fill/scatter serially on tid==0 (~600 dependent iterations
+// gating both GEMMs on all ~40 MoE layers). This parallelizes it: parallel
+// count, Hillis-Steele padded prefix-scan (O(log 256)=8 steps), parallel
+// pad-fill + expert-id emit (one expert/thread), atomic scatter of real
+// routes. Output is block-M-8-padded with the identical `routes` sentinel and
+// per-expert base offsets — token-equal to the serial version; the only
+// difference is intra-expert route ORDER (atomic scatter vs ascending), which
+// changes only the fp reduction order in the blend (within existing NVFP4
+// tolerance), same as vLLM's count_and_sort_expert_tokens ordering.
 __global__ void align_routes_c8(const int32_t* topk_ids,
                                 int32_t* sorted_token_ids,
                                 int32_t* expert_ids,
                                 int32_t* num_tokens_post_padded,
                                 int num_tokens) {
   __shared__ int counts[256];
-  __shared__ int offsets[257];
+  __shared__ int scan[256];   // padded counts, then inclusive prefix scan
+  __shared__ int offs[256];   // exclusive base offset per expert
   __shared__ int cursors[256];
   const int tid = threadIdx.x;
+  const int routes = num_tokens * 8;
   counts[tid] = 0;
   cursors[tid] = 0;
   __syncthreads();
 
-  if (tid == 0) {
-    const int routes = num_tokens * 8;
-    for (int route = 0; route < routes; ++route) {
-      const int expert = topk_ids[route];
-      if (expert >= 0 && expert < 256) ++counts[expert];
-    }
+  // 1. parallel count (routes <= 64, sparse)
+  if (tid < routes) {
+    const int e = topk_ids[tid];
+    if (e >= 0 && e < 256) atomicAdd(&counts[e], 1);
+  }
+  __syncthreads();
 
-    offsets[0] = 0;
-    for (int expert = 0; expert < 256; ++expert) {
-      const int padded = (counts[expert] + 7) & ~7;
-      offsets[expert + 1] = offsets[expert] + padded;
-      for (int i = 0; i < padded; ++i) {
-        sorted_token_ids[offsets[expert] + i] = routes;
-      }
-      for (int block = 0; block < padded / 8; ++block) {
-        expert_ids[offsets[expert] / 8 + block] = expert;
-      }
+  // 2. pad each expert's count up to a multiple of 8 (identical quantum)
+  const int padded = (counts[tid] + 7) & ~7;
+  scan[tid] = padded;
+  __syncthreads();
+
+  // 3. Hillis-Steele inclusive scan over 256 experts
+  for (int d = 1; d < 256; d <<= 1) {
+    const int v = (tid >= d) ? scan[tid - d] : 0;
+    __syncthreads();
+    scan[tid] += v;
+    __syncthreads();
+  }
+  const int base = scan[tid] - padded;  // exclusive per-expert offset
+  offs[tid] = base;
+  if (tid == 255) *num_tokens_post_padded = scan[255];
+
+  // 4. parallel pad-fill (sentinel) + expert-id emit, one expert per thread
+  for (int i = 0; i < padded; ++i) sorted_token_ids[base + i] = routes;
+  for (int b = 0; b < (padded >> 3); ++b) expert_ids[(base >> 3) + b] = tid;
+  __syncthreads();
+
+  // 5. parallel scatter of real routes (overwrites the leading sentinels)
+  if (tid < routes) {
+    const int e = topk_ids[tid];
+    if (e >= 0 && e < 256) {
+      const int slot = atomicAdd(&cursors[e], 1);
+      sorted_token_ids[offs[e] + slot] = tid;
     }
-    for (int route = 0; route < routes; ++route) {
-      const int expert = topk_ids[route];
-      if (expert >= 0 && expert < 256) {
-        sorted_token_ids[offsets[expert] + cursors[expert]++] = route;
-      }
-    }
-    *num_tokens_post_padded = offsets[256];
   }
 }
 
