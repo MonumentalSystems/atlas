@@ -122,8 +122,8 @@ impl PowerHandle {
     }
 }
 
-/// Finish a legacy `/v1/completions` span and stamp the report onto the
-/// response. Work share comes from the response's own `completion_tokens`.
+/// Finish a legacy `/v1/completions` (blocking) span and stamp the report
+/// onto the response. Work share comes from the response's completion_tokens.
 pub fn attach_completion_power(
     resp: &mut crate::openai::CompletionResponse,
     handle: &PowerHandle,
@@ -132,6 +132,18 @@ pub fn attach_completion_power(
 ) {
     let share = work_share(start_tokens, resp.usage.completion_tokens);
     resp.power = handle.finish_report(&span, share);
+}
+
+/// Finish a legacy `/v1/completions` STREAMING span (called from the terminal
+/// `Done` event) and return the report JSON for the terminal usage chunk.
+pub fn finish_completion_stream(
+    handle: &PowerHandle,
+    span: PowerSpan,
+    start_tokens: u64,
+    completion_tokens: usize,
+) -> Option<serde_json::Value> {
+    let share = work_share(start_tokens, completion_tokens);
+    handle.finish_report(&span, share)
 }
 
 /// Current monotonic generated-token count (0 when the counter is untouched).
