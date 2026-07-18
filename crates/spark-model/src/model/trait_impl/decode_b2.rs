@@ -57,6 +57,28 @@ impl TransformerModel {
 
         let logits = self.buffers.logits();
         let v = self.config.vocab_size;
+        // Batched M<=16 NVFP4 fast path: read the ~254 MB vocab weight ONCE for
+        // all padded_n rows instead of the per-token GEMV loop below (which re-reads
+        // it padded_n×). Opt-in via ATLAS_LMHEAD_BATCH_GEMV; covers the mixed /
+        // MTP-verify decode batch on an NVFP4 head. Falls back to the loop.
+        if self.lm_head_nvfp4.is_some()
+            && self.lmhead_batch_gemv
+            && padded_n <= 16
+            && self.w4a16_gemv_batch16_kernel.0 != 0
+        {
+            let nvfp4 = self.lm_head_nvfp4.as_ref().unwrap();
+            ops::w4a16_gemv_batchm(
+                self.gpu.as_ref(),
+                self.w4a16_gemv_batch16_kernel,
+                normed,
+                nvfp4,
+                logits,
+                padded_n as u32,
+                v as u32,
+                h as u32,
+                stream,
+            )?;
+        } else {
         for i in 0..padded_n {
             let normed_i = normed.offset(i * h * bf16);
             let logits_i = logits.offset(i * v * bf16);
@@ -94,6 +116,7 @@ impl TransformerModel {
                     stream,
                 )?;
             }
+        }
         }
         let decode_logits = logits;
 
