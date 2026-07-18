@@ -96,6 +96,7 @@ fn validate_token_ids(state: &AppState, ids: &[u32]) -> Result<(), (StatusCode, 
 
 pub async fn completions(
     State(state): State<Arc<AppState>>,
+    #[cfg(feature = "power_attribution")] headers: axum::http::HeaderMap,
     req: Result<Json<CompletionRequest>, JsonRejection>,
 ) -> Response {
     let Json(req) = match req {
@@ -229,6 +230,18 @@ pub async fn completions(
     let length_penalty = req.length_penalty.unwrap_or(1.0);
     let early_stopping = req.early_stopping.unwrap_or(false);
 
+    // Opt-in power window: begin before generation (spans prefill + decode)
+    // only when enabled on this node and the request sent `X-Atlas-Power: 1`.
+    #[cfg(feature = "power_attribution")]
+    let power_ctx = state
+        .power
+        .as_ref()
+        .filter(|_| crate::power::header_requests_power(&headers))
+        .map(|h| {
+            let (span, start_tokens) = h.begin();
+            (h.clone(), span, start_tokens)
+        });
+
     let params = super::completions_exec::CompletionParams {
         temperature,
         top_k,
@@ -248,6 +261,8 @@ pub async fn completions(
         num_beams,
         length_penalty,
         early_stopping,
+        #[cfg(feature = "power_attribution")]
+        power_ctx,
     };
 
     if req.stream {

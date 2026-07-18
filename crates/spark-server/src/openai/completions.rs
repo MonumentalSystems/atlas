@@ -174,6 +174,11 @@ pub struct CompletionResponse {
     /// Matches chat completions ("fp_atlas"); some SDKs read it for
     /// seed/determinism bookkeeping.
     pub system_fingerprint: String,
+    /// Opt-in per-request power/energy metadata (Atlas extension). Present
+    /// only when the `power_attribution` feature is enabled and the request
+    /// sent `X-Atlas-Power: 1`; omitted otherwise (never zero-filled).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub power: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -210,6 +215,7 @@ impl CompletionResponse {
             choices,
             usage,
             system_fingerprint: "fp_atlas".to_string(),
+            power: None,
         }
     }
 }
