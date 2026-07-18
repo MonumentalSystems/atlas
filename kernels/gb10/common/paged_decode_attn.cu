@@ -576,7 +576,12 @@ extern "C" __global__ void paged_decode_attn_reduce(
 #if HDIM == 256
 
 #define GQA_MMA_WARPS 4
-#define GQA_MMA_STEP  16   // KV positions per MMA step per warp (2 n8-tiles)
+#define GQA_MMA_STEP  16   // KV positions per MMA step per warp (2 n8-tiles) — Inc1 kernel
+// CTA-cooperative shared-tile params (splitk kernel, Increment 3.5). ONE 32-position
+// K tile + one 32-position V tile is loaded per CTA step by all 128 threads; the 4
+// warps partition the 32 positions (8 each) and merge partials in the epilogue.
+#define GQA_TILE_KV   32                              // positions per CTA shared tile
+#define GQA_MMA_WPOS  (GQA_TILE_KV / GQA_MMA_WARPS)   // 8 positions per warp per tile
 
 // Manual m16n8k16 fragment MMA — same idiom as w8a16_gemm.cu:66 (g=lane>>2,
 // t=lane&3). D[16][8] += A[16][16] * B[16][8], f32 accumulate, bf16 operands.
@@ -839,35 +844,63 @@ extern "C" __global__ void paged_decode_attn_gqa_mma(
 }
 
 // ============================================================================
-// GQA-group-packed MMA flash-decode — Increment 2 (split-KV) + Increment 3
-// (latency hiding). One CTA owns ONE kv-head, for ONE KV-split, for ONE seq.
+// GQA-group-packed MMA flash-decode — CTA-cooperative K+V shared-tile (Increment
+// 3.5). One CTA owns ONE kv-head, for ONE KV-split, for ONE seq.
 //
 //   Grid:  (num_kv_heads, num_splits, num_seqs)   Block: (128,1,1) = 4 warps
 //
-// vs the Increment-1 `paged_decode_attn_gqa_mma`, this adds:
-//   * Split-KV occupancy: at C=8, num_splits = 48/(2*8) = 3 -> 2*3*8 = 48 CTAs
-//     (one 48-SM wave) instead of 16. Each CTA processes only its split's KV
-//     sub-range [kv_start, kv_end) (scalar-splitk-identical clamps over
-//     [0, seq_len)); the partials are combined by `paged_decode_attn_reduce`.
+// Core idea (fixing the warp-stripe / V-only-staged Inc1-3 design that was NOT
+// faster than scalar because K was read direct from global with no latency
+// hiding): the WHOLE CTA (128 threads) cooperatively loads ONE 32-position K
+// tile AND one 32-position V tile into shared memory per step, via a PIPE_DEPTH=2
+// `cp.async.cg` double-buffer — BOTH K and V are staged (K is the key change) so
+// the NEXT tile's K+V gather overlaps the current tile's Q·K^T + softmax + P·V.
+// At ~2K ctx, C=8 attention is gather-latency-bound (KV is L2-resident), so
+// hiding the strided page gathers is the whole win.
+//
+// Warp/position partition: the 4 warps partition the 32-position shared tile,
+// GQA_MMA_WPOS=8 positions each (warp w owns tile-local positions [w*8, w*8+8)).
+// Each warp computes ONE n8-tile Q·K^T (8 positions x the 8 group q-rows = MMA
+// M-rows) reading sK/sV from the SHARED smem tile, keeps a per-warp online-
+// softmax partial (m,l,O) in registers, and the 4 partials are combined by the
+// epilogue's per-row 2-round tree-merge — a valid flash-attention CTA-level
+// online softmax (the merge is the cross-warp softmax combine). Positions are
+// partitioned disjointly across warps (no double-count), and each shared tile is
+// loaded exactly once by all 128 threads (cooperative, fully coalesced).
+//
+// Per-warp P·V uses the k16 MMA with only k=0..7 live (a2m==0): the 8 real
+// positions map to K-contraction rows 0..7; rows 8..15 do not exist for the warp
+// so their A-operand is a literal 0 and their B-operand is set 0 — half the MMA
+// is structurally idle but MMA is free here (latency-bound). O_accum stays 64
+// f32 regs (32 head_dim n8-tiles x 2 live C regs; the g+8 dead rows park in two
+// throwaway regs).
+//
+// smem (dynamic, 72,064 B < 99 KB — unchanged from the prior layout, so the Rust
+// `.shared_mem(72064)` wiring is untouched):
+//   sQ    : [8][HDIM+PADQ] bf16                     = 4,224 B
+//   smem_m: [4*8] f32 / smem_l: [4*8] f32           =   256 B
+//   pool  : max( sK+sV double-buffer 67,584 , smem_o epilogue 32,768 ) = 67,584 B
+//     sK  : [2 stage][32 pos][HDIM+PAD] bf16   = 33,792 B
+//     sV  : [2 stage][32 pos][HDIM+PAD] bf16   = 33,792 B
+//     smem_o (epilogue, reuses pool): [4*8][HDIM] f32 = 32,768 B
+// The +8 bf16 (16 B) row pad on sK removes the K^T-column read bank conflict: the
+// row stride is 264 bf16 = 132 u32 ≡ 4 (mod 32), so the 32 lanes of a warp read
+// K at u32-bank (4*g + t) (mod 32) — a bijection over 0..31 = zero-conflict (no
+// XOR swizzle needed). The pad also keeps every cp.async dest 16 B aligned
+// ((256+8)*2 = 528, 528%16==0).
+//
 //   * num_splits==1  -> normalize + write O directly (no workspace / reduce).
 //   * num_splits>1   -> write UN-normalized (O_partial[hd], m, l) f32 to
 //     `workspace[seq, kv_head*group+g, split, hd+2]` — the EXACT slot layout the
 //     reduce reads (`((seq*nq + q_head)*num_splits + split)*(hd+2)`).
-//   * Increment-3 latency hiding: the tile's V is staged into smem ONCE (killing
-//     the Inc1 per-n8-tile global V re-read in the P·V loop) via a PIPE_DEPTH=2
-//     `cp.async.cg` double-buffer — the NEXT tile's V gather overlaps the current
-//     tile's Q·K^T + softmax + P·V. K stays a direct (already-coalesced) global
-//     read in the Q·K^T loop, so there is NO K^T-column smem bank conflict to
-//     swizzle; the staged V rows carry the same +8 bf16 (16 B) pad as sQ (chosen
-//     over a 128 B XOR swizzle — the plan says pick one, not both), which also
-//     keeps every cp.async destination 16 B aligned ((256+8)*2 = 528, 528%16==0).
 //
-// Numerics are IDENTICAL to the Inc1 kernel run over the same [kv_start,kv_end):
-// staging V in smem does not change any value or accumulation order, and masked
-// (>= valid) positions carry p==0 (exp underflow) so their finite staged V never
-// contributes (0*finite==0 — the clamped-source load guarantees V is finite,
-// never NaN/Inf). The split partials combine through the reduce's log-sum-exp,
-// tolerance-equal to the non-split result.
+// Numerics track the scalar golden within tolerance: f32 S accum, f32 scale-
+// after-dot, __expf, m init -1e30f, l>0 guards, single bf16 output round. The
+// interleaved (vs scalar contiguous) position partition only reorders the f32
+// online-softmax merge (order-robust); P is rounded to bf16 for the P·V MMA
+// exactly as before. Masked (>= valid) positions carry p==0 so their finite,
+// clamped staged K/V never contribute (0*finite==0). Split partials combine
+// through the reduce's log-sum-exp, tolerance-equal to the non-split result.
 // (Still inside the `#if HDIM == 256` block opened above for the Inc1 kernel.)
 // ============================================================================
 
@@ -886,28 +919,37 @@ __device__ __forceinline__ void gqa_cp_async_wait_all() {
     asm volatile("cp.async.wait_group 0;");
 }
 
-// Stage one TILE=16-position V tile (this warp's 16 KV positions of the current
-// step) into its smem sub-region, via 512 16 B cp.async ops = 16 ops/lane. The
-// source position is clamped to [p0, p0+valid) so every load is a real (finite)
-// V row; masked rows (>= valid) are harmless because their softmax weight is 0.
-__device__ __forceinline__ void gqa_stage_v_tile(
-    __nv_bfloat16* sVw,                            // this (stage,warp) sub-region base
+// Cooperatively stage ONE GQA_TILE_KV=32-position K tile AND V tile (the CTA's KV
+// tile for the current step) into shared memory, via cp.async.cg. All 128 threads
+// participate: 32 positions x (HDIM/8 = 32) 16 B chunks = 1024 chunks per tensor,
+// i.e. 8 chunks/thread for K + 8 for V = 16 cp.async ops/thread/stage. Masked
+// positions (local index >= valid) are clamped to a real (finite) source row so
+// every load is in-bounds; their softmax weight is later forced to 0. `sK`/`sV`
+// are the stage bases (each [GQA_TILE_KV][row_stride]); one commit_group covers
+// both K and V of this tile.
+__device__ __forceinline__ void gqa_stage_kv_tile(
+    __nv_bfloat16* sK, __nv_bfloat16* sV,          // stage bases, each [GQA_TILE_KV][row_stride]
+    const __nv_bfloat16* __restrict__ K_cache,
     const __nv_bfloat16* __restrict__ V_cache,
     const int* __restrict__ my_block_table,
     unsigned int p0, unsigned int valid,
     unsigned int block_size, unsigned int num_kv_heads,
     unsigned int head_dim, unsigned int kv_head,
-    unsigned int lane_id, unsigned int row_stride  // row_stride = HDIM + PADV
+    unsigned int tid, unsigned int row_stride       // row_stride = HDIM + PAD
 ) {
+    const unsigned int CPR = HDIM / 8u;             // 16 B chunks per 256-elem row = 32
     #pragma unroll
-    for (unsigned int c = 0; c < 16; c++) {
-        const unsigned int chunk = lane_id + 32u * c;   // 0..511
-        const unsigned int lp = chunk >> 5;             // local pos 0..15
-        const unsigned int dim = (chunk & 31u) * 8u;    // bf16 dim, 16 B chunks
+    for (unsigned int i = 0; i < (GQA_TILE_KV * (HDIM / 8u)) / 128u; i++) {
+        const unsigned int chunk = tid + 128u * i;  // 0..1023
+        const unsigned int lp = chunk / CPR;        // local pos 0..31
+        const unsigned int dim = (chunk % CPR) * 8u;// bf16 dim, 16 B step
         const unsigned int src_pos = p0 + (lp < valid ? lp : (valid - 1u));
+        const __nv_bfloat16* kptr = paged_kv_ptr(
+            K_cache, my_block_table, src_pos, block_size, num_kv_heads, head_dim, kv_head);
         const __nv_bfloat16* vptr = paged_kv_ptr(
             V_cache, my_block_table, src_pos, block_size, num_kv_heads, head_dim, kv_head);
-        gqa_cp_async_16(&sVw[lp * row_stride + dim], vptr + dim);
+        gqa_cp_async_16(&sK[lp * row_stride + dim], kptr + dim);
+        gqa_cp_async_16(&sV[lp * row_stride + dim], vptr + dim);
     }
 }
 
@@ -956,22 +998,24 @@ extern "C" __global__ void paged_decode_attn_gqa_mma_splitk(
     if (kv_start >= seq_len) kv_start = kv_end;   // empty split
 
     // ── Dynamic smem layout (unioned; total 72,064 B < 99 KB SM cap) ──
-    //   sQ    : [8][HDIM+PADQ] bf16          = 4,224 B
-    //   smem_m: [4][8] f32                   =   128 B
-    //   smem_l: [4][8] f32                   =   128 B
-    //   pool  : max( sV double-buffer 67,584 , smem_o merge 32,768 ) = 67,584 B
-    //     sV  : [2 stage][4 warp][16 pos][HDIM+PADV] bf16 (loop)
-    //     smem_o: [4 warp][8 row][HDIM] f32           (epilogue, reuses pool)
+    //   sQ    : [8][HDIM+PADQ] bf16                    = 4,224 B
+    //   smem_m: [4*8] f32 / smem_l: [4*8] f32          =   256 B
+    //   pool  : max( sK+sV double-buffer 67,584 , smem_o merge 32,768 ) = 67,584 B
+    //     sK  : [2 stage][32 pos][HDIM+PAD] bf16 (loop)  = 33,792 B
+    //     sV  : [2 stage][32 pos][HDIM+PAD] bf16 (loop)  = 33,792 B
+    //     smem_o: [4 warp * 8 row][HDIM] f32              (epilogue, reuses pool)
     const int PADQ = 8;
-    const int PADV = 8;
+    const int PAD  = 8;   // sK/sV row pad: makes the K^T-column read bank-conflict-free
     const unsigned int SQ_BYTES = 8u * (HDIM + PADQ) * 2u;   // 4224
     extern __shared__ unsigned char gqa_smem[];
-    __nv_bfloat16* sQ = (__nv_bfloat16*)gqa_smem;                 // [8][HDIM+PADQ]
-    float* smem_m = (float*)(gqa_smem + SQ_BYTES);               // [4][8]
-    float* smem_l = (float*)(gqa_smem + SQ_BYTES + 128u);        // [4][8]
+    __nv_bfloat16* sQ = (__nv_bfloat16*)gqa_smem;               // [8][HDIM+PADQ]
+    float* smem_m = (float*)(gqa_smem + SQ_BYTES);             // [4*8]
+    float* smem_l = (float*)(gqa_smem + SQ_BYTES + 128u);      // [4*8]
     unsigned char* pool = gqa_smem + SQ_BYTES + 256u;
-    __nv_bfloat16* sVb = (__nv_bfloat16*)pool;                    // [2][4][16][HDIM+PADV]
-    const unsigned int VROW = HDIM + PADV;                       // bf16 row stride
+    const unsigned int VROW = HDIM + PAD;                      // bf16 row stride (264)
+    const unsigned int STAGE_ROWS = GQA_TILE_KV * VROW;        // bf16 per K (or V) stage
+    __nv_bfloat16* sKb = (__nv_bfloat16*)pool;                 // [2][32][VROW]
+    __nv_bfloat16* sVb = sKb + 2u * STAGE_ROWS;                // [2][32][VROW]
 
     // Cooperative Q load: rows [0,group) from global (honoring q_stride), rows
     // [group,8) zeroed so dead fragment rows contribute nothing.
@@ -991,13 +1035,10 @@ extern "C" __global__ void paged_decode_attn_gqa_mma_splitk(
 
     const int* my_block_table = block_tables + (unsigned long long)seq_idx * max_blocks_per_seq;
 
-    // Warp KV stripe over THIS split's range (scalar-style contiguous split).
-    const unsigned int local_len = kv_end - kv_start;
-    const unsigned int chunk = (local_len + GQA_MMA_WARPS - 1) / GQA_MMA_WARPS;
-    unsigned int my_start = kv_start + warp_id * chunk;
-    unsigned int my_end = my_start + chunk;
-    if (my_end > kv_end) my_end = kv_end;
-    if (my_start > kv_end) my_start = kv_end;
+    // This warp's tile-local base position within the shared 32-position tile.
+    // Warp w owns tile positions [wbase, wbase+GQA_MMA_WPOS) = 8 positions each;
+    // the 4 warps partition each shared tile disjointly.
+    const unsigned int wbase = warp_id * GQA_MMA_WPOS;   // 0 / 8 / 16 / 24
 
     // Online-softmax state for this warp's row g (m_run/l_run redundant across t).
     float m_run = -1e30f;
@@ -1008,112 +1049,101 @@ extern "C" __global__ void paged_decode_attn_gqa_mma_splitk(
     for (unsigned int nt = 0; nt < NT; nt++) { O_accum[nt][0] = 0.0f; O_accum[nt][1] = 0.0f; }
     float dead2 = 0.0f, dead3 = 0.0f;   // g+8 rows; remain 0 across all MMAs
 
-    if (my_start < my_end) {
-        // Prologue: stage tile 0's V into stage 0.
+    if (kv_start < kv_end) {
+        // Prologue: cooperatively stage tile 0's K+V into stage 0 (all 128 threads).
         {
-            const unsigned int valid0 = (my_end - my_start) < GQA_MMA_STEP
-                ? (my_end - my_start) : GQA_MMA_STEP;
-            __nv_bfloat16* sVw0 = sVb + (0u * 4u + warp_id) * 16u * VROW;
-            gqa_stage_v_tile(sVw0, V_cache, my_block_table, my_start, valid0,
-                             block_size, num_kv_heads, head_dim, kv_head, lane_id, VROW);
+            const unsigned int valid0 = (kv_end - kv_start) < GQA_TILE_KV
+                ? (kv_end - kv_start) : GQA_TILE_KV;
+            gqa_stage_kv_tile(sKb, sVb, K_cache, V_cache, my_block_table,
+                              kv_start, valid0, block_size, num_kv_heads,
+                              head_dim, kv_head, tidx, VROW);
             gqa_cp_async_commit();
         }
         unsigned int cur_stage = 0;
 
-        for (unsigned int p0 = my_start; p0 < my_end; p0 += GQA_MMA_STEP) {
-            const unsigned int valid = (my_end - p0) < GQA_MMA_STEP ? (my_end - p0) : GQA_MMA_STEP;
+        // CTA-cooperative loop: all 4 warps advance in lockstep over shared 32-tiles.
+        for (unsigned int p0 = kv_start; p0 < kv_end; p0 += GQA_TILE_KV) {
+            const unsigned int valid = (kv_end - p0) < GQA_TILE_KV ? (kv_end - p0) : GQA_TILE_KV;
 
-            // Prefetch the NEXT tile's V (double-buffer). If none remains, reload
-            // the current tile (finite filler) so exactly 2 groups stay in flight
-            // and wait_group 1 always drains the CURRENT (older) tile.
-            const unsigned int np0 = p0 + GQA_MMA_STEP;
+            // Prefetch the NEXT tile's K+V (double-buffer). If none remains, reload
+            // the current tile (finite filler) so exactly 2 groups stay in flight and
+            // wait_group 1 always drains the CURRENT (older) tile.
+            const unsigned int np0 = p0 + GQA_TILE_KV;
             const unsigned int nstage = cur_stage ^ 1u;
-            const unsigned int fp0 = (np0 < my_end) ? np0 : p0;
-            const unsigned int fvalid = (np0 < my_end)
-                ? ((my_end - np0) < GQA_MMA_STEP ? (my_end - np0) : GQA_MMA_STEP)
+            const unsigned int fp0 = (np0 < kv_end) ? np0 : p0;
+            const unsigned int fvalid = (np0 < kv_end)
+                ? ((kv_end - np0) < GQA_TILE_KV ? (kv_end - np0) : GQA_TILE_KV)
                 : valid;
             // Prefetch the next block-table entry one tile ahead (L2 hint).
-            if (np0 < my_end) {
+            if (np0 < kv_end) {
                 const unsigned int nlb = np0 / block_size;
                 asm volatile("prefetch.global.L2 [%0];" ::"l"(my_block_table + nlb));
             }
-            __nv_bfloat16* sVwN = sVb + (nstage * 4u + warp_id) * 16u * VROW;
-            gqa_stage_v_tile(sVwN, V_cache, my_block_table, fp0, fvalid,
-                             block_size, num_kv_heads, head_dim, kv_head, lane_id, VROW);
+            gqa_stage_kv_tile(sKb + nstage * STAGE_ROWS, sVb + nstage * STAGE_ROWS,
+                              K_cache, V_cache, my_block_table, fp0, fvalid,
+                              block_size, num_kv_heads, head_dim, kv_head, tidx, VROW);
             gqa_cp_async_commit();
-            gqa_cp_async_wait1();   // current tile's V ready; next stays in flight
-            __syncwarp();
+            gqa_cp_async_wait1();   // current tile's K+V ready; next stays in flight
+            __syncthreads();        // shared tile: all warps must see the completed load
 
-            // --- (1) S = Q · K^T for 16 positions -> two n8-tiles (lo:0..7, hi:8..15)
-            const __nv_bfloat16* kp_lo = (0u * 8 + g) < valid
-                ? paged_kv_ptr(K_cache, my_block_table, p0 + (0u * 8 + g), block_size, num_kv_heads, head_dim, kv_head)
-                : nullptr;
-            const __nv_bfloat16* kp_hi = (1u * 8 + g) < valid
-                ? paged_kv_ptr(K_cache, my_block_table, p0 + (1u * 8 + g), block_size, num_kv_heads, head_dim, kv_head)
-                : nullptr;
+            // Only warps holding >=1 real position this tile compute. Guards the
+            // first-tile-fully-masked case (m_run still -1e30f, where __expf(s-m_new)
+            // would be a spurious 1 for masked cols). Warp-uniform => no barrier skew.
+            if (wbase < valid) {
+                const __nv_bfloat16* sKc = sKb + cur_stage * STAGE_ROWS;   // [32][VROW]
+                const __nv_bfloat16* sVc = sVb + cur_stage * STAGE_ROWS;   // [32][VROW]
 
-            float S_lo[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-            float S_hi[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-            #pragma unroll
-            for (unsigned int kk = 0; kk < HDIM / 16; kk++) {
-                const unsigned int a0 = *(const unsigned int*)&sQ[g * (HDIM + PADQ) + kk * 16 + t * 2];
-                const unsigned int a2 = *(const unsigned int*)&sQ[g * (HDIM + PADQ) + kk * 16 + t * 2 + 8];
-                unsigned int b0_lo = 0, b1_lo = 0, b0_hi = 0, b1_hi = 0;
-                if (kp_lo) {
-                    b0_lo = *(const unsigned int*)(kp_lo + kk * 16 + t * 2);
-                    b1_lo = *(const unsigned int*)(kp_lo + kk * 16 + t * 2 + 8);
+                // --- (1) S = Q · K^T over THIS warp's 8 positions -> ONE n8-tile.
+                // B(K) column g = tile position (wbase+g); K row read from shared smem
+                // (row stride 264 bf16 ≡ 4 mod 32 u32 => bank(4g+t) bijection, 0 conflict).
+                const __nv_bfloat16* krow = sKc + (unsigned long long)(wbase + g) * VROW;
+                float S[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+                #pragma unroll
+                for (unsigned int kk = 0; kk < HDIM / 16; kk++) {
+                    const unsigned int a0 = *(const unsigned int*)&sQ[g * (HDIM + PADQ) + kk * 16 + t * 2];
+                    const unsigned int a2 = *(const unsigned int*)&sQ[g * (HDIM + PADQ) + kk * 16 + t * 2 + 8];
+                    const unsigned int b0 = *(const unsigned int*)(krow + kk * 16 + t * 2);
+                    const unsigned int b1 = *(const unsigned int*)(krow + kk * 16 + t * 2 + 8);
+                    gqa_mma_m16n8k16(S[0], S[1], S[2], S[3], a0, 0u, a2, 0u, b0, b1);
                 }
-                if (kp_hi) {
-                    b0_hi = *(const unsigned int*)(kp_hi + kk * 16 + t * 2);
-                    b1_hi = *(const unsigned int*)(kp_hi + kk * 16 + t * 2 + 8);
+
+                // Frag col c0/c1 = tile position wbase+t*2 / wbase+t*2+1.
+                float s0 = S[0] * inv_sqrt_d;   // tile pos wbase + t*2
+                float s1 = S[1] * inv_sqrt_d;   // tile pos wbase + t*2+1
+                if ((wbase + t * 2)     >= valid) s0 = -1e30f;
+                if ((wbase + t * 2 + 1) >= valid) s1 = -1e30f;
+
+                // --- (2) online softmax (per row g; quad-reduce across the 4 t-lanes)
+                float tmax = fmaxf(s0, s1);
+                tmax = fmaxf(tmax, __shfl_xor_sync(0xffffffff, tmax, 1));
+                tmax = fmaxf(tmax, __shfl_xor_sync(0xffffffff, tmax, 2));
+                float m_new = fmaxf(m_run, tmax);
+                float scale = __expf(m_run - m_new);
+                #pragma unroll
+                for (unsigned int nt = 0; nt < NT; nt++) { O_accum[nt][0] *= scale; O_accum[nt][1] *= scale; }
+                l_run *= scale;
+                float p0v = __expf(s0 - m_new);
+                float p1v = __expf(s1 - m_new);
+                float psum = p0v + p1v;
+                psum += __shfl_xor_sync(0xffffffff, psum, 1);
+                psum += __shfl_xor_sync(0xffffffff, psum, 2);
+                l_run += psum;
+                m_run = m_new;
+
+                // --- (3) P · V  (P->bf16; V from shared smem tile). Only k=0..7 live
+                // (this warp's 8 positions): a2m==0 zeroes the non-existent k=8..15.
+                const unsigned int a0m = gqa_pack_bf16x2_f(p0v, p1v);   // positions wbase+t*2, +1
+                #pragma unroll
+                for (unsigned int nt = 0; nt < NT; nt++) {
+                    const unsigned int ncol = nt * 8 + g;   // head_dim column
+                    __nv_bfloat16 v0 = sVc[(unsigned long long)(wbase + t * 2)     * VROW + ncol];
+                    __nv_bfloat16 v1 = sVc[(unsigned long long)(wbase + t * 2 + 1) * VROW + ncol];
+                    const unsigned int b0 = gqa_pack_bf16x2_raw(v0, v1);
+                    gqa_mma_m16n8k16(O_accum[nt][0], O_accum[nt][1], dead2, dead3,
+                                     a0m, 0u, 0u, 0u, b0, 0u);
                 }
-                gqa_mma_m16n8k16(S_lo[0], S_lo[1], S_lo[2], S_lo[3], a0, 0u, a2, 0u, b0_lo, b1_lo);
-                gqa_mma_m16n8k16(S_hi[0], S_hi[1], S_hi[2], S_hi[3], a0, 0u, a2, 0u, b0_hi, b1_hi);
             }
-
-            float s0 = S_lo[0] * inv_sqrt_d;   // local pos t*2
-            float s1 = S_lo[1] * inv_sqrt_d;   // local pos t*2+1
-            float s2 = S_hi[0] * inv_sqrt_d;   // local pos 8+t*2
-            float s3 = S_hi[1] * inv_sqrt_d;   // local pos 8+t*2+1
-            if ((t * 2)         >= valid) s0 = -1e30f;
-            if ((t * 2 + 1)     >= valid) s1 = -1e30f;
-            if ((8 + t * 2)     >= valid) s2 = -1e30f;
-            if ((8 + t * 2 + 1) >= valid) s3 = -1e30f;
-
-            // --- (2) online softmax (per row g; quad-reduce across the 4 t-lanes)
-            float tmax = fmaxf(fmaxf(s0, s1), fmaxf(s2, s3));
-            tmax = fmaxf(tmax, __shfl_xor_sync(0xffffffff, tmax, 1));
-            tmax = fmaxf(tmax, __shfl_xor_sync(0xffffffff, tmax, 2));
-            float m_new = fmaxf(m_run, tmax);
-            float scale = __expf(m_run - m_new);
-            #pragma unroll
-            for (unsigned int nt = 0; nt < NT; nt++) { O_accum[nt][0] *= scale; O_accum[nt][1] *= scale; }
-            l_run *= scale;
-            float p0v = __expf(s0 - m_new);
-            float p1v = __expf(s1 - m_new);
-            float p2v = __expf(s2 - m_new);
-            float p3v = __expf(s3 - m_new);
-            float psum = p0v + p1v + p2v + p3v;
-            psum += __shfl_xor_sync(0xffffffff, psum, 1);
-            psum += __shfl_xor_sync(0xffffffff, psum, 2);
-            l_run += psum;
-            m_run = m_new;
-
-            // --- (3) P · V  (P->bf16; V read from staged smem, not global)
-            const unsigned int a0m = gqa_pack_bf16x2_f(p0v, p1v);   // K-cols t*2, t*2+1
-            const unsigned int a2m = gqa_pack_bf16x2_f(p2v, p3v);   // K-cols t*2+8, t*2+9
-            const __nv_bfloat16* sVw = sVb + (cur_stage * 4u + warp_id) * 16u * VROW;
-            #pragma unroll
-            for (unsigned int nt = 0; nt < NT; nt++) {
-                const unsigned int ncol = nt * 8 + g;   // head_dim column
-                __nv_bfloat16 v_lo0 = sVw[(t * 2)         * VROW + ncol];
-                __nv_bfloat16 v_lo1 = sVw[(t * 2 + 1)     * VROW + ncol];
-                __nv_bfloat16 v_hi0 = sVw[(8 + t * 2)     * VROW + ncol];
-                __nv_bfloat16 v_hi1 = sVw[(8 + t * 2 + 1) * VROW + ncol];
-                const unsigned int b0 = gqa_pack_bf16x2_raw(v_lo0, v_lo1);
-                const unsigned int b1 = gqa_pack_bf16x2_raw(v_hi0, v_hi1);
-                gqa_mma_m16n8k16(O_accum[nt][0], O_accum[nt][1], dead2, dead3, a0m, 0u, a2m, 0u, b0, b1);
-            }
+            __syncthreads();        // all warps done reading stage cur before it is reused
             cur_stage = nstage;
         }
         gqa_cp_async_wait_all();   // drain the trailing prefetch before pool reuse
