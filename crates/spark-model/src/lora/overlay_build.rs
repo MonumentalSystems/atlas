@@ -133,7 +133,10 @@ pub fn stage_overlay_raw(
         raw.embed_delta = Some(p);
         raw.embed_t = t;
     }
-    let lmhead_base_name = overlay.lmhead_base.as_ref().or(overlay.lmhead_full.as_ref());
+    let lmhead_base_name = overlay
+        .lmhead_base
+        .as_ref()
+        .or(overlay.lmhead_full.as_ref());
     if let Some(name) = lmhead_base_name {
         let (p, r) = stage_tensor(store, name, h, gpu)?;
         raw.lmhead_base = Some(p);
@@ -147,7 +150,9 @@ pub fn stage_overlay_raw(
     if raw.embed_base.is_none() && raw.lmhead_base.is_none() {
         // A bare delta with no base to diff against is meaningless; a real
         // trainable_tokens adapter always ships base_layer.weight.
-        bail!("REJECT[overlay-no-base]: overlay tensors present but no embed/lm_head base row table");
+        bail!(
+            "REJECT[overlay-no-base]: overlay tensors present but no embed/lm_head base row table"
+        );
     }
     Ok(Some(OverlayRawSlot {
         raw,
@@ -217,7 +222,9 @@ fn compact_override(
         match override_source(id, kept) {
             Some(k) => {
                 let d = delta.ok_or_else(|| {
-                    anyhow::anyhow!("REJECT[overlay-delta-missing]: trainable id {id} but no delta tensor")
+                    anyhow::anyhow!(
+                        "REJECT[overlay-delta-missing]: trainable id {id} but no delta tensor"
+                    )
                 })?;
                 gpu.copy_d2h(d.offset(k * h * F32_BYTES), &mut frow)?;
                 for i in 0..h {

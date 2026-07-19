@@ -94,7 +94,9 @@ fn fold_chunked(
         let m = (rows - done).min(step);
         let x_row = x.offset((done as u64 * pair.k_in as u64 * BF16_BYTES) as usize);
         let out_row = base_out.offset((done as u64 * pair.n_out as u64 * BF16_BYTES) as usize);
-        apply_lora_delta(gpu, kernels, pair, x_row, out_row, m, lora_xa, lora_delta, stream)?;
+        apply_lora_delta(
+            gpu, kernels, pair, x_row, out_row, m, lora_xa, lora_delta, stream,
+        )?;
         done += m;
     }
     Ok(())
@@ -117,7 +119,16 @@ pub fn apply_router_lora(
     stream: u64,
 ) -> Result<()> {
     fold_chunked(
-        gpu, kernels, pair, router_in, gate_logits, n, max_rows, lora_xa, lora_delta, stream,
+        gpu,
+        kernels,
+        pair,
+        router_in,
+        gate_logits,
+        n,
+        max_rows,
+        lora_xa,
+        lora_delta,
+        stream,
     )
 }
 

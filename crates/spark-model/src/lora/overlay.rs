@@ -152,7 +152,11 @@ impl OverlayTensors {
             (LmHead, FullSave) => &mut self.lmhead_full,
         };
         if slot.is_some() {
-            bail!("REJECT[duplicate-overlay-tensor]: two tensors map to {:?}/{:?}", t.module, t.kind);
+            bail!(
+                "REJECT[duplicate-overlay-tensor]: two tensors map to {:?}/{:?}",
+                t.module,
+                t.kind
+            );
         }
         *slot = Some(name.to_string());
         Ok(())
@@ -213,9 +217,7 @@ pub fn clamp_trainable_to_vocab(
     for &idx in trainable {
         let i = idx as usize;
         if i >= r {
-            bail!(
-                "REJECT[trainable-index-out-of-adapter]: id {idx} >= adapter embedding rows {r}"
-            );
+            bail!("REJECT[trainable-index-out-of-adapter]: id {idx} >= adapter embedding rows {r}");
         }
         if i >= vocab {
             skipped += 1;

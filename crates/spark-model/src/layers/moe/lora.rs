@@ -299,7 +299,9 @@ impl MoeLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
-        let Some(ref l) = self.lora else { return Ok(()) };
+        let Some(ref l) = self.lora else {
+            return Ok(());
+        };
         let Some(ref route) = l.expert_route else {
             return Ok(()); // router-only adapter: no expert down fold
         };
@@ -377,7 +379,9 @@ impl MoeLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
-        let Some(ref l) = self.lora else { return Ok(()) };
+        let Some(ref l) = self.lora else {
+            return Ok(());
+        };
         let Some(ref route) = l.expert_route else {
             return Ok(()); // router-only adapter: no expert down fold
         };
@@ -444,7 +448,6 @@ impl MoeLayer {
         }
         Ok(())
     }
-
 }
 
 #[cfg(test)]

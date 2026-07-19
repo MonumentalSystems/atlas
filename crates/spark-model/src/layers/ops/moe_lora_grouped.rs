@@ -112,15 +112,15 @@ pub fn moe_lora_grouped_down(
     gpu: &dyn GpuBackend,
     kernels: &LoraKernels,
     route: &MoeExpertRoute,
-    x: DevicePtr,               // [te, k_in] BF16 (post-SiLU sorted)
-    base_out: DevicePtr,        // [te, n_out] BF16, folded in place
-    expert_offsets: DevicePtr,  // [num_experts+1] i32 DEVICE
+    x: DevicePtr,                // [te, k_in] BF16 (post-SiLU sorted)
+    base_out: DevicePtr,         // [te, n_out] BF16, folded in place
+    expert_offsets: DevicePtr,   // [num_experts+1] i32 DEVICE
     sorted_token_ids: DevicePtr, // [te] i32 DEVICE
-    moe_row_adapter: DevicePtr, // [num_tokens] i32 DEVICE or NULL
-    xa: DevicePtr,              // [cap, max_rank] BF16 scratch (fixed address, LOCAL-row indexed)
-    row_offset: u32,           // first ABSOLUTE sorted row of this chunk window
-    row_end: u32,              // one-past-last ABSOLUTE row (== min(row_offset+cap, te))
-    x_gather: u32,             // 0: x row = sorted row r (down); 1: x row = sorted_token_ids[r] (gate/up)
+    moe_row_adapter: DevicePtr,  // [num_tokens] i32 DEVICE or NULL
+    xa: DevicePtr,               // [cap, max_rank] BF16 scratch (fixed address, LOCAL-row indexed)
+    row_offset: u32,             // first ABSOLUTE sorted row of this chunk window
+    row_end: u32,                // one-past-last ABSOLUTE row (== min(row_offset+cap, te))
+    x_gather: u32, // 0: x row = sorted row r (down); 1: x row = sorted_token_ids[r] (gate/up)
     stream: u64,
 ) -> Result<()> {
     use spark_runtime::kernel_args::{KernelLaunch, div_ceil};
@@ -241,7 +241,7 @@ pub fn moe_lora_gather_bgmv(
     xa: DevicePtr,          // [n_slots, max_rank] BF16 scratch (fixed address)
     n_slots: u32,           // num_tokens * top_k
     top_k: u32,
-    x_gather: u32,          // 0: x row = flat slot (down); 1: x row = token = row/top_k (gate/up)
+    x_gather: u32, // 0: x row = flat slot (down); 1: x row = token = row/top_k (gate/up)
     stream: u64,
 ) -> Result<()> {
     use spark_runtime::kernel_args::KernelLaunch;

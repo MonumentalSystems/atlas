@@ -45,7 +45,9 @@ impl MoeLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
-        let Some(ref l) = self.lora else { return Ok(()) };
+        let Some(ref l) = self.lora else {
+            return Ok(());
+        };
         if l.gate_route.is_none() && l.up_route.is_none() {
             return Ok(()); // no gate/up pairs: down-only or router-only adapter
         }
@@ -121,7 +123,9 @@ impl MoeLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
-        let Some(ref l) = self.lora else { return Ok(()) };
+        let Some(ref l) = self.lora else {
+            return Ok(());
+        };
         if l.gate_route.is_none() && l.up_route.is_none() {
             return Ok(());
         }

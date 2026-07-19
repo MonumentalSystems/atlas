@@ -238,7 +238,10 @@ fn moe_row_adapter_relocated_decode_cap_is_32() {
     // exactly the boundary the impl_b1.rs `ensure!(padded_n <= 32)` guard fires
     // on. (Before the relocation, moe_row_adapter@+160 squatted seq_slot's range
     // and forced the cap down to 8; that squat is now gone.)
-    assert!(POSITIONS_OFF + 33 * 4 > SEQ_SLOT_OFF, "n=33: positions overruns");
+    assert!(
+        POSITIONS_OFF + 33 * 4 > SEQ_SLOT_OFF,
+        "n=33: positions overruns"
+    );
     assert!(SEQ_SLOT_OFF + 33 * 4 > SLOT_OFF, "n=33: seq_slot overruns");
     assert!(SLOT_OFF + 33 * 8 > SEQ_LEN_OFF, "n=33: slot overruns");
 }

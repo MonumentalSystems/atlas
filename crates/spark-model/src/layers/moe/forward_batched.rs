@@ -41,8 +41,8 @@ impl MoeLayer {
         let n = num_tokens as u32;
         let bf16 = 2usize;
 
-        let (gate_logits, fp32_gate, gate_elem) = self
-            .batched_gate_logits(input, n, h, num_experts, row_adapter_base, ctx, stream)?;
+        let (gate_logits, fp32_gate, gate_elem) =
+            self.batched_gate_logits(input, n, h, num_experts, row_adapter_base, ctx, stream)?;
 
         // Per-token: topK routing + expert dispatch + weighted sum
         let h_usize = h as usize;
@@ -184,7 +184,14 @@ impl MoeLayer {
                 )?;
                 // SOLID Incr-4: fold gate/up delta BEFORE the fused silu+down.
                 self.apply_expert_lora_decode_gateup(
-                    expert_gate_out, expert_up_out, input_t, indices_dev, top_k, top_k, ra_t, ctx,
+                    expert_gate_out,
+                    expert_up_out,
+                    input_t,
+                    indices_dev,
+                    top_k,
+                    top_k,
+                    ra_t,
+                    ctx,
                     stream,
                 )?;
                 ops::moe_expert_silu_down_shared_bf16(
@@ -233,7 +240,14 @@ impl MoeLayer {
                 )?;
                 // SOLID Incr-4: fold gate/up delta BEFORE the fused silu+down.
                 self.apply_expert_lora_decode_gateup(
-                    expert_gate_out, expert_up_out, input_t, indices_dev, top_k, top_k, ra_t, ctx,
+                    expert_gate_out,
+                    expert_up_out,
+                    input_t,
+                    indices_dev,
+                    top_k,
+                    top_k,
+                    ra_t,
+                    ctx,
                     stream,
                 )?;
                 ops::moe_expert_silu_down_shared_fp8(
@@ -307,7 +321,14 @@ impl MoeLayer {
                 )?;
                 // SOLID Incr-4: fold gate/up delta BEFORE the fused silu+down.
                 self.apply_expert_lora_decode_gateup(
-                    expert_gate_out, expert_up_out, input_t, indices_dev, top_k, top_k, ra_t, ctx,
+                    expert_gate_out,
+                    expert_up_out,
+                    input_t,
+                    indices_dev,
+                    top_k,
+                    top_k,
+                    ra_t,
+                    ctx,
                     stream,
                 )?;
                 ops::moe_expert_silu_down_shared_t(
@@ -359,7 +380,14 @@ impl MoeLayer {
                 )?;
                 // SOLID Incr-4: fold gate/up delta BEFORE the fused silu+down.
                 self.apply_expert_lora_decode_gateup(
-                    expert_gate_out, expert_up_out, input_t, indices_dev, top_k, top_k, ra_t, ctx,
+                    expert_gate_out,
+                    expert_up_out,
+                    input_t,
+                    indices_dev,
+                    top_k,
+                    top_k,
+                    ra_t,
+                    ctx,
                     stream,
                 )?;
                 ops::moe_expert_silu_down_shared(
@@ -389,8 +417,15 @@ impl MoeLayer {
             // gate/up out — BEFORE the weighted-sum blend (so the router weight
             // scales base+delta). Route-agnostic via `ra_t` (base rows no-op).
             self.apply_expert_lora_decode_down(
-                expert_gate_out, expert_up_out, expert_down_out, indices_dev, top_k, top_k, ra_t,
-                ctx, stream,
+                expert_gate_out,
+                expert_up_out,
+                expert_down_out,
+                indices_dev,
+                top_k,
+                top_k,
+                ra_t,
+                ctx,
+                stream,
             )?;
 
             ops::moe_weighted_sum_blend(

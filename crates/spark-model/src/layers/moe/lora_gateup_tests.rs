@@ -76,7 +76,10 @@ fn gate_route_dims_are_hidden_to_inter() {
     // Table holds the gate A/B/scale only at index 5, zeros elsewhere.
     assert_eq!(u64s(&gpu, route.a_table, 6), vec![0, 0, 0, 0, 0, 0x100]);
     assert_eq!(u64s(&gpu, route.b_table, 6), vec![0, 0, 0, 0, 0, 0x101]);
-    assert_eq!(f32s(&gpu, route.scale_table, 6), vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.5]);
+    assert_eq!(
+        f32s(&gpu, route.scale_table, 6),
+        vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.5]
+    );
 }
 
 #[test]

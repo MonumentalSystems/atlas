@@ -17,9 +17,21 @@ fn workitems_map_offsets_to_row_ranges() {
     assert_eq!(
         work,
         vec![
-            ExpertWork { expert: 0, row_off: 0, rows: 3 },
-            ExpertWork { expert: 2, row_off: 3, rows: 7 },
-            ExpertWork { expert: 3, row_off: 10, rows: 2 },
+            ExpertWork {
+                expert: 0,
+                row_off: 0,
+                rows: 3
+            },
+            ExpertWork {
+                expert: 2,
+                row_off: 3,
+                rows: 7
+            },
+            ExpertWork {
+                expert: 3,
+                row_off: 10,
+                rows: 2
+            },
         ]
     );
 }
@@ -32,7 +44,11 @@ fn workitems_skip_empty_and_out_of_range() {
     // Adapts expert 0 (5 rows) → single work-item.
     assert_eq!(
         expert_delta_workitems(&offsets, &[0]),
-        vec![ExpertWork { expert: 0, row_off: 0, rows: 5 }]
+        vec![ExpertWork {
+            expert: 0,
+            row_off: 0,
+            rows: 5
+        }]
     );
 }
 
@@ -41,5 +57,12 @@ fn workitems_only_adapted_experts_launch() {
     // Every expert has routed rows, but the adapter adapts only expert 1.
     let offsets = [0u32, 4, 8, 12];
     let work = expert_delta_workitems(&offsets, &[1]);
-    assert_eq!(work, vec![ExpertWork { expert: 1, row_off: 4, rows: 4 }]);
+    assert_eq!(
+        work,
+        vec![ExpertWork {
+            expert: 1,
+            row_off: 4,
+            rows: 4
+        }]
+    );
 }

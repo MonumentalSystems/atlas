@@ -111,7 +111,7 @@ impl ExpertLoraLayer {
 
 /// Pure padded-byte estimator for the (separate) expert/router pool, used by the
 /// VRAM preflight and pinned by a golden unit test — mirrors
-/// [`super::pool_slot_bytes`] but over the audited routed-expert + router key
+/// `super::pool_slot_bytes` but over the audited routed-expert + router key
 /// set (real adapters target a SUBSET, so this is sized from the audit, never
 /// from `num_experts × num_layers` maxima). Per (layer, expert, proj) and per
 /// router layer: `(max_rank·in + out·max_rank)·2` BF16 bytes.

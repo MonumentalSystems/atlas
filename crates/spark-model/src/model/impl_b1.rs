@@ -204,7 +204,8 @@ impl TransformerModel {
              adapter."
         );
         let adapter_slots: Vec<i32> = seqs.iter().map(|s| s.adapter_slot).collect();
-        let host = crate::lora::build_moe_row_adapter_decode(&adapter_slots, padded_n, active, true);
+        let host =
+            crate::lora::build_moe_row_adapter_decode(&adapter_slots, padded_n, active, true);
         let bytes: Vec<u8> = host.iter().flat_map(|v| v.to_le_bytes()).collect();
         self.gpu.copy_h2d_async(&bytes, dst, stream)?;
         Ok(dst)
