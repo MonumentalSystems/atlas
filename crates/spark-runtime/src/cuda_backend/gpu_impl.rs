@@ -327,21 +327,17 @@ impl GpuBackend for AtlasCudaBackend {
     }
 
     fn abort_capture_if_active(&self, stream: u64) {
-        // Query capture status; 1 == CU_STREAM_CAPTURE_STATUS_ACTIVE.
-        let mut cap_status: u32 = 0;
-        let mut _cap_id: u64 = 0;
-        let q = unsafe { super::cuStreamGetCaptureInfo(stream, &mut cap_status, &mut _cap_id) };
-        if q != 0 || cap_status != 1 {
-            return;
-        }
-        // End the capture to release the stream; discard the partial graph.
+        // Best-effort: end any in-progress capture on this stream to release it
+        // after a mid-capture error. cuStreamEndCapture returns an error (which
+        // we intentionally ignore) when the stream is NOT capturing, so no
+        // capture-status probe is needed. This deliberately avoids
+        // cuStreamIsCapturing / cuStreamGetCaptureInfo — neither is exported by
+        // the CUDA-13 driver stub CI links against.
         let mut graph: u64 = 0;
         let status = unsafe { cuStreamEndCapture(stream, &mut graph) };
-        if status != 0 {
-            tracing::warn!("abort_capture_if_active: cuStreamEndCapture: status {status}");
-            return;
-        }
-        if graph != 0 {
+        // Only a stream that WAS capturing yields status==0 + a partial graph
+        // to discard; the not-capturing path returns non-zero with graph null.
+        if status == 0 && graph != 0 {
             unsafe { cuGraphDestroy(graph) };
         }
     }
