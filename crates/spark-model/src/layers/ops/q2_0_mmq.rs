@@ -94,7 +94,9 @@ pub fn q2_0_mmq_gemm_packed(
         "Q2_0 MMQ requires group 128 (got {}); use the transient-dequant path for group 64",
         w.group
     );
-    q2_0_mmq_gemm(gpu, kernel_nc, kernel_wc, a_q8, w.weight, out_bf16, m, w.n, w.k, stream)
+    q2_0_mmq_gemm(
+        gpu, kernel_nc, kernel_wc, a_q8, w.weight, out_bf16, m, w.n, w.k, stream,
+    )
 }
 
 #[cfg(test)]
@@ -235,7 +237,7 @@ mod tests {
         // Deterministic pseudo-random codes in {0,1,2} and per-block scales.
         let mut codes = vec![0u8; n * k];
         for (i, c) in codes.iter_mut().enumerate() {
-            *c = ((i * 2654435761usize >> 5) % 3) as u8; // {0,1,2}
+            *c = (((i * 2654435761usize) >> 5) % 3) as u8; // {0,1,2}
         }
         let mut scales = vec![0f32; n * bpr];
         for (i, s) in scales.iter_mut().enumerate() {

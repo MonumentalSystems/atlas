@@ -54,8 +54,8 @@ pub fn find_mmproj(dir: &Path, backbone: &Path) -> Option<PathBuf> {
 /// [`container::GgufFile`] are independent of the `File`, which is kept only so
 /// the caller can `evict_page_cache` it after the pass.
 pub fn open_gguf(path: &Path) -> Result<(std::fs::File, memmap2::Mmap, container::GgufFile)> {
-    let file = std::fs::File::open(path)
-        .with_context(|| format!("Failed to open {}", path.display()))?;
+    let file =
+        std::fs::File::open(path).with_context(|| format!("Failed to open {}", path.display()))?;
     // SAFETY: same mmap contract as the safetensors loader.
     let mmap = unsafe { memmap2::MmapOptions::new().map(&file)? };
     let gguf = container::GgufFile::parse(&mmap)
@@ -130,8 +130,7 @@ pub fn load_pass(
         // the mirror of ExpertStack's fan-out); dequant to F32 and stash for the
         // post-loop concat. Matched BEFORE names::translate because the `.1`
         // frame suffix breaks the default `.weight`/`.bias` name split.
-        if let (Some(_), Some(frame)) =
-            (vpatch, value_transform::vision_patch_frame(&tensor.name))
+        if let (Some(_), Some(frame)) = (vpatch, value_transform::vision_patch_frame(&tensor.name))
         {
             let gt = dequant_cpu::GgmlType::from_id(id, q2_group)
                 .with_context(|| format!("ggml type for {}", tensor.name))?;
@@ -199,7 +198,12 @@ pub fn load_pass(
         {
             let block_bytes = 2 + q2_group / 4; // fp16 scale + group/4 code bytes
             let permuted = value_transform::reorder_packed_rows(
-                raw, &hf_shape, &dims, after_qk, q2_group, block_bytes,
+                raw,
+                &hf_shape,
+                &dims,
+                after_qk,
+                q2_group,
+                block_bytes,
             )
             .with_context(|| format!("packed GDN row-permute {hf_name}"))?;
             let ptr = gpu.alloc(permuted.len())?;
@@ -221,9 +225,7 @@ pub fn load_pass(
         // rewrite the BF16 host bytes before upload; everything else (all clip
         // tensors included) takes the prefer-GPU path.
         let bf16_ptr = match (&target, gdn) {
-            (names::GgufName::Direct(hf_name), Some(dims))
-                if value_transform::needs(hf_name) =>
-            {
+            (names::GgufName::Direct(hf_name), Some(dims)) if value_transform::needs(hf_name) => {
                 let gt = dequant_cpu::GgmlType::from_id(id, q2_group)
                     .with_context(|| format!("ggml type for {}", tensor.name))?;
                 let mut vals = vec![0f32; num_elements];
@@ -279,7 +281,10 @@ pub fn load_pass(
             value_transform::VISION_PATCH_EMBED_HF.to_string(),
             WeightTensor {
                 ptr,
-                shape: vec![dims.out_ch, dims.in_ch * frames.len() * dims.patch * dims.patch],
+                shape: vec![
+                    dims.out_ch,
+                    dims.in_ch * frames.len() * dims.patch * dims.patch,
+                ],
                 dtype: WeightDtype::BF16,
             },
         );

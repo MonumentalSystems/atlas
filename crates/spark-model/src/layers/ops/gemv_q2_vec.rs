@@ -142,7 +142,7 @@ mod tests {
         }
         let mut codes = vec![0u8; n * k];
         for (i, c) in codes.iter_mut().enumerate() {
-            *c = ((i * 2654435761usize >> 6) % 3) as u8; // ternary {0,1,2}
+            *c = (((i * 2654435761usize) >> 6) % 3) as u8; // ternary {0,1,2}
         }
         let mut scales = vec![0f32; n * (k / 128)];
         for (i, s) in scales.iter_mut().enumerate() {
@@ -159,7 +159,10 @@ mod tests {
             let mut total = 0u32;
             for &(r0, mc) in &chunks {
                 assert_eq!(r0, next_r0, "M={m}: chunk starts must be contiguous");
-                assert!((1..=super::Q2_BATCHM_MAX_M).contains(&mc), "M={m}: bad chunk {mc}");
+                assert!(
+                    (1..=super::Q2_BATCHM_MAX_M).contains(&mc),
+                    "M={m}: bad chunk {mc}"
+                );
                 next_r0 += mc;
                 total += mc;
             }
@@ -195,7 +198,10 @@ mod tests {
                     got[row * n..(row + 1) * n].copy_from_slice(&r);
                 }
             }
-            assert_eq!(got, reference, "M={m}: chunked batchm must equal per-row M=1 GEMV bit-for-bit");
+            assert_eq!(
+                got, reference,
+                "M={m}: chunked batchm must equal per-row M=1 GEMV bit-for-bit"
+            );
         }
     }
 }

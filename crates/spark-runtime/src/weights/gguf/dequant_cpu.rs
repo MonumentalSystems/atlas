@@ -193,7 +193,9 @@ pub fn dequant_to_f32(
     }
     let bb = t.block_bytes()?;
     let n_blocks = n_elements / qk;
-    let need = n_blocks.checked_mul(bb).context("block byte count overflow")?;
+    let need = n_blocks
+        .checked_mul(bb)
+        .context("block byte count overflow")?;
     require_len(block_bytes, need)?;
 
     for b in 0..n_blocks {

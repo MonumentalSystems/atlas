@@ -39,8 +39,8 @@ impl GgufMeta for GgufFile {
 pub fn config_from_gguf_dir(model_dir: &Path) -> Result<ModelConfig> {
     let path = find_gguf(model_dir)
         .with_context(|| format!("no .gguf file in {}", model_dir.display()))?;
-    let file = std::fs::File::open(&path)
-        .with_context(|| format!("failed to open {}", path.display()))?;
+    let file =
+        std::fs::File::open(&path).with_context(|| format!("failed to open {}", path.display()))?;
     // SAFETY: same mmap contract as the GGUF weight loader; the map outlives the
     // borrow below and the file is not mutated concurrently.
     let mmap = unsafe { memmap2::MmapOptions::new().map(&file)? };

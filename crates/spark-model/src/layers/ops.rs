@@ -88,8 +88,8 @@ mod prefill_attn_main_a;
 mod prefill_attn_main_b;
 #[path = "ops/prefill_attn_turbok.rs"]
 mod prefill_attn_turbok;
-mod q4k_mmq;
 mod q2_0_mmq;
+mod q4k_mmq;
 #[path = "ops/quant_dispatch.rs"]
 mod quant_dispatch;
 #[path = "ops/sampling.rs"]

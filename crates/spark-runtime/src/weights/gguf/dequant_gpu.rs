@@ -151,7 +151,7 @@ fn dispatch_gpu_dequant(
     q2_group: usize,
 ) -> Result<Option<DevicePtr>> {
     let out = match ggml_type {
-        8 => dequant_q8_0(gpu, blocks, numel / 32)?, // Q8_0
+        8 => dequant_q8_0(gpu, blocks, numel / 32)?,   // Q8_0
         12 => dequant_q4_k(gpu, blocks, numel / 256)?, // Q4_K
         14 => dequant_q6_k(gpu, blocks, numel / 256)?, // Q6_K
         42 => dequant_q2_0_gn(gpu, blocks, numel / q2_group, q2_group)?, // Q2_0 id42

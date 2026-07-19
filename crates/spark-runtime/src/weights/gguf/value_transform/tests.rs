@@ -86,7 +86,11 @@ fn a_log_recovers_and_reorders() {
         // HF head hf pulls from GGUF head src; A_log = ln(-ssm_a[src]).
         let src = d.gguf_head(hf);
         let expect = (-ssm_a[src]).ln();
-        assert!((buf[hf] - expect).abs() < 1e-5, "hf {hf}: got {}, want {expect}", buf[hf]);
+        assert!(
+            (buf[hf] - expect).abs() < 1e-5,
+            "hf {hf}: got {}, want {expect}",
+            buf[hf]
+        );
     }
 }
 
@@ -95,7 +99,13 @@ fn reorder_rows_one_row_per_head() {
     // dt_bias analogue: 48 heads, 1 element each, value == GGUF index.
     let n = 48;
     let mut buf: Vec<f32> = (0..n).map(|i| i as f32).collect();
-    apply("model.layers.0.linear_attn.dt_bias", &mut buf, &[n], &dims()).unwrap();
+    apply(
+        "model.layers.0.linear_attn.dt_bias",
+        &mut buf,
+        &[n],
+        &dims(),
+    )
+    .unwrap();
     let d = dims();
     for hf in 0..n {
         assert_eq!(buf[hf] as usize, d.gguf_head(hf), "hf {hf}");
@@ -131,7 +141,11 @@ fn reorder_rows_head_dim_block() {
     for hf in 0..d.num_v_heads {
         for sub in 0..d.value_head_dim {
             let r = hf * d.value_head_dim + sub;
-            assert_eq!(buf[r * hidden] as usize, d.gguf_head(hf), "hf {hf} sub {sub}");
+            assert_eq!(
+                buf[r * hidden] as usize,
+                d.gguf_head(hf),
+                "hf {hf} sub {sub}"
+            );
         }
     }
 }
@@ -209,7 +223,13 @@ fn untouched_names_are_noops() {
     assert!(!needs("model.layers.0.mlp.down_proj.weight"));
     assert!(!needs("model.embed_tokens.weight"));
     let mut buf = vec![1.0f32, 2.0, 3.0];
-    apply("model.layers.0.self_attn.q_proj.weight", &mut buf, &[3], &dims()).unwrap();
+    apply(
+        "model.layers.0.self_attn.q_proj.weight",
+        &mut buf,
+        &[3],
+        &dims(),
+    )
+    .unwrap();
     assert_eq!(buf, vec![1.0, 2.0, 3.0]);
 }
 
@@ -313,7 +333,7 @@ fn packed_reorder_rows_moves_whole_blocks_like_reorder_rows() {
     let row_bytes = (k / group) * block_bytes; // 12
     // Tag every byte of row r with value r (mod 256) so we can trace movement.
     let raw: Vec<u8> = (0..n)
-        .flat_map(|r| std::iter::repeat(r as u8).take(row_bytes))
+        .flat_map(|r| std::iter::repeat_n(r as u8, row_bytes))
         .collect();
     let shape = [n, k];
     let out = super::reorder_packed_rows(&raw, &shape, &d, true, group, block_bytes).unwrap();
@@ -333,7 +353,8 @@ fn packed_reorder_rows_moves_whole_blocks_like_reorder_rows() {
             let src = qk_rows + g * d.value_head_dim + j;
             for b in 0..row_bytes {
                 assert_eq!(
-                    out[dst * row_bytes + b], src as u8,
+                    out[dst * row_bytes + b],
+                    src as u8,
                     "V dest row {dst} should come from src {src}"
                 );
             }

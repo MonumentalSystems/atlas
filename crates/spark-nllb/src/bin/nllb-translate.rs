@@ -82,7 +82,9 @@ fn main() -> Result<()> {
     let t0 = std::time::Instant::now();
     let model = match (&args.gguf, &args.lora) {
         (Some(gguf), None) => NllbModel::load_gguf(&args.model, gguf)?,
-        (Some(_), Some(_)) => bail!("--gguf and --lora cannot be combined (LoRA path is safetensors-only)"),
+        (Some(_), Some(_)) => {
+            bail!("--gguf and --lora cannot be combined (LoRA path is safetensors-only)")
+        }
         (None, Some(lora_dir)) => NllbModel::load_dir_with_lora(&args.model, lora_dir)?,
         (None, None) => NllbModel::load_dir(&args.model)?,
     };

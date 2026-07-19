@@ -10,7 +10,9 @@ use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 
 use crate::layer::ForwardContext;
 use crate::layers::ops;
-use crate::weight_map::{DenseWeight, Fp8Weight, Fp8WeightTransposed, PackedQ2Weight, QuantizedWeight};
+use crate::weight_map::{
+    DenseWeight, Fp8Weight, Fp8WeightTransposed, PackedQ2Weight, QuantizedWeight,
+};
 
 pub struct DenseFfnWeights {
     pub gate_proj: QuantizedWeight,
@@ -634,7 +636,12 @@ impl DenseFfnLayer {
     /// Caller must ensure the `q2_0_gemv` kernel is present in the target
     /// (checked at forward time; falls through to a clear error otherwise).
     /// Prefill for packed-Q2 is a deferred phase — see `forward_prefill`.
-    pub fn set_q2_weights(&mut self, gate: PackedQ2Weight, up: PackedQ2Weight, down: PackedQ2Weight) {
+    pub fn set_q2_weights(
+        &mut self,
+        gate: PackedQ2Weight,
+        up: PackedQ2Weight,
+        down: PackedQ2Weight,
+    ) {
         self.q2_weights = Some(DenseFfnWeightsQ2 {
             gate_proj: gate,
             up_proj: up,
@@ -768,13 +775,45 @@ impl DenseFfnLayer {
                 );
             }
             if self.activation != FfnActivation::SiLU {
-                anyhow::bail!("packed-Q2 FFN decode supports SiLU only (got {:?})", self.activation);
+                anyhow::bail!(
+                    "packed-Q2 FFN decode supports SiLU only (got {:?})",
+                    self.activation
+                );
             }
             let output = ctx.buffers.moe_output();
-            ops::q2_0_gemv_vec(ctx.gpu, self.q2_0_gemv_k, input, &q2w.gate_proj, gate_out, stream)?;
-            ops::q2_0_gemv_vec(ctx.gpu, self.q2_0_gemv_k, input, &q2w.up_proj, up_out, stream)?;
-            ops::silu_mul(ctx.gpu, self.act_mul, gate_out, up_out, gate_out, inter, stream)?;
-            ops::q2_0_gemv_vec(ctx.gpu, self.q2_0_gemv_k, gate_out, &q2w.down_proj, output, stream)?;
+            ops::q2_0_gemv_vec(
+                ctx.gpu,
+                self.q2_0_gemv_k,
+                input,
+                &q2w.gate_proj,
+                gate_out,
+                stream,
+            )?;
+            ops::q2_0_gemv_vec(
+                ctx.gpu,
+                self.q2_0_gemv_k,
+                input,
+                &q2w.up_proj,
+                up_out,
+                stream,
+            )?;
+            ops::silu_mul(
+                ctx.gpu,
+                self.act_mul,
+                gate_out,
+                up_out,
+                gate_out,
+                inter,
+                stream,
+            )?;
+            ops::q2_0_gemv_vec(
+                ctx.gpu,
+                self.q2_0_gemv_k,
+                gate_out,
+                &q2w.down_proj,
+                output,
+                stream,
+            )?;
             return Ok(output);
         }
 
@@ -1142,7 +1181,10 @@ impl DenseFfnLayer {
             );
         }
         if self.activation != FfnActivation::SiLU {
-            anyhow::bail!("packed-Q2 FFN batched decode supports SiLU only (got {:?})", self.activation);
+            anyhow::bail!(
+                "packed-Q2 FFN batched decode supports SiLU only (got {:?})",
+                self.activation
+            );
         }
         let inter = ctx.config.intermediate_size as u32;
         let gate_out = ctx.buffers.expert_gate_out();
@@ -1152,7 +1194,15 @@ impl DenseFfnLayer {
         };
         batchm(&q2w.gate_proj, input, gate_out)?;
         batchm(&q2w.up_proj, input, up_out)?;
-        ops::silu_mul(ctx.gpu, self.act_mul, gate_out, up_out, gate_out, m * inter, stream)?;
+        ops::silu_mul(
+            ctx.gpu,
+            self.act_mul,
+            gate_out,
+            up_out,
+            gate_out,
+            m * inter,
+            stream,
+        )?;
         let output = ctx.buffers.moe_output();
         batchm(&q2w.down_proj, gate_out, output)?;
         Ok(())
@@ -1440,7 +1490,10 @@ impl DenseFfnLayer {
         // still uses the native `q2_0_gemv` (no dequant). SiLU only.
         if let Some(ref q2w) = self.q2_weights {
             if self.activation != FfnActivation::SiLU {
-                anyhow::bail!("packed-Q2 FFN prefill supports SiLU only (got {:?})", self.activation);
+                anyhow::bail!(
+                    "packed-Q2 FFN prefill supports SiLU only (got {:?})",
+                    self.activation
+                );
             }
 
             // Tier-2 native MMQ prefill (ATLAS_GGUF_NATIVE_Q2_MMQ=1): quantize the
@@ -1480,10 +1533,26 @@ impl DenseFfnLayer {
                 ops::quantize_act_q8_1(ctx.gpu, self.q4k_quant_act_k, input, a_q8, m, h, stream)?;
                 mmq(&q2w.gate_proj, gate_out)?;
                 mmq(&q2w.up_proj, up_out)?;
-                ops::silu_mul(ctx.gpu, self.act_mul, gate_out, up_out, gate_out, m * inter, stream)?;
+                ops::silu_mul(
+                    ctx.gpu,
+                    self.act_mul,
+                    gate_out,
+                    up_out,
+                    gate_out,
+                    m * inter,
+                    stream,
+                )?;
                 // down: quantize `gate_out` [m,inter] (same-stream after silu_mul).
                 let output = ctx.buffers.moe_output();
-                ops::quantize_act_q8_1(ctx.gpu, self.q4k_quant_act_k, gate_out, a_q8, m, inter, stream)?;
+                ops::quantize_act_q8_1(
+                    ctx.gpu,
+                    self.q4k_quant_act_k,
+                    gate_out,
+                    a_q8,
+                    m,
+                    inter,
+                    stream,
+                )?;
                 mmq(&q2w.down_proj, output)?;
                 return Ok(());
             }
@@ -1521,15 +1590,43 @@ impl DenseFfnLayer {
                 )?;
                 let dw = DenseWeight { weight: scratch };
                 if tc {
-                    ops::dense_gemm_tc(ctx.gpu, self.dense_gemm_tc_k, input, &dw, out, m, n, k, stream)?;
+                    ops::dense_gemm_tc(
+                        ctx.gpu,
+                        self.dense_gemm_tc_k,
+                        input,
+                        &dw,
+                        out,
+                        m,
+                        n,
+                        k,
+                        stream,
+                    )?;
                 } else {
-                    ops::dense_gemm(ctx.gpu, self.dense_gemm_bf16_k, input, &dw, out, m, n, k, stream)?;
+                    ops::dense_gemm(
+                        ctx.gpu,
+                        self.dense_gemm_bf16_k,
+                        input,
+                        &dw,
+                        out,
+                        m,
+                        n,
+                        k,
+                        stream,
+                    )?;
                 }
                 Ok(())
             };
             q2_gemm(&q2w.gate_proj, input, gate_out)?;
             q2_gemm(&q2w.up_proj, input, up_out)?;
-            ops::silu_mul(ctx.gpu, self.act_mul, gate_out, up_out, gate_out, m * inter, stream)?;
+            ops::silu_mul(
+                ctx.gpu,
+                self.act_mul,
+                gate_out,
+                up_out,
+                gate_out,
+                m * inter,
+                stream,
+            )?;
             let output = ctx.buffers.moe_output();
             q2_gemm(&q2w.down_proj, gate_out, output)?;
             return Ok(());

@@ -71,10 +71,10 @@ impl<'a> Cursor<'a> {
 /// Byte width of a scalar GGUF metadata value type (`None` for string/array).
 fn scalar_size(vtype: u32) -> Option<usize> {
     match vtype {
-        0 | 1 | 7 => Some(1),    // u8, i8, bool
-        2 | 3 => Some(2),        // u16, i16
-        4..=6 => Some(4),        // u32, i32, f32
-        10..=12 => Some(8),      // u64, i64, f64
+        0 | 1 | 7 => Some(1), // u8, i8, bool
+        2 | 3 => Some(2),     // u16, i16
+        4..=6 => Some(4),     // u32, i32, f32
+        10..=12 => Some(8),   // u64, i64, f64
         _ => None,
     }
 }
@@ -140,7 +140,9 @@ pub fn read_gguf_f32(path: &Path) -> Result<Vec<GgufTensor>> {
     let mut alignment = DEFAULT_ALIGNMENT;
     for i in 0..kv_count {
         let key = c.string().with_context(|| format!("metadata key #{i}"))?;
-        let vtype = c.u32().with_context(|| format!("metadata type for {key:?}"))?;
+        let vtype = c
+            .u32()
+            .with_context(|| format!("metadata type for {key:?}"))?;
         let val = skip_value(&mut c, vtype).with_context(|| format!("metadata value {key:?}"))?;
         if key == "general.alignment" {
             if let Some(a) = val {

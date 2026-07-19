@@ -36,10 +36,7 @@ fn proj_q2_group(store: &WeightStore, prefix: &str) -> Option<u16> {
 /// Build a [`PackedQ2Weight`] borrowing the store's packed `block_q2_0` buffer.
 /// The buffer is owned by the `WeightStore` (freed with it), so this only wraps
 /// the pointer + `[n, k]` + group; no dequant, no allocation.
-fn packed_q2_from_store(
-    store: &WeightStore,
-    prefix: &str,
-) -> Result<PackedQ2Weight> {
+fn packed_q2_from_store(store: &WeightStore, prefix: &str) -> Result<PackedQ2Weight> {
     let w = store.get(&format!("{prefix}.weight"))?;
     let group = w
         .q2_group()
@@ -299,7 +296,9 @@ impl ModelWeightLoader for Qwen35DenseWeightLoader {
                     down_proj_t: None,
                 }
             } else {
-                load_dense_ffn(store, &lp, gpu, variant, absmax_k, quantize_k, stream, config)?
+                load_dense_ffn(
+                    store, &lp, gpu, variant, absmax_k, quantize_k, stream, config,
+                )?
             };
             let mut dffn = DenseFfnLayer::new(ffn_weights, gpu)?;
             if ffn_q2 {

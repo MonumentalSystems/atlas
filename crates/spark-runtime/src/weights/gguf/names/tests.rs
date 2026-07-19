@@ -18,8 +18,14 @@ fn top_level_tensors() {
         translate("output_norm.weight", "llama"),
         direct("model.norm.weight")
     );
-    assert_eq!(translate("output.weight", "llama"), direct("lm_head.weight"));
-    assert_eq!(translate("rope_freqs.weight", "llama"), Some(GgufName::Drop));
+    assert_eq!(
+        translate("output.weight", "llama"),
+        direct("lm_head.weight")
+    );
+    assert_eq!(
+        translate("rope_freqs.weight", "llama"),
+        Some(GgufName::Drop)
+    );
 }
 
 #[test]
@@ -102,15 +108,24 @@ fn moe_router_and_expert_stack() {
     );
     assert_eq!(
         translate("blk.4.ffn_gate_exps.weight", "qwen3"),
-        Some(GgufName::ExpertStack { layer: 4, proj: "gate" })
+        Some(GgufName::ExpertStack {
+            layer: 4,
+            proj: "gate"
+        })
     );
     assert_eq!(
         translate("blk.4.ffn_up_exps.weight", "qwen3"),
-        Some(GgufName::ExpertStack { layer: 4, proj: "up" })
+        Some(GgufName::ExpertStack {
+            layer: 4,
+            proj: "up"
+        })
     );
     assert_eq!(
         translate("blk.4.ffn_down_exps.weight", "qwen3"),
-        Some(GgufName::ExpertStack { layer: 4, proj: "down" })
+        Some(GgufName::ExpertStack {
+            layer: 4,
+            proj: "down"
+        })
     );
 }
 
@@ -220,7 +235,10 @@ fn qwen35_shared_names_fall_through_to_default() {
         translate("token_embd.weight", "qwen35"),
         direct("model.embed_tokens.weight")
     );
-    assert_eq!(translate("output.weight", "qwen35"), direct("lm_head.weight"));
+    assert_eq!(
+        translate("output.weight", "qwen35"),
+        direct("lm_head.weight")
+    );
 }
 
 #[test]
@@ -235,7 +253,10 @@ fn nllb_top_level_and_positions() {
         direct("model.shared.weight")
     );
     // Learned positions dropped (sinusoidal regenerated at runtime).
-    assert_eq!(translate("position_embd.weight", "nllb"), Some(GgufName::Drop));
+    assert_eq!(
+        translate("position_embd.weight", "nllb"),
+        Some(GgufName::Drop)
+    );
     // Per-stack final norm.
     assert_eq!(
         translate("enc.output_norm.weight", "nllb"),
@@ -438,10 +459,18 @@ fn keep_packed_proj_scoped_to_dense_ffn() {
     assert!(is_keep_packed_proj("model.layers.7.mlp.down_proj.weight"));
 
     // Tier-1c: FULL-ATTENTION q/k/v/o keep-pack DIRECTLY (transform-free).
-    assert!(is_keep_packed_proj("model.layers.0.self_attn.q_proj.weight"));
-    assert!(is_keep_packed_proj("model.layers.3.self_attn.k_proj.weight"));
-    assert!(is_keep_packed_proj("model.layers.3.self_attn.v_proj.weight"));
-    assert!(is_keep_packed_proj("model.layers.0.self_attn.o_proj.weight"));
+    assert!(is_keep_packed_proj(
+        "model.layers.0.self_attn.q_proj.weight"
+    ));
+    assert!(is_keep_packed_proj(
+        "model.layers.3.self_attn.k_proj.weight"
+    ));
+    assert!(is_keep_packed_proj(
+        "model.layers.3.self_attn.v_proj.weight"
+    ));
+    assert!(is_keep_packed_proj(
+        "model.layers.0.self_attn.o_proj.weight"
+    ));
 
     // Deliberately NOT matched by this filter: lm_head, embeddings, norms, and
     // the GDN/linear-attn projections. The GDN input projections keep-pack via
@@ -449,9 +478,15 @@ fn keep_packed_proj_scoped_to_dense_ffn() {
     // `out_proj` (column reorder) stays on its NVFP4/BF16 path.
     assert!(!is_keep_packed_proj("lm_head.weight"));
     assert!(!is_keep_packed_proj("model.embed_tokens.weight"));
-    assert!(!is_keep_packed_proj("model.layers.0.input_layernorm.weight"));
-    assert!(!is_keep_packed_proj("model.layers.0.linear_attn.in_proj_qkv.weight"));
-    assert!(!is_keep_packed_proj("model.layers.0.linear_attn.out_proj.weight"));
+    assert!(!is_keep_packed_proj(
+        "model.layers.0.input_layernorm.weight"
+    ));
+    assert!(!is_keep_packed_proj(
+        "model.layers.0.linear_attn.in_proj_qkv.weight"
+    ));
+    assert!(!is_keep_packed_proj(
+        "model.layers.0.linear_attn.out_proj.weight"
+    ));
     // A bias must never match (only .weight projections are packed).
     assert!(!is_keep_packed_proj("model.layers.0.mlp.gate_proj.bias"));
 }

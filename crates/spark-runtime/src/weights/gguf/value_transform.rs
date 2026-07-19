@@ -116,10 +116,7 @@ enum Op {
     /// starts after the fused Q|K partition (`in_proj_qkv` / `conv1d`);
     /// otherwise the whole tensor is value heads. `head_dim_rows` = rows per
     /// value head (`false` → one, `true` → `value_head_dim`).
-    ReorderRows {
-        after_qk: bool,
-        head_dim_rows: bool,
-    },
+    ReorderRows { after_qk: bool, head_dim_rows: bool },
     /// Value-head reorder along the column (input) axis of `out_proj`.
     ReorderOutCols,
 }
@@ -152,8 +149,7 @@ fn classify(hf: &str) -> Option<Op> {
             head_dim_rows: true,
         });
     }
-    if hf.ends_with(".linear_attn.in_proj_qkv.weight")
-        || hf.ends_with(".linear_attn.conv1d.weight")
+    if hf.ends_with(".linear_attn.in_proj_qkv.weight") || hf.ends_with(".linear_attn.conv1d.weight")
     {
         return Some(Op::ReorderRows {
             after_qk: true,
@@ -301,7 +297,11 @@ fn reorder_rows(
     head_dim_rows: bool,
 ) -> Result<()> {
     let rw = row_width(hf_shape);
-    let hd = if head_dim_rows { dims.value_head_dim } else { 1 };
+    let hd = if head_dim_rows {
+        dims.value_head_dim
+    } else {
+        1
+    };
     let base = if after_qk { dims.qk_rows() * rw } else { 0 };
     let blk = hd * rw; // elements per value head
     let region = dims.num_v_heads * blk;

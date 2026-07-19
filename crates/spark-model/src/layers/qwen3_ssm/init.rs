@@ -377,7 +377,9 @@ impl Qwen3SsmLayer {
         }
 
         if self.dequant_q2_0_gn_k.0 == 0 {
-            anyhow::bail!("dequant_q2_0_gn_to_bf16 kernel missing — packed-Q2 GDN prefill unavailable");
+            anyhow::bail!(
+                "dequant_q2_0_gn_to_bf16 kernel missing — packed-Q2 GDN prefill unavailable"
+            );
         }
         crate::layers::ops::dequant_q2_0_gn_to_bf16(
             gpu,
@@ -403,7 +405,17 @@ impl Qwen3SsmLayer {
                 stream,
             )?;
         } else {
-            crate::layers::ops::dense_gemm(gpu, self.dense_gemm_k, input, &dw, out, m, n, k, stream)?;
+            crate::layers::ops::dense_gemm(
+                gpu,
+                self.dense_gemm_k,
+                input,
+                &dw,
+                out,
+                m,
+                n,
+                k,
+                stream,
+            )?;
         }
         Ok(())
     }

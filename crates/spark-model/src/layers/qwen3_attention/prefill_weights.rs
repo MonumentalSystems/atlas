@@ -215,7 +215,17 @@ impl Qwen3AttentionLayer {
                 stream,
             )?;
         } else {
-            crate::layers::ops::dense_gemm(gpu, self.dense_gemm_k, input, &dw, out, m, n, k, stream)?;
+            crate::layers::ops::dense_gemm(
+                gpu,
+                self.dense_gemm_k,
+                input,
+                &dw,
+                out,
+                m,
+                n,
+                k,
+                stream,
+            )?;
         }
         Ok(())
     }

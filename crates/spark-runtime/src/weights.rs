@@ -46,7 +46,9 @@ pub enum WeightDtype {
     /// footprint is NOT a per-element size (2-bit codes + an inline scale per
     /// group), so [`WeightDtype::byte_size`] returns 0 for this variant and the
     /// real size is computed in [`WeightTensor::byte_size`] (shape + group).
-    PackedQ2_0 { group: u16 },
+    PackedQ2_0 {
+        group: u16,
+    },
 }
 
 impl WeightDtype {

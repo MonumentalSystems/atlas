@@ -306,9 +306,19 @@ fn translate_default(gguf_name: &str) -> Option<GgufName> {
 fn translate_layer_sub(layer: usize, sub: &str) -> Option<GgufName> {
     // Stacked MoE experts fan out to many HF tensors — handled by the loader.
     match sub {
-        "ffn_gate_exps.weight" => return Some(GgufName::ExpertStack { layer, proj: "gate" }),
+        "ffn_gate_exps.weight" => {
+            return Some(GgufName::ExpertStack {
+                layer,
+                proj: "gate",
+            });
+        }
         "ffn_up_exps.weight" => return Some(GgufName::ExpertStack { layer, proj: "up" }),
-        "ffn_down_exps.weight" => return Some(GgufName::ExpertStack { layer, proj: "down" }),
+        "ffn_down_exps.weight" => {
+            return Some(GgufName::ExpertStack {
+                layer,
+                proj: "down",
+            });
+        }
         _ => {}
     }
 

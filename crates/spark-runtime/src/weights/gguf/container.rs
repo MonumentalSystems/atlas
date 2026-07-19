@@ -348,7 +348,9 @@ impl GgufFile {
         let mut metadata = Vec::with_capacity(kv_count.min(1 << 16) as usize);
         for i in 0..kv_count {
             let key = r.string().with_context(|| format!("metadata key #{i}"))?;
-            let vtype = r.u32().with_context(|| format!("metadata type for {key:?}"))?;
+            let vtype = r
+                .u32()
+                .with_context(|| format!("metadata type for {key:?}"))?;
             let value =
                 read_value(&mut r, vtype).with_context(|| format!("metadata value for {key:?}"))?;
             metadata.push((key, value));

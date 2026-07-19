@@ -295,7 +295,11 @@ mod tests {
     #[test]
     fn llama_dense_maps_to_mistral() {
         let m = llama_meta();
-        let inp = GgufConfigInputs { meta: &m, token_embd_vocab: None, has_output_weight: true };
+        let inp = GgufConfigInputs {
+            meta: &m,
+            token_embd_vocab: None,
+            has_output_weight: true,
+        };
         let c = config_from_gguf(&inp).unwrap();
         assert_eq!(c.model_type, "mistral");
         assert_eq!(c.hidden_size, 4096);
@@ -316,7 +320,11 @@ mod tests {
     #[test]
     fn head_dim_derived_when_key_absent() {
         let m = llama_meta();
-        let inp = GgufConfigInputs { meta: &m, token_embd_vocab: None, has_output_weight: true };
+        let inp = GgufConfigInputs {
+            meta: &m,
+            token_embd_vocab: None,
+            has_output_weight: true,
+        };
         let c = config_from_gguf(&inp).unwrap();
         assert_eq!(c.head_dim, 128);
     }
@@ -324,7 +332,11 @@ mod tests {
     #[test]
     fn explicit_key_length_wins() {
         let m = llama_meta().u("llama.attention.key_length", 96);
-        let inp = GgufConfigInputs { meta: &m, token_embd_vocab: None, has_output_weight: true };
+        let inp = GgufConfigInputs {
+            meta: &m,
+            token_embd_vocab: None,
+            has_output_weight: true,
+        };
         let c = config_from_gguf(&inp).unwrap();
         assert_eq!(c.head_dim, 96);
     }
@@ -333,7 +345,11 @@ mod tests {
     fn kv_heads_default_to_mha() {
         let mut m = llama_meta();
         m.u.remove("llama.attention.head_count_kv");
-        let inp = GgufConfigInputs { meta: &m, token_embd_vocab: None, has_output_weight: true };
+        let inp = GgufConfigInputs {
+            meta: &m,
+            token_embd_vocab: None,
+            has_output_weight: true,
+        };
         let c = config_from_gguf(&inp).unwrap();
         assert_eq!(c.num_key_value_heads, c.num_attention_heads);
     }
@@ -342,8 +358,11 @@ mod tests {
     fn vocab_from_token_embd_rows() {
         let mut m = llama_meta();
         m.u.remove("llama.vocab_size");
-        let inp =
-            GgufConfigInputs { meta: &m, token_embd_vocab: Some(128256), has_output_weight: true };
+        let inp = GgufConfigInputs {
+            meta: &m,
+            token_embd_vocab: Some(128256),
+            has_output_weight: true,
+        };
         let c = config_from_gguf(&inp).unwrap();
         assert_eq!(c.vocab_size, 128256);
     }
@@ -351,7 +370,11 @@ mod tests {
     #[test]
     fn tied_embeddings_when_no_output_tensor() {
         let m = llama_meta();
-        let inp = GgufConfigInputs { meta: &m, token_embd_vocab: None, has_output_weight: false };
+        let inp = GgufConfigInputs {
+            meta: &m,
+            token_embd_vocab: None,
+            has_output_weight: false,
+        };
         let c = config_from_gguf(&inp).unwrap();
         assert!(c.tie_word_embeddings);
     }
@@ -370,7 +393,11 @@ mod tests {
             .u("qwen3.vocab_size", 151936)
             .f("qwen3.attention.layer_norm_rms_epsilon", 1e-6)
             .f("qwen3.rope.freq_base", 1000000.0);
-        let inp = GgufConfigInputs { meta: &m, token_embd_vocab: None, has_output_weight: true };
+        let inp = GgufConfigInputs {
+            meta: &m,
+            token_embd_vocab: None,
+            has_output_weight: true,
+        };
         let c = config_from_gguf(&inp).unwrap();
         assert_eq!(c.model_type, "qwen3_5");
         assert_eq!(c.num_experts, 0);
@@ -396,7 +423,11 @@ mod tests {
             .u("qwen3moe.expert_feed_forward_length", 768)
             .f("qwen3moe.attention.layer_norm_rms_epsilon", 1e-6)
             .f("qwen3moe.rope.freq_base", 1000000.0);
-        let inp = GgufConfigInputs { meta: &m, token_embd_vocab: None, has_output_weight: true };
+        let inp = GgufConfigInputs {
+            meta: &m,
+            token_embd_vocab: None,
+            has_output_weight: true,
+        };
         let c = config_from_gguf(&inp).unwrap();
         assert_eq!(c.model_type, "qwen3_5_moe");
         assert_eq!(c.num_experts, 128);
@@ -419,7 +450,11 @@ mod tests {
             .u("gemma2.attention.sliding_window", 4096)
             .f("gemma2.attention.layer_norm_rms_epsilon", 1e-6)
             .f("gemma2.final_logit_softcapping", 30.0);
-        let inp = GgufConfigInputs { meta: &m, token_embd_vocab: None, has_output_weight: false };
+        let inp = GgufConfigInputs {
+            meta: &m,
+            token_embd_vocab: None,
+            has_output_weight: false,
+        };
         let c = config_from_gguf(&inp).unwrap();
         assert_eq!(c.model_type, "gemma4");
         assert!(!c.attn_gated);
@@ -431,7 +466,11 @@ mod tests {
     #[test]
     fn missing_architecture_errors() {
         let m = Meta::default().u("llama.embedding_length", 4096);
-        let inp = GgufConfigInputs { meta: &m, token_embd_vocab: None, has_output_weight: true };
+        let inp = GgufConfigInputs {
+            meta: &m,
+            token_embd_vocab: None,
+            has_output_weight: true,
+        };
         assert!(config_from_gguf(&inp).is_err());
     }
 
@@ -439,7 +478,11 @@ mod tests {
     fn missing_required_dim_errors() {
         let mut m = llama_meta();
         m.u.remove("llama.embedding_length");
-        let inp = GgufConfigInputs { meta: &m, token_embd_vocab: None, has_output_weight: true };
+        let inp = GgufConfigInputs {
+            meta: &m,
+            token_embd_vocab: None,
+            has_output_weight: true,
+        };
         let err = config_from_gguf(&inp).unwrap_err().to_string();
         assert!(err.contains("embedding_length"), "unexpected: {err}");
     }
@@ -456,7 +499,11 @@ mod tests {
             .u("qwen3moe.vocab_size", 151936)
             .u("qwen3moe.expert_count", 128);
         // expert_used_count / expert_feed_forward_length intentionally absent.
-        let inp = GgufConfigInputs { meta: &m, token_embd_vocab: None, has_output_weight: true };
+        let inp = GgufConfigInputs {
+            meta: &m,
+            token_embd_vocab: None,
+            has_output_weight: true,
+        };
         assert!(config_from_gguf(&inp).is_err());
     }
 
@@ -465,7 +512,11 @@ mod tests {
         let m = Meta::default()
             .s("general.architecture", "mamba")
             .u("mamba.embedding_length", 4096);
-        let inp = GgufConfigInputs { meta: &m, token_embd_vocab: None, has_output_weight: true };
+        let inp = GgufConfigInputs {
+            meta: &m,
+            token_embd_vocab: None,
+            has_output_weight: true,
+        };
         assert!(config_from_gguf(&inp).is_err());
     }
 }

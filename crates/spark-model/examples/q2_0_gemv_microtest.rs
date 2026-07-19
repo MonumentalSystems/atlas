@@ -133,7 +133,14 @@ fn make_weight(g: &dyn GpuBackend, rng: &mut Lcg, n: usize, k: usize) -> Result<
     let packed = pack_weight(&codes, &scales, n, k);
     let bytes = packed.len();
     let d = up_u8(g, &packed)?;
-    Ok(Weight { d, codes, scales, bytes, n, k })
+    Ok(Weight {
+        d,
+        codes,
+        scales,
+        bytes,
+        n,
+        k,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -186,7 +193,9 @@ fn run_variant(
 ) -> Result<VariantR> {
     let mopt = if m == 1 { None } else { Some(m as u32) };
     // If m>1 but kernel is the M=1 variant, caller passes the batchm handle.
-    launch(g, kern, grid_div, a_d, w.d, c_d, w.n as u32, w.k as u32, mopt, shmem)?;
+    launch(
+        g, kern, grid_div, a_d, w.d, c_d, w.n as u32, w.k as u32, mopt, shmem,
+    )?;
     g.synchronize(0)?;
     let got = dn_bf16(g, c_d, m * w.n)?;
     let want = oracle(&w.codes, &w.scales, a_host, m, w.n, w.k);
@@ -195,7 +204,9 @@ fn run_variant(
     g.synchronize(0)?;
     let t0 = std::time::Instant::now();
     for _ in 0..ITERS {
-        launch(g, kern, grid_div, a_d, w.d, c_d, w.n as u32, w.k as u32, mopt, shmem)?;
+        launch(
+            g, kern, grid_div, a_d, w.d, c_d, w.n as u32, w.k as u32, mopt, shmem,
+        )?;
     }
     g.synchronize(0)?;
     let us = t0.elapsed().as_secs_f64() / ITERS as f64 * 1e6;
@@ -219,7 +230,10 @@ fn main() -> Result<()> {
     const MAXM: usize = 8;
 
     // Shapes: (name, N, K)
-    let shapes = [("gate/up", 17408usize, 5120usize), ("down", 5120usize, 17408usize)];
+    let shapes = [
+        ("gate/up", 17408usize, 5120usize),
+        ("down", 5120usize, 17408usize),
+    ];
 
     println!("== Q2_0 decode-GEMV microbench (GROUP={GROUP}, {ITERS} iters) ==\n");
     println!(
@@ -230,16 +244,25 @@ fn main() -> Result<()> {
     let mut pass = true;
     for (name, n, k) in shapes {
         let w = make_weight(g, &mut rng, n, k)?;
-        let a: Vec<bf16> = (0..MAXM * k).map(|_| bf16::from_f32(rng.r(-1.0, 1.0))).collect();
+        let a: Vec<bf16> = (0..MAXM * k)
+            .map(|_| bf16::from_f32(rng.r(-1.0, 1.0)))
+            .collect();
         let a_d = up_bf16(g, &a)?;
         let c_d = g.alloc(MAXM * n * 2)?;
 
         for m in [1usize, 4] {
             // baseline (M=1 kernel for m==1, batchm otherwise)
-            let (bk, bg) = if m == 1 { (base1, 4u32) } else { (base_m, 4u32) };
+            let (bk, bg) = if m == 1 {
+                (base1, 4u32)
+            } else {
+                (base_m, 4u32)
+            };
             let base = run_variant(g, bk, bg, &w, a_d, &a, c_d, m, 0)?;
-            let variants: [(&str, KernelHandle, u32, u32); 1] =
-                if m == 1 { [("B-vec", vec1, 8, 0)] } else { [("B-vec", vec_m, 8, 0)] };
+            let variants: [(&str, KernelHandle, u32, u32); 1] = if m == 1 {
+                [("B-vec", vec1, 8, 0)]
+            } else {
+                [("B-vec", vec_m, 8, 0)]
+            };
             let bl = |v: &VariantR| base.us / v.us;
             println!(
                 "{name:<9} {m:>3} {:<9} {:>9.5} {:>9.1} {:>8.1} {:>8}",

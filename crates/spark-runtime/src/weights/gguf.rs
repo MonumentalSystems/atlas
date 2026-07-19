@@ -323,8 +323,18 @@ impl super::WeightLoader for GgufLoader {
 
         // Pass 1: backbone → weights.
         sidecar::load_pass(
-            self, gpu, &bb_gguf, &bb_mmap, &arch, gdn, force_cpu, native_q2, q2_group, q2_variant,
-            &mut weights, &mut skipped,
+            self,
+            gpu,
+            &bb_gguf,
+            &bb_mmap,
+            &arch,
+            gdn,
+            force_cpu,
+            native_q2,
+            q2_group,
+            q2_variant,
+            &mut weights,
+            &mut skipped,
         )?;
         drop(bb_gguf);
         drop(bb_mmap);
@@ -338,8 +348,18 @@ impl super::WeightLoader for GgufLoader {
             // mmproj is a `clip` tower — no qwen35 FFN names, so native_q2 is
             // irrelevant there; pass false to keep it on the plain BF16 path.
             sidecar::load_pass(
-                self, gpu, &mm_gguf, &mm_mmap, &mm_arch, None, force_cpu, false, q2_group,
-                q2_variant, &mut weights, &mut skipped,
+                self,
+                gpu,
+                &mm_gguf,
+                &mm_mmap,
+                &mm_arch,
+                None,
+                force_cpu,
+                false,
+                q2_group,
+                q2_variant,
+                &mut weights,
+                &mut skipped,
             )?;
             tracing::info!(
                 "Merged {} mmproj tensors (arch '{}') into the weight store",
@@ -455,8 +475,7 @@ mod tests {
 
     #[test]
     fn find_gguf_skips_mmproj_and_find_mmproj_pairs() {
-        let dir =
-            std::env::temp_dir().join(format!("atlas_gguf_mmproj_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("atlas_gguf_mmproj_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         // The mmproj sorts lexicographically FIRST ('B' < 'T'), so a naive
         // first-file pick would wrongly select the sidecar as the backbone.
@@ -475,8 +494,7 @@ mod tests {
         );
 
         // A text-only dir yields no sidecar.
-        let dir2 =
-            std::env::temp_dir().join(format!("atlas_gguf_textonly_{}", std::process::id()));
+        let dir2 = std::env::temp_dir().join(format!("atlas_gguf_textonly_{}", std::process::id()));
         std::fs::create_dir_all(&dir2).unwrap();
         std::fs::write(dir2.join("model-Q2_0.gguf"), b"x").unwrap();
         let bb2 = find_gguf(&dir2).unwrap();

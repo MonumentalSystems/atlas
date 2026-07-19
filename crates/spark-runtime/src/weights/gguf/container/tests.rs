@@ -175,7 +175,10 @@ fn q2_0_group_selects_block_layout() {
         GgmlType::Q6_K.block_layout(Q2Group::G128).unwrap(),
         (256, 210)
     );
-    assert_eq!(GgmlType::Q8_0.block_layout(Q2Group::G128).unwrap(), (32, 34));
+    assert_eq!(
+        GgmlType::Q8_0.block_layout(Q2Group::G128).unwrap(),
+        (32, 34)
+    );
     // IQ family intentionally has no block layout here.
     assert!(GgmlType::Iq2Xxs.block_layout(Q2Group::G128).is_err());
 }

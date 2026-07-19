@@ -169,10 +169,7 @@ mod tests {
 
         let got = packed_dot(&row, &a, group);
         let want = dense_dot(&codes, &d, &a, group);
-        assert!(
-            (got - want).abs() < 1e-3,
-            "packed {got} vs dense {want}"
-        );
+        assert!((got - want).abs() < 1e-3, "packed {got} vs dense {want}");
     }
 
     #[test]
@@ -201,6 +198,9 @@ mod tests {
         row.extend(pack_block(d[1], &codes[group..]));
         let got = packed_dot(&row, &a, group);
         let want = dense_dot(&codes, &d, &a, group);
-        assert!((got - want).abs() < 1e-3, "g64 packed {got} vs dense {want}");
+        assert!(
+            (got - want).abs() < 1e-3,
+            "g64 packed {got} vs dense {want}"
+        );
     }
 }

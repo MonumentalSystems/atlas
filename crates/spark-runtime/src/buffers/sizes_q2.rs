@@ -40,23 +40,21 @@ pub fn q2_dequant_scratch_bytes(config: &ModelConfig) -> usize {
 ///   qkv (h) or o (q_heads*head_dim), GDN qkvz (h). q8_1_mmq is 4 bytes/elem
 ///   over kpad (K rounded to 256), + 1MB margin — matches `q8_1_scratch_bytes`.
 pub fn q2_scratch_sizes(config: &ModelConfig, m: usize, h: usize, hd: usize) -> (usize, usize) {
-    let q2_dequant_scratch =
-        if std::env::var("ATLAS_GGUF_NATIVE_Q2").ok().as_deref() == Some("1") {
-            q2_dequant_scratch_bytes(config)
-        } else {
-            0
-        };
+    let q2_dequant_scratch = if std::env::var("ATLAS_GGUF_NATIVE_Q2").ok().as_deref() == Some("1") {
+        q2_dequant_scratch_bytes(config)
+    } else {
+        0
+    };
 
-    let q2_act_q8 =
-        if std::env::var("ATLAS_GGUF_NATIVE_Q2_MMQ").ok().as_deref() == Some("1") {
-            let kmax = h
-                .max(config.intermediate_size)
-                .max(config.num_attention_heads * hd);
-            let kpad = kmax.div_ceil(256) * 256;
-            m * kpad * 4 + (1 << 20)
-        } else {
-            0
-        };
+    let q2_act_q8 = if std::env::var("ATLAS_GGUF_NATIVE_Q2_MMQ").ok().as_deref() == Some("1") {
+        let kmax = h
+            .max(config.intermediate_size)
+            .max(config.num_attention_heads * hd);
+        let kpad = kmax.div_ceil(256) * 256;
+        m * kpad * 4 + (1 << 20)
+    } else {
+        0
+    };
 
     (q2_dequant_scratch, q2_act_q8)
 }
