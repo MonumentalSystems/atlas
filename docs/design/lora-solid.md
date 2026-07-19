@@ -115,7 +115,7 @@ All in `crates/spark-model/src/layers/moe/`.
 
 | Path | fn (file:line) | base dtype | out-buf layout | routing (device) | down fold point | gate/up fold point | graph-safe |
 |---|---|---|---|---|---|---|---|
-| 1 NVFP4 grouped | `forward_prefill.rs:17` (routed `forward_prefill_routed.rs:34`) | NVFP4 | sorted `[te,·]` | `expert_offsets`+`sorted_expert_ids` (`:311-327`) | after down GEMM, before unpermute (`:379`, WIRED) | after up GEMM, before `silu_mul` (`fpr:317→322`) | after Incr 1 |
+| 1 NVFP4 grouped | `forward_prefill.rs:17` (routed `forward_prefill_routed.rs:34`) | NVFP4 | sorted `[te,·]` | `expert_offsets`+`sorted_expert_ids` (`:311-327`) | after down GEMM, before unpermute (`:379`, WIRED) | after up GEMM, before `silu_mul` (`forward_prefill_routed.rs:317→322`) | after Incr 1 |
 | 2 bf16-dequant | `forward_prefill_bf16.rs:11` | bf16 | sorted `[te,·]` | idem (`:161-177`) | after down GEMM `:242`, before unpermute `:246` | `:219→220` | after Incr 1 |
 | 3 fp8 grouped | `forward_prefill_fp8.rs:19` | fp8/W8A8 | sorted `[te,·]` | idem (`:301-313`) | after down block `:587`, before unpermute `:591` | `:483/:419→:492` | after Incr 1 |
 | 4 batched short | `forward_batched.rs:12` | bf16/fp8/nvfp4 | slot-major `[top_k,·]` | `indices_dev`+`weights_dev` (`:123`) | after fused silu+down, before `moe_weighted_sum_blend` `:414` | between fused gate+up and silu+down | Incr 4 (gather-BGMV) |

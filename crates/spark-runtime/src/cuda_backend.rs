@@ -37,8 +37,16 @@ unsafe extern "C" {
     // CUDA graph capture/replay
     pub(super) fn cuStreamBeginCapture(hStream: u64, mode: u32) -> i32;
     pub(super) fn cuStreamEndCapture(hStream: u64, phGraph: *mut u64) -> i32;
-    // Query whether a stream is mid-capture (0=NONE, 1=ACTIVE, 2=INVALIDATED).
-    pub(super) fn cuStreamIsCapturing(hStream: u64, captureStatus: *mut u32) -> i32;
+    // Query whether a stream is mid-capture (captureStatus 0=NONE, 1=ACTIVE,
+    // 2=INVALIDATED). Uses cuStreamGetCaptureInfo, not cuStreamIsCapturing:
+    // the latter was REMOVED from libcuda in CUDA 13 (deprecated → the CI
+    // stub no longer exports it, so a raw extern fails to link). The base
+    // cuStreamGetCaptureInfo returns the same status enum plus a capture id.
+    pub(super) fn cuStreamGetCaptureInfo(
+        hStream: u64,
+        captureStatus: *mut u32,
+        id: *mut u64,
+    ) -> i32;
     // CUDA-graph instantiate. NVIDIA's libcuda exports the 3-arg
     // `cuGraphInstantiateWithFlags`; SCALE's libcuda (gfx1151) exports only
     // `cuGraphInstantiate` — same ABI `(CUgraphExec*, CUgraph, u64)`, no

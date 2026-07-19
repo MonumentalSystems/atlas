@@ -329,7 +329,8 @@ impl GpuBackend for AtlasCudaBackend {
     fn abort_capture_if_active(&self, stream: u64) {
         // Query capture status; 1 == CU_STREAM_CAPTURE_STATUS_ACTIVE.
         let mut cap_status: u32 = 0;
-        let q = unsafe { super::cuStreamIsCapturing(stream, &mut cap_status) };
+        let mut _cap_id: u64 = 0;
+        let q = unsafe { super::cuStreamGetCaptureInfo(stream, &mut cap_status, &mut _cap_id) };
         if q != 0 || cap_status != 1 {
             return;
         }
