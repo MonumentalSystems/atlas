@@ -117,7 +117,7 @@ impl Qwen3AttentionLayer {
     /// Install keep-packed ternary Q2_0 q/k/v/o weights (Tier-1c,
     /// `ATLAS_GGUF_NATIVE_Q2=1`). Decode dispatches `q2_0_gemv_vec` (2-bit
     /// resident, no NVFP4); prefill transient-dequants each to BF16 via
-    /// [`Self::q2_prefill_gemm`]. Replaces the NVFP4 decode weights (which are
+    /// `Self::q2_prefill_gemm`. Replaces the NVFP4 decode weights (which are
     /// NULL on this path — no NVFP4 was allocated).
     pub fn set_packed_q2_weights(
         &mut self,

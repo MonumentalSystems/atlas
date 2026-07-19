@@ -7,7 +7,7 @@ use super::*;
 impl Qwen3SsmLayer {
     /// Install the Tier-1c keep-packed ternary Q2_0 fused `in_proj_qkvz`
     /// (`ATLAS_GGUF_NATIVE_Q2`). Decode dispatches `q2_0_gemv_vec`; prefill
-    /// transient-dequants via [`Self::qkvz_q2_prefill_gemm`]. `out_proj` is
+    /// transient-dequants via `Self::qkvz_q2_prefill_gemm`. `out_proj` is
     /// unaffected (stays NVFP4). Requires `sequential_qkvz` (Bonsai concats
     /// [Q|K|V|Z] at load).
     pub fn set_packed_q2_qkvz(&mut self, qkvz: crate::weight_map::PackedQ2Weight) {
