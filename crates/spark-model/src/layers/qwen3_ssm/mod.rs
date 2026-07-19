@@ -207,6 +207,7 @@ pub struct Qwen3SsmLayer {
 // ── Sub-files (split for ≤500 LoC) ────────────────────────────────────────
 mod debug;
 mod init;
+mod init_q2;
 mod ssm_forward;
 mod trait_decode;
 mod trait_decode_batched;
