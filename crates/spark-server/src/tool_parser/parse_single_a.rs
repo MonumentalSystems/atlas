@@ -3,6 +3,18 @@
 
 use super::*;
 
+/// Parse a body whose outer `</tool_call>` delimiter was observed. A bare
+/// identifier is Poolside's zero-argument shape and is only safe to recognize
+/// here: the same bytes without an outer close are an incomplete envelope.
+pub(super) fn parse_complete_call(text: &str, idx: u32) -> Option<ToolCall> {
+    let body = text.trim();
+    if is_tool_name_component(body) {
+        parse_poolside_v1_call(body)
+    } else {
+        parse_one_call(body, idx)
+    }
+}
+
 /// Auto-detect and parse inner content of a `<tool_call>` block.
 /// Tries Gemma-4 native, JSON (hermes), qwen3_coder XML, then tag-style XML fallback.
 pub(super) fn parse_one_call(text: &str, idx: u32) -> Option<ToolCall> {

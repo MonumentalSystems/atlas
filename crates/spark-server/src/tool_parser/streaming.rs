@@ -74,12 +74,6 @@ pub enum DetectorOutput {
 /// Extract function name from partial tool call buffer for incremental streaming.
 /// Handles Hermes JSON, Qwen3-Coder XML, Gemma-4, and Mistral native formats.
 pub(super) fn extract_streaming_name(buffer: &str) -> Option<String> {
-    if let Some(end) = buffer.find("<arg_key>") {
-        let name = buffer[..end].trim();
-        if !name.is_empty() && !name.contains('<') {
-            return Some(normalize_tool_name(name));
-        }
-    }
     // Mistral native: [TOOL_CALLS]NAME[ARGS]
     if let Some(start) = buffer.find(MISTRAL_TOOL_CALLS_TAG) {
         let after = &buffer[start + MISTRAL_TOOL_CALLS_TAG.len()..];

@@ -728,12 +728,21 @@ impl GrammarEngine {
                 .as_ref()
                 .cloned()
                 .unwrap_or_else(|| serde_json::json!({"type":"object","properties":{}}));
+            let has_no_parameters = raw_schema
+                .get("properties")
+                .and_then(serde_json::Value::as_object)
+                .is_some_and(serde_json::Map::is_empty)
+                && raw_schema
+                    .get("additionalProperties")
+                    .and_then(serde_json::Value::as_bool)
+                    != Some(true);
             let Some(schema) = sanitize_schema_for_grammar(&raw_schema) else {
                 tracing::warn!("Skipping tool '{name}' in grammar — schema unsanitizable");
                 continue;
             };
 
-            let paramname_rule = match schema_param_names(&schema) {
+            let param_names = schema_param_names(&schema);
+            let paramname_rule = match param_names.as_ref() {
                 Some(names) if !names.is_empty() => {
                     let alternatives = names
                         .iter()
@@ -745,17 +754,22 @@ impl GrammarEngine {
                 _ => "paramname ::= [a-zA-Z_] [a-zA-Z_0-9]*".to_string(),
             };
             let value_ladder = ebnf_until_close_ladder(value_close);
-            let body_ebnf = format!(
-                "root ::= pair pair*\n\
-                 pair ::= \"<arg_key>\" paramname \"</arg_key><arg_value>\" value \"{value_close}\"\n\
-                 {paramname_rule}\n\
-                 value ::= value_part*\n\
-                 value_part ::= {value_ladder}"
-            );
+            let content = if has_no_parameters {
+                serde_json::json!({"type": "const_string", "value": ""})
+            } else {
+                let body_ebnf = format!(
+                    "root ::= pair pair*\n\
+                     pair ::= \"<arg_key>\" paramname \"</arg_key><arg_value>\" value \"{value_close}\"\n\
+                     {paramname_rule}\n\
+                     value ::= value_part*\n\
+                     value_part ::= {value_ladder}"
+                );
+                serde_json::json!({"type": "grammar", "grammar": body_ebnf})
+            };
             tag_entries.push(serde_json::json!({
                 "type": "tag",
                 "begin": format!("<tool_call>{name}"),
-                "content": {"type": "grammar", "grammar": body_ebnf},
+                "content": content,
                 "end": "</tool_call>",
             }));
         }

@@ -653,6 +653,8 @@ pub fn assess_tool_call(call: &ToolCall, tools: &[ToolDefinition]) -> Result<(),
         "MultiEdit",
         "multiEdit",
         "multi_edit",
+        "write_file",
+        "writeFile",
     ];
     if WRITE_FAMILY.contains(&name.as_str()) {
         for key in PATH_KEYS {

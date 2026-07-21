@@ -243,7 +243,7 @@ pub(super) async fn run_blocking_path(args: BlockingPathArgs) -> super::chat::Ch
 }
 
 /// Decode `(reasoning_content, output_text)` from the scheduler's
-/// response. When `enable_thinking=true`, split at the last `</think>`
+/// response. When `enable_thinking=true`, split at the first `</think>`
 /// token. When `enable_thinking=false`, decode all output_tokens as
 /// content — mirrors streaming's `thinking_done = !enable_thinking`
 /// init in chat_stream/state.rs and recovers the answer Qwen3.x emits
@@ -257,14 +257,9 @@ fn decode_response_text(
     let output_tokens =
         output_tokens_without_stop(&response.output_tokens, response.finish_reason.as_str());
     if let Some(think_tok) = state.think_end_token_id {
-        let last_think_pos = if enable_thinking {
-            output_tokens.iter().rposition(|&t| t == think_tok)
-        } else {
-            None
-        };
-        if let Some(pos) = last_think_pos {
-            let thinking_tokens = &output_tokens[..pos];
-            let content_tokens = &output_tokens[pos + 1..];
+        if let Some((thinking_tokens, content_tokens)) =
+            split_at_first_think_end(output_tokens, think_tok, enable_thinking)
+        {
             let reasoning = if !thinking_tokens.is_empty() {
                 state
                     .tokenizer
@@ -288,6 +283,22 @@ fn decode_response_text(
         let text = state.tokenizer.decode(output_tokens).unwrap_or_default();
         extract_thinking(&text, enable_thinking, state.reasoning_parser.as_deref())
     }
+}
+
+/// Split native reasoning from assistant content at the first end marker.
+/// Any later marker belongs to post-reasoning output and must not move an
+/// already-complete answer or tool call back into the reasoning channel.
+fn split_at_first_think_end(
+    tokens: &[u32],
+    think_end_token: u32,
+    enable_thinking: bool,
+) -> Option<(&[u32], &[u32])> {
+    if !enable_thinking {
+        return None;
+    }
+
+    let pos = tokens.iter().position(|&token| token == think_end_token)?;
+    Some((&tokens[..pos], &tokens[pos + 1..]))
 }
 
 /// The scheduler retains a terminal stop token in blocking output for usage
@@ -340,13 +351,9 @@ async fn build_choice_message(
         // reasoning, hoist the calls back into the assistant message and
         // scrub the residual XML from the reasoning trace so it isn't
         // double-emitted to the client.
-        let (hoisted_reasoning, hoisted_tool_calls): (Option<String>, Vec<_>) =
-            if let Some(ref rc) = reasoning_content {
-                let (scrubbed, tcs) = tool_parser::parse_tool_calls(rc);
-                (scrubbed, tcs)
-            } else {
-                (None, Vec::new())
-            };
+        let parser_name = state.tool_call_parser.as_ref().map(|parser| parser.name());
+        let (hoisted_reasoning, hoisted_tool_calls) =
+            extract_hoisted_tool_calls(reasoning_content.as_deref(), parser_name);
         if !hoisted_tool_calls.is_empty() {
             tracing::info!(
                 "F7: hoisted {} tool-call(s) from inside <think> block (would have been silently dropped)",
@@ -449,6 +456,23 @@ async fn build_choice_message(
     }
 }
 
+/// Recover tool calls from reasoning for legacy parsers that depend on F7.
+/// Poolside v1 uses native interleaved reasoning: only post-reasoning content
+/// is executable, so an envelope in the reasoning channel remains trace text.
+fn extract_hoisted_tool_calls(
+    reasoning_content: Option<&str>,
+    parser_name: Option<&str>,
+) -> (Option<String>, Vec<tool_parser::ToolCall>) {
+    let Some(reasoning) = reasoning_content else {
+        return (None, Vec::new());
+    };
+    if parser_name == Some("poolside_v1") {
+        return (Some(reasoning.to_string()), Vec::new());
+    }
+
+    tool_parser::parse_tool_calls(reasoning)
+}
+
 /// Merge calls recovered from reasoning with calls in assistant content.
 ///
 /// Some reasoning models emit the same native tool envelope immediately
@@ -466,52 +490,6 @@ fn merge_hoisted_tool_calls(
     });
     hoisted.extend(parsed);
     hoisted
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{merge_hoisted_tool_calls, output_tokens_without_stop};
-    use crate::tool_parser::{FunctionCall, ToolCall};
-
-    fn tool_call(id: &str, city: &str) -> ToolCall {
-        ToolCall {
-            id: id.into(),
-            call_type: "function".into(),
-            function: FunctionCall {
-                name: "get_weather".into(),
-                arguments: format!(r#"{{"city":"{city}"}}"#),
-            },
-        }
-    }
-
-    #[test]
-    fn duplicate_call_across_reasoning_and_content_is_emitted_once() {
-        let merged = merge_hoisted_tool_calls(
-            vec![tool_call("reasoning", "Boston")],
-            vec![tool_call("content", "Boston")],
-        );
-
-        assert_eq!(merged.len(), 1);
-        assert_eq!(merged[0].id, "content");
-    }
-
-    #[test]
-    fn distinct_calls_across_reasoning_and_content_are_preserved() {
-        let merged = merge_hoisted_tool_calls(
-            vec![tool_call("reasoning", "Boston")],
-            vec![tool_call("content", "Seattle")],
-        );
-
-        assert_eq!(merged.len(), 2);
-    }
-
-    #[test]
-    fn blocking_decode_excludes_terminal_stop_token() {
-        let tokens = [10, 11, 24];
-
-        assert_eq!(output_tokens_without_stop(&tokens, "stop"), &[10, 11]);
-        assert_eq!(output_tokens_without_stop(&tokens, "length"), &tokens);
-    }
 }
 
 /// Convert internal logprobs to OpenAI `ChoiceLogprobs` format.
@@ -595,4 +573,85 @@ fn finalize_response(
         choices: all_choices,
         usage,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        extract_hoisted_tool_calls, merge_hoisted_tool_calls, output_tokens_without_stop,
+        split_at_first_think_end,
+    };
+    use crate::tool_parser::{FunctionCall, ToolCall};
+
+    fn tool_call(id: &str, city: &str) -> ToolCall {
+        ToolCall {
+            id: id.into(),
+            call_type: "function".into(),
+            function: FunctionCall {
+                name: "get_weather".into(),
+                arguments: format!(r#"{{"city":"{city}"}}"#),
+            },
+        }
+    }
+
+    #[test]
+    fn duplicate_call_across_reasoning_and_content_is_emitted_once() {
+        let merged = merge_hoisted_tool_calls(
+            vec![tool_call("reasoning", "Boston")],
+            vec![tool_call("content", "Boston")],
+        );
+
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].id, "content");
+    }
+
+    #[test]
+    fn distinct_calls_across_reasoning_and_content_are_preserved() {
+        let merged = merge_hoisted_tool_calls(
+            vec![tool_call("reasoning", "Boston")],
+            vec![tool_call("content", "Seattle")],
+        );
+
+        assert_eq!(merged.len(), 2);
+    }
+
+    #[test]
+    fn blocking_decode_excludes_terminal_stop_token() {
+        let tokens = [10, 11, 24];
+
+        assert_eq!(output_tokens_without_stop(&tokens, "stop"), &[10, 11]);
+        assert_eq!(output_tokens_without_stop(&tokens, "length"), &tokens);
+    }
+
+    #[test]
+    fn blocking_thinking_split_uses_first_end_token() {
+        let tokens = [10, 19, 20, 19, 30];
+
+        let split = split_at_first_think_end(&tokens, 19, true);
+
+        assert_eq!(split, Some((&[10][..], &[20, 19, 30][..])));
+        assert_eq!(split_at_first_think_end(&tokens, 19, false), None);
+    }
+
+    #[test]
+    fn poolside_tool_call_in_reasoning_is_not_hoisted() {
+        let reasoning = "plan <tool_call>write_file<arg_key>path</arg_key>\
+            <arg_value>/tmp/x</arg_value></tool_call> more";
+
+        let (preserved, calls) = extract_hoisted_tool_calls(Some(reasoning), Some("poolside_v1"));
+
+        assert_eq!(preserved.as_deref(), Some(reasoning));
+        assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn non_poolside_tool_call_in_reasoning_is_still_hoisted() {
+        let reasoning =
+            r#"plan <tool_call>{"name":"get_weather","arguments":{"city":"Boston"}}</tool_call>"#;
+
+        let (_scrubbed, calls) = extract_hoisted_tool_calls(Some(reasoning), Some("hermes"));
+
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "get_weather");
+    }
 }

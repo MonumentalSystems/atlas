@@ -76,21 +76,23 @@ impl ToolCallParser for PoolsideV1Parser {
 pub(super) fn parse_poolside_v1_call(text: &str) -> Option<ToolCall> {
     let name_end = text.find("<arg_key>").unwrap_or(text.len());
     let name = normalize_tool_name(text[..name_end].trim());
-    if name.is_empty() || name.contains('<') {
+    if !is_tool_name_component(&name) {
         return None;
     }
 
     let mut args = serde_json::Map::new();
     let mut rest = &text[name_end..];
-    while let Some(key_start) = rest.find("<arg_key>") {
-        rest = &rest[key_start + "<arg_key>".len()..];
+    while !rest.is_empty() {
+        rest = rest.strip_prefix("<arg_key>")?;
         let key_end = rest.find("</arg_key>")?;
         let key = rest[..key_end].trim();
+        if !is_tool_name_component(key) || args.contains_key(key) {
+            return None;
+        }
         rest = &rest[key_end + "</arg_key>".len()..];
-        let value_start = rest.find("<arg_value>")?;
-        rest = &rest[value_start + "<arg_value>".len()..];
+        rest = rest.strip_prefix("<arg_value>")?;
         let value_end = rest.find("</arg_value>")?;
-        let raw_value = rest[..value_end].trim();
+        let raw_value = &rest[..value_end];
         let value = serde_json::from_str(raw_value)
             .unwrap_or_else(|_| serde_json::Value::String(raw_value.to_string()));
         args.insert(key.to_string(), value);
@@ -122,6 +124,69 @@ mod tests {
         assert_eq!(
             call.function.arguments,
             r#"{"command":"pwd","timeout":120}"#
+        );
+    }
+
+    #[test]
+    fn preserves_unquoted_string_whitespace_exactly() {
+        let call = parse_poolside_v1_call(
+            "write_file<arg_key>content</arg_key><arg_value>  first\nlast  </arg_value>",
+        )
+        .expect("poolside call");
+        let args: serde_json::Value = serde_json::from_str(&call.function.arguments).unwrap();
+
+        assert_eq!(args["content"], "  first\nlast  ");
+    }
+
+    #[test]
+    fn rejects_duplicate_argument_keys() {
+        let call = parse_poolside_v1_call(
+            "write_file<arg_key>path</arg_key><arg_value>/tmp/a</arg_value>\
+             <arg_key>path</arg_key><arg_value>/tmp/b</arg_value>",
+        );
+
+        assert!(call.is_none());
+    }
+
+    #[test]
+    fn rejects_incomplete_argument_pair() {
+        assert!(
+            parse_poolside_v1_call("write_file<arg_key>path</arg_key><arg_value>/tmp/a").is_none()
+        );
+    }
+
+    #[test]
+    fn blocking_parser_accepts_complete_zero_argument_call() {
+        let (_, calls) = parse_tool_calls("<tool_call>get_status</tool_call>");
+
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "get_status");
+        assert_eq!(calls[0].function.arguments, "{}");
+    }
+
+    #[test]
+    fn blocking_parser_does_not_salvage_incomplete_poolside_envelope() {
+        let (_, calls) = parse_tool_calls(
+            "<tool_call>write_file<arg_key>path</arg_key>\
+             <arg_value>/tmp/a</arg_value>",
+        );
+
+        assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn streaming_parser_does_not_emit_incomplete_poolside_envelope() {
+        let mut detector = StreamingToolDetector::new();
+        let mut outputs = detector.process(
+            "<tool_call>write_file<arg_key>path</arg_key>\
+             <arg_value>/tmp/a</arg_value>",
+        );
+        outputs.extend(detector.flush());
+
+        assert!(
+            outputs
+                .iter()
+                .all(|output| matches!(output, DetectorOutput::Content(_)))
         );
     }
 }

@@ -7,16 +7,17 @@
   {%- set system_message = messages[0].content -%}
   {%- set messages = messages[1:] -%}
 {%- endif -%}
-{%- if system_message or tools or enable_thinking -%}
+{%- set has_sys = system_message and system_message.strip() -%}
+{%- if has_sys or tools or enable_thinking -%}
   {{- "<system>" -}}
-  {%- if system_message -%}
-    {{- system_message -}}
+  {%- if has_sys -%}
+    {{- system_message.rstrip() -}}
     {%- if tools -%}{{- "\n\n" -}}{%- endif -%}
   {%- endif -%}
   {%- if tools -%}
     {{- "### Tools\n\nYou may call functions to assist with the user query.\nAll available function signatures are listed below:\n<available_tools>\n" -}}
     {%- for tool in tools -%}
-      {{- (tool | tojson) ~ "\n" -}}
+      {{- (tool | tojson_hf) ~ "\n" -}}
     {%- endfor -%}
     {{- "</available_tools>" -}}
   {%- endif -%}
@@ -28,7 +29,12 @@
     {{- "<user>" + content + "</user>\n" -}}
   {%- elif message.role == "assistant" -%}
     {{- "<assistant>" -}}
-    {%- set reasoning_content = message.reasoning_content if message.reasoning_content is string else "" -%}
+    {%- set reasoning_content = "" -%}
+    {%- if message.reasoning is string -%}
+      {%- set reasoning_content = message.reasoning -%}
+    {%- elif message.reasoning_content is string -%}
+      {%- set reasoning_content = message.reasoning_content -%}
+    {%- endif -%}
     {%- if enable_thinking -%}
       {{- "<think>" + reasoning_content + "</think>" -}}
     {%- else -%}
@@ -41,7 +47,7 @@
         {{- "<tool_call>" + function_data.name -}}
         {%- for key, value in function_data.arguments.items() -%}
           {{- "<arg_key>" ~ key ~ "</arg_key><arg_value>" -}}
-          {{- value | tojson if value is not string else value -}}
+          {{- value | tojson_hf if value is not string else value -}}
           {{- "</arg_value>" -}}
         {%- endfor -%}
         {{- "</tool_call>" -}}

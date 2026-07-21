@@ -12,4 +12,5 @@ mod group_e;
 mod group_f;
 mod group_g_parallel;
 mod group_h_salvage;
+mod group_i_poolside_safety;
 mod streaming_frag;

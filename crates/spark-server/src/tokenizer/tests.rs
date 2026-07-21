@@ -47,6 +47,32 @@ fn laguna_template_renders_native_tool_round_trip() {
     assert!(rendered.ends_with("<assistant><think>"));
 }
 
+#[test]
+fn laguna_template_uses_checkpoint_tool_json_and_reasoning_controls() {
+    let messages = vec![json!({"role": "user", "content": "weather"})];
+    let tools = vec![json!({
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Get weather",
+            "parameters": {
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+                "required": ["city"]
+            }
+        }
+    })];
+
+    let no_think = render_laguna_template(&messages, Some(&tools), false);
+    assert!(no_think.contains(
+        r#"{"type": "function", "function": {"name": "get_weather", "description": "Get weather", "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}}"#
+    ));
+    assert!(no_think.ends_with("<assistant></think>"));
+
+    let think = render_laguna_template(&messages, Some(&tools), true);
+    assert!(think.ends_with("<assistant><think>"));
+}
+
 fn render_minimax_openai_template(
     messages: &[serde_json::Value],
     tools: Option<&[serde_json::Value]>,

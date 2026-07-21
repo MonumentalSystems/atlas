@@ -91,6 +91,30 @@ fn poolside_grammar_rejects_empty_tool_list() {
 }
 
 #[test]
+fn poolside_grammar_accepts_complete_zero_argument_call() {
+    let mut engine = GrammarEngine::new(&test_vocab(), &[130]).unwrap();
+    let tools = vec![ToolDefinition {
+        tool_type: "function".to_string(),
+        function: crate::tool_parser::FunctionDefinition {
+            name: "get_status".to_string(),
+            description: None,
+            parameters: Some(serde_json::json!({
+                "type": "object",
+                "properties": {}
+            })),
+        },
+    }];
+    let compiled = engine
+        .compile_poolside_v1_tool_grammar(&tools, true, "</arg_value>")
+        .expect("compile must succeed");
+
+    assert!(grammar_accepts(
+        &compiled,
+        "<tool_call>get_status</tool_call>"
+    ));
+}
+
+#[test]
 fn poolside_parser_reports_grammar_support() {
     assert!(crate::tool_parser::ToolCallFormat::PoolsideV1.has_grammar());
 }
