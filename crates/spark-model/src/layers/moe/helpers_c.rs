@@ -176,9 +176,10 @@ impl MoeLayer {
                     stream,
                 )
             } else {
-                ops::dense_gemm(
+                ops::dense_gemm_prefill(
                     ctx.gpu,
                     self.dense_gemm,
+                    self.dense_gemm_pipelined,
                     activation,
                     weight,
                     output,

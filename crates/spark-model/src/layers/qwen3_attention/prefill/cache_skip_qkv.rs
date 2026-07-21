@@ -326,9 +326,10 @@ impl Qwen3AttentionLayer {
                 anyhow::anyhow!("{label} w4a16_gemm failed: m={n} n={out_dim} k={h}: {e}")
             })?;
         } else {
-            ops::dense_gemm(
+            ops::dense_gemm_prefill(
                 ctx.gpu,
                 self.dense_gemm_k,
+                self.dense_gemm_pipelined_k,
                 normed,
                 dense,
                 out,

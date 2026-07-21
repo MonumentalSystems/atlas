@@ -252,9 +252,10 @@ impl MoeLayer {
                 stream,
             )?;
         } else {
-            ops::dense_gemm(
+            ops::dense_gemm_prefill(
                 ctx.gpu,
                 self.dense_gemm,
+                self.dense_gemm_pipelined,
                 router_in,
                 &self.weights.gate,
                 gate_logits,
