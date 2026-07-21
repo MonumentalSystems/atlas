@@ -3,7 +3,7 @@ name = "laguna-s-2.1"
 hf_id = "poolside/Laguna-S-2.1-NVFP4"
 model_type = "laguna"
 architecture = "Hybrid Full/Sliding Attention + Dense/MoE"
-parameters = "100B"
+parameters = "117.6B-A8.5B"
 
 layers_total = 48
 layers_sliding_attention = 36
