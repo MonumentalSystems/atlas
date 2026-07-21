@@ -65,11 +65,19 @@ repetition_penalty = 1.0
 dry_multiplier = 0.0
 
 [behavior]
-thinking_in_tools = false
+thinking_in_tools = true
 max_thinking_budget = 8192
-thinking_default = false
+# Poolside recommends thinking for agentic coding and preserving it between
+# tool calls. Clients can still opt out per request with enable_thinking=false.
+thinking_default = true
 default_kv_dtype = "fp8"
 tool_call_parser = "poolside_v1"
+# The model card recommends 0.7 / 0.95 for quality and reliability, while the
+# generic generation_config.json retains 1.0 / 1.0 evaluation defaults.
+use_sampling_presets_for_core = true
+# OpenCode already supplies its cwd in the native system prompt. Reinjecting a
+# second Atlas-specific environment block made Laguna fixate on path discovery.
+disable_cwd_hint_injection = true
 
 [[model_types]]
 model_type = "laguna"

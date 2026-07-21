@@ -60,7 +60,7 @@ pub(crate) fn test_build_msg_entries(
     input: &[crate::ir::Message],
     tools_active: bool,
 ) -> Result<Vec<msg_entry::MsgEntry>, axum::response::Response> {
-    msg_entry::build_msg_entries(None, None, input, tools_active).map(|o| o.messages)
+    msg_entry::build_msg_entries(None, None, input, tools_active, false).map(|o| o.messages)
 }
 
 #[cfg(test)]

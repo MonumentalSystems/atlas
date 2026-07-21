@@ -77,6 +77,7 @@ pub(crate) fn prepare_chat_prompt(
         state.vision_max_pixels,
         &req.messages,
         tools_active,
+        state.behavior.disable_cwd_hint_injection,
     )?;
 
     // ── Phase 1.5 + 2: thinking directive + resolution (pre-template) ─

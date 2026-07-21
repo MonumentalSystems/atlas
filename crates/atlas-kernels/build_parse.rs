@@ -131,6 +131,8 @@ pub(super) struct ParsedBehavior {
     pub default_kv_dtype: String,
     pub default_num_drafts: u32,
     pub disable_tool_steering: bool,
+    pub disable_cwd_hint_injection: bool,
+    pub use_sampling_presets_for_core: bool,
     pub tool_call_parser: String,
     pub enable_loop_watchdog: bool,
     pub min_p_floor: f32,
@@ -159,6 +161,8 @@ impl Default for ParsedBehavior {
             default_kv_dtype: String::new(),
             default_num_drafts: 0,
             disable_tool_steering: false,
+            disable_cwd_hint_injection: false,
+            use_sampling_presets_for_core: false,
             tool_call_parser: String::new(),
             enable_loop_watchdog: false,
             min_p_floor: 0.0,
@@ -222,6 +226,14 @@ pub(super) fn parse_behavior(model_dir: &std::path::Path) -> ParsedBehavior {
         .unwrap_or(0);
     let disable_tool_steering = b
         .and_then(|v| v.get("disable_tool_steering"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let disable_cwd_hint_injection = b
+        .and_then(|v| v.get("disable_cwd_hint_injection"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let use_sampling_presets_for_core = b
+        .and_then(|v| v.get("use_sampling_presets_for_core"))
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
     let tool_call_parser = b
@@ -306,6 +318,8 @@ pub(super) fn parse_behavior(model_dir: &std::path::Path) -> ParsedBehavior {
         default_kv_dtype,
         default_num_drafts,
         disable_tool_steering,
+        disable_cwd_hint_injection,
+        use_sampling_presets_for_core,
         tool_call_parser,
         enable_loop_watchdog,
         min_p_floor,

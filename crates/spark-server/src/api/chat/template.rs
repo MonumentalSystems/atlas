@@ -256,7 +256,7 @@ mod json_message_tests {
             text_msg(Role::User, "thanks"),
         ];
 
-        let out = super::super::msg_entry::build_msg_entries(None, None, &msgs, true)
+        let out = super::super::msg_entry::build_msg_entries(None, None, &msgs, true, false)
             .expect("fixture builds");
         assert_eq!(out.cwd_hint.as_deref(), Some("/tmp/proj"));
         let json = build_json_messages(&out.messages);

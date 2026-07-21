@@ -156,6 +156,14 @@ pub struct ModelBehavior {
     /// when the prefix forces them into that structure. Default: false
     /// (keep the existing Nemotron-Nano-correct behavior).
     pub disable_tool_steering: bool,
+    /// Do not append Atlas's derived `<environment>working_directory` block to
+    /// a client system prompt. Native agent clients may already provide the
+    /// cwd; duplicating it can become a tool-selection attractor.
+    pub disable_cwd_hint_injection: bool,
+    /// Use the selected MODEL.toml sampling category for default temperature,
+    /// top-k, and top-p instead of generation_config.json. Explicit request
+    /// values still take precedence.
+    pub use_sampling_presets_for_core: bool,
     /// Per-model tool-call parser override. Empty string = use the
     /// `tool_defaults.toml` mapping for this `model_type`. Set in MODEL.toml
     /// `[behavior].tool_call_parser` when one variant of a model_type needs
@@ -290,6 +298,8 @@ impl Default for ModelBehavior {
             default_kv_dtype: "",
             default_num_drafts: 0,
             disable_tool_steering: false,
+            disable_cwd_hint_injection: false,
+            use_sampling_presets_for_core: false,
             tool_call_parser: "",
             enable_loop_watchdog: false,
             min_p_floor: 0.0,

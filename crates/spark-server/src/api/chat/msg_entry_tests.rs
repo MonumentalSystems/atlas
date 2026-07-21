@@ -116,7 +116,7 @@ mod build_tests {
     use axum::http::StatusCode;
 
     fn assert_bad_request(msgs: &[Message], tools_active: bool) {
-        match build_msg_entries(None, None, msgs, tools_active) {
+        match build_msg_entries(None, None, msgs, tools_active, false) {
             Ok(_) => panic!("expected 400, got Ok"),
             Err(resp) => assert_eq!(resp.status(), StatusCode::BAD_REQUEST),
         }
@@ -154,7 +154,7 @@ mod build_tests {
     #[test]
     fn text_only_builds_without_vision_config() {
         let msgs = vec![text(Role::User, "hello")];
-        let out = build_msg_entries(None, None, &msgs, false).expect("text-only ok");
+        let out = build_msg_entries(None, None, &msgs, false, false).expect("text-only ok");
         assert_eq!(out.messages.len(), 1);
         assert_eq!(out.messages[0].image_count, 0);
     }
@@ -179,13 +179,13 @@ mod build_tests {
         // messages bypassed the cwd-hint / vacuous-system / CWD-injection
         // scans that string-compare on "system".
         let msgs = vec![text(Role::Other("developer".into()), "be terse")];
-        let out = build_msg_entries(None, None, &msgs, false).expect("ok");
+        let out = build_msg_entries(None, None, &msgs, false, false).expect("ok");
         assert_eq!(out.messages[0].role, "system");
 
         // Other unknown roles still pass through verbatim for the
         // template to handle.
         let msgs = vec![text(Role::Other("critic".into()), "hm")];
-        let out = build_msg_entries(None, None, &msgs, false).expect("ok");
+        let out = build_msg_entries(None, None, &msgs, false, false).expect("ok");
         assert_eq!(out.messages[0].role, "critic");
     }
 
@@ -207,9 +207,28 @@ mod build_tests {
             reasoning: None,
             tool_error: false,
         };
-        match build_msg_entries(None, None, &[url_msg], false) {
+        match build_msg_entries(None, None, &[url_msg], false, false) {
             Ok(_) => panic!("expected 400, got Ok"),
             Err(resp) => assert_eq!(resp.status(), StatusCode::BAD_REQUEST),
         }
+    }
+
+    #[test]
+    fn model_can_disable_duplicate_cwd_hint_injection() {
+        let msgs = vec![text(
+            Role::System,
+            "client prompt\nworking directory: /tmp/project",
+        )];
+
+        let enabled = build_msg_entries(None, None, &msgs, true, false).expect("enabled");
+        assert_eq!(enabled.cwd_hint.as_deref(), Some("/tmp/project"));
+        assert!(enabled.messages[0].content.contains("<environment>"));
+
+        let disabled = build_msg_entries(None, None, &msgs, true, true).expect("disabled");
+        assert_eq!(disabled.cwd_hint.as_deref(), Some("/tmp/project"));
+        assert_eq!(
+            disabled.messages[0].content,
+            "client prompt\nworking directory: /tmp/project"
+        );
     }
 }

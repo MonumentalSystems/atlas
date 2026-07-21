@@ -32,6 +32,14 @@ fn call(arguments: serde_json::Value) -> ToolCall {
 }
 
 #[test]
+fn poolside_parser_does_not_reinject_tool_prompt() {
+    let prompt =
+        PoolsideV1Parser.system_prompt(&[write_file_tool()], &ToolChoice::Mode("auto".to_string()));
+
+    assert!(prompt.is_empty());
+}
+
+#[test]
 fn missing_write_path_is_not_executable_after_backfill() {
     let mut calls = vec![call(serde_json::json!({"content": "hello"}))];
     let tools = [write_file_tool()];
