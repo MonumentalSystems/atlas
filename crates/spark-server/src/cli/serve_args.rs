@@ -100,6 +100,17 @@ pub struct ServeArgs {
     #[arg(long, visible_alias = "stupify", default_value_t = false)]
     pub disable_thinking: bool,
 
+    /// Skip the tool_call_parser's `system_prompt()` tool-format injection.
+    /// Use for models whose OWN chat template already renders the tool list +
+    /// call-format instructions (e.g. nvidia Nemotron-H-Puzzle-75B): injecting
+    /// the parser prompt ON TOP of the template's tool rendering gives the model
+    /// two competing tool-format guidances, which makes it ramble/decline instead
+    /// of emitting a call. vLLM injects nothing and relies on the template alone;
+    /// this flag matches that. Default false (keep injecting — needed by models
+    /// whose template does not render tools, e.g. hermes/GDN decline behavior).
+    #[arg(long, default_value_t = false)]
+    pub suppress_tool_system_prompt: bool,
+
     /// Override MODEL.toml's `[behavior].max_thinking_budget` (tokens).
     /// Sets the per-request ceiling for thinking-block length. Per-request
     /// `thinking.budget_tokens` (or `reasoning_effort`) still wins below

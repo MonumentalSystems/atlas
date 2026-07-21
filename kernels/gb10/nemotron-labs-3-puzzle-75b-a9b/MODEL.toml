@@ -46,8 +46,18 @@ dry_multiplier = 0.0
 
 [behavior]
 enable_loop_watchdog = true
+# The model natively emits qwen3_coder XML tool calls
+# (<tool_call><function=NAME><parameter=KEY>…) — its own chat template renders
+# the tool list + call format. Proven vs vLLM (qwen3_xml parser, auto mode): a
+# clean parsed call. `bare_json` forced the wrong JSON shape off-distribution.
 thinking_in_tools = true
 disable_tool_steering = true
-tool_call_parser = "bare_json"
+tool_call_parser = "qwen3_coder"
+# vLLM auto mode is unconstrained; grammar-constraining this XML-native model
+# fights its distribution (garbled args / length). Post-hoc parse recovers it.
+disable_tool_grammar = true
+# fp8 KV corrupts this thinking model's long reasoning context (hallucinated
+# tool schemas / non-sequiturs); bf16 KV keeps it coherent. Matches vLLM.
+default_kv_dtype = "bf16"
 max_thinking_budget = 2048
 thinking_default = true

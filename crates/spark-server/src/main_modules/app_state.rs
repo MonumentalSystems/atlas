@@ -109,6 +109,10 @@ pub struct AppState {
     /// thinking is forced OFF regardless of the request body or the
     /// model's MODEL.toml default. Wired from `--disable-thinking`.
     pub disable_thinking: bool,
+    /// When true, skip the tool_call_parser's `system_prompt()` injection in
+    /// `prepare_chat_prompt` (the model's own chat template already renders the
+    /// tool list + call format). Wired from `--suppress-tool-system-prompt`.
+    pub suppress_tool_system_prompt: bool,
     /// Server-level default thinking directive applied when the client
     /// sends no thinking parameters. Overridden per-request by the request
     /// body. Wired from `--default-chat-template-kwargs` (parsed at the
