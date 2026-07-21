@@ -12,6 +12,12 @@ use crate::weight_map::{AttentionWeights, DenseWeight, QuantWeight, QuantizedWei
 
 pub use super::types_weights::{HcWeights, MlaWeights};
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum HeadGateActivation {
+    Sigmoid,
+    Softplus,
+}
+
 /// Qwen3-Next full attention layer (12 of 48 layers).
 #[allow(dead_code)]
 pub struct Qwen3AttentionLayer {
@@ -55,8 +61,13 @@ pub struct Qwen3AttentionLayer {
     /// attn_out = attn_out * sigmoid(g_proj @ hidden_states)
     /// with broadcast over head_dim.
     pub(crate) head_gate_weight: Option<DenseWeight>,
+    pub(crate) head_gate_activation: HeadGateActivation,
     /// Kernel handle for per-head sigmoid gate broadcast multiply.
     pub(super) sigmoid_gate_head_broadcast_k: KernelHandle,
+    pub(super) softplus_gate_head_broadcast_k: KernelHandle,
+    /// Optional YaRN frequencies for standard (non-MLA) attention.
+    pub(crate) yarn_inv_freq: DevicePtr,
+    pub(crate) yarn_attention_factor: f32,
     /// Post-attention output norm (Gemma-4).  
     pub(crate) post_attn_out_norm: Option<DenseWeight>,
     /// Post-FFN output norm (Gemma-4).
@@ -145,6 +156,7 @@ pub struct Qwen3AttentionLayer {
     pub(super) rope_mrope_interleaved_k_only_k: KernelHandle,
     /// YaRN RoPE kernel using pre-computed inv_freq table (Mistral, etc.)
     pub(super) rope_yarn_k: KernelHandle,
+    pub(super) rope_yarn_scaled_k: KernelHandle,
     /// Interleaved (GPT-J / is_neox_style=False) YaRN RoPE kernel — DeepSeek MLA.
     pub(super) rope_yarn_interleaved_k: KernelHandle,
     /// Conjugate (negated-sin) interleaved YaRN RoPE — DeepSeek-V4 attention

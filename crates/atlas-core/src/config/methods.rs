@@ -33,12 +33,12 @@ impl ModelConfig {
         }
     }
 
-    /// Number of full attention layers.
+    /// Number of KV-cache-backed attention layers (full plus sliding).
     pub fn num_attention_layers(&self) -> usize {
         if !self.layer_types.is_empty() {
             self.layer_types
                 .iter()
-                .filter(|t| **t == LayerType::FullAttention)
+                .filter(|t| matches!(t, LayerType::FullAttention | LayerType::SlidingAttention))
                 .count()
         } else {
             self.num_hidden_layers
@@ -242,6 +242,9 @@ impl ModelConfig {
             return force_bf16;
         }
         if self.kv_lora_rank > 0 {
+            return true;
+        }
+        if self.model_type == "laguna" {
             return true;
         }
         if self.model_type == "gemma4" && self.num_experts == 0 {

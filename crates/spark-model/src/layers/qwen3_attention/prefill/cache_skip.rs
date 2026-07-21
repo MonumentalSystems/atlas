@@ -367,6 +367,24 @@ impl Qwen3AttentionLayer {
                 stream,
             )
             .map_err(|e| anyhow::anyhow!("rope_mrope_interleaved_k_only failed: {e}"))?;
+        } else if !self.yarn_inv_freq.is_null() {
+            ops::rope_yarn_scaled(
+                ctx.gpu,
+                self.rope_yarn_scaled_k,
+                q_contiguous,
+                k_contiguous,
+                positions,
+                n,
+                nq,
+                nkv,
+                hd,
+                self.rotary_dim_override
+                    .unwrap_or(ctx.config.rotary_dim() as u32),
+                self.yarn_inv_freq,
+                self.yarn_attention_factor,
+                stream,
+            )
+            .map_err(|e| anyhow::anyhow!("rope_yarn_scaled failed: {e}"))?;
         } else if self.rope_proportional && self.rope_proportional_k.0 != 0 {
             let rope_angles = self
                 .rotary_dim_override
@@ -671,17 +689,34 @@ impl Qwen3AttentionLayer {
                 stream,
             )?;
             // Sigmoid + broadcast multiply: attn_out[t,h,d] *= sigmoid(gate[t,h])
-            ops::sigmoid_gate_mul_head_broadcast(
-                ctx.gpu,
-                self.sigmoid_gate_head_broadcast_k,
-                attn_out,
-                gate_buf,
-                attn_out,
-                nq,
-                hd,
-                n,
-                stream,
-            )?;
+            match self.head_gate_activation {
+                super::super::types::HeadGateActivation::Sigmoid => {
+                    ops::sigmoid_gate_mul_head_broadcast(
+                        ctx.gpu,
+                        self.sigmoid_gate_head_broadcast_k,
+                        attn_out,
+                        gate_buf,
+                        attn_out,
+                        nq,
+                        hd,
+                        n,
+                        stream,
+                    )?;
+                }
+                super::super::types::HeadGateActivation::Softplus => {
+                    ops::softplus_gate_mul_head_broadcast(
+                        ctx.gpu,
+                        self.softplus_gate_head_broadcast_k,
+                        attn_out,
+                        gate_buf,
+                        attn_out,
+                        nq,
+                        hd,
+                        n,
+                        stream,
+                    )?;
+                }
+            }
         }
         aprof!("sigmoid_gate", t0);
         t0 = if ctx.profile {

@@ -254,15 +254,17 @@ fn decode_response_text(
     response: &super::inference_types::InferenceResponse,
     enable_thinking: bool,
 ) -> (Option<String>, String) {
+    let output_tokens =
+        output_tokens_without_stop(&response.output_tokens, response.finish_reason.as_str());
     if let Some(think_tok) = state.think_end_token_id {
         let last_think_pos = if enable_thinking {
-            response.output_tokens.iter().rposition(|&t| t == think_tok)
+            output_tokens.iter().rposition(|&t| t == think_tok)
         } else {
             None
         };
         if let Some(pos) = last_think_pos {
-            let thinking_tokens = &response.output_tokens[..pos];
-            let content_tokens = &response.output_tokens[pos + 1..];
+            let thinking_tokens = &output_tokens[..pos];
+            let content_tokens = &output_tokens[pos + 1..];
             let reasoning = if !thinking_tokens.is_empty() {
                 state
                     .tokenizer
@@ -280,17 +282,22 @@ fn decode_response_text(
                 .to_string();
             return (reasoning, content);
         }
-        let text = state
-            .tokenizer
-            .decode(&response.output_tokens)
-            .unwrap_or_default();
+        let text = state.tokenizer.decode(output_tokens).unwrap_or_default();
         (None, text)
     } else {
-        let text = state
-            .tokenizer
-            .decode(&response.output_tokens)
-            .unwrap_or_default();
+        let text = state.tokenizer.decode(output_tokens).unwrap_or_default();
         extract_thinking(&text, enable_thinking, state.reasoning_parser.as_deref())
+    }
+}
+
+/// The scheduler retains a terminal stop token in blocking output for usage
+/// accounting. Do not expose its decoded text when a tokenizer does not mark
+/// that EOS token as special (Laguna's `</assistant>` is one such token).
+fn output_tokens_without_stop<'a>(tokens: &'a [u32], finish_reason: &str) -> &'a [u32] {
+    if finish_reason == "stop" {
+        tokens.split_last().map_or(tokens, |(_, visible)| visible)
+    } else {
+        tokens
     }
 }
 
@@ -348,8 +355,7 @@ async fn build_choice_message(
             reasoning_content = hoisted_reasoning;
         }
         let (content, parsed_tool_calls) = tool_parser::parse_tool_calls(&output_text_i);
-        let mut tool_calls_i = hoisted_tool_calls;
-        tool_calls_i.extend(parsed_tool_calls);
+        let mut tool_calls_i = merge_hoisted_tool_calls(hoisted_tool_calls, parsed_tool_calls);
         if !tool_calls_i.is_empty() {
             let tools_ref = req.tools.clone();
             tool_parser::backfill_required_params(&mut tool_calls_i, &tools_ref);
@@ -440,6 +446,71 @@ async fn build_choice_message(
         finish_reason: ir::FinishReason::from(finish_reason_i.as_str()),
         matched_stop: None, // caller fills
         logprobs: None,     // caller fills
+    }
+}
+
+/// Merge calls recovered from reasoning with calls in assistant content.
+///
+/// Some reasoning models emit the same native tool envelope immediately
+/// before and after their final `</think>`. Prefer the content copy in that
+/// case, while preserving intentional repeated calls within either channel.
+fn merge_hoisted_tool_calls(
+    mut hoisted: Vec<tool_parser::ToolCall>,
+    parsed: Vec<tool_parser::ToolCall>,
+) -> Vec<tool_parser::ToolCall> {
+    hoisted.retain(|candidate| {
+        !parsed.iter().any(|call| {
+            call.function.name == candidate.function.name
+                && call.function.arguments == candidate.function.arguments
+        })
+    });
+    hoisted.extend(parsed);
+    hoisted
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{merge_hoisted_tool_calls, output_tokens_without_stop};
+    use crate::tool_parser::{FunctionCall, ToolCall};
+
+    fn tool_call(id: &str, city: &str) -> ToolCall {
+        ToolCall {
+            id: id.into(),
+            call_type: "function".into(),
+            function: FunctionCall {
+                name: "get_weather".into(),
+                arguments: format!(r#"{{"city":"{city}"}}"#),
+            },
+        }
+    }
+
+    #[test]
+    fn duplicate_call_across_reasoning_and_content_is_emitted_once() {
+        let merged = merge_hoisted_tool_calls(
+            vec![tool_call("reasoning", "Boston")],
+            vec![tool_call("content", "Boston")],
+        );
+
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].id, "content");
+    }
+
+    #[test]
+    fn distinct_calls_across_reasoning_and_content_are_preserved() {
+        let merged = merge_hoisted_tool_calls(
+            vec![tool_call("reasoning", "Boston")],
+            vec![tool_call("content", "Seattle")],
+        );
+
+        assert_eq!(merged.len(), 2);
+    }
+
+    #[test]
+    fn blocking_decode_excludes_terminal_stop_token() {
+        let tokens = [10, 11, 24];
+
+        assert_eq!(output_tokens_without_stop(&tokens, "stop"), &[10, 11]);
+        assert_eq!(output_tokens_without_stop(&tokens, "length"), &tokens);
     }
 }
 

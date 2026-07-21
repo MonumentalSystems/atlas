@@ -185,7 +185,9 @@ impl BufferSizes {
         // Sized for max(K=3 verify, prefill chunk) × top_k experts.
         let k_max = m.max(3); // prefill chunk or K=3 verify, whichever larger
         let expert_inter = if config.num_experts > 0 {
-            k_max * config.num_experts_per_tok * config.moe_intermediate_size
+            k_max
+                * (config.num_experts_per_tok * config.moe_intermediate_size)
+                    .max(config.intermediate_size)
         } else {
             k_max * config.intermediate_size
         };

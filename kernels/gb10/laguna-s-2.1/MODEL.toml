@@ -1,0 +1,79 @@
+[model]
+name = "laguna-s-2.1"
+hf_id = "poolside/Laguna-S-2.1-NVFP4"
+model_type = "laguna"
+architecture = "Hybrid Full/Sliding Attention + Dense/MoE"
+parameters = "100B"
+
+layers_total = 48
+layers_sliding_attention = 36
+layers_full_attention = 12
+layer_pattern = "1 full attention followed by 3 sliding attention"
+
+hidden_dim = 3072
+head_dim = 128
+q_heads = 72
+kv_heads = 8
+intermediate_size = 12288
+moe_experts = 256
+moe_topk = 10
+moe_intermediate = 1024
+shared_expert_intermediate = 1024
+moe_scoring_func = "sigmoid"
+moe_routing_bias = true
+
+rotary_dim = 64
+rope_theta = 500000
+partial_rotary_factor = 0.5
+vocab_size = 100352
+max_position_embeddings = 262144
+sliding_window = 512
+vision = false
+mtp_layers = 0
+
+[sampling.thinking_text]
+temperature = 1.0
+top_p = 1.0
+top_k = 20
+presence_penalty = 0.0
+repetition_penalty = 1.0
+dry_multiplier = 0.0
+
+[sampling.thinking_coding]
+temperature = 1.0
+top_p = 1.0
+top_k = 20
+presence_penalty = 0.0
+repetition_penalty = 1.0
+dry_multiplier = 0.0
+
+[sampling.non_thinking]
+temperature = 1.0
+top_p = 1.0
+top_k = 20
+presence_penalty = 0.0
+repetition_penalty = 1.0
+dry_multiplier = 0.0
+
+[sampling.tools]
+temperature = 1.0
+top_p = 1.0
+top_k = 20
+presence_penalty = 0.0
+frequency_penalty = 0.0
+repetition_penalty = 1.0
+dry_multiplier = 0.0
+
+[behavior]
+thinking_in_tools = true
+max_thinking_budget = 8192
+thinking_default = true
+default_kv_dtype = "fp8"
+tool_call_parser = "poolside_v1"
+
+[[model_types]]
+model_type = "laguna"
+hidden_size = 3072
+
+[kernel]
+moe_gate_shmem_bytes = 6144

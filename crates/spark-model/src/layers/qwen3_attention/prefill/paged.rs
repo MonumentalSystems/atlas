@@ -311,6 +311,23 @@ impl Qwen3AttentionLayer {
             .unwrap();
         if self.mla.is_some() {
             // MLA: RoPE already applied inside the MLA block to rope portions only.
+        } else if !self.yarn_inv_freq.is_null() {
+            ops::rope_yarn_scaled(
+                ctx.gpu,
+                self.rope_yarn_scaled_k,
+                q_contiguous,
+                k_contiguous,
+                bmeta_positions,
+                n,
+                nq,
+                nkv,
+                hd,
+                self.rotary_dim_override
+                    .unwrap_or(ctx.config.rotary_dim() as u32),
+                self.yarn_inv_freq,
+                self.yarn_attention_factor,
+                stream,
+            )?;
         } else if let Some(ref mla) = self.mla {
             // unreachable but keeps the else chain valid
             if !mla.yarn_inv_freq.is_null() {
@@ -671,17 +688,34 @@ impl Qwen3AttentionLayer {
                 h,
                 stream,
             )?;
-            ops::sigmoid_gate_mul_head_broadcast(
-                ctx.gpu,
-                self.sigmoid_gate_head_broadcast_k,
-                attn_out,
-                gate_buf,
-                attn_out,
-                nq,
-                hd,
-                n,
-                stream,
-            )?;
+            match self.head_gate_activation {
+                super::super::types::HeadGateActivation::Sigmoid => {
+                    ops::sigmoid_gate_mul_head_broadcast(
+                        ctx.gpu,
+                        self.sigmoid_gate_head_broadcast_k,
+                        attn_out,
+                        gate_buf,
+                        attn_out,
+                        nq,
+                        hd,
+                        n,
+                        stream,
+                    )?;
+                }
+                super::super::types::HeadGateActivation::Softplus => {
+                    ops::softplus_gate_mul_head_broadcast(
+                        ctx.gpu,
+                        self.softplus_gate_head_broadcast_k,
+                        attn_out,
+                        gate_buf,
+                        attn_out,
+                        nq,
+                        hd,
+                        n,
+                        stream,
+                    )?;
+                }
+            }
         }
 
         // ATLAS_OP_DUMP: attn_out AFTER sigmoid gate (input to o_proj linear).

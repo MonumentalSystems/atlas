@@ -10,6 +10,7 @@ use spark_runtime::kv_cache::PagedKvCache;
 use super::ctx::MultiSeqCtx;
 use crate::layer::AttnMetadataDev;
 use crate::layers::ops;
+use crate::layers::qwen3_attention::HeadGateActivation;
 use crate::layers::qwen3_attention::Qwen3AttentionLayer;
 
 impl Qwen3AttentionLayer {
@@ -31,22 +32,41 @@ impl Qwen3AttentionLayer {
             let q_out_i = qkv_buf.offset(i * per_seq_qkv);
             let k_out_i = q_out_i.offset(q_proj_bytes);
             let pos_i = meta.positions.offset(i * 4); // u32 per position
-            ops::rope(
-                fwd.gpu,
-                self.rope_k,
-                q_out_i,
-                k_out_i,
-                pos_i,
-                1,
-                nq,
-                nkv,
-                hd,
-                self.rotary_dim_override
-                    .unwrap_or(fwd.config.rotary_dim() as u32),
-                self.rope_theta_override
-                    .unwrap_or(fwd.config.rope_theta as f32),
-                stream,
-            )?;
+            if self.yarn_inv_freq.is_null() {
+                ops::rope(
+                    fwd.gpu,
+                    self.rope_k,
+                    q_out_i,
+                    k_out_i,
+                    pos_i,
+                    1,
+                    nq,
+                    nkv,
+                    hd,
+                    self.rotary_dim_override
+                        .unwrap_or(fwd.config.rotary_dim() as u32),
+                    self.rope_theta_override
+                        .unwrap_or(fwd.config.rope_theta as f32),
+                    stream,
+                )?;
+            } else {
+                ops::rope_yarn_scaled(
+                    fwd.gpu,
+                    self.rope_yarn_scaled_k,
+                    q_out_i,
+                    k_out_i,
+                    pos_i,
+                    1,
+                    nq,
+                    nkv,
+                    hd,
+                    self.rotary_dim_override
+                        .unwrap_or(fwd.config.rotary_dim() as u32),
+                    self.yarn_inv_freq,
+                    self.yarn_attention_factor,
+                    stream,
+                )?;
+            }
         }
         Ok(())
     }
@@ -210,6 +230,7 @@ impl Qwen3AttentionLayer {
             q_dim,
             per_seq_qkv,
             qkv_buf,
+            normed,
             ..
         } = *c;
         if self.gated {
@@ -225,6 +246,45 @@ impl Qwen3AttentionLayer {
                     q_dim,
                     stream,
                 )?;
+            }
+        }
+
+        if let Some(ref g_proj) = self.head_gate_weight {
+            let gate_buf = qkv_buf;
+            ops::dense_gemm_tc(
+                fwd.gpu,
+                self.dense_gemm_tc_k,
+                normed,
+                g_proj,
+                gate_buf,
+                n as u32,
+                nq,
+                h as u32,
+                stream,
+            )?;
+            match self.head_gate_activation {
+                HeadGateActivation::Sigmoid => ops::sigmoid_gate_mul_head_broadcast(
+                    fwd.gpu,
+                    self.sigmoid_gate_head_broadcast_k,
+                    attn_out,
+                    gate_buf,
+                    attn_out,
+                    nq,
+                    hd,
+                    n as u32,
+                    stream,
+                )?,
+                HeadGateActivation::Softplus => ops::softplus_gate_mul_head_broadcast(
+                    fwd.gpu,
+                    self.softplus_gate_head_broadcast_k,
+                    attn_out,
+                    gate_buf,
+                    attn_out,
+                    nq,
+                    hd,
+                    n as u32,
+                    stream,
+                )?,
             }
         }
 

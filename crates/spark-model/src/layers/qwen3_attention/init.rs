@@ -7,7 +7,7 @@ use anyhow::Result;
 use spark_runtime::gpu::{GpuBackend, KernelHandle};
 use spark_runtime::kv_cache::KvCacheDtype;
 
-use super::types::Qwen3AttentionLayer;
+use super::types::{HeadGateActivation, Qwen3AttentionLayer};
 use crate::layers::FfnComponent;
 use crate::layers::fp8_calibration::Fp8KvCalibration;
 use crate::weight_map::{AttentionWeights, DenseWeight, QuantWeight, QuantizedWeight};
@@ -115,11 +115,19 @@ impl Qwen3AttentionLayer {
             k_eq_v: false,
             v_norm_weight: None,
             head_gate_weight: None,
+            head_gate_activation: HeadGateActivation::Sigmoid,
             sigmoid_gate_head_broadcast_k: super::super::try_kernel(
                 gpu,
                 "residual_add",
                 "sigmoid_gate_mul_head_broadcast",
             ),
+            softplus_gate_head_broadcast_k: super::super::try_kernel(
+                gpu,
+                "residual_add",
+                "softplus_gate_mul_head_broadcast",
+            ),
+            yarn_inv_freq: spark_runtime::gpu::DevicePtr::NULL,
+            yarn_attention_factor: 1.0,
             post_attn_out_norm: None,
             post_ffn_out_norm: None,
             layer_scalar: None,
@@ -180,7 +188,11 @@ impl Qwen3AttentionLayer {
                 gpu.kernel("norm", "rms_norm")?
             },
             norm_vanilla: crate::ships_vanilla_norm_weights(config),
-            rms_norm_residual_k: gpu.kernel("norm", "rms_norm_residual")?,
+            rms_norm_residual_k: if crate::ships_vanilla_norm_weights(config) {
+                gpu.kernel("norm", "rms_norm_residual_vanilla")?
+            } else {
+                gpu.kernel("norm", "rms_norm_residual")?
+            },
             dense_gemv_k: gpu.kernel("gemv", "dense_gemv_bf16")?,
             w4a16_gemv_k: gpu.kernel("w4a16_gemv", "w4a16_gemv")?,
             w8a16_gemv_k: gpu.kernel("w8a16_gemv", "w8a16_gemv")?,
@@ -203,6 +215,7 @@ impl Qwen3AttentionLayer {
                 "rope_forward_mrope_interleaved_k_only",
             ),
             rope_yarn_k: super::super::try_kernel(gpu, "rope", "rope_forward_yarn"),
+            rope_yarn_scaled_k: super::super::try_kernel(gpu, "rope", "rope_forward_yarn_scaled"),
             // Interleaved (GPT-J / is_neox_style=False) YaRN RoPE — DeepSeek-V4 MLA.
             rope_yarn_interleaved_k: super::super::try_kernel(
                 gpu,
@@ -397,7 +410,11 @@ impl Qwen3AttentionLayer {
             sigmoid_gate_mul_k: gpu.kernel("residual_add", "sigmoid_gate_mul")?,
             deinterleave_qg_k: gpu.kernel("ssm_preprocess", "deinterleave_qg")?,
             w4a16_gemv_qg_k: gpu.kernel("w4a16_gemv", "w4a16_gemv_qg")?,
-            residual_add_rms_norm_k: gpu.kernel("norm", "residual_add_rms_norm")?,
+            residual_add_rms_norm_k: if crate::ships_vanilla_norm_weights(config) {
+                gpu.kernel("norm", "residual_add_rms_norm_vanilla")?
+            } else {
+                gpu.kernel("norm", "residual_add_rms_norm")?
+            },
             residual_add_rms_norm_gatef32_k: crate::layers::try_kernel(
                 gpu,
                 "norm",
@@ -412,8 +429,8 @@ impl Qwen3AttentionLayer {
             w4a16_gemv_batch4_k: crate::layers::try_kernel(gpu, "w4a16_gemv", "w4a16_gemv_batch4"),
             w4a16_gemm_k: gpu.kernel("w4a16", "w4a16_gemm")?,
             w4a16_gemm_t_k: gpu.kernel("w4a16", "w4a16_gemm_t")?,
-            w4a16_gemm_t_k64_k: gpu.kernel("w4a16", "w4a16_gemm_t_k64")?,
-            w4a16_gemm_t_m128_k: gpu.kernel("w4a16", "w4a16_gemm_t_m128")?,
+            w4a16_gemm_t_k64_k: super::super::try_kernel(gpu, "w4a16", "w4a16_gemm_t_k64"),
+            w4a16_gemm_t_m128_k: super::super::try_kernel(gpu, "w4a16", "w4a16_gemm_t_m128"),
             w4a16_gemm_t_m128_bf16_k: super::super::try_kernel(
                 gpu,
                 "w4a16",

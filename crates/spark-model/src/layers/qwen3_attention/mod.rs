@@ -39,6 +39,7 @@ mod types_weights;
 pub use innerq_driver::InnerQDriver;
 // V4: re-export the new hyper-connection / compressor weight types alongside the
 // existing ones. These are only constructed under DeepSeek-V4 detection.
+pub(crate) use types::HeadGateActivation;
 pub use types::Qwen3AttentionLayer;
 pub use types_weights::{CompressorWeights, HcHeadWeights, HcSiteWeights, HcWeights, MlaWeights};
 

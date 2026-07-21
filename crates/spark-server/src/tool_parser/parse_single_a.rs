@@ -6,6 +6,11 @@ use super::*;
 /// Auto-detect and parse inner content of a `<tool_call>` block.
 /// Tries Gemma-4 native, JSON (hermes), qwen3_coder XML, then tag-style XML fallback.
 pub(super) fn parse_one_call(text: &str, idx: u32) -> Option<ToolCall> {
+    if text.contains("<arg_key>")
+        && let Some(tc) = parse_poolside_v1_call(text)
+    {
+        return Some(tc);
+    }
     // Try Gemma-4 native: call:fn_name{...} or _call:fn_name{...}
     if text.starts_with("call:") || text.starts_with("_call:") {
         return parse_gemma4_native_call(text);
