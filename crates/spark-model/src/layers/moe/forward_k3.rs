@@ -24,6 +24,9 @@ impl MoeLayer {
         if self.bf16_gate_weight_ptrs.is_some() {
             return self.forward_batched(input, 3, ctx, stream);
         }
+        if self.has_mixed_bf16_shared_expert() {
+            return self.forward_batched(input, 3, ctx, stream);
+        }
 
         let h = ctx.config.hidden_size as u32;
         let inter = ctx.config.moe_intermediate_size as u32;

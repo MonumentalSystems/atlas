@@ -132,7 +132,11 @@ fn load_moe_ffn(
         correction_bias: Some(correction_bias),
     };
     let mut layer = MoeLayer::new(weights, config.num_experts, None, gpu, config)?;
-    layer.predequant_for_prefill(gpu, config, stream)?;
+    // The checkpoint explicitly excludes the shared expert from NVFP4
+    // compression. Keep its BF16 weights authoritative for both prefill and
+    // decode; the quantized copies above are placeholders for fused routed
+    // kernels and their shared contribution is overwritten before blending.
+    layer.set_bf16_shared_expert(shared_gate, shared_up, shared_down)?;
     Ok(FfnComponent::Moe(layer))
 }
 

@@ -12,7 +12,7 @@ impl MoeLayer {
     ///
     /// Pipeline: gate → topK → sort → grouped gate/up GEMM → SiLU → grouped down GEMM
     ///           → unpermute + weighted reduce → shared expert blend.
-    /// Shared expert uses standard w4a16_gemm (single-expert, M=N_tokens).
+    /// Shared expert uses checkpoint-native BF16 when installed, otherwise W4A16.
     #[allow(unused_assignments)]
     pub fn forward_prefill(
         &self,

@@ -34,6 +34,9 @@ impl MoeLayer {
         if self.bf16_gate_weight_ptrs.is_some() && !use_bf16_batch2 {
             return self.forward_batched(input, 2, ctx, stream);
         }
+        if self.has_mixed_bf16_shared_expert() {
+            return self.forward_batched(input, 2, ctx, stream);
+        }
 
         let h = ctx.config.hidden_size as u32;
         let inter = ctx.config.moe_intermediate_size as u32;
@@ -163,13 +166,11 @@ impl MoeLayer {
         let output = ctx.buffers.moe_output();
 
         if use_bf16_batch2
-            && let (Some(gp), Some(up), Some(dp), Some(sg), Some(su), Some(sd)) = (
+            && let (Some(gp), Some(up), Some(dp), Some(shared)) = (
                 self.bf16_gate_weight_ptrs,
                 self.bf16_up_weight_ptrs,
                 self.bf16_down_weight_ptrs,
-                self.bf16_shared_gate,
-                self.bf16_shared_up,
-                self.bf16_shared_down,
+                self.bf16_shared_expert,
             )
         {
             // BF16 batch2 path (FP8-dequant-on-load experts, MTP K=2 verify).
@@ -185,9 +186,9 @@ impl MoeLayer {
                 up,
                 expert_up_out,
                 indices_dev,
-                sg,
+                shared.gate_proj.weight,
                 shared_gate_scratch,
-                su,
+                shared.up_proj.weight,
                 shared_up_scratch,
                 inter,
                 h,
@@ -204,7 +205,7 @@ impl MoeLayer {
                 indices_dev,
                 shared_gate_scratch,
                 shared_up_scratch,
-                sd,
+                shared.down_proj.weight,
                 shared_down_out,
                 h,
                 inter,
