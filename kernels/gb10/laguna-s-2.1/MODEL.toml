@@ -75,6 +75,16 @@ dry_multiplier = 0.0
 # with no natural continuation. Other models keep the watchdog (flag defaults
 # to true); this opts Laguna out.
 enable_think_loop_watchdog = false
+# The rest of the thinking-watchdog family misfires the same way on this model:
+# they all trip on the temperature-0 greedy repeat-plateau the model falls into
+# (it is designed for 0.7/0.95, not greedy), then force-close </think> or
+# rollback mid-reason, after which the content channel degenerates into token
+# spam. Measured 2026-07-22 on RC1: F2 "Confidence early stop armed" fired on
+# "explain the sky in two sentences" -> finish=length garbage; with the whole
+# family off + default sampling the same prompt is coherent. Disable all of them
+# for Laguna; other models keep the defaults (true).
+confidence_early_stop = false
+rollback_resteer = false
 thinking_in_tools = true
 max_thinking_budget = 8192
 # Poolside recommends thinking for agentic coding and preserving it between
