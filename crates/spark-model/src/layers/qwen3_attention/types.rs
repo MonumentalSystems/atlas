@@ -146,6 +146,10 @@ pub struct Qwen3AttentionLayer {
     /// Gemma-4 FP32-input rms_norm (absolute formula).
     pub(super) rms_norm_f32_in_k: KernelHandle,
     pub(super) dense_gemv_k: KernelHandle,
+    /// Batched BF16 GEMV (M rows, one weight pass). Multi-seq decode q/k/v for
+    /// models whose attention weights are plain BF16 -- the quantized paths have
+    /// w4a16/w8a16 batch tiers, BF16 had none.
+    pub(super) dense_gemv_batchm_k: KernelHandle,
     pub(super) w4a16_gemv_k: KernelHandle,
     pub(super) w8a16_gemv_k: KernelHandle,
     pub(super) w8a16_gemm_k: KernelHandle,
