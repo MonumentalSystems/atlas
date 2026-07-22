@@ -46,6 +46,35 @@ use super::{
 };
 use crate::gpu::{DevicePtr, GpuBackend, GraphHandle, KernelHandle};
 
+/// D2H call counter + one-shot caller identification
+/// (`ATLAS_D2H_TRACE=<N>`: log a backtrace on the Nth call, and the running
+/// count on every 10000th).
+///
+/// Every `copy_d2h*` below pairs its async copy with a `cuStreamSynchronize`,
+/// so each call BLOCKS the host until the GPU drains. An nsys trace of a 1K
+/// Laguna prefill counted 32,343 D2H + 32,533 syncs inside the prefill span,
+/// accounting for 212.8 ms of 306 ms of GPU starvation (58% idle). This exists
+/// to name whoever is issuing them.
+static D2H_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn d2h_trace_tick() {
+    use std::sync::atomic::Ordering;
+    let n = D2H_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    let Ok(target) = std::env::var("ATLAS_D2H_TRACE") else {
+        return;
+    };
+    let target: u64 = target.parse().unwrap_or(0);
+    if target != 0 && n == target {
+        tracing::warn!(
+            "ATLAS_D2H_TRACE: call #{n} backtrace:\n{}",
+            std::backtrace::Backtrace::force_capture()
+        );
+    }
+    if n % 10_000 == 0 {
+        tracing::warn!("ATLAS_D2H_TRACE: {n} D2H copies so far (each forces a stream sync)");
+    }
+}
+
 impl GpuBackend for AtlasCudaBackend {
     fn alloc(&self, bytes: usize) -> Result<DevicePtr> {
         let mut dptr: u64 = 0;
@@ -112,6 +141,7 @@ impl GpuBackend for AtlasCudaBackend {
     }
 
     fn copy_d2h(&self, src: DevicePtr, dst: &mut [u8]) -> Result<()> {
+        d2h_trace_tick();
         let status = unsafe {
             cuMemcpyDtoHAsync_v2(
                 dst.as_mut_ptr() as *mut c_void,
@@ -138,6 +168,7 @@ impl GpuBackend for AtlasCudaBackend {
         // any prior kernel launches on the same stream. Without this, the
         // copy may run on the default stream concurrently with kernels on
         // `stream` and read torn bytes (HSS Turbo8 race, 2026-04-28).
+        d2h_trace_tick();
         let status = unsafe {
             cuMemcpyDtoHAsync_v2(dst.as_mut_ptr() as *mut c_void, src.0, dst.len(), stream)
         };
