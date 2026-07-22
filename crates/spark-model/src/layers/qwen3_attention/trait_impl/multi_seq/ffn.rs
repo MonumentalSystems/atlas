@@ -16,6 +16,26 @@ fn pairwise_moe_decode_enabled() -> bool {
     *ON.get_or_init(|| std::env::var("ATLAS_MOE_PAIRWISE_DECODE").as_deref() != Ok("0"))
 }
 
+/// Route decode MoE (n >= min) through the grouped read-once GEMM
+/// (forward_prefill) instead of the pairwise per-slot loop. Default OFF while
+/// A/B'ing the "grouped is a net loss at small batch" claim. Min default 4:
+/// n=2 is already ~optimal on pairwise (one forward_k2), the win is at n>=4.
+fn grouped_routed_decode_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ATLAS_MOE_GROUPED_ROUTED_DECODE").as_deref() == Ok("1"))
+}
+fn grouped_routed_decode_min() -> usize {
+    use std::sync::OnceLock;
+    static M: OnceLock<usize> = OnceLock::new();
+    *M.get_or_init(|| {
+        std::env::var("ATLAS_MOE_GROUPED_ROUTED_DECODE_MIN")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(4)
+    })
+}
+
 impl Qwen3AttentionLayer {
     pub(super) fn ms_phase_ffn(&self, c: &MultiSeqCtx<'_>, o_out: DevicePtr) -> Result<()> {
         let MultiSeqCtx {
@@ -115,6 +135,41 @@ impl Qwen3AttentionLayer {
             // DENSE ONLY: on a 256-expert MoE the grouped-GEMM is a net loss at
             // small batch, so MoE (and MLA / force_seq) fall through to the
             // per-token loop below — no regression for 122b/35b-a3b.
+            let normed2 = fwd.buffers.norm_output();
+            ops::residual_add_rms_norm(
+                fwd.gpu,
+                self.residual_add_rms_norm_k,
+                hidden,
+                o_out,
+                &self.post_attn_norm,
+                normed2,
+                residual,
+                n as u32,
+                h as u32,
+                eps,
+                stream,
+            )?;
+            self.ffn.forward_prefill(normed2, n, fwd, stream)?;
+            let moe_out = fwd.buffers.moe_output();
+            ops::residual_add(
+                fwd.gpu,
+                self.residual_add_k,
+                hidden,
+                moe_out,
+                (n * h) as u32,
+                stream,
+            )?;
+        } else if !force_seq_ffn
+            && n >= grouped_routed_decode_min()
+            && grouped_routed_decode_enabled()
+            && self.ffn.moe_grouped_decode_ok()
+        {
+            // GROUPED READ-ONCE MoE DECODE (A/B, default off). The pairwise
+            // branch below issues 4*top_k per-slot CTAs at n=4, each re-reading
+            // an expert weight for one token; forward_prefill sorts by expert
+            // and reads each DISTINCT active expert ONCE (+ one batched BF16
+            // shared pass). Byte-identical structure to the is_dense branch
+            // above; only reachable for native-NVFP4-routed MoE with the flag.
             let normed2 = fwd.buffers.norm_output();
             ops::residual_add_rms_norm(
                 fwd.gpu,
