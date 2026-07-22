@@ -58,6 +58,7 @@ use emit_step::*;
 pub use helpers::disable_watchdogs;
 pub use helpers::set_boundary_token_mask;
 pub use helpers::set_enable_loop_watchdog;
+pub use helpers::set_enable_think_loop_watchdog;
 pub use helpers::set_im_start_hard_stop;
 pub use helpers::set_max_seq_len;
 pub use helpers::set_mid_word_token_mask;

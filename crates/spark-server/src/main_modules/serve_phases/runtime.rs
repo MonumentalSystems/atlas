@@ -178,6 +178,13 @@ pub(crate) fn log_behavior_audit(args: &cli::ServeArgs, ptx_set: &atlas_kernels:
         );
     }
     crate::scheduler::set_enable_loop_watchdog(ptx_set.behavior.enable_loop_watchdog);
+    crate::scheduler::set_enable_think_loop_watchdog(ptx_set.behavior.enable_think_loop_watchdog);
+    if !ptx_set.behavior.enable_think_loop_watchdog {
+        tracing::info!(
+            "Model behavior: THINKING-loop watchdog DISABLED (per MODEL.toml \
+             [behavior].enable_think_loop_watchdog = false)"
+        );
+    }
     if ptx_set.behavior.enable_loop_watchdog {
         tracing::info!(
             "Model behavior: content-loop watchdog ENABLED (period-{}…{} repetition detector)",

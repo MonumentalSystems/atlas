@@ -165,6 +165,7 @@ pub(super) fn generate_target_ptx_rs(
              \x20               use_sampling_presets_for_core: {},\n\
              \x20               tool_call_parser: \"{}\",\n\
              \x20               enable_loop_watchdog: {},\n\
+             \x20               enable_think_loop_watchdog: {},\n\
              \x20               min_p_floor: {:?},\n\
              \x20               temperature_max: {:?},\n\
              \x20               think_loop_min_repeats: {},\n\
@@ -199,6 +200,7 @@ pub(super) fn generate_target_ptx_rs(
             target.behavior_use_sampling_presets_for_core,
             target.behavior_tool_call_parser,
             target.behavior_enable_loop_watchdog,
+            target.behavior_enable_think_loop_watchdog,
             target.behavior_min_p_floor,
             target.behavior_temperature_max,
             target.behavior_think_loop_min_repeats,

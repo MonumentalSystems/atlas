@@ -135,6 +135,13 @@ pub(super) struct ParsedBehavior {
     pub use_sampling_presets_for_core: bool,
     pub tool_call_parser: String,
     pub enable_loop_watchdog: bool,
+    /// Gate for the THINKING-phase token-loop watchdog, which force-injects
+    /// `</think>` when it detects a period-4..20 repeat in the reasoning tail.
+    /// Defaults TRUE (the behaviour every model had before this flag existed).
+    /// Set false for models where it misfires: force-closing a reasoning block
+    /// the model did not choose to end leaves it in a state it cannot continue
+    /// from, and the post-close content degenerates into token spam.
+    pub enable_think_loop_watchdog: bool,
     pub min_p_floor: f32,
     pub temperature_max: f32,
     pub think_loop_min_repeats: u32,
@@ -165,6 +172,7 @@ impl Default for ParsedBehavior {
             use_sampling_presets_for_core: false,
             tool_call_parser: String::new(),
             enable_loop_watchdog: false,
+            enable_think_loop_watchdog: true,
             min_p_floor: 0.0,
             temperature_max: 0.0,
             think_loop_min_repeats: 3,
@@ -245,6 +253,10 @@ pub(super) fn parse_behavior(model_dir: &std::path::Path) -> ParsedBehavior {
         .and_then(|v| v.get("enable_loop_watchdog"))
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    let enable_think_loop_watchdog = b
+        .and_then(|v| v.get("enable_think_loop_watchdog"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
     // Server-side sampling safety floor/ceiling (0.0 = disabled). See
     // ModelBehavior::{min_p_floor,temperature_max} for rationale.
     let min_p_floor = b
@@ -322,6 +334,7 @@ pub(super) fn parse_behavior(model_dir: &std::path::Path) -> ParsedBehavior {
         use_sampling_presets_for_core,
         tool_call_parser,
         enable_loop_watchdog,
+        enable_think_loop_watchdog,
         min_p_floor,
         temperature_max,
         think_loop_min_repeats,

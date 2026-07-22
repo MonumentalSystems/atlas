@@ -65,6 +65,16 @@ repetition_penalty = 1.0
 dry_multiplier = 0.0
 
 [behavior]
+# The thinking-phase loop watchdog force-injects `</think>` on a period-4..20
+# repeat in the reasoning tail. On this model it does more harm than good:
+# measured 2026-07-22 on RC1, "Explain why the sky is blue in two sentences."
+#   watchdog ON  -> fires at thinking_tokens=264, finish=length, and the
+#                   post-close CONTENT is spam ('####...' / backtick runs)
+#   watchdog OFF -> reasoning stays coherent, no spam
+# Force-closing a reasoning block the model did not choose to end leaves it
+# with no natural continuation. Other models keep the watchdog (flag defaults
+# to true); this opts Laguna out.
+enable_think_loop_watchdog = false
 thinking_in_tools = true
 max_thinking_budget = 8192
 # Poolside recommends thinking for agentic coding and preserving it between

@@ -182,6 +182,8 @@ pub struct ModelBehavior {
     /// JSON arrays of similar objects, multiplication tables). Enable only
     /// when the model has been observed to need it.
     pub enable_loop_watchdog: bool,
+    /// See build_parse.rs: gate for the THINKING-phase loop watchdog.
+    pub enable_think_loop_watchdog: bool,
     /// Server-side min-p FLOOR (0.0 = disabled). Applied as `min_p.max(floor)`
     /// AFTER request/preset resolution, so it binds even when a client sends
     /// `min_p = 0` (or omits it on a server without `--default-min-p`). On
@@ -302,6 +304,7 @@ impl Default for ModelBehavior {
             use_sampling_presets_for_core: false,
             tool_call_parser: "",
             enable_loop_watchdog: false,
+            enable_think_loop_watchdog: true,
             min_p_floor: 0.0,
             temperature_max: 0.0,
             think_loop_min_repeats: 3,
