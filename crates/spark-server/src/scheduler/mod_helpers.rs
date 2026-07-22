@@ -61,7 +61,7 @@ pub(super) fn install_high_speed_swap(
 }
 
 /// Co-dispatch admission window: `Some(duration)` when `ATLAS_PREFILL_CODISPATCH=1`,
-/// else `None`. The window length is `ATLAS_PREFILL_CODISPATCH_WINDOW_MS` (default 5).
+/// else `None`. The window length is `ATLAS_PREFILL_CODISPATCH_WINDOW_MS` (default 100).
 fn codispatch_window() -> Option<std::time::Duration> {
     let on = std::env::var("ATLAS_PREFILL_CODISPATCH")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
@@ -72,7 +72,7 @@ fn codispatch_window() -> Option<std::time::Duration> {
     let ms = std::env::var("ATLAS_PREFILL_CODISPATCH_WINDOW_MS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(10);
+        .unwrap_or(100);
     Some(std::time::Duration::from_millis(ms))
 }
 
@@ -112,24 +112,23 @@ pub(super) fn drain_pending_requests(
         // gather a whole concurrent BURST into one forward (batched via
         // run_batched_prefill_step) rather than stopping at the 2nd request — a
         // 4-request burst used to split into 2+2 because the loop exited at len==2.
-        // Keep collecting up to `max_batch_size`, bounded by `window`, and dispatch
-        // EARLY once the burst settles (>=2 gathered and no new arrival within
-        // SETTLE) so latency stays low. A lone request pays at most `window` TTFT.
+        // Keep collecting up to `max_batch_size` for the full admission window.
+        // Agentic/RAG clients commonly submit a burst through independently
+        // parsed HTTP tasks; the former 2 ms "settle" shortcut split a C=4
+        // burst into C=3+1 before its last request reached this queue. A lone
+        // request pays at most `window` TTFT, which is the intentional tradeoff
+        // when co-dispatch is explicitly enabled.
         if g.requests.len() < max_batch_size
             && let Some(window) = codispatch_window()
         {
-            const SETTLE: std::time::Duration = std::time::Duration::from_millis(2);
             let deadline = std::time::Instant::now() + window;
             while g.requests.len() < max_batch_size && !g.closed {
                 let now = std::time::Instant::now();
                 if now >= deadline {
                     break;
                 }
-                let wait = (deadline - now).min(SETTLE);
-                let res = cv.wait_for(&mut g, wait);
-                // Timed out with no new arrival in SETTLE → burst drained; dispatch
-                // what we have (if it's batchable). Otherwise keep gathering.
-                if res.timed_out() && g.requests.len() >= 2 {
+                let res = cv.wait_for(&mut g, deadline - now);
+                if res.timed_out() {
                     break;
                 }
             }
