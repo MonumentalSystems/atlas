@@ -157,12 +157,18 @@ impl Qwen3AttentionLayer {
         }
 
         // ── Standard Q/K/V projection (non-MLA models) ──
+        let ht = std::env::var("ATLAS_PREFILL_HOST_TIMING").as_deref() == Ok("1");
+        let tp0 = ht.then(std::time::Instant::now);
         if self.mla.is_none() {
             self.prefill_attention_cache_skip_qkv(
                 normed, normed_fp8, n, h, nkv, hd, q_proj_dim, kv_dim, num_tokens, bf16, ctx,
                 stream,
             )?;
         } // end if self.mla.is_none() (standard projection path)
+        if let Some(t) = tp0 {
+            crate::layers::qwen3_attention::add_attn_phase_us(0, t.elapsed().as_micros() as u64);
+        }
+        let tp1 = ht.then(std::time::Instant::now);
 
         // ── 4+5. Deinterleave Q/Gate + per-head Q/K RMS norms ──
         let qg_out = ctx.buffers.qkv_output();
@@ -643,6 +649,13 @@ impl Qwen3AttentionLayer {
                 anyhow::anyhow!("prefill_512 failed: n={n} nq={nq} nkv={nkv} hd={hd}: {e}")
             })?;
         } else {
+            if let Some(t) = tp1 {
+                crate::layers::qwen3_attention::add_attn_phase_us(
+                    1,
+                    t.elapsed().as_micros() as u64,
+                );
+            }
+            let tp2 = std::time::Instant::now();
             ops::prefill_attention_64(
                 ctx.gpu,
                 self.prefill_attn_64_k,
@@ -663,6 +676,7 @@ impl Qwen3AttentionLayer {
             .map_err(|e| {
                 anyhow::anyhow!("flash_attn_64 failed: n={n} nq={nq} nkv={nkv} hd={hd}: {e}")
             })?;
+            crate::layers::qwen3_attention::add_attn_phase_us(2, tp2.elapsed().as_micros() as u64);
         }
 
         // TurboQuant WHT bookend (output side): attention output is
