@@ -82,6 +82,13 @@ impl TransformerModel {
         // 0-handle on targets that predate it; dispatch falls back).
         let w4a16_gemv_batch4_kernel =
             crate::layers::try_kernel(gpu.as_ref(), "w4a16_gemv", "w4a16_gemv_batch4");
+        // Batched M<=16 NVFP4 GEMV for the LM head: reads the ~254 MB vocab
+        // weight once for all decode rows (the tiled w4a16_gemm re-tiles it).
+        // try_kernel → handle 0 on older images, where dispatch falls back.
+        let w4a16_gemv_batch16_kernel =
+            crate::layers::try_kernel(gpu.as_ref(), "w4a16_gemv", "w4a16_gemv_batch16");
+        let lmhead_batch_gemv =
+            std::env::var("ATLAS_LMHEAD_BATCH_GEMV").ok().as_deref() == Some("1");
         // FP8 E4M3 LUT GEMV for the `--lm-head-dtype fp8` head. Loaded
         // unconditionally (a handle is cheap); only invoked when `lm_head_fp8`
         // is set, so the NVFP4/BF16 paths never touch it.
@@ -493,6 +500,8 @@ impl TransformerModel {
             w4a16_gemm_kernel,
             w4a16_gemv_batch2_kernel,
             w4a16_gemv_batch4_kernel,
+            w4a16_gemv_batch16_kernel,
+            lmhead_batch_gemv,
             dense_gemv_fp8w_kernel,
             dense_gemv_fp8w_batch2_kernel,
             dense_gemm_kernel,

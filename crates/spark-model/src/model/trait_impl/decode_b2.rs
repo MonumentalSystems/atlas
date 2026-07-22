@@ -57,42 +57,64 @@ impl TransformerModel {
 
         let logits = self.buffers.logits();
         let v = self.config.vocab_size;
-        for i in 0..padded_n {
-            let normed_i = normed.offset(i * h * bf16);
-            let logits_i = logits.offset(i * v * bf16);
-            if let Some(ref fp8) = self.lm_head_fp8 {
-                ops::dense_gemv_fp8w(
-                    self.gpu.as_ref(),
-                    self.dense_gemv_fp8w_kernel,
-                    normed_i,
-                    fp8,
-                    logits_i,
-                    v as u32,
-                    h as u32,
-                    stream,
-                )?;
-            } else if let Some(ref nvfp4) = self.lm_head_nvfp4 {
-                ops::w4a16_gemv(
-                    self.gpu.as_ref(),
-                    self.w4a16_gemv_kernel,
-                    normed_i,
-                    nvfp4,
-                    logits_i,
-                    v as u32,
-                    h as u32,
-                    stream,
-                )?;
-            } else {
-                ops::dense_gemv(
-                    self.gpu.as_ref(),
-                    self.dense_gemv_kernel,
-                    normed_i,
-                    &self.lm_head_weight,
-                    logits_i,
-                    v as u32,
-                    h as u32,
-                    stream,
-                )?;
+        // Batched M<=16 NVFP4 fast path: read the ~254 MB vocab weight ONCE for
+        // all padded_n rows instead of the per-token GEMV loop below (which re-reads
+        // it padded_n×). Opt-in via ATLAS_LMHEAD_BATCH_GEMV; covers the mixed /
+        // MTP-verify decode batch on an NVFP4 head. Falls back to the loop.
+        if self.lmhead_batch_gemv
+            && padded_n <= 16
+            && self.w4a16_gemv_batch16_kernel.0 != 0
+            && let Some(nvfp4) = self.lm_head_nvfp4.as_ref()
+        {
+            ops::w4a16_gemv_batchm(
+                self.gpu.as_ref(),
+                self.w4a16_gemv_batch16_kernel,
+                normed,
+                nvfp4,
+                logits,
+                padded_n as u32,
+                v as u32,
+                h as u32,
+                stream,
+            )?;
+        } else {
+            for i in 0..padded_n {
+                let normed_i = normed.offset(i * h * bf16);
+                let logits_i = logits.offset(i * v * bf16);
+                if let Some(ref fp8) = self.lm_head_fp8 {
+                    ops::dense_gemv_fp8w(
+                        self.gpu.as_ref(),
+                        self.dense_gemv_fp8w_kernel,
+                        normed_i,
+                        fp8,
+                        logits_i,
+                        v as u32,
+                        h as u32,
+                        stream,
+                    )?;
+                } else if let Some(ref nvfp4) = self.lm_head_nvfp4 {
+                    ops::w4a16_gemv(
+                        self.gpu.as_ref(),
+                        self.w4a16_gemv_kernel,
+                        normed_i,
+                        nvfp4,
+                        logits_i,
+                        v as u32,
+                        h as u32,
+                        stream,
+                    )?;
+                } else {
+                    ops::dense_gemv(
+                        self.gpu.as_ref(),
+                        self.dense_gemv_kernel,
+                        normed_i,
+                        &self.lm_head_weight,
+                        logits_i,
+                        v as u32,
+                        h as u32,
+                        stream,
+                    )?;
+                }
             }
         }
         let decode_logits = logits;
