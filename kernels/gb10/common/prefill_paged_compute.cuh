@@ -284,6 +284,24 @@ extern "C" __global__ void KERNEL_NAME(
     unsigned int num_kv_blocks = (kv_len + BC - 1) / BC;
     { unsigned int mx = (q_offset + q_tile_end - 1) / BC;
       num_kv_blocks = min(num_kv_blocks, mx + 1); }
+    // Sliding-window lower bound. The mask below drops any key with
+    // (q_abs - k) >= sliding_window, so every KV block strictly below the
+    // first in-window key is fully masked — start there instead of scoring
+    // and discarding. Uses q_rope_pos (the same absolute position the mask
+    // uses) so the DFlash Q_ROPE_POS_OVERRIDE variant stays correct.
+    unsigned int kv_block_lo = 0;
+    if (causal_mask_enabled && sliding_window > 0) {
+        unsigned int q_abs_lo = q_rope_pos + q_start;
+        if (q_abs_lo + 1 > sliding_window) {
+            kv_block_lo = (q_abs_lo + 1 - sliding_window) / BC;
+        }
+    }
+    // Never skip past the end: the epilogue must still write O. If every key
+    // were out of window the row sum stays 0 and the store emits zeros, which
+    // is the correct result; an early return would leave O stale instead.
+    if (kv_block_lo >= num_kv_blocks && num_kv_blocks > 0) {
+        kv_block_lo = num_kv_blocks - 1;
+    }
 
     // === Merged Q + K[0] load (single commit group) ===
     // Q via cp.async, K[0] via LOAD_KV_TILE (cp.async for BF16, sync for FP8/NVFP4).
@@ -302,18 +320,18 @@ extern "C" __global__ void KERNEL_NAME(
             } else { *((uint4*)&smem_Q[row][col]) = make_uint4(0,0,0,0); }
         }
         if (num_kv_blocks > 0) {
-            LOAD_KV_TILE(K_cache, block_table, smem_K[0], 0, kv_len, kv_head, tid, blockDim.x);
+            LOAD_KV_TILE(K_cache, block_table, smem_K[0], kv_block_lo * BC, kv_len, kv_head, tid, blockDim.x);
         }
         atlas_cp_commit();
         atlas_cp_wait();
     }
     __syncthreads();
 
-    for (unsigned int kv_block = 0; kv_block < num_kv_blocks; kv_block++) {
+    for (unsigned int kv_block = kv_block_lo; kv_block < num_kv_blocks; kv_block++) {
         unsigned int kv_start = kv_block * BC;
         unsigned int kv_end = min(kv_start + BC, kv_len);
         unsigned int kv_tile_len = kv_end - kv_start;
-        unsigned int buf = kv_block & 1;
+        unsigned int buf = (kv_block - kv_block_lo) & 1;
 
         // === Start V load (overlaps with QK^T for BF16 cp.async) ===
         LOAD_KV_TILE(V_cache, block_table, smem_V, kv_start, kv_len, kv_head, tid, blockDim.x);
@@ -726,6 +744,24 @@ extern "C" __global__ void PAGED_CONCAT(KERNEL_NAME, _64)(
     unsigned int num_kv_blocks = (kv_len + BC - 1) / BC;
     { unsigned int mx = (q_offset + q_tile_end - 1) / BC;
       num_kv_blocks = min(num_kv_blocks, mx + 1); }
+    // Sliding-window lower bound. The mask below drops any key with
+    // (q_abs - k) >= sliding_window, so every KV block strictly below the
+    // first in-window key is fully masked — start there instead of scoring
+    // and discarding. Uses q_rope_pos (the same absolute position the mask
+    // uses) so the DFlash Q_ROPE_POS_OVERRIDE variant stays correct.
+    unsigned int kv_block_lo = 0;
+    if (causal_mask_enabled && sliding_window > 0) {
+        unsigned int q_abs_lo = q_rope_pos + q_start;
+        if (q_abs_lo + 1 > sliding_window) {
+            kv_block_lo = (q_abs_lo + 1 - sliding_window) / BC;
+        }
+    }
+    // Never skip past the end: the epilogue must still write O. If every key
+    // were out of window the row sum stays 0 and the store emits zeros, which
+    // is the correct result; an early return would leave O stale instead.
+    if (kv_block_lo >= num_kv_blocks && num_kv_blocks > 0) {
+        kv_block_lo = num_kv_blocks - 1;
+    }
 
     // === Merged Q(64 rows) + K[0](32 rows) load ===
     {
@@ -742,18 +778,18 @@ extern "C" __global__ void PAGED_CONCAT(KERNEL_NAME, _64)(
             } else { *((uint4*)&smem_Q64[row][col]) = make_uint4(0,0,0,0); }
         }
         if (num_kv_blocks > 0) {
-            LOAD_KV_TILE(K_cache, block_table, smem_K64[0], 0, kv_len, kv_head, tid, blockDim.x);
+            LOAD_KV_TILE(K_cache, block_table, smem_K64[0], kv_block_lo * BC, kv_len, kv_head, tid, blockDim.x);
         }
         atlas_cp_commit();
         atlas_cp_wait();
     }
     __syncthreads();
 
-    for (unsigned int kv_block = 0; kv_block < num_kv_blocks; kv_block++) {
+    for (unsigned int kv_block = kv_block_lo; kv_block < num_kv_blocks; kv_block++) {
         unsigned int kv_start = kv_block * BC;
         unsigned int kv_end = min(kv_start + BC, kv_len);
         unsigned int kv_tile_len = kv_end - kv_start;
-        unsigned int buf = kv_block & 1;
+        unsigned int buf = (kv_block - kv_block_lo) & 1;
 
         // === Warp-specialized: QK^T (warps 0-3) || V load (warps 4-7) ===
         // Warps 4-7 load V tile with 128 threads while warps 0-3 compute QK^T.
