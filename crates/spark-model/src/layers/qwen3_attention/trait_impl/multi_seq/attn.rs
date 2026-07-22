@@ -251,17 +251,35 @@ impl Qwen3AttentionLayer {
 
         if let Some(ref g_proj) = self.head_gate_weight {
             let gate_buf = qkv_buf;
-            ops::dense_gemm_tc(
-                fwd.gpu,
-                self.dense_gemm_tc_k,
-                normed,
-                g_proj,
-                gate_buf,
-                n as u32,
-                nq,
-                h as u32,
-                stream,
-            )?;
+            // See the decode-path note: N = nq = 72 gives dense_gemm_tc only
+            // ceil(72/64) = 2 CTAs. Use the batched GEMV (ceil(N/4) CTAs), which
+            // also keeps this consistent with the single-sequence decode path.
+            if self.dense_gemv_batchm_k.0 != 0 && super::qkv::bf16_batchm_enabled() {
+                ops::dense_gemv_batchm(
+                    fwd.gpu,
+                    self.dense_gemv_batchm_k,
+                    normed,
+                    g_proj,
+                    gate_buf,
+                    n as u32,
+                    nq,
+                    h as u32,
+                    nq, // gate rows are nq BF16 elements apart
+                    stream,
+                )?;
+            } else {
+                ops::dense_gemm_tc(
+                    fwd.gpu,
+                    self.dense_gemm_tc_k,
+                    normed,
+                    g_proj,
+                    gate_buf,
+                    n as u32,
+                    nq,
+                    h as u32,
+                    stream,
+                )?;
+            }
             match self.head_gate_activation {
                 HeadGateActivation::Sigmoid => ops::sigmoid_gate_mul_head_broadcast(
                     fwd.gpu,

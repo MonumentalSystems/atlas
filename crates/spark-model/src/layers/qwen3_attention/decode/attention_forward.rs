@@ -669,17 +669,36 @@ impl Qwen3AttentionLayer {
         if let Some(ref g_proj) = self.head_gate_weight {
             // For decode, n=1 (single token). Reuse q_out scratch for gate [1, nq].
             let gate_buf = q_out;
-            ops::dense_gemm_tc(
-                ctx.gpu,
-                self.dense_gemm_tc_k,
-                normed,
-                g_proj,
-                gate_buf,
-                1, // decode: single token
-                nq,
-                h,
-                stream,
-            )?;
+            // N = nq = 72, so dense_gemm_tc's grid (ceil(N/64) x ceil(M/16)) is
+            // TWO CTAs on a 48-SM part, latency-bound over a K=3072 loop. The
+            // batched GEMV grids at ceil(N/4) with coalesced uint4 loads and is
+            // bit-identical to dense_gemv_bf16 at M=1.
+            if self.dense_gemv_batchm_k.0 != 0 {
+                ops::dense_gemv_batchm(
+                    ctx.gpu,
+                    self.dense_gemv_batchm_k,
+                    normed,
+                    g_proj,
+                    gate_buf,
+                    1, // decode: single token
+                    nq,
+                    h,
+                    nq, // one row, stride unused
+                    stream,
+                )?;
+            } else {
+                ops::dense_gemm_tc(
+                    ctx.gpu,
+                    self.dense_gemm_tc_k,
+                    normed,
+                    g_proj,
+                    gate_buf,
+                    1, // decode: single token
+                    nq,
+                    h,
+                    stream,
+                )?;
+            }
             match self.head_gate_activation {
                 super::super::types::HeadGateActivation::Sigmoid => {
                     ops::sigmoid_gate_mul_head_broadcast(
