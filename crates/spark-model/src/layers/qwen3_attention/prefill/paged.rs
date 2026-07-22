@@ -534,8 +534,14 @@ impl Qwen3AttentionLayer {
             // reason co-dispatch flatlined). Chunk-0 only (seq_len_start==0):
             // later chunks need the cached prefix, which isn't in the fresh
             // buffers. BF16 / no-WHT only; head_dim 256.
+            // hd=256 (Holo) and hd=128 (Laguna) are both instantiated in
+            // cuda/flashinfer_ragged_prefill.cu. Only the hd=128 entry point
+            // takes a sliding window, so a windowed layer is safe there and
+            // NOT safe on hd=256 (whose variant is use_sliding_window=false).
+            let windowed_ok = hd == 128 || self.sliding_window.is_none();
             let use_flashinfer = seq_len_start == 0
-                && hd == 256
+                && (hd == 256 || hd == 128)
+                && windowed_ok
                 && !k_is_turbo
                 && !v_is_turbo
                 && spark_runtime::flashinfer::available()
@@ -555,29 +561,54 @@ impl Qwen3AttentionLayer {
                         tracing::warn!(
                             "FLASHINFER_PREFILL(varlen) batch={batch} total={total} \
                              num_tokens={num_tokens} cu_seqlens={indptr_h:?} \
-                             nq={nq} nkv={nkv} hd={hd} sm_scale={inv_sqrt_d}"
+                             nq={nq} nkv={nkv} hd={hd} sm_scale={inv_sqrt_d} \
+                             sliding_window={sw:?}",
+                            sw = self.sliding_window
                         );
                     }
                 }
-                spark_runtime::flashinfer::ragged_prefill_bf16_hd256(
-                    q_contiguous.0,
-                    k_contiguous.0,
-                    v_contiguous.0,
-                    attn_out.0,
-                    indptr_h,
-                    indptr_h,
-                    indptr_d,
-                    indptr_d,
-                    batch as u32,
-                    total,
-                    total,
-                    nq,
-                    nkv,
-                    hd,
-                    inv_sqrt_d,
-                    true,
-                    stream,
-                )?;
+                if hd == 128 {
+                    spark_runtime::flashinfer::ragged_prefill_bf16_hd128(
+                        q_contiguous.0,
+                        k_contiguous.0,
+                        v_contiguous.0,
+                        attn_out.0,
+                        indptr_h,
+                        indptr_h,
+                        indptr_d,
+                        indptr_d,
+                        batch as u32,
+                        total,
+                        total,
+                        nq,
+                        nkv,
+                        hd,
+                        inv_sqrt_d,
+                        true,
+                        self.sliding_window,
+                        stream,
+                    )?;
+                } else {
+                    spark_runtime::flashinfer::ragged_prefill_bf16_hd256(
+                        q_contiguous.0,
+                        k_contiguous.0,
+                        v_contiguous.0,
+                        attn_out.0,
+                        indptr_h,
+                        indptr_h,
+                        indptr_d,
+                        indptr_d,
+                        batch as u32,
+                        total,
+                        total,
+                        nq,
+                        nkv,
+                        hd,
+                        inv_sqrt_d,
+                        true,
+                        stream,
+                    )?;
+                }
             } else {
                 // Q12 Path B: batched paged-prefill attention. The kernel reads
                 // Q/O at per-batch offsets internally via blockIdx.z and uses
