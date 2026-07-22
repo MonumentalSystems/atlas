@@ -56,6 +56,12 @@ pub(super) fn u32_bytes(v: &[u32]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
 }
 
+/// Reinterpret a `&[i32]` as raw little-endian bytes for an H2D copy.
+pub(super) fn i32_bytes(v: &[i32]) -> &[u8] {
+    // SAFETY: `i32` is `Copy`/POD; same reasoning as `u32_bytes`.
+    unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
+}
+
 /// Reinterpret a `&[bf16]` as raw little-endian bytes for an H2D copy.
 pub(super) fn bf16_bytes(v: &[bf16]) -> &[u8] {
     // SAFETY: `bf16` is a `#[repr(transparent)]` POD wrapper over `u16`; same

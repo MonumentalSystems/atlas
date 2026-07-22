@@ -26,11 +26,16 @@ use crate::weight_map::DenseWeight;
 /// are authoritative, and NLLB's `out_proj`/`fc1`/`fc2` targets are rejected by
 /// the decoder-only PEFT parser).
 #[derive(serde::Deserialize)]
-struct PeftCfg {
+pub(super) struct PeftCfg {
     r: usize,
     lora_alpha: f64,
     #[serde(default)]
     use_rslora: bool,
+    /// PEFT `trainable_tokens` indices — the vocab rows whose embedding this
+    /// adapter replaces (see [`super::token_adapter`]). Absent for standard
+    /// A/B-only adapters (`Vec::default()` → no overlay).
+    #[serde(default)]
+    pub(super) trainable_token_indices: Vec<u32>,
 }
 
 pub(super) struct NllbLora {
@@ -42,13 +47,23 @@ pub(super) struct NllbLora {
     xa: DevicePtr,
     delta: DevicePtr,
     max_rows: usize,
+    /// Vocab-extending embedding overlay (PEFT `trainable_tokens`). `None` for
+    /// standard A/B-only adapters — the projection-delta path is unaffected.
+    overlay: Option<super::token_adapter::EmbedOverlay>,
 }
 
 impl NllbLora {
     /// Load a PEFT adapter directory (`adapter_config.json` +
     /// `adapter_model.safetensors`) for NLLB. `max_rows` bounds the per-call row
     /// count (encoder source length for prefill; 1 for decode).
-    pub(super) fn load(dir: &Path, gpu: &dyn GpuBackend, max_rows: usize) -> Result<Self> {
+    pub(super) fn load(
+        dir: &Path,
+        gpu: &dyn GpuBackend,
+        max_rows: usize,
+        embed_table: DevicePtr,
+        vocab: usize,
+        d: usize,
+    ) -> Result<Self> {
         let raw = std::fs::read_to_string(dir.join("adapter_config.json"))
             .with_context(|| format!("reading {}/adapter_config.json", dir.display()))?;
         // Minimal PEFT parse: NLLB targets `out_proj`/`fc1`/`fc2`, which the
@@ -132,6 +147,15 @@ impl NllbLora {
             pairs.len(),
             dir.display()
         );
+        // Vocab-extending PEFT `trainable_tokens` overlay (`None` for A/B-only).
+        let overlay = super::token_adapter::build_overlay(
+            &store,
+            gpu,
+            embed_table,
+            vocab,
+            d,
+            &peft.trainable_token_indices,
+        )?;
         Ok(Self {
             _store: store,
             kernels,
@@ -139,7 +163,14 @@ impl NllbLora {
             xa,
             delta,
             max_rows,
+            overlay,
         })
+    }
+
+    /// The vocab-extending embedding overlay, if this adapter has one.
+    #[inline]
+    pub(super) fn overlay(&self) -> Option<&super::token_adapter::EmbedOverlay> {
+        self.overlay.as_ref()
     }
 
     /// Apply the LoRA residual for base-module `prefix` in place onto
