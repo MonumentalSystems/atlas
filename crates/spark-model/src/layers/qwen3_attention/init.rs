@@ -187,6 +187,12 @@ impl Qwen3AttentionLayer {
             } else {
                 gpu.kernel("norm", "rms_norm")?
             },
+            rms_norm_w_warp_row_k: if crate::ships_vanilla_norm_weights(config) {
+                gpu.kernel("rms_norm_vanilla", "rms_norm_vanilla_warp_row")
+                    .unwrap_or(KernelHandle(0))
+            } else {
+                KernelHandle(0)
+            },
             norm_vanilla: crate::ships_vanilla_norm_weights(config),
             rms_norm_residual_k: if crate::ships_vanilla_norm_weights(config) {
                 gpu.kernel("norm", "rms_norm_residual_vanilla")?

@@ -272,17 +272,35 @@ impl Qwen3AttentionLayer {
                     stream,
                 )?;
             } else if !self.attn.q_norm.weight.is_null() {
-                ops::rms_norm(
-                    ctx.gpu,
-                    self.rms_norm_w_k,
-                    q_contiguous,
-                    &self.attn.q_norm,
-                    q_contiguous,
-                    nq * n,
-                    hd,
-                    eps,
-                    stream,
-                )?;
+                // Per-head rows are head_dim long and there are nq*n of them;
+                // the block-per-row kernel runs ~43x above its bandwidth floor
+                // on that shape.
+                if self.rms_norm_w_warp_row_k.0 != 0 && ops::rms_norm_short_row_eligible(nq * n, hd)
+                {
+                    ops::rms_norm_warp_row(
+                        ctx.gpu,
+                        self.rms_norm_w_warp_row_k,
+                        q_contiguous,
+                        &self.attn.q_norm,
+                        q_contiguous,
+                        nq * n,
+                        hd,
+                        eps,
+                        stream,
+                    )?;
+                } else {
+                    ops::rms_norm(
+                        ctx.gpu,
+                        self.rms_norm_w_k,
+                        q_contiguous,
+                        &self.attn.q_norm,
+                        q_contiguous,
+                        nq * n,
+                        hd,
+                        eps,
+                        stream,
+                    )?;
+                }
             }
         }
         if let Some(ref k_norm_full) = self.attn.k_norm_full {
@@ -298,18 +316,34 @@ impl Qwen3AttentionLayer {
                 stream,
             )?;
         } else if !self.attn.k_norm.weight.is_null() {
-            ops::rms_norm(
-                ctx.gpu,
-                self.rms_norm_w_k,
-                k_contiguous,
-                &self.attn.k_norm,
-                k_contiguous,
-                nkv * n,
-                hd,
-                eps,
-                stream,
-            )
-            .map_err(|e| anyhow::anyhow!("k_norm rms_norm failed: nkv={nkv} n={n} hd={hd}: {e}"))?;
+            if self.rms_norm_w_warp_row_k.0 != 0 && ops::rms_norm_short_row_eligible(nkv * n, hd) {
+                ops::rms_norm_warp_row(
+                    ctx.gpu,
+                    self.rms_norm_w_warp_row_k,
+                    k_contiguous,
+                    &self.attn.k_norm,
+                    k_contiguous,
+                    nkv * n,
+                    hd,
+                    eps,
+                    stream,
+                )?;
+            } else {
+                ops::rms_norm(
+                    ctx.gpu,
+                    self.rms_norm_w_k,
+                    k_contiguous,
+                    &self.attn.k_norm,
+                    k_contiguous,
+                    nkv * n,
+                    hd,
+                    eps,
+                    stream,
+                )
+                .map_err(|e| {
+                    anyhow::anyhow!("k_norm rms_norm failed: nkv={nkv} n={n} hd={hd}: {e}")
+                })?;
+            }
         }
 
         // ATLAS_OP_DUMP: k AFTER k_norm, BEFORE RoPE. Matches vLLM's "k_proj"

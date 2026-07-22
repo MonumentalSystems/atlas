@@ -137,6 +137,8 @@ pub struct Qwen3AttentionLayer {
     /// Same handle as `rms_norm_k` for offset-from-1 models; `rms_norm_vanilla`
     /// (`out = x * w / rms`) for models that ship HF-vanilla norm weights.
     pub(super) rms_norm_w_k: KernelHandle,
+    /// Warp-per-row sibling of `rms_norm_w_k` for short per-head rows; 0 if absent.
+    pub(super) rms_norm_w_warp_row_k: KernelHandle,
     /// True when `rms_norm_w_k` is the vanilla kernel — i.e. the checkpoint's
     /// norm weights are loaded exactly, with no `-1` pre-subtraction.
     pub(super) norm_vanilla: bool,
