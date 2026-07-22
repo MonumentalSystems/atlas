@@ -168,7 +168,18 @@ impl Qwen3AttentionLayer {
         let qg_out = ctx.buffers.qkv_output();
         let k_contiguous = ctx.buffers.ssm_qkvz();
         let v_contiguous = k_contiguous.offset(num_tokens * kv_dim * bf16);
-        let q_contiguous = ctx.buffers.ssm_deinterleaved();
+        // UNGATED models: the q_proj output IS the contiguous Q in exactly the
+        // layout downstream wants ([n, nq*hd]) — `q_proj_dim == q_dim` above,
+        // and the only other reader of `qg_out`, the sigmoid gate at step 9, is
+        // `if self.gated`. Aliasing avoids a full duplicate of Q: at 8K that
+        // copy_d2d moves 135 MB out + 135 MB in PER LAYER (~6.5 GB per prefill)
+        // to produce a byte-identical buffer. Gated models still need the
+        // separate destination because their qg_out carries [Q | G].
+        let q_contiguous = if self.gated {
+            ctx.buffers.ssm_deinterleaved()
+        } else {
+            qg_out
+        };
         let q_rope_fused = self.gated
             && !self.attn.q_norm.weight.is_null()
             && self.mrope_interleaved
@@ -244,9 +255,10 @@ impl Qwen3AttentionLayer {
                 .copy_d2d_async(qg_out, q_contiguous, num_tokens * q_dim * bf16, stream)
                 .map_err(|e| anyhow::anyhow!("MLA Q copy failed: {e}"))?;
         } else {
-            ctx.gpu
-                .copy_d2d_async(qg_out, q_contiguous, num_tokens * q_dim * bf16, stream)
-                .map_err(|e| anyhow::anyhow!("Q copy d2d failed: {e}"))?;
+            // No copy: `q_contiguous` aliases `qg_out` for ungated models (see
+            // its binding above). Kept as a no-op branch so the gated/MLA
+            // structure below is unchanged.
+            debug_assert_eq!(q_contiguous.0, qg_out.0);
             if let Some(ref q_norm_full) = self.attn.q_norm_full {
                 ops::rms_norm(
                     ctx.gpu,
