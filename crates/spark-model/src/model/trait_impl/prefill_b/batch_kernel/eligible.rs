@@ -20,7 +20,11 @@ impl TransformerModel {
     /// streams. Cheap upfront check — caller (dispatch) falls back to
     /// per-stream when false.
     pub(in crate::model) fn kernel_batched_eligible(&self, streams: &[PrefillSlice<'_>]) -> bool {
-        let varlen = varlen_prefill_enabled();
+        // Routed-MoE metadata still assumes a uniform per-stream layout.
+        // Keep the experimental ragged path on dense models until its MoE
+        // indexing is made cu_seqlens-aware; otherwise C=4 heterogeneous
+        // Laguna traffic can reach a CUDA illegal access after admission.
+        let varlen = varlen_prefill_enabled() && self.config.num_experts == 0;
         check_kernel_batched_eligible(
             streams
                 .iter()

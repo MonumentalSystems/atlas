@@ -160,7 +160,16 @@ impl TransformerModel {
         // Cumulative scratch offset cursor — starts after MoE topk
         // staging area (per single-stream upload_meta convention). Sized by the
         // largest per-stream chunk so a long VARLEN stream's topk staging fits.
-        let moe_scratch_bytes = max_chunk_len * self.config.num_experts_per_tok * 4 * 2 * n;
+        // VARLEN packs routed-MoE metadata by `cu_seqlens`, just like hidden
+        // states and BatchedAttnMetadata. Charging every stream at the longest
+        // request length both disagrees with the admission SSOT and can push
+        // the first per-stream metadata upload past scratch capacity.
+        let moe_scratch_tokens = if varlen {
+            streams.iter().map(|slice| slice.chunk_len).sum()
+        } else {
+            max_chunk_len * n
+        };
+        let moe_scratch_bytes = moe_scratch_tokens * self.config.num_experts_per_tok * 4 * 2;
         let mut scratch_cursor = (moe_scratch_bytes + 63) & !63;
 
         for (b, slice) in streams.iter_mut().enumerate() {
