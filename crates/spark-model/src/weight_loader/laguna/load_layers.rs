@@ -34,6 +34,13 @@ pub(super) fn load_layers(
     let quantize_k = gpu.kernel("quantize_nvfp4", "quantize_bf16_to_nvfp4")?;
     let stream = gpu.default_stream();
     let yarn_inv_freq = compute_yarn_inv_freq(config, gpu)?;
+    let unified_moe_layout =
+        unified_moe_layout_enabled(std::env::var("ATLAS_UNIFIED_MOE_LAYOUT").ok().as_deref());
+    if unified_moe_layout {
+        tracing::info!(
+            "Laguna: using unified transposed MoE layout; prefill uses fused K64 kernels and decode uses transposed experts"
+        );
+    }
     let mut layers: Vec<Box<dyn TransformerLayer>> = Vec::with_capacity(config.num_hidden_layers);
 
     for i in 0..config.num_hidden_layers {
@@ -43,7 +50,16 @@ pub(super) fn load_layers(
         let ffn = if config.mlp_only_layers.contains(&i) {
             load_dense_ffn(store, gpu, &lp)?
         } else {
-            load_moe_ffn(store, config, gpu, &lp, absmax_k, quantize_k, stream)?
+            load_moe_ffn(
+                store,
+                config,
+                gpu,
+                &lp,
+                absmax_k,
+                quantize_k,
+                stream,
+                unified_moe_layout,
+            )?
         };
         let layer = load_attention(
             store,
@@ -92,6 +108,7 @@ fn load_moe_ffn(
     absmax_k: spark_runtime::gpu::KernelHandle,
     quantize_k: spark_runtime::gpu::KernelHandle,
     stream: u64,
+    unified_moe_layout: bool,
 ) -> Result<FfnComponent> {
     let mlp = format!("{lp}.mlp");
     let gate = dense(store, &format!("{mlp}.gate.weight"))?;
@@ -137,7 +154,14 @@ fn load_moe_ffn(
     // decode; the quantized copies above are placeholders for fused routed
     // kernels and their shared contribution is overwritten before blending.
     layer.set_bf16_shared_expert(shared_gate, shared_up, shared_down)?;
+    if unified_moe_layout {
+        layer.transpose_for_prefill_unified(gpu, config)?;
+    }
     Ok(FfnComponent::Moe(layer))
+}
+
+fn unified_moe_layout_enabled(value: Option<&str>) -> bool {
+    value.is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -298,4 +322,19 @@ fn compute_yarn_inv_freq(config: &ModelConfig, gpu: &dyn GpuBackend) -> Result<D
         .context("allocate laguna YaRN table")?;
     gpu.copy_h2d(&bytes, ptr)?;
     Ok(ptr)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::unified_moe_layout_enabled;
+
+    #[test]
+    fn unified_moe_layout_is_explicitly_opt_in() {
+        assert!(unified_moe_layout_enabled(Some("1")));
+        assert!(unified_moe_layout_enabled(Some("true")));
+        assert!(unified_moe_layout_enabled(Some("TRUE")));
+        assert!(!unified_moe_layout_enabled(None));
+        assert!(!unified_moe_layout_enabled(Some("0")));
+        assert!(!unified_moe_layout_enabled(Some("full")));
+    }
 }
