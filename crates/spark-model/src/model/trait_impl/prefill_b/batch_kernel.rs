@@ -41,7 +41,6 @@ mod eligible;
 // Re-exports so `batch_kernel::check_kernel_batched_eligible` (used by
 // `batch_kernel_tests.rs`) and the env-flag predicates resolve unchanged
 // after the eligibility cluster moved into the `eligible` submodule.
-use eligible::first_chunk_batched_enabled;
 pub(in crate::model) use eligible::{check_kernel_batched_eligible, varlen_prefill_enabled};
 
 use crate::layer::{
@@ -129,7 +128,8 @@ impl TransformerModel {
             proc_off: usize,
         }
         let mut per_stream: Vec<PerStreamMeta> = Vec::with_capacity(n);
-        let force_paged_first_chunk = streams[0].chunk_start == 0 && first_chunk_batched_enabled();
+        let force_paged_first_chunk = streams[0].chunk_start == 0
+            && crate::layers::ops::prefill_batched_first_chunk_enabled();
 
         // Tracks MRoPE / paged-flag agreement across streams.
         let mut use_mrope: Option<bool> = None;

@@ -27,6 +27,17 @@ pub fn fp8_blockscaled_prefill_enabled() -> bool {
     )
 }
 
+/// Whether chunk-zero streams may use the paged batched-prefill path.
+///
+/// `ATLAS_PREFILL_CODISPATCH` is the end-to-end request-admission flag;
+/// keep the older Q12 spelling as a compatibility alias for existing recipes.
+pub fn prefill_batched_first_chunk_enabled() -> bool {
+    ["ATLAS_Q12_BATCHED_FIRST_CHUNK", "ATLAS_PREFILL_CODISPATCH"]
+        .iter()
+        .map(|name| std::env::var(name).ok())
+        .any(|value| bool_value_enabled(value.as_deref()))
+}
+
 /// cuBLASLt GEMM path enabled? (`ATLAS_CUBLAS_GEMM=1`), cached. The hand-written
 /// mma.sync projection GEMMs hit only ~30% of the cuBLAS bf16 ceiling on GB10.
 pub fn cublas_gemm_enabled() -> bool {
@@ -59,33 +70,37 @@ pub fn cutlass_nvfp4_gemm_enabled() -> bool {
     *EN.get_or_init(|| std::env::var("ATLAS_CUTLASS_NVFP4_GEMM").ok().as_deref() == Some("1"))
 }
 
-fn cutlass_nvfp4_flag_enabled(name: &str) -> bool {
+fn env_flag_enabled(name: &str) -> bool {
     std::env::var(name).ok().as_deref() == Some("1")
+}
+
+fn bool_value_enabled(value: Option<&str>) -> bool {
+    matches!(value, Some("1")) || value.is_some_and(|value| value.eq_ignore_ascii_case("true"))
 }
 
 /// Native CUTLASS NVFP4 SSM QKVZ path enabled.
 pub fn cutlass_nvfp4_qkvz_enabled() -> bool {
-    cutlass_nvfp4_gemm_enabled() || cutlass_nvfp4_flag_enabled("ATLAS_CUTLASS_NVFP4_QKVZ")
+    cutlass_nvfp4_gemm_enabled() || env_flag_enabled("ATLAS_CUTLASS_NVFP4_QKVZ")
 }
 
 /// Native CUTLASS NVFP4 attention Q/K/V path enabled for the named projection.
 pub fn cutlass_nvfp4_attn_qkv_enabled(label: &str) -> bool {
     cutlass_nvfp4_gemm_enabled()
         || match label {
-            "q_proj" => cutlass_nvfp4_flag_enabled("ATLAS_CUTLASS_NVFP4_ATTN_Q"),
-            "k_proj" | "v_proj" => cutlass_nvfp4_flag_enabled("ATLAS_CUTLASS_NVFP4_ATTN_KV"),
+            "q_proj" => env_flag_enabled("ATLAS_CUTLASS_NVFP4_ATTN_Q"),
+            "k_proj" | "v_proj" => env_flag_enabled("ATLAS_CUTLASS_NVFP4_ATTN_KV"),
             _ => false,
         }
 }
 
 /// Native CUTLASS NVFP4 attention O path enabled.
 pub fn cutlass_nvfp4_attn_o_enabled() -> bool {
-    cutlass_nvfp4_gemm_enabled() || cutlass_nvfp4_flag_enabled("ATLAS_CUTLASS_NVFP4_ATTN_O")
+    cutlass_nvfp4_gemm_enabled() || env_flag_enabled("ATLAS_CUTLASS_NVFP4_ATTN_O")
 }
 
 /// Native CUTLASS NVFP4 SSM out-projection path enabled.
 pub fn cutlass_nvfp4_ssm_out_enabled() -> bool {
-    cutlass_nvfp4_flag_enabled("ATLAS_CUTLASS_NVFP4_SSM_OUT")
+    env_flag_enabled("ATLAS_CUTLASS_NVFP4_SSM_OUT")
 }
 
 pub fn log_cutlass_nvfp4_route(name: &str, m: u32, n: u32, k: u32) {
@@ -121,5 +136,26 @@ pub fn log_gemm_shape(name: &str, m: u32, n: u32, k: u32) {
     if seen.lock().unwrap().insert(key) {
         let flop = 2.0 * m as f64 * n as f64 * k as f64;
         tracing::warn!("GEMM_SHAPE {name} M={m} N={n} K={k} FLOP={flop:.3e}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::bool_value_enabled;
+
+    #[test]
+    fn accepts_boolean_environment_spellings() {
+        assert!(bool_value_enabled(Some("1")));
+        assert!(bool_value_enabled(Some("true")));
+        assert!(bool_value_enabled(Some("TRUE")));
+        assert!(!bool_value_enabled(Some("0")));
+        assert!(!bool_value_enabled(Some("false")));
+        assert!(!bool_value_enabled(None));
+    }
+
+    #[test]
+    fn accepts_the_codispatch_alias_for_chunk_zero() {
+        let enabled = [None, Some("1")].into_iter().any(bool_value_enabled);
+        assert!(enabled);
     }
 }

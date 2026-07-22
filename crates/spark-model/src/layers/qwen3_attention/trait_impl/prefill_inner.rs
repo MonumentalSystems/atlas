@@ -128,10 +128,8 @@ impl Qwen3AttentionLayer {
         // tried and FAILED for large prefill chunks — numerically off + ~7x
         // slower (the kernel's batch dim is not compatible with the co-dispatch
         // stacking at large seq_len). So batched chunk-0 still uses paged.
-        let allow_batched_first_chunk = batched_meta.is_some()
-            && std::env::var("ATLAS_Q12_BATCHED_FIRST_CHUNK")
-                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-                .unwrap_or(false);
+        let allow_batched_first_chunk =
+            batched_meta.is_some() && crate::layers::ops::prefill_batched_first_chunk_enabled();
         if batched_meta.is_some() && seq_len_start == 0 && !allow_batched_first_chunk {
             anyhow::bail!(
                 "prefill_inner: batched mode requires seq_len_start > 0 (paged path); \
