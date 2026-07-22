@@ -422,12 +422,25 @@ impl MoeLayer {
         let num = self.weights.experts.len();
         // Swizzled SFB atom size (bytes): round_up(N,128) * round_up(K/16,4).
         let sfb_len = |n: usize, k: usize| n.div_ceil(128) * 128 * (k / 16).div_ceil(4) * 4;
-        let (gate_scale_dev, up_scale_dev) =
+        // Prefer the Atlas-transposed [K/16,N] scales when they exist. Without
+        // them (a checkpoint served straight from its native tables, e.g.
+        // Laguna with the unified transpose disabled) fall back to the
+        // ORIGINAL [N,K/16] scales and tell the packer to read N-major — the
+        // SFB output is identical, so this avoids materialising a transposed
+        // copy purely to feed the swizzle.
+        let (gate_scale_dev, up_scale_dev, src_n_major) =
             match (self.gate_ptrs_t.as_ref(), self.up_ptrs_t.as_ref()) {
-                (Some(g), Some(u)) => (g.scale_ptrs, u.scale_ptrs),
-                _ => return Ok(()),
+                (Some(g), Some(u)) => (g.scale_ptrs, u.scale_ptrs, false),
+                _ => (self.gate_ptrs.scale_ptrs, self.up_ptrs.scale_ptrs, true),
             };
-        let down_scale_dev = self.down_ptrs_t.as_ref().map(|d| d.scale_ptrs);
+        if gate_scale_dev.is_null() || up_scale_dev.is_null() {
+            return Ok(());
+        }
+        let down_scale_dev = match self.down_ptrs_t.as_ref() {
+            Some(d) => Some(d.scale_ptrs),
+            None if !self.down_ptrs.scale_ptrs.is_null() => Some(self.down_ptrs.scale_ptrs),
+            None => None,
+        };
         let mut owned: Vec<DevicePtr> = Vec::new();
         // Swizzle each expert's [K/16,N] scale into the CUTLASS SFB atom. `n`/`k`
         // are the projection's GEMM dims: gate/up = (inter, hidden); down = (hidden, inter).
@@ -445,7 +458,14 @@ impl MoeLayer {
                     continue; // remote/placeholder expert
                 }
                 let sfb = gpu.alloc(len)?;
-                spark_runtime::cutlass::pack_weight_sfb(sptr, sfb.0, n as u32, k as u32, stream)?;
+                spark_runtime::cutlass::pack_weight_sfb(
+                    sptr,
+                    sfb.0,
+                    n as u32,
+                    k as u32,
+                    src_n_major,
+                    stream,
+                )?;
                 sfb_ptrs[e] = sfb.0;
                 owned.push(sfb);
             }

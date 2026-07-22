@@ -191,10 +191,11 @@ __global__ void pack_act_group(
 // ONLY on N,K (not M), so a single load-time call is valid for all per-group M.
 template <class LayoutSFB_t>
 __global__ void pack_weight_sfb_group(
-    const unsigned char* __restrict__ atlas_scales_t,  // [K/16, N] E4M3
-    unsigned char* __restrict__ cutlass_scales,        // swizzled SFB out
+    const unsigned char* __restrict__ atlas_scales,  // [K/16,N] (K-major) or [N,K/16] (N-major)
+    unsigned char* __restrict__ cutlass_scales,      // swizzled SFB out
     int n,
     int k,
+    int src_n_major,  // 0 = Atlas-transposed [K/16,N]; 1 = checkpoint-native [N,K/16]
     LayoutSFB_t layout_sfb) {
   int col = blockIdx.x;
   int group = blockIdx.y * blockDim.x + threadIdx.x;
@@ -202,7 +203,12 @@ __global__ void pack_weight_sfb_group(
   if (col >= n || group >= groups) {
     return;
   }
-  unsigned char atlas_scale = atlas_scales_t[(unsigned long long)group * n + col];
+  // SFB output layout is unchanged; only the SOURCE indexing differs. N-major
+  // lets a checkpoint that ships [N,K/16] scales (Laguna) build SFB without
+  // materialising an Atlas-transposed copy first.
+  unsigned char atlas_scale =
+      src_n_major ? atlas_scales[(unsigned long long)col * groups + group]
+                  : atlas_scales[(unsigned long long)group * n + col];
   __nv_fp8_e4m3 in;
   *reinterpret_cast<unsigned char*>(&in) = atlas_scale;
   float scale = static_cast<float>(in);
@@ -218,10 +224,11 @@ __global__ void pack_weight_sfb_group(
 // this is a one-time-per-expert call (gated by FAST_MOE_MODE at the Rust layer).
 // ════════════════════════════════════════════════════════════════════════════
 extern "C" int atlas_cutlass_pack_weight_sfb(
-    const void* scale_in,  // [K/16, N] E4M3 (Atlas transposed)
+    const void* scale_in,  // [K/16,N] E4M3 (Atlas transposed) or [N,K/16] when src_n_major
     void* scale_out,       // swizzled SFB (ue4m3)
     int n,
     int k,
+    int src_n_major,
     cudaStream_t stream) {
 #if defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED) || defined(CUTLASS_ARCH_MMA_SM121_SUPPORTED)
   if (n <= 0 || k <= 0 || (k % 16) != 0) {
@@ -237,6 +244,7 @@ extern "C" int atlas_cutlass_pack_weight_sfb(
       static_cast<unsigned char*>(scale_out),
       n,
       k,
+      src_n_major,
       layout_sfb);
   cudaError_t err = cudaGetLastError();
   return err == cudaSuccess ? 0 : -static_cast<int>(err);
@@ -245,6 +253,7 @@ extern "C" int atlas_cutlass_pack_weight_sfb(
   (void)scale_out;
   (void)n;
   (void)k;
+  (void)src_n_major;
   (void)stream;
   return -120;
 #endif
