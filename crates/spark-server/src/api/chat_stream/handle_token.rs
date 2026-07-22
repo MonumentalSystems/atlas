@@ -377,17 +377,9 @@ fn handle_token_inner(state: &mut StreamState, ctx: &StreamCtx, tok: u32) -> Del
 
     // Strip residual think tags from content after thinking is done.
     if state.thinking_done {
-        for tag in &[
-            "</think>",
-            "</thinking>",
-            "<thinking>",
-            "</analysis>",
-            "<analysis>",
-        ] {
-            while let Some(pos) = delta.find(tag) {
-                delta = format!("{}{}", &delta[..pos], delta[pos + tag.len()..].trim_start());
-            }
-        }
+        // SSOT with the blocking path (api/chat_blocking.rs), which had no
+        // equivalent scrub and therefore leaked '</think>' into content.
+        delta = crate::api::strip::scrub_think_markers(&delta);
         // If model re-opens <think>, suppress content from <think> onward.
         if let Some(pos) = delta.find("<think>") {
             delta = delta[..pos].to_string();

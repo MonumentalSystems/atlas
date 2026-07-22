@@ -269,16 +269,26 @@ fn decode_response_text(
             } else {
                 None
             };
-            let content = state
-                .tokenizer
-                .decode(content_tokens)
-                .unwrap_or_default()
-                .trim_start()
-                .to_string();
+            // The split consumes only the FIRST close. Laguna emits the close
+            // more than once (observed: [19, answer, 19, answer] for a question
+            // it declines to reason about), so scrub any survivor — the
+            // streaming path has always done this, the blocking path did not,
+            // which is why stream:false leaked '</think>' into content while
+            // stream:true did not.
+            let content = super::strip::scrub_think_markers(
+                state
+                    .tokenizer
+                    .decode(content_tokens)
+                    .unwrap_or_default()
+                    .trim_start(),
+            );
             return (reasoning, content);
         }
+        // Fallback: no close token found (or thinking disabled, where the
+        // template already closed the block in the PROMPT). Everything is
+        // content — but a stray marker must still not reach the client.
         let text = state.tokenizer.decode(output_tokens).unwrap_or_default();
-        (None, text)
+        (None, super::strip::scrub_think_markers(&text))
     } else {
         let text = state.tokenizer.decode(output_tokens).unwrap_or_default();
         extract_thinking(&text, enable_thinking, state.reasoning_parser.as_deref())
