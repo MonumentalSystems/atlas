@@ -41,12 +41,18 @@ impl MoeLayer {
         // GEMM pass afterwards (`mixed_bf16_shared` below). Every other layout
         // falls back to the per-token loop.
         let mixed_bf16_shared = self.has_mixed_bf16_shared_expert();
-        if mixed_bf16_shared
-            && !(self.use_t_layout_for_decode()
-                && self.moe_expert_gate_up_shared_batch2_t_k.0 != 0
-                && self.moe_expert_silu_down_shared_batch2_t_k.0 != 0
-                && !is_ep)
-        {
+        // Either fused layout serves the mixed config. The originals-layout
+        // kernels are usable only since 37e818ad NULL-guarded their shared
+        // expert (their `_t` siblings always had that guard); before it, this
+        // faulted with CUDA 700 on the first 2-sequence batch.
+        let mixed_t_ok = self.use_t_layout_for_decode()
+            && self.moe_expert_gate_up_shared_batch2_t_k.0 != 0
+            && self.moe_expert_silu_down_shared_batch2_t_k.0 != 0;
+        let mixed_orig_ok = !self.use_t_layout_for_decode()
+            && self.moe_expert_gate_up_shared_batch2.0 != 0
+            && self.moe_expert_silu_down_shared_batch2.0 != 0
+            && !self.gate_ptrs.packed_ptrs.is_null();
+        if mixed_bf16_shared && !((mixed_t_ok || mixed_orig_ok) && !is_ep) {
             return self.forward_batched(input, 2, ctx, stream);
         }
 
@@ -416,7 +422,8 @@ impl MoeLayer {
                 stream,
             )?;
         } else {
-            // NVFP4 batch2 path
+            // NVFP4 batch2 path (originals layout)
+            let null_shared = QuantizedWeight::null();
             let batch2_block = if ctx.config.hidden_size >= 3072 {
                 256u32
             } else {
@@ -435,9 +442,17 @@ impl MoeLayer {
                 self.up_ptrs.scale2_vals,
                 expert_up_out,
                 indices_dev,
-                &self.weights.shared_expert.gate_proj,
+                if mixed_bf16_shared {
+                    &null_shared
+                } else {
+                    &self.weights.shared_expert.gate_proj
+                },
                 shared_gate_scratch,
-                &self.weights.shared_expert.up_proj,
+                if mixed_bf16_shared {
+                    &null_shared
+                } else {
+                    &self.weights.shared_expert.up_proj
+                },
                 shared_up_scratch,
                 inter,
                 h,
@@ -457,7 +472,11 @@ impl MoeLayer {
                 indices_dev,
                 shared_gate_scratch,
                 shared_up_scratch,
-                &self.weights.shared_expert.down_proj,
+                if mixed_bf16_shared {
+                    &null_shared
+                } else {
+                    &self.weights.shared_expert.down_proj
+                },
                 shared_down_out,
                 h,
                 inter,
@@ -465,6 +484,22 @@ impl MoeLayer {
                 batch2_block,
                 stream,
             )?;
+            // Mixed config: one batched BF16 shared-expert pass for both tokens,
+            // replacing the placeholder the kernel was told (via NULL) to skip.
+            if mixed_bf16_shared {
+                let shared_inter = ctx.config.shared_expert_intermediate_size as u32;
+                self.run_bf16_shared_expert(
+                    input,
+                    2,
+                    h,
+                    shared_inter,
+                    shared_gate_scratch,
+                    shared_up_scratch,
+                    shared_down_out,
+                    ctx,
+                    stream,
+                )?;
+            }
             // EP fix: after silu_down, expert_gate_out is free — use as zero buffer
             let shared_for_blend = if is_ep && !shared_down_out.is_null() {
                 ctx.gpu
