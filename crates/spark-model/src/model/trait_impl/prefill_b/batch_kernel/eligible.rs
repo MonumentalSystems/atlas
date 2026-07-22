@@ -13,37 +13,13 @@
 
 use super::super::super::super::types::TransformerModel;
 use crate::traits::PrefillSlice;
+use spark_runtime::prefix_cache::PrefixMatch;
 
 impl TransformerModel {
     /// Returns true when the batched-kernel path is viable for these
     /// streams. Cheap upfront check — caller (dispatch) falls back to
     /// per-stream when false.
     pub(in crate::model) fn kernel_batched_eligible(&self, streams: &[PrefillSlice<'_>]) -> bool {
-        // Fix #4 (mixed-length cache + co-dispatch silent failure): when the
-        // prefix cache is active a co-dispatched batch can contain streams with
-        // DIFFERENT cache-hit depths (the first arrival recomputes →
-        // effective_seq_len_start=0; later arrivals restore the just-saved
-        // snapshot → effective_seq_len_start>0). The kernel-batched PHASE A
-        // mutates each stream IN ORDER (snapshot restore into the SSM pool slot,
-        // KV block alloc, kv_valid_tokens/seq_len) BEFORE it discovers the
-        // effective_seq_len_start mismatch and bails Err — leaving streams
-        // 0..b partially mutated. The dispatch then re-runs the per-stream loop
-        // on those dirty seqs (double snapshot-restore / double block-alloc),
-        // and any surfaced Err drops ALL streams in the scheduler
-        // (run_batched_prefill.rs: every stream marked failed → client sees a
-        // connection reset, server survives). Route cache-possible batches
-        // STRAIGHT to the per-stream loop (batch.rs:199) on pristine seqs — that
-        // loop is structurally equivalent to the proven single-stream cache path
-        // (prefill_chunk_dispatch) and already handles hits correctly, with
-        // per-stream logits rows (fix #1). NoPrefixCaching::is_active()==false,
-        // so no-cache co-dispatch (the +35% PHASE-C scaling) and the cold path
-        // stay byte-identical — the gate only fires when a real radix cache holds
-        // refs. Trade: cold requests under active caching lose kernel-batched
-        // co-dispatch, but with caching on most requests hit and a hit's
-        // processed suffix is tiny, so the co-dispatch scaling is moot.
-        if self.prefix_cache.is_active() {
-            return false;
-        }
         let varlen = varlen_prefill_enabled();
         check_kernel_batched_eligible(
             streams
@@ -61,6 +37,37 @@ impl TransformerModel {
             varlen,
         )
     }
+}
+
+/// Whether reserved prefix matches can share one stacked attention forward.
+///
+/// This is deliberately narrower than the single-stream prefix-cache path.
+/// A batched cache hit is admitted only when every request has identical
+/// processing geometry and needs neither an SSM restore nor disk-cache work.
+/// The caller owns the reservation/rollback protocol; this predicate is pure
+/// so the safety envelope remains unit-testable.
+pub(in crate::model) fn cache_batch_matches_compatible(
+    matches: &[PrefixMatch],
+    chunk_len: usize,
+) -> bool {
+    let Some(first) = matches.first() else {
+        return false;
+    };
+    let matched = first.matched_tokens;
+    // Full-chunk hits use the single-token logits/early-return special cases;
+    // keep those on the established sequential path in v1.
+    if matched >= chunk_len {
+        return false;
+    }
+    matches.iter().all(|m| {
+        m.matched_tokens == matched
+            && m.matched_blocks.len() == first.matched_blocks.len()
+            && m.matched_disk_block_ids.is_empty()
+            && m.ssm_snapshot.is_none()
+            && m.ssm_snapshot_tokens == 0
+            && m.ssm_snapshot_tier_key.is_none()
+            && m.ssm_snapshot_tier_tokens == 0
+    })
 }
 
 impl TransformerModel {

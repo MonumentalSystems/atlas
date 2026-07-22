@@ -4,7 +4,9 @@
 //! `batch_kernel.rs`. Kept in a sibling file to keep `batch_kernel.rs`
 //! itself under the 500-LoC file-size-cap.
 
-use super::batch_kernel::check_kernel_batched_eligible;
+use spark_runtime::prefix_cache::PrefixMatch;
+
+use super::batch_kernel::{cache_batch_matches_compatible, check_kernel_batched_eligible};
 
 /// (chunk_len, chunk_start, is_last_chunk)
 fn s(chunk_len: usize, chunk_start: usize, is_last: bool) -> (usize, usize, bool) {
@@ -17,6 +19,60 @@ fn s(chunk_len: usize, chunk_start: usize, is_last: bool) -> (usize, usize, bool
 const BIG_SCRATCH: usize = 8 * 1024 * 1024;
 const TOP_K: usize = 8;
 const MROPE: bool = false;
+
+fn cache_match(tokens: usize) -> PrefixMatch {
+    PrefixMatch {
+        matched_blocks: vec![7; tokens / 16],
+        matched_disk_block_ids: Vec::new(),
+        matched_tokens: tokens,
+        ssm_snapshot: None,
+        ssm_snapshot_tokens: 0,
+        ssm_snapshot_tier_key: None,
+        ssm_snapshot_tier_tokens: 0,
+    }
+}
+
+#[test]
+fn cache_batch_accepts_equal_partial_hits() {
+    assert!(cache_batch_matches_compatible(
+        &[cache_match(48), cache_match(48)],
+        8192,
+    ));
+}
+
+#[test]
+fn cache_batch_rejects_mixed_hit_depths() {
+    assert!(!cache_batch_matches_compatible(
+        &[cache_match(0), cache_match(48)],
+        8192,
+    ));
+}
+
+#[test]
+fn cache_batch_rejects_snapshot_or_disk_restore() {
+    let mut snapshot = cache_match(48);
+    snapshot.ssm_snapshot = Some(3);
+    snapshot.ssm_snapshot_tokens = 48;
+    assert!(!cache_batch_matches_compatible(
+        &[cache_match(48), snapshot],
+        8192,
+    ));
+
+    let mut disk = cache_match(48);
+    disk.matched_disk_block_ids = vec![9; 3];
+    assert!(!cache_batch_matches_compatible(
+        &[cache_match(48), disk],
+        8192,
+    ));
+}
+
+#[test]
+fn cache_batch_rejects_full_chunk_hit() {
+    assert!(!cache_batch_matches_compatible(
+        &[cache_match(8192), cache_match(8192)],
+        8192,
+    ));
+}
 
 #[test]
 fn rejects_under_two_streams() {

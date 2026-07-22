@@ -41,12 +41,19 @@ mod eligible;
 // Re-exports so `batch_kernel::check_kernel_batched_eligible` (used by
 // `batch_kernel_tests.rs`) and the env-flag predicates resolve unchanged
 // after the eligibility cluster moved into the `eligible` submodule.
-pub(in crate::model) use eligible::{check_kernel_batched_eligible, varlen_prefill_enabled};
+pub(in crate::model) use eligible::{
+    cache_batch_matches_compatible, check_kernel_batched_eligible, varlen_prefill_enabled,
+};
 
 use crate::layer::{
     BatchedAttnMetadata, ForwardContext, GdnPrefillBuffers, LayerState, TransformerLayer,
 };
 use crate::traits::{Model, PrefillSlice, SequenceState};
+
+pub(in crate::model) enum KernelBatchResult {
+    Completed(Vec<DevicePtr>),
+    NotAdmitted,
+}
 
 impl TransformerModel {
     /// Q12 Path B: full kernel-batched prefill orchestration.
@@ -59,7 +66,7 @@ impl TransformerModel {
         &self,
         streams: &mut [PrefillSlice<'_>],
         stream: u64,
-    ) -> Result<Vec<DevicePtr>> {
+    ) -> Result<KernelBatchResult> {
         let n = streams.len();
         let chunk_len = streams[0].chunk_len;
         let is_last_chunk = streams[0].is_last_chunk;
@@ -95,6 +102,16 @@ impl TransformerModel {
 
         // Lock KV cache once.
         let mut kv_cache = self.kv_cache.lock();
+
+        // Cache admission happens while every sequence is pristine. A rejected
+        // plan has released its exact radix references and may safely take the
+        // established per-stream path. Once admitted, Phase A consumes these
+        // reservations instead of walking the cache again.
+        let reserved_prefix_matches =
+            match self.prefill_b_reserve_batched_prefix_matches(streams, kv_cache.block_size()) {
+                Some(matches) => matches,
+                None => return Ok(KernelBatchResult::NotAdmitted),
+            };
 
         // Zero shared buffers once (instead of N times in per-stream).
         if self.comm.is_some() {
@@ -166,7 +183,13 @@ impl TransformerModel {
             let hidden_b = hidden_base.offset(proc_off_b * h * dtype_bytes);
             self.prefill_b_embed_chunk_at(tokens, chunk_start, cl, hidden_b, stream)?;
 
-            // Prefix-cache lookup, EP-sync, Marconi restore.
+            // Prefix-cache lookup, EP-sync, Marconi restore. Cache-admitted
+            // batches consume their preflight reservation exactly once.
+            let reserved_match = if self.prefix_cache.is_active() && chunk_start == 0 {
+                Some(reserved_prefix_matches[b].clone())
+            } else {
+                None
+            };
             let (kv_write_start, marconi_skip) = self.prefill_b_prefix_lookup(
                 tokens,
                 seq,
@@ -174,6 +197,7 @@ impl TransformerModel {
                 total,
                 &mut kv_cache,
                 stream,
+                reserved_match,
             )?;
 
             // Block allocation through end of chunk.
@@ -489,7 +513,7 @@ impl TransformerModel {
             logits_out.push(logits);
         }
 
-        Ok(logits_out)
+        Ok(KernelBatchResult::Completed(logits_out))
     }
 }
 

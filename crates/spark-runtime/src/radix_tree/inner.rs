@@ -246,13 +246,19 @@ impl RadixTreeInner {
         }
     }
 
-    /// Decrement ref_count on all nodes along the matched path.
-    pub(super) fn dec_refs(&mut self, tokens: &[u32], block_size: usize, adapter_id: u64) {
+    /// Decrement ref_count on up to `matched_tokens` along the matched path.
+    pub(super) fn dec_refs(
+        &mut self,
+        tokens: &[u32],
+        block_size: usize,
+        matched_tokens: usize,
+        adapter_id: u64,
+    ) {
         let mut current = match self.root_for_read(adapter_id) {
             Some(r) => r,
             None => return,
         };
-        let num_full_blocks = tokens.len() / block_size;
+        let num_full_blocks = (matched_tokens / block_size).min(tokens.len() / block_size);
 
         for i in 0..num_full_blocks {
             let chunk = &tokens[i * block_size..(i + 1) * block_size];

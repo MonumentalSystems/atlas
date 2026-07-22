@@ -265,6 +265,21 @@ pub trait PrefixCache: Send + Sync {
     /// Task #24: `adapter_id` must match the one used at `lookup`/`insert`.
     fn release(&self, tokens: &[u32], block_size: usize, adapter_id: u64);
 
+    /// Release exactly the block-aligned prefix acquired by one `lookup`.
+    ///
+    /// Batched-prefill admission may acquire several candidates, then reject
+    /// the batch before any sequence owns their blocks. Releasing the full
+    /// token slice in that case would be racy: another request could insert a
+    /// longer matching suffix between acquisition and rollback. Implementors
+    /// must therefore decrement no more than `matched_tokens`.
+    fn release_matched(
+        &self,
+        tokens: &[u32],
+        block_size: usize,
+        matched_tokens: usize,
+        adapter_id: u64,
+    );
+
     /// Evict up to `num_blocks` cached blocks, returning their physical
     /// indices and parallel disk-block IDs (Phase 6.1.e).
     ///
@@ -382,6 +397,15 @@ impl PrefixCache for NoPrefixCaching {
     }
 
     fn release(&self, _tokens: &[u32], _block_size: usize, _adapter_id: u64) {}
+
+    fn release_matched(
+        &self,
+        _tokens: &[u32],
+        _block_size: usize,
+        _matched_tokens: usize,
+        _adapter_id: u64,
+    ) {
+    }
 
     fn evict(&self, _num_blocks: usize) -> EvictedBlocks {
         EvictedBlocks::default()
