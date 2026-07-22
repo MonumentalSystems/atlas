@@ -886,6 +886,7 @@ pub(crate) async fn serve(mut args: cli::ServeArgs) -> Result<()> {
             b
         },
         disable_thinking: args.disable_thinking,
+        suppress_tool_system_prompt: args.suppress_tool_system_prompt,
         default_thinking: args
             .default_chat_template_kwargs
             .as_deref()

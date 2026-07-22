@@ -19,7 +19,8 @@
 FROM nvidia/cuda:13.0.0-devel-ubuntu24.04 AS builder
 
 RUN apt-get update -qq && \
-    apt-get install -y -qq curl build-essential pkg-config git cmake libclang-dev && \
+    apt-get install -y -qq curl build-essential pkg-config git cmake libclang-dev \
+      libibverbs-dev librdmacm-dev && \
     rm -rf /var/lib/apt/lists/*
 
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
@@ -31,12 +32,13 @@ WORKDIR /build
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY crates/ crates/
 COPY kernels/ kernels/
+COPY vendor/ vendor/
 
 ENV ATLAS_TARGET_HW=gb10
 ENV ATLAS_TARGET_MODEL=qwen3.6-35b-a3b
 ENV ATLAS_TARGET_QUANT=nvfp4
 
-RUN cargo build --release -p spark-server
+RUN cargo build --release -p spark-server --no-default-features --features cuda
 
 # ── Runtime stage ────────────────────────────────────────────────
 FROM nvidia/cuda:13.0.0-runtime-ubuntu24.04

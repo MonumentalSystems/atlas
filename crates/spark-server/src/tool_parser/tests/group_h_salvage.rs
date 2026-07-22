@@ -231,3 +231,62 @@ fn legit_close_prefix_content_not_split() {
         "the close tag is </parameter followed by text"
     );
 }
+
+// ────────────────────────────────────────────────────────────────────────
+// Bare-JSON open-brace salvage (2026-07-21). Grammar-forced tool_choice=required
+// decode on Nemotron-H-Puzzle-75B (bare_json parser) drops the leading `{` of
+// the forced `{"name":"…","arguments":{…}}` object — verified via
+// ATLAS_LOG_TOOL_RAW the pre-parse text is `"name":"…","arguments":{…}}`.
+// parse_tool_calls (blocking) and parse_bare_function_calls (streaming finalize)
+// prepend the missing brace when the trimmed text begins exactly with `"name":"`.
+// ────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn bare_json_missing_open_brace_recovered() {
+    let text = r#""name":"write_file","arguments":{"path":"test.txt","content":"Hello, world!"}}"#;
+    let (_content, calls) = parse_tool_calls(text);
+    assert_eq!(calls.len(), 1, "dropped-brace bare-json call not recovered");
+    assert_eq!(calls[0].function.name, "write_file");
+    let args: serde_json::Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
+    assert_eq!(args["path"], "test.txt");
+    assert_eq!(args["content"], "Hello, world!");
+}
+
+#[test]
+fn bare_json_missing_open_brace_recovered_with_leading_ws() {
+    // A leading newline/space before the dropped-brace body is still salvaged.
+    let text = "\n  \"name\":\"get_weather\",\"arguments\":{\"city\":\"Paris\"}}";
+    let (_content, calls) = parse_tool_calls(text);
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].function.name, "get_weather");
+}
+
+#[test]
+fn bare_json_salvage_does_not_fire_on_prose() {
+    // Prose that merely mentions "name" must NOT be salvaged into a tool call.
+    let text = r#"The "name" field is required in the JSON schema."#;
+    let (_content, calls) = parse_tool_calls(text);
+    assert!(calls.is_empty(), "salvage wrongly fired on prose");
+}
+
+#[test]
+fn bare_json_normal_braced_call_still_parses() {
+    // A correctly-braced call is unaffected by the salvage path.
+    let text = r#"{"name":"write_file","arguments":{"path":"a.txt","content":"x"}}"#;
+    let (_content, calls) = parse_tool_calls(text);
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].function.name, "write_file");
+}
+
+#[test]
+fn bare_json_missing_open_brace_and_quote_recovered() {
+    // Variant observed on Puzzle-75B: the decoder dropped BOTH `{` and the
+    // following `"`, so the raw text begins `name":"…`.
+    let text = r#"name":"write_file","arguments":{"path":"t.txt","content":"hi"}}"#;
+    let (_content, calls) = parse_tool_calls(text);
+    assert_eq!(calls.len(), 1, "missing {{\" bare-json call not recovered");
+    assert_eq!(calls[0].function.name, "write_file");
+    let args: serde_json::Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
+    assert_eq!(args["path"], "t.txt");
+    assert_eq!(args["content"], "hi");
+}

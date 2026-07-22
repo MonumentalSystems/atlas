@@ -71,6 +71,27 @@ pub fn parse_tool_calls(text: &str) -> (Option<String>, Vec<ToolCall>) {
     } else {
         text
     };
+
+    // Bare-JSON open-brace salvage. Under grammar-forced `tool_choice=required`
+    // decoding, some models (observed: nvidia Nemotron-H-Puzzle-75B, bare_json
+    // parser) drop the leading `{` of the forced `{"name":"…","arguments":{…}}`
+    // object — the raw pre-parse text arrives as `"name":"…","arguments":{…}}`
+    // (confirmed via ATLAS_LOG_TOOL_RAW). The `{"name"` scanners below then miss
+    // it entirely and the call is mis-emitted as assistant content. If the whole
+    // trimmed output begins EXACTLY with the brace-dropped tag prefix `"name":"`,
+    // prepend the missing `{` so the normal balanced-brace scan recovers the
+    // call. The guard is deliberately exact (only a message that starts with a
+    // bare `"name":"` — never natural prose or a legitimately-braced call) so it
+    // can never mis-salvage real content.
+    let brace_fixed: String;
+    let text: &str = match recover_braceless_bare_json(text) {
+        Some(fixed) => {
+            brace_fixed = fixed;
+            brace_fixed.as_str()
+        }
+        None => text,
+    };
+
     let mut calls = Vec::new();
     let mut content_parts = Vec::new();
     let mut rest = text;

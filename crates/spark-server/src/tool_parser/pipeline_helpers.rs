@@ -7,7 +7,48 @@ use super::*;
 /// Models sometimes output tool calls without the `<tool_call>` wrapper,
 /// especially at lower quantization levels. This catches those cases.
 pub(super) fn parse_bare_function_calls(text: &str) -> (Option<String>, Vec<ToolCall>) {
+    // Bare-JSON open-brace salvage at the streaming-finalize path (see
+    // `recover_braceless_bare_json`). Same fix as `parse_dispatch::parse_tool_calls`.
+    let salvaged: String;
+    let text: &str = match recover_braceless_bare_json(text) {
+        Some(fixed) => {
+            salvaged = fixed;
+            salvaged.as_str()
+        }
+        None => text,
+    };
     ToolCallPipeline::bare_function_default().run(text)
+}
+
+/// Reconstruct a bare-JSON tool call whose leading structural bytes were dropped
+/// by the decoder.
+///
+/// Grammar-forced `tool_choice=required` decoding on some models (observed:
+/// nvidia Nemotron-H-Puzzle-75B, a thinking model + bare_json parser) drops the
+/// leading `{` — and sometimes the following `"` — of the forced
+/// `{"name":"…","arguments":{…}}` object. The raw pre-parse text (confirmed via
+/// `ATLAS_LOG_TOOL_RAW`) arrives as `"name":"…","arguments":{…}}` (missing `{`)
+/// or `name":"…","arguments":{…}}` (missing `{"`), so the `{"name"` scanners miss
+/// it and the call is mis-emitted as assistant content. When the whole trimmed
+/// message begins EXACTLY with one of those brace-dropped tag prefixes, prepend
+/// the missing bytes so the normal balanced-brace scan recovers the call. The
+/// guards are exact (a message that starts with a bare `"name":"` / `name":"`,
+/// never natural prose or an already-braced call) so this can never mis-salvage
+/// real content. Returns `None` when no reconstruction applies.
+pub(super) fn recover_braceless_bare_json(text: &str) -> Option<String> {
+    let trimmed = text.trim_start();
+    if trimmed.starts_with('{') {
+        return None; // already has an open brace — normal path handles it
+    }
+    if let Some(rest) = trimmed.strip_prefix("\"name\":\"") {
+        // Missing only the leading `{`.
+        Some(format!("{{\"name\":\"{rest}"))
+    } else if let Some(rest) = trimmed.strip_prefix("name\":\"") {
+        // Missing the leading `{"`.
+        Some(format!("{{\"name\":\"{rest}"))
+    } else {
+        None
+    }
 }
 
 // ── JSON fallback tool call parser ──

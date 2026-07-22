@@ -45,7 +45,15 @@ pub(crate) fn prepare_chat_prompt(
     // don't make assumptions"), which the GDN model needs to correctly
     // DECLINE on irrelevance prompts. With it (and compact tool-JSON)
     // hallucination returns to ~96 (vs 30/64 without).
-    if tools_active && let Some(ref parser) = state.tool_call_parser {
+    // Suppress the parser system-prompt injection for models whose OWN chat
+    // template already renders the tool list + call-format (e.g.
+    // nemotron_h_puzzle): injecting on top gives the model two competing
+    // tool-format guidances → it rambles/declines instead of emitting a call.
+    // vLLM injects nothing and relies on the template alone; this matches it.
+    if tools_active
+        && !state.suppress_tool_system_prompt
+        && let Some(ref parser) = state.tool_call_parser
+    {
         let default_choice = crate::tool_parser::ToolChoice::Mode("auto".to_string());
         let tool_choice = req.tool_choice.as_ref().unwrap_or(&default_choice);
         let tool_prompt = parser.system_prompt(&req.tools, tool_choice);

@@ -154,6 +154,29 @@ pub(super) fn handle_done(
         }
     }
 
+    // ── Streaming bare-JSON salvage fallback ────────────────────────
+    // If tools were active but the incremental detector emitted ZERO tool
+    // calls, re-parse the full accumulated content. This catches the case
+    // where a decoder-dropped leading `{` (grammar-forced tool_choice=required
+    // on Nemotron-H-Puzzle-75B — see `recover_braceless_bare_json`) made the
+    // call stream out as content: `safe_emit_len` doesn't hold a braceless
+    // bare-JSON start, so the incremental detector never classified it and the
+    // finalize buffer was already drained. `parse_tool_calls` applies the brace
+    // salvage; any recovered call is emitted now so the client still dispatches
+    // it. Content already streamed is left as-is (the client prefers tool_calls).
+    if state.detector.is_some()
+        && state.tool_calls_emitted_count == 0
+        && !state.content_decoded.trim().is_empty()
+    {
+        let (_content, mut calls) = tool_parser::parse_tool_calls(&state.content_decoded);
+        if !calls.is_empty() {
+            tool_parser::backfill_required_params(&mut calls, &ctx.tool_defs_for_backfill);
+            for (i, mut tc) in calls.into_iter().enumerate() {
+                handle_complete_tool_call(state, ctx, &mut tc, i, &mut deltas);
+            }
+        }
+    }
+
     // ── Sanitizer tail flush ────────────────────────────────────────
     let tail = flush_content_sanitizer(
         &mut state.tag_scan_buf,
