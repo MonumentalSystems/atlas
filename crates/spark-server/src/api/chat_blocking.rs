@@ -284,11 +284,24 @@ fn decode_response_text(
             );
             return (reasoning, content);
         }
-        // Fallback: no close token found (or thinking disabled, where the
-        // template already closed the block in the PROMPT). Everything is
-        // content — but a stray marker must still not reach the client.
+        // Fallback: the exact close TOKEN was not found. That does not mean
+        // the model never closed — it routinely spells the close as ordinary
+        // BPE tokens instead of id 19, because the scheduler masks id 19:
+        // PostCloseThinkMask pins logits[19] = -inf once think_ended is set,
+        // and MidWordThinkEndMask masks it at ~93% of thinking positions. Both
+        // push probability mass onto the text spelling ["</", "think", ">"],
+        // which decodes byte-identically and is invisible to every `== 19`
+        // comparison in the stack.
+        //
+        // So fall back to the STRING-level reasoning parser rather than
+        // dumping everything into content. It is configured for this model and
+        // was previously unreachable here (the `else` below only runs when
+        // think_end_token_id is None), and it handles the unterminated case by
+        // routing the chain of thought to reasoning instead of content.
         let text = state.tokenizer.decode(output_tokens).unwrap_or_default();
-        (None, super::strip::scrub_think_markers(&text))
+        let (reasoning, content) =
+            extract_thinking(&text, enable_thinking, state.reasoning_parser.as_deref());
+        (reasoning, super::strip::scrub_think_markers(&content))
     } else {
         let text = state.tokenizer.decode(output_tokens).unwrap_or_default();
         extract_thinking(&text, enable_thinking, state.reasoning_parser.as_deref())
