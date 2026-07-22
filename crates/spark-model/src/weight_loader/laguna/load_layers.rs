@@ -164,6 +164,15 @@ fn load_moe_ffn(
     if unified_moe_layout {
         layer.transpose_for_prefill_unified(gpu, config)?;
     }
+    // Native NVFP4 CUTLASS grouped MoE (ATLAS_HOLO_MOE_GROUPED_CUTLASS=1).
+    // The routed grouped GEMMs are ~47% of Laguna's C=1 prefill GPU time and
+    // otherwise run on the w4a16 kernels, which LUT-dequant NVFP4 to FP8 per
+    // tile. The SFB swizzle is built from whichever scale tables exist —
+    // transposed [K/16,N] under the unified layout, else the checkpoint's own
+    // [N,K/16] via the src_n_major packer path.
+    if cutlass_grouped_moe_enabled() {
+        layer.build_cutlass_grouped_sfb(gpu, config, gpu.default_stream())?;
+    }
     Ok(FfnComponent::Moe(layer))
 }
 
@@ -350,6 +359,16 @@ fn compute_yarn_inv_freq(config: &ModelConfig, gpu: &dyn GpuBackend) -> Result<D
 ///
 /// Computed in f64 and narrowed once, so the stored values are at least as
 /// accurate as the kernel's own FP64 `pow` followed by an f32 store.
+/// Build the CUTLASS grouped-NVFP4 SFB tables at load
+/// (`ATLAS_HOLO_MOE_GROUPED_CUTLASS=1`). Costs ~7.1 GB of device memory for
+/// Laguna (256 experts x 47 layers x 3 projections), so it is opt-in.
+fn cutlass_grouped_moe_enabled() -> bool {
+    matches!(
+        std::env::var("ATLAS_HOLO_MOE_GROUPED_CUTLASS").as_deref(),
+        Ok("1") | Ok("true")
+    )
+}
+
 fn compute_plain_inv_freq(theta: f64, dim: usize, gpu: &dyn GpuBackend) -> Result<DevicePtr> {
     let bytes = (0..dim / 2)
         .map(|j| (1.0f64 / theta.powf((2 * j) as f64 / dim as f64)) as f32)
