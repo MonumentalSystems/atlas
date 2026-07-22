@@ -104,3 +104,17 @@ pub(crate) fn split_ref_seqs(num_seqs: u32) -> u32 {
         .unwrap_or(num_seqs)
         .max(num_seqs)
 }
+
+/// Host-time accumulator for the FFN/MoE half of prefill layers
+/// (`ATLAS_PREFILL_HOST_TIMING=1`). Summed across layers and read+reset once
+/// per prefill by the layer loop, so the attention half can be derived as
+/// loop_wall - ffn.
+pub static FFN_HOST_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn add_ffn_host_us(us: u64) {
+    FFN_HOST_US.fetch_add(us, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn take_ffn_host_us() -> u64 {
+    FFN_HOST_US.swap(0, std::sync::atomic::Ordering::Relaxed)
+}

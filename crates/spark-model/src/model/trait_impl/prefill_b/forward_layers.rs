@@ -292,6 +292,7 @@ impl TransformerModel {
         }
         if let Some(t) = t_loop {
             let wall = t.elapsed();
+            let ffn_us = crate::layers::qwen3_attention::take_ffn_host_us();
             // loop_wall is the host's own elapsed time across the whole layer
             // dispatch. `in_prefill` is time inside layer.prefill() itself,
             // `dflash` is the per-layer DFlash capture (expected ~0 for models
@@ -299,13 +300,14 @@ impl TransformerModel {
             // bookkeeping. Compare loop_wall against nsys GPU-busy time: the
             // difference is host work not overlapped with the device.
             tracing::info!(
-                "PREFILL HOST TIMING layers={} tokens={}: loop_wall={:.1}ms in_prefill={:.1}ms dflash={:.1}ms other={:.1}ms",
+                "PREFILL HOST TIMING layers={} tokens={}: loop_wall={:.1}ms in_prefill={:.1}ms ffn={:.1}ms attn_rest={:.1}ms dflash={:.1}ms",
                 self.layers.len(),
                 proc_count,
                 wall.as_secs_f64() * 1e3,
                 t_in_prefill.as_secs_f64() * 1e3,
+                ffn_us as f64 / 1e3,
+                (t_in_prefill.as_micros() as f64 - ffn_us as f64) / 1e3,
                 t_dflash.as_secs_f64() * 1e3,
-                (wall - t_in_prefill - t_dflash).as_secs_f64() * 1e3,
             );
         }
 

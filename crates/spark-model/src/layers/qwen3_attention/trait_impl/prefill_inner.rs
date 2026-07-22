@@ -306,9 +306,17 @@ impl Qwen3AttentionLayer {
             )?;
         }
 
+        // HOST-TIME split (ATLAS_PREFILL_HOST_TIMING=1): isolate the FFN/MoE
+        // half of this layer from the attention half. No synchronize — see
+        // prefill_b/forward_layers.rs for why.
+        let t_ffn = (std::env::var("ATLAS_PREFILL_HOST_TIMING").as_deref() == Ok("1"))
+            .then(std::time::Instant::now);
         self.ffn
             .forward_prefill(ctx.buffers.norm_output(), num_tokens, ctx, stream)
             .map_err(|e| anyhow::anyhow!("ffn.forward_prefill failed: {e}"))?;
+        if let Some(t) = t_ffn {
+            crate::layers::qwen3_attention::add_ffn_host_us(t.elapsed().as_micros() as u64);
+        }
 
         let dense_out = ctx.buffers.moe_output();
         // ATLAS_OP_DUMP hook: MoE output (sum of all weighted expert outputs).
