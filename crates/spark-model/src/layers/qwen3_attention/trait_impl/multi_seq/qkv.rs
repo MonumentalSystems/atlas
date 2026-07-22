@@ -15,9 +15,10 @@ use super::ctx::MultiSeqCtx;
 use crate::layers::ops;
 use crate::layers::qwen3_attention::Qwen3AttentionLayer;
 
-/// Kill-switch for the batched dense-BF16 q/k/v path. Read ONCE (never per
-/// layer per step) so it cannot vary across CUDA-graph replays.
-fn bf16_batchm_enabled() -> bool {
+/// Kill-switch for the batched dense-BF16 decode projections (q/k/v here, and
+/// o_proj in `attn.rs`). Read ONCE (never per layer per step) so it cannot vary
+/// across CUDA-graph replays.
+pub(super) fn bf16_batchm_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("ATLAS_BF16_QKV_BATCHM").ok().as_deref() != Some("0"))
 }

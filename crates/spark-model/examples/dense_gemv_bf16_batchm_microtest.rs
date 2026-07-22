@@ -25,8 +25,13 @@ use spark_runtime::cuda_backend::AtlasCudaBackend;
 use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 use spark_runtime::kernel_args::{KernelLaunch, div_ceil};
 
-const K: usize = 3072;
-const SHAPES: &[(usize, &str)] = &[(9216, "q_proj"), (3072, "o_proj"), (1024, "k/v/shared")];
+/// (N, K, label) at the REAL decode shapes. o_proj is N=h=3072, K=nq*hd=9216 —
+/// the same weight bytes as q_proj, not the 3072x3072 it looks like.
+const SHAPES: &[(usize, usize, &str)] = &[
+    (9216, 3072, "q_proj"),
+    (3072, 9216, "o_proj"),
+    (1024, 3072, "k/v/shared"),
+];
 const MS: &[usize] = &[1, 2, 4];
 const ITERS: usize = 50;
 const WARMUP: usize = 10;
@@ -67,6 +72,7 @@ fn launch_m1(
     b: DevicePtr,
     c: DevicePtr,
     n: usize,
+    k_dim: usize,
 ) -> Result<()> {
     KernelLaunch::new(g, kern)
         .grid([div_ceil(n as u32, 4), 1, 1])
@@ -75,7 +81,7 @@ fn launch_m1(
         .arg_ptr(b)
         .arg_ptr(c)
         .arg_u32(n as u32)
-        .arg_u32(K as u32)
+        .arg_u32(k_dim as u32)
         .launch(0)
 }
 
@@ -88,6 +94,7 @@ fn launch_batchm(
     c: DevicePtr,
     m: usize,
     n: usize,
+    k_dim: usize,
     out_stride: usize,
 ) -> Result<()> {
     KernelLaunch::new(g, kern)
@@ -98,7 +105,7 @@ fn launch_batchm(
         .arg_ptr(c)
         .arg_u32(m as u32)
         .arg_u32(n as u32)
-        .arg_u32(K as u32)
+        .arg_u32(k_dim as u32)
         .arg_u32(out_stride as u32)
         .launch(0)
 }
@@ -117,12 +124,12 @@ fn main() -> Result<()> {
         "shape", "M", "N", "Mx M=1 (ms)", "batchm (ms)", "speedup", "bit-identical"
     );
 
-    for &(n, label) in SHAPES {
-        let w: Vec<bf16> = (0..n * K).map(|_| bf16::from_f32(rng.r())).collect();
+    for &(n, k_dim, label) in SHAPES {
+        let w: Vec<bf16> = (0..n * k_dim).map(|_| bf16::from_f32(rng.r())).collect();
         let wd = up_bf16(g, &w)?;
 
         for &m in MS {
-            let a: Vec<bf16> = (0..m * K).map(|_| bf16::from_f32(rng.r())).collect();
+            let a: Vec<bf16> = (0..m * k_dim).map(|_| bf16::from_f32(rng.r())).collect();
             let ad = up_bf16(g, &a)?;
             let c_ref = g.alloc(m * n * 2)?;
             let c_bat = g.alloc(m * n * 2)?;
@@ -132,13 +139,14 @@ fn main() -> Result<()> {
                 launch_m1(
                     g,
                     m1_k,
-                    ad.offset(t * K * 2),
+                    ad.offset(t * k_dim * 2),
                     wd,
                     c_ref.offset(t * n * 2),
                     n,
+                    k_dim,
                 )?;
             }
-            launch_batchm(g, bm_k, ad, wd, c_bat, m, n, n)?;
+            launch_batchm(g, bm_k, ad, wd, c_bat, m, n, k_dim, n)?;
             g.synchronize(0)?;
 
             let r = dn_bits(g, c_ref, m * n)?;
@@ -152,16 +160,16 @@ fn main() -> Result<()> {
             // ---- speed ----
             for _ in 0..WARMUP {
                 for t in 0..m {
-                    launch_m1(g, m1_k, ad.offset(t * K * 2), wd, c_ref.offset(t * n * 2), n)?;
+                    launch_m1(g, m1_k, ad.offset(t * k_dim * 2), wd, c_ref.offset(t * n * 2), n, k_dim)?;
                 }
-                launch_batchm(g, bm_k, ad, wd, c_bat, m, n, n)?;
+                launch_batchm(g, bm_k, ad, wd, c_bat, m, n, k_dim, n)?;
             }
             g.synchronize(0)?;
 
             let t0 = std::time::Instant::now();
             for _ in 0..ITERS {
                 for t in 0..m {
-                    launch_m1(g, m1_k, ad.offset(t * K * 2), wd, c_ref.offset(t * n * 2), n)?;
+                    launch_m1(g, m1_k, ad.offset(t * k_dim * 2), wd, c_ref.offset(t * n * 2), n, k_dim)?;
                 }
             }
             g.synchronize(0)?;
@@ -169,7 +177,7 @@ fn main() -> Result<()> {
 
             let t1 = std::time::Instant::now();
             for _ in 0..ITERS {
-                launch_batchm(g, bm_k, ad, wd, c_bat, m, n, n)?;
+                launch_batchm(g, bm_k, ad, wd, c_bat, m, n, k_dim, n)?;
             }
             g.synchronize(0)?;
             let t_bat = t1.elapsed().as_secs_f64() * 1e3 / ITERS as f64;

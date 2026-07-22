@@ -294,17 +294,41 @@ impl Qwen3AttentionLayer {
             // attn_out is contiguous [n, q_dim] and o_out is [n, h], so a single
             // batched GEMM reads the BF16 o_proj weight ONCE for all n sequences
             // instead of once per sequence (per-seq dense_gemv re-read it N×).
-            ops::dense_gemm(
-                fwd.gpu,
-                self.dense_gemm_k,
-                attn_out,
-                o_bf16,
-                o_out,
-                n as u32,
-                h as u32,
-                nq * hd,
-                stream,
-            )?;
+            //
+            // At small n the batched GEMV beats dense_gemm: dense_gemm's grid is
+            // [ceil(N/16), ceil(M/16)] with a 16-row tile, so M<=8 wastes >=50%
+            // of every tile and it is a scalar FFMA kernel (~89 GB/s measured)
+            // against a ~274 GB/s streaming GEMV. o_proj is N=h=3072, K=nq*hd,
+            // i.e. the same weight bytes as q_proj -- worth the branch.
+            if (2..=8).contains(&n)
+                && self.dense_gemv_batchm_k.0 != 0
+                && super::qkv::bf16_batchm_enabled()
+            {
+                ops::dense_gemv_batchm(
+                    fwd.gpu,
+                    self.dense_gemv_batchm_k,
+                    attn_out,
+                    o_bf16,
+                    o_out,
+                    n as u32,
+                    h as u32,
+                    nq * hd,
+                    h as u32, // o_out rows are h BF16 elements apart
+                    stream,
+                )?;
+            } else {
+                ops::dense_gemm(
+                    fwd.gpu,
+                    self.dense_gemm_k,
+                    attn_out,
+                    o_bf16,
+                    o_out,
+                    n as u32,
+                    h as u32,
+                    nq * hd,
+                    stream,
+                )?;
+            }
         } else if let Some(o_fp8) = self.o_weight.as_ref().and_then(|w| w.as_fp8()) {
             // FP8 native: per-token w8a16_gemv for O projection.
             for i in 0..n {
