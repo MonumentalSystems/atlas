@@ -16,10 +16,9 @@ fn pairwise_moe_decode_enabled() -> bool {
     *ON.get_or_init(|| std::env::var("ATLAS_MOE_PAIRWISE_DECODE").as_deref() != Ok("0"))
 }
 
-/// Route decode MoE (n >= min) through the grouped read-once GEMM
-/// (forward_prefill) instead of the pairwise per-slot loop. Default OFF while
-/// A/B'ing the "grouped is a net loss at small batch" claim. Min default 4:
-/// n=2 is already ~optimal on pairwise (one forward_k2), the win is at n>=4.
+/// Route batched decode MoE (n >= min) through the grouped read-once GEMM
+/// (forward_prefill) instead of the pairwise per-slot loop. Default OFF.
+/// Min default 2: one consistent grouped path for every batched decode size.
 fn grouped_routed_decode_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
@@ -32,7 +31,7 @@ fn grouped_routed_decode_min() -> usize {
         std::env::var("ATLAS_MOE_GROUPED_ROUTED_DECODE_MIN")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(4)
+            .unwrap_or(2)
     })
 }
 
@@ -74,7 +73,15 @@ impl Qwen3AttentionLayer {
         // without depending on the buggy batched-MoE kernels. Fixing the
         // batched-MoE kernel is tracked separately (out of #84 scope).
         let force_seq_ffn = self.mla.is_some();
-        if n == 3 && !force_seq_ffn {
+        // Grouped read-once MoE decode: when enabled and eligible, ALL batched
+        // decode (n >= min, default 2) goes through the single grouped branch
+        // below instead of the n==2/n==3/pairwise special cases. One consistent
+        // path for every batch size.
+        let use_grouped = !force_seq_ffn
+            && n >= grouped_routed_decode_min()
+            && grouped_routed_decode_enabled()
+            && self.ffn.moe_grouped_decode_ok();
+        if !use_grouped && n == 3 && !force_seq_ffn {
             let normed2 = fwd.buffers.norm_output();
             ops::residual_add_rms_norm(
                 fwd.gpu,
@@ -99,7 +106,7 @@ impl Qwen3AttentionLayer {
                 (3 * h) as u32,
                 stream,
             )?;
-        } else if n == 2 && !force_seq_ffn {
+        } else if !use_grouped && n == 2 && !force_seq_ffn {
             let normed2 = fwd.buffers.norm_output();
             ops::residual_add_rms_norm(
                 fwd.gpu,
@@ -159,11 +166,7 @@ impl Qwen3AttentionLayer {
                 (n * h) as u32,
                 stream,
             )?;
-        } else if !force_seq_ffn
-            && n >= grouped_routed_decode_min()
-            && grouped_routed_decode_enabled()
-            && self.ffn.moe_grouped_decode_ok()
-        {
+        } else if use_grouped {
             // GROUPED READ-ONCE MoE DECODE (A/B, default off). The pairwise
             // branch below issues 4*top_k per-slot CTAs at n=4, each re-reading
             // an expert weight for one token; forward_prefill sorts by expert
