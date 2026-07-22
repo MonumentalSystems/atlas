@@ -181,6 +181,16 @@ impl MoeLayer {
                 h,
                 stream,
             )?;
+        } else if ops::cublas_gemm_enabled() && n > 1 {
+            ops::cublas_bf16_proj_dense(
+                router_in,
+                self.weights.gate.weight,
+                gate_logits,
+                n,
+                num_experts,
+                h,
+                stream,
+            )?;
         } else {
             ops::dense_gemm_prefill(
                 ctx.gpu,

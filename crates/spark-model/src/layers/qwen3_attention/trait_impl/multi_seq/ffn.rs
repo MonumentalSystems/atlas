@@ -9,6 +9,13 @@ use super::ctx::MultiSeqCtx;
 use crate::layers::ops;
 use crate::layers::qwen3_attention::Qwen3AttentionLayer;
 
+/// Kill-switch for the pairwise batched MoE decode path (`ATLAS_MOE_PAIRWISE_DECODE=0`).
+fn pairwise_moe_decode_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ATLAS_MOE_PAIRWISE_DECODE").as_deref() != Ok("0"))
+}
+
 impl Qwen3AttentionLayer {
     pub(super) fn ms_phase_ffn(&self, c: &MultiSeqCtx<'_>, o_out: DevicePtr) -> Result<()> {
         let MultiSeqCtx {
@@ -132,6 +139,41 @@ impl Qwen3AttentionLayer {
                 (n * h) as u32,
                 stream,
             )?;
+        } else if !force_seq_ffn && n > 2 && n % 2 == 0 && pairwise_moe_decode_enabled() {
+            // BATCHED MoE DECODE (n = 4/8 after padding). The per-token loop
+            // below re-reads every routed expert weight once per token; the
+            // fused batch2 kernels process a token PAIR in 5 launches. Walk the
+            // batch two tokens at a time and consume moe_output before the next
+            // pair overwrites it. Falls back inside forward_k2 for layouts that
+            // have no fused batch2 path, which is still no worse than per-token
+            // (the gate GEMM is batched there too).
+            let normed2 = fwd.buffers.norm_output();
+            ops::residual_add_rms_norm(
+                fwd.gpu,
+                self.residual_add_rms_norm_k,
+                hidden,
+                o_out,
+                &self.post_attn_norm,
+                normed2,
+                residual,
+                n as u32,
+                h as u32,
+                eps,
+                stream,
+            )?;
+            for pair in 0..(n / 2) {
+                let off = pair * 2 * h;
+                self.ffn
+                    .forward_k2(normed2.offset(off * bf16), fwd, stream)?;
+                ops::residual_add(
+                    fwd.gpu,
+                    self.residual_add_k,
+                    hidden.offset(off * 2),
+                    fwd.buffers.moe_output(),
+                    (2 * h) as u32,
+                    stream,
+                )?;
+            }
         } else {
             // force_seq_ffn (MLA / batched-MoE-unsafe): per-token sequential.
             // CONCURRENT-DECODE BUG (sibling of qwen3_ssm.rs:1102 fix):

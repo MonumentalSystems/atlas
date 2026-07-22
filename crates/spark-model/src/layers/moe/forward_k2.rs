@@ -34,7 +34,19 @@ impl MoeLayer {
         if self.bf16_gate_weight_ptrs.is_some() && !use_bf16_batch2 {
             return self.forward_batched(input, 2, ctx, stream);
         }
-        if self.has_mixed_bf16_shared_expert() {
+        // Mixed NVFP4-routed / BF16-shared (Laguna): the fused batch2 kernels
+        // cannot compute a BF16 shared expert alongside NVFP4 routed weights.
+        // Under the transposed unified layout we still batch the routed half
+        // through the _t kernels and run the shared expert as one batched BF16
+        // GEMM pass afterwards (`mixed_bf16_shared` below). Every other layout
+        // falls back to the per-token loop.
+        let mixed_bf16_shared = self.has_mixed_bf16_shared_expert();
+        if mixed_bf16_shared
+            && !(self.use_t_layout_for_decode()
+                && self.moe_expert_gate_up_shared_batch2_t_k.0 != 0
+                && self.moe_expert_silu_down_shared_batch2_t_k.0 != 0
+                && !is_ep)
+        {
             return self.forward_batched(input, 2, ctx, stream);
         }
 
@@ -308,9 +320,19 @@ impl MoeLayer {
                 .as_ref()
                 .expect("down_ptrs_t under unified_t");
             let null_qw = QuantizedWeight::null();
-            let sh_gate_t = self.shared_gate_t.as_ref().unwrap_or(&null_qw);
-            let sh_up_t = self.shared_up_t.as_ref().unwrap_or(&null_qw);
-            let sh_down_t = self.shared_down_t.as_ref().unwrap_or(&null_qw);
+            // Mixed config: force the in-kernel shared expert off (NULL weights
+            // → the kernel skips it) and compute it in BF16 below instead. The
+            // NVFP4 shared_*_t tables are load-time placeholders whose values
+            // would be numerically wrong for this checkpoint.
+            let (sh_gate_t, sh_up_t, sh_down_t) = if mixed_bf16_shared {
+                (&null_qw, &null_qw, &null_qw)
+            } else {
+                (
+                    self.shared_gate_t.as_ref().unwrap_or(&null_qw),
+                    self.shared_up_t.as_ref().unwrap_or(&null_qw),
+                    self.shared_down_t.as_ref().unwrap_or(&null_qw),
+                )
+            };
             ops::moe_expert_gate_up_shared_batch2_t(
                 ctx.gpu,
                 self.moe_expert_gate_up_shared_batch2_t_k,
@@ -350,6 +372,47 @@ impl MoeLayer {
                 h,
                 inter,
                 top_k,
+                stream,
+            )?;
+            // Mixed config: one batched BF16 shared-expert pass for both tokens
+            // (3 GEMMs + silu_mul total, vs 4 launches per token in the
+            // per-token fallback). Must run after silu_down_t, which owns the
+            // shared scratch buffers for the non-mixed case.
+            if mixed_bf16_shared {
+                let shared_inter = ctx.config.shared_expert_intermediate_size as u32;
+                self.run_bf16_shared_expert(
+                    input,
+                    2,
+                    h,
+                    shared_inter,
+                    shared_gate_scratch,
+                    shared_up_scratch,
+                    shared_down_out,
+                    ctx,
+                    stream,
+                )?;
+            }
+            // The _t branch previously returned without writing moe_output at
+            // all — every sibling branch ends in this blend.
+            let shared_for_blend = if is_ep && !shared_down_out.is_null() {
+                ctx.gpu
+                    .memset_async(expert_gate_out, 0, 2 * h as usize * 2, stream)?;
+                expert_gate_out
+            } else {
+                shared_down_out
+            };
+            ops::moe_weighted_sum_blend_batch2(
+                ctx.gpu,
+                self.moe_weighted_sum_blend_batch2,
+                output,
+                expert_down_out,
+                weights_dev,
+                shared_for_blend,
+                input,
+                self.weights.shared_expert_gate.weight,
+                h,
+                top_k,
+                h,
                 stream,
             )?;
         } else {
