@@ -267,6 +267,31 @@ fn accepts_n_4_uniform() {
 }
 
 #[test]
+fn accepts_varlen_batch_when_packed_footprint_fits() {
+    // Regression: the old preflight charged all four requests at 4,782 tokens
+    // (19,128 tokens) instead of their packed cu_seqlens total (13,649). The
+    // standard 16,388-token arena is deliberately provisioned for this
+    // workload, so the oversized estimate silently serialized realistic
+    // agentic/RAG traffic.
+    let streams = [
+        s(2051, 0, true),
+        s(2953, 0, true),
+        s(3863, 0, true),
+        s(4782, 0, true),
+    ];
+    let arena: usize = 16_388;
+    let scratch = spark_runtime::buffers::q12_batched_scratch_bytes(
+        spark_runtime::buffers::Q12_SIZING_STREAMS,
+        arena.div_ceil(spark_runtime::buffers::Q12_SIZING_STREAMS),
+        TOP_K,
+        MROPE,
+    );
+    assert!(check_kernel_batched_eligible(
+        streams, 4, arena, "laguna", 128, scratch, TOP_K, MROPE, true, true,
+    ));
+}
+
+#[test]
 fn rejects_scratch_footprint_overflow() {
     // #110 regression lock: the staging footprint must fit in scratch even
     // when the token-arena check passes. The deterministic crash repro was

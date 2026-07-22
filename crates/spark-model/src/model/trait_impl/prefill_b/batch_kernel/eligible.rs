@@ -193,5 +193,16 @@ where
     // per-stream path from a clean state (a mid-dispatch overrun would leave
     // streams dirty and the fallback would re-run setup → corruption).
     // VARLEN: size the scratch pre-flight by the worst-case per-stream length.
-    spark_runtime::buffers::q12_batched_scratch_bytes(n, max_chunk_len, top_k, mrope) <= scratch_cap
+    let scratch_needed = if varlen {
+        spark_runtime::buffers::q12_batched_scratch_bytes_varlen(
+            n,
+            total,
+            max_chunk_len,
+            top_k,
+            mrope,
+        )
+    } else {
+        spark_runtime::buffers::q12_batched_scratch_bytes(n, max_chunk_len, top_k, mrope)
+    };
+    scratch_needed <= scratch_cap
 }

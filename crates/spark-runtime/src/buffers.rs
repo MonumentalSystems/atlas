@@ -13,7 +13,9 @@ mod accessors;
 mod sizes;
 mod sizes_q12;
 pub use sizes::BufferSizes;
-pub use sizes_q12::{Q12_SIZING_STREAMS, q12_batched_scratch_bytes};
+pub use sizes_q12::{
+    Q12_SIZING_STREAMS, q12_batched_scratch_bytes, q12_batched_scratch_bytes_varlen,
+};
 
 /// Pre-allocated GPU buffers for a single forward pass.
 ///
