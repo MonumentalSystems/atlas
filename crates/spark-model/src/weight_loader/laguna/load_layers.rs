@@ -34,6 +34,12 @@ pub(super) fn load_layers(
     let quantize_k = gpu.kernel("quantize_nvfp4", "quantize_bf16_to_nvfp4")?;
     let stream = gpu.default_stream();
     let yarn_inv_freq = compute_yarn_inv_freq(config, gpu)?;
+    // Sliding layers: theta=10000 over the full head_dim, no YaRN ramp.
+    let sliding_inv_freq = if sliding_rope_table_enabled() {
+        compute_plain_inv_freq(10_000.0, config.head_dim, gpu)?
+    } else {
+        DevicePtr::NULL
+    };
     let unified_moe_layout =
         unified_moe_layout_enabled(std::env::var("ATLAS_UNIFIED_MOE_LAYOUT").ok().as_deref());
     if unified_moe_layout {
@@ -71,6 +77,7 @@ pub(super) fn load_layers(
             ffn,
             layer_kv_dtypes[i],
             yarn_inv_freq,
+            sliding_inv_freq,
             i,
         )?;
         layers.push(Box::new(layer));
@@ -175,6 +182,7 @@ fn load_attention(
     ffn: FfnComponent,
     kv_dtype: KvCacheDtype,
     yarn_inv_freq: DevicePtr,
+    sliding_inv_freq: DevicePtr,
     i: usize,
 ) -> Result<Qwen3AttentionLayer> {
     let p = format!("{lp}.self_attn");
@@ -240,6 +248,10 @@ fn load_attention(
         LayerType::SlidingAttention => {
             layer.set_sliding_window(Some(config.sliding_window));
             layer.set_rope_overrides(10_000.0, config.head_dim as u32);
+            if !sliding_inv_freq.is_null() {
+                // attention_factor = 1.0 => cos/sin unscaled, i.e. plain RoPE.
+                layer.set_yarn_rope(sliding_inv_freq, 1.0);
+            }
         }
         LayerType::FullAttention => {
             layer.set_sliding_window(None);
@@ -322,6 +334,38 @@ fn compute_yarn_inv_freq(config: &ModelConfig, gpu: &dyn GpuBackend) -> Result<D
         .context("allocate laguna YaRN table")?;
     gpu.copy_h2d(&bytes, ptr)?;
     Ok(ptr)
+}
+
+/// Precomputed plain RoPE inv_freq table for the sliding-attention layers.
+///
+/// Those layers use theta=10000 over the full head_dim with no YaRN ramp, and
+/// the default rope kernel recomputes `1/theta^(2j/dim)` on the GPU with an
+/// FP64 `pow` per pair index per block (kernels/gb10/common/rope.cu). For
+/// Laguna's sliding layers rotary_dim == head_dim == 128, so a block covers
+/// only 2 positions and pays 64 doubles to produce them — measured at 6.3% of
+/// C=1 prefill GPU time. The table-based `rope_yarn_scaled` kernel is already
+/// wired for this model (it serves the full-attention YaRN layers); feeding it
+/// a plain table with attention_factor = 1.0 is the same math without the
+/// per-block transcendentals.
+///
+/// Computed in f64 and narrowed once, so the stored values are at least as
+/// accurate as the kernel's own FP64 `pow` followed by an f32 store.
+fn compute_plain_inv_freq(theta: f64, dim: usize, gpu: &dyn GpuBackend) -> Result<DevicePtr> {
+    let bytes = (0..dim / 2)
+        .map(|j| (1.0f64 / theta.powf((2 * j) as f64 / dim as f64)) as f32)
+        .flat_map(|v| v.to_le_bytes())
+        .collect::<Vec<_>>();
+    let ptr = gpu
+        .alloc(bytes.len())
+        .context("allocate laguna sliding-layer RoPE table")?;
+    gpu.copy_h2d(&bytes, ptr)?;
+    Ok(ptr)
+}
+
+/// Opt out of the precomputed sliding-layer RoPE table with
+/// `ATLAS_LAGUNA_ROPE_TABLE=0` (falls back to the on-the-fly rope kernel).
+fn sliding_rope_table_enabled() -> bool {
+    std::env::var("ATLAS_LAGUNA_ROPE_TABLE").as_deref() != Ok("0")
 }
 
 #[cfg(test)]
