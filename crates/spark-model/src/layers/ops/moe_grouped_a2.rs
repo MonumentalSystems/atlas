@@ -162,6 +162,10 @@ pub fn moe_batched_blend(
 /// (the C entry indexes offsets/scale2 on the host and needs the pointer values),
 /// syncs the stream so they are valid, then dispatches the single grouped launch.
 #[allow(clippy::too_many_arguments)]
+/// Returns the host copy of `expert_offsets` so the paired `down` call can
+/// reuse it instead of repeating the D2H + synchronize. The two calls share the
+/// same offsets (both are driven by one `moe_sort_by_expert`), and each sync
+/// blocks the host until the GPU drains — halving them halves that stall.
 pub fn moe_grouped_gate_up_cutlass(
     gpu: &dyn GpuBackend,
     a: DevicePtr,
@@ -179,7 +183,7 @@ pub fn moe_grouped_gate_up_cutlass(
     inter: u32,
     hidden: u32,
     stream: u64,
-) -> Result<()> {
+) -> Result<Vec<i32>> {
     // Static after load — snapshot once, not once per layer per prefill.
     let gate_packed_h = cached_u64(gpu, gate_packed, num_experts, stream)?;
     let gate_sfb_h = cached_u64(gpu, gate_sfb, num_experts, stream)?;
@@ -213,7 +217,8 @@ pub fn moe_grouped_gate_up_cutlass(
         inter,
         hidden,
         stream,
-    )
+    )?;
+    Ok(eoff)
 }
 
 /// Single-launch CUTLASS grouped NVFP4 DOWN projection. `a` is the post-SiLU
@@ -225,6 +230,10 @@ pub fn moe_grouped_gate_up_cutlass(
 #[allow(clippy::too_many_arguments)]
 pub fn moe_grouped_down_cutlass(
     gpu: &dyn GpuBackend,
+    // Host `expert_offsets` from the paired gate_up call. When supplied, the
+    // D2H + synchronize here is skipped entirely — the offsets are identical
+    // (one sort feeds both projections).
+    eoff_cached: Option<&[i32]>,
     a: DevicePtr,
     packed: DevicePtr,
     sfb: DevicePtr,
@@ -240,15 +249,19 @@ pub fn moe_grouped_down_cutlass(
     let packed_h = cached_u64(gpu, packed, num_experts, stream)?;
     let sfb_h = cached_u64(gpu, sfb, num_experts, stream)?;
     let scale2_h = cached_f32(gpu, scale2, num_experts, stream)?;
-    // Only the offsets are produced per call (by the expert sort), so this is
-    // the only copy that still has to be waited on.
-    let mut off_raw = vec![0u8; (num_experts + 1) * 4];
-    gpu.copy_d2h_on_stream(expert_offsets, &mut off_raw, stream)?;
-    gpu.synchronize(stream)?;
-    let eoff: Vec<i32> = off_raw
-        .chunks_exact(4)
-        .map(|c| i32::from_le_bytes(c.try_into().expect("4")))
-        .collect();
+    // Offsets come from the paired gate_up when available; otherwise fetch them
+    // (D2H + the sync that blocks the host until the GPU drains).
+    let eoff: Vec<i32> = if let Some(e) = eoff_cached {
+        e.to_vec()
+    } else {
+        let mut off_raw = vec![0u8; (num_experts + 1) * 4];
+        gpu.copy_d2h_on_stream(expert_offsets, &mut off_raw, stream)?;
+        gpu.synchronize(stream)?;
+        off_raw
+            .chunks_exact(4)
+            .map(|c| i32::from_le_bytes(c.try_into().expect("4")))
+            .collect()
+    };
     spark_runtime::cutlass::nvfp4_grouped_down(
         a.0, &packed_h, &sfb_h, &scale2_h, c.0, &eoff, hidden, inter, stream,
     )

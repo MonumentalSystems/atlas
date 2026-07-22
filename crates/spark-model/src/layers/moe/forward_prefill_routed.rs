@@ -124,6 +124,9 @@ impl MoeLayer {
             ctx.gpu
                 .memset_async(ctx.buffers.expert_down_out(), 0, down_bytes, stream)?;
         }
+        // Host expert_offsets from the CUTLASS gate_up, reused by down to skip
+        // a second D2H + host-blocking synchronize.
+        let mut cutlass_eoff: Option<Vec<i32>> = None;
         if max_m_tiles > 0 {
             // CUTLASS grouped NVFP4 gate_up reads the ORIGINAL [N,K/2] tables
             // (CUTLASS B is ColumnMajor = K-contiguous), NOT the Atlas
@@ -145,7 +148,7 @@ impl MoeLayer {
                 // expert_input + sorted_token_ids directly, no separate permute pass.
                 // Writes C_gate/C_up in the sorted layout so silu+down+unpermute are
                 // unchanged.
-                ops::moe_grouped_gate_up_cutlass(
+                cutlass_eoff = Some(ops::moe_grouped_gate_up_cutlass(
                     ctx.gpu,
                     expert_input,
                     sorted_token_ids,
@@ -162,7 +165,7 @@ impl MoeLayer {
                     inter,
                     h,
                     stream,
-                )?;
+                )?);
             } else if let (Some(gp), Some(up)) = (&self.gate_ptrs_t, &self.up_ptrs_t) {
                 if self.experts_scale_kind == crate::weight_map::WeightQuantFormat::Mxfp4E8m0 {
                     // ── ARM-2 Phase-K: native-MXFP4 (E8M0) fused gate_up ──
@@ -353,6 +356,7 @@ impl MoeLayer {
                 // expert_down_out in the sorted layout (unpermute downstream unchanged).
                 ops::moe_grouped_down_cutlass(
                     ctx.gpu,
+                    cutlass_eoff.as_deref(),
                     expert_gate_out,
                     self.down_ptrs.packed_ptrs,
                     self.down_sfb_cutlass.expect("down sfb checked above"),
