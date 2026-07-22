@@ -152,6 +152,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "atlas-power"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "atlas-quant"
 version = "0.1.0"
 dependencies = [
@@ -2170,6 +2179,7 @@ dependencies = [
  "anyhow",
  "atlas-core",
  "atlas-kernels",
+ "atlas-power",
  "axum",
  "clap",
  "futures",

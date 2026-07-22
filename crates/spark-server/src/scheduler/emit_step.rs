@@ -4,6 +4,19 @@
 
 use super::*;
 
+/// Bump the monotonic generated-token counter that power attribution samples
+/// for its work-weighted concurrency share. No-op (compiles away) unless the
+/// `power_attribution` feature is on, so the decode hot loop is untouched
+/// otherwise. Called once per emitted token.
+#[cfg(feature = "power_attribution")]
+#[inline(always)]
+fn count_generated_token() {
+    crate::metrics::GENERATED_TOKENS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+#[cfg(not(feature = "power_attribution"))]
+#[inline(always)]
+fn count_generated_token() {}
+
 /// Emit a token for an active sequence (stream + bookkeeping).
 ///
 /// Per OpenAI spec, stop/EOS tokens are NOT streamed to the client —
@@ -53,6 +66,7 @@ pub fn emit_token(a: &mut ActiveSeq, tok: u32, logprobs: Option<crate::api::Toke
         // The streamed-text path strips stop tokens server-side, so the
         // client never sees the literal `<|im_start|>` bytes.
         a.output_tokens.push(tok);
+        count_generated_token();
         a.finished = true;
         tracing::debug!(
             "<|im_start|> hard-stop fired (id={ims}); ending turn before grammar/suppress_eos"
@@ -68,6 +82,7 @@ pub fn emit_token(a: &mut ActiveSeq, tok: u32, logprobs: Option<crate::api::Toke
         && tok == trs
     {
         a.output_tokens.push(tok);
+        count_generated_token();
         a.finished = true;
         tracing::debug!("<tool_response> hard-stop fired (id={trs}); ending turn");
         return;
@@ -176,6 +191,7 @@ pub fn emit_token(a: &mut ActiveSeq, tok: u32, logprobs: Option<crate::api::Toke
     }
 
     a.output_tokens.push(tok);
+    count_generated_token();
 
     // Spec-resume guard bookkeeping: count tokens emitted after `</think>`.
     // The `</think>` token itself is not counted (think_ended is still false
@@ -492,6 +508,7 @@ pub(crate) fn emit_grammar_close(a: &mut ActiveSeq) {
     for tok in close {
         let tok = tok as u32;
         a.output_tokens.push(tok);
+        count_generated_token();
         if !send_stream_event(a, StreamEvent::Token(tok)) {
             break;
         }

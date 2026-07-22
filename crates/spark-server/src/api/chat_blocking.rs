@@ -523,5 +523,8 @@ fn finalize_response(
         created: crate::ids::unix_timestamp(),
         choices: all_choices,
         usage,
+        // Populated (when enabled + requested) by the public handler after
+        // this returns; see `chat::chat_completions`.
+        power: None,
     }))
 }

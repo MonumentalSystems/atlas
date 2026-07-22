@@ -8,6 +8,15 @@ use prometheus::{
     register_int_counter_vec, register_int_gauge,
 };
 
+/// Monotonic count of tokens generated across ALL sequences, incremented once
+/// per emitted token in the decode loop. Unlike `GENERATION_TOKENS_TOTAL`
+/// (a Prometheus counter bumped once per request at completion), this steps
+/// smoothly as work happens, so power attribution can sample it at a request
+/// window's start/end to get each request's share of concurrent work.
+/// Feature-gated so non-`power_attribution` builds never touch the hot loop.
+#[cfg(feature = "power_attribution")]
+pub static GENERATED_TOKENS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 lazy_static! {
     pub static ref REQUESTS_TOTAL: IntCounter =
         register_int_counter!("atlas_requests_total", "Total requests processed").unwrap();

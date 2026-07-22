@@ -10,6 +10,7 @@ members = [
     "crates/atlas-kernels",
     "crates/atlas-tier",
     "crates/atlas-rdma",
+    "crates/atlas-power",
     "crates/spark-runtime",
     "crates/spark-comm",
     "crates/spark-model",
@@ -90,6 +91,7 @@ atlas-reduce = { path = "crates/atlas-reduce" }
 atlas-kernels = { path = "crates/atlas-kernels" }
 atlas-tier = { path = "crates/atlas-tier" }
 atlas-rdma = { path = "crates/atlas-rdma" }
+atlas-power = { path = "crates/atlas-power" }
 
 # W7: the `[patch.crates-io] xgrammar-rs` entry was removed — Atlas now
 # depends on the pure-Rust `crates/xgrammar` crate directly (no FFI,
