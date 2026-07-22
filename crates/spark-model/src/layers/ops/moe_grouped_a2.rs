@@ -20,6 +20,53 @@ use super::*;
 /// and token_to_perm (reverse map for unpermute).
 ///
 /// Grid: (1, 1, 1)  Block: (256, 1, 1)
+
+/// Host snapshots of per-expert pointer/scale arrays, keyed by device pointer.
+///
+/// The CUTLASS grouped entry needs these on the HOST to build its per-group
+/// problem shapes, so each call used to D2H six arrays that are IMMUTABLE after
+/// `build_cutlass_grouped_sfb` — 6 copies x 2 calls x 47 MoE layers = 564
+/// pointless transfers per prefill. Only `expert_offsets` genuinely changes per
+/// call (it is produced by the sort), so only that one still needs a copy and
+/// the synchronize that waits for it.
+fn cached_u64(gpu: &dyn GpuBackend, p: DevicePtr, n: usize, stream: u64) -> Result<Vec<u64>> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<HashMap<u64, Vec<u64>>>> = OnceLock::new();
+    let c = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(v) = c.lock().unwrap().get(&p.0) {
+        return Ok(v.clone());
+    }
+    let mut raw = vec![0u8; n * 8];
+    gpu.copy_d2h_on_stream(p, &mut raw, stream)?;
+    gpu.synchronize(stream)?;
+    let v: Vec<u64> = raw
+        .chunks_exact(8)
+        .map(|x| u64::from_le_bytes([x[0], x[1], x[2], x[3], x[4], x[5], x[6], x[7]]))
+        .collect();
+    c.lock().unwrap().insert(p.0, v.clone());
+    Ok(v)
+}
+
+fn cached_f32(gpu: &dyn GpuBackend, p: DevicePtr, n: usize, stream: u64) -> Result<Vec<f32>> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<HashMap<u64, Vec<f32>>>> = OnceLock::new();
+    let c = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(v) = c.lock().unwrap().get(&p.0) {
+        return Ok(v.clone());
+    }
+    let mut raw = vec![0u8; n * 4];
+    gpu.copy_d2h_on_stream(p, &mut raw, stream)?;
+    gpu.synchronize(stream)?;
+    let v: Vec<f32> = raw
+        .chunks_exact(4)
+        .map(|x| f32::from_le_bytes([x[0], x[1], x[2], x[3]]))
+        .collect();
+    c.lock().unwrap().insert(p.0, v.clone());
+    Ok(v)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn moe_sort_by_expert(
     gpu: &dyn GpuBackend,
@@ -133,29 +180,13 @@ pub fn moe_grouped_gate_up_cutlass(
     hidden: u32,
     stream: u64,
 ) -> Result<()> {
-    let read_u64 = |p: DevicePtr| -> Result<Vec<u64>> {
-        let mut raw = vec![0u8; num_experts * 8];
-        gpu.copy_d2h_on_stream(p, &mut raw, stream)?;
-        Ok(raw
-            .chunks_exact(8)
-            .map(|c| u64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]))
-            .collect())
-    };
-    let read_f32 = |p: DevicePtr| -> Result<Vec<f32>> {
-        let mut raw = vec![0u8; num_experts * 4];
-        gpu.copy_d2h_on_stream(p, &mut raw, stream)?;
-        Ok(raw
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect())
-    };
-
-    let gate_packed_h = read_u64(gate_packed)?;
-    let gate_sfb_h = read_u64(gate_sfb)?;
-    let up_packed_h = read_u64(up_packed)?;
-    let up_sfb_h = read_u64(up_sfb)?;
-    let gate_scale2_h = read_f32(gate_scale2)?;
-    let up_scale2_h = read_f32(up_scale2)?;
+    // Static after load — snapshot once, not once per layer per prefill.
+    let gate_packed_h = cached_u64(gpu, gate_packed, num_experts, stream)?;
+    let gate_sfb_h = cached_u64(gpu, gate_sfb, num_experts, stream)?;
+    let up_packed_h = cached_u64(gpu, up_packed, num_experts, stream)?;
+    let up_sfb_h = cached_u64(gpu, up_sfb, num_experts, stream)?;
+    let gate_scale2_h = cached_f32(gpu, gate_scale2, num_experts, stream)?;
+    let up_scale2_h = cached_f32(gpu, up_scale2, num_experts, stream)?;
 
     let mut off_raw = vec![0u8; (num_experts + 1) * 4];
     gpu.copy_d2h_on_stream(expert_offsets, &mut off_raw, stream)?;
@@ -205,27 +236,15 @@ pub fn moe_grouped_down_cutlass(
     inter: u32,
     stream: u64,
 ) -> Result<()> {
-    let mut praw = vec![0u8; num_experts * 8];
-    gpu.copy_d2h_on_stream(packed, &mut praw, stream)?;
-    let mut sraw = vec![0u8; num_experts * 8];
-    gpu.copy_d2h_on_stream(sfb, &mut sraw, stream)?;
-    let mut s2raw = vec![0u8; num_experts * 4];
-    gpu.copy_d2h_on_stream(scale2, &mut s2raw, stream)?;
+    // Static after load — see cached_u64/cached_f32.
+    let packed_h = cached_u64(gpu, packed, num_experts, stream)?;
+    let sfb_h = cached_u64(gpu, sfb, num_experts, stream)?;
+    let scale2_h = cached_f32(gpu, scale2, num_experts, stream)?;
+    // Only the offsets are produced per call (by the expert sort), so this is
+    // the only copy that still has to be waited on.
     let mut off_raw = vec![0u8; (num_experts + 1) * 4];
     gpu.copy_d2h_on_stream(expert_offsets, &mut off_raw, stream)?;
     gpu.synchronize(stream)?;
-    let packed_h: Vec<u64> = praw
-        .chunks_exact(8)
-        .map(|c| u64::from_le_bytes(c.try_into().expect("8")))
-        .collect();
-    let sfb_h: Vec<u64> = sraw
-        .chunks_exact(8)
-        .map(|c| u64::from_le_bytes(c.try_into().expect("8")))
-        .collect();
-    let scale2_h: Vec<f32> = s2raw
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes(c.try_into().expect("4")))
-        .collect();
     let eoff: Vec<i32> = off_raw
         .chunks_exact(4)
         .map(|c| i32::from_le_bytes(c.try_into().expect("4")))
