@@ -38,6 +38,19 @@ pub fn prefill_batched_first_chunk_enabled() -> bool {
         .any(|value| bool_value_enabled(value.as_deref()))
 }
 
+/// VARLEN (ragged) batched prefill enabled? (`ATLAS_PREFILL_VARLEN=1`).
+///
+/// SSOT for both the admission predicate (`check_kernel_batched_eligible`) and
+/// the batched-attention layer's chunk-0 guard. Those two must agree: if
+/// admission accepts a batch the layer then rejects, the bail happens
+/// mid-Phase-A with streams already mutated, and the per-stream fallback
+/// re-runs setup on dirty state.
+pub fn prefill_varlen_enabled() -> bool {
+    use std::sync::OnceLock;
+    static EN: OnceLock<bool> = OnceLock::new();
+    *EN.get_or_init(|| bool_value_enabled(std::env::var("ATLAS_PREFILL_VARLEN").ok().as_deref()))
+}
+
 /// cuBLASLt GEMM path enabled? (`ATLAS_CUBLAS_GEMM=1`), cached. The hand-written
 /// mma.sync projection GEMMs hit only ~30% of the cuBLAS bf16 ceiling on GB10.
 pub fn cublas_gemm_enabled() -> bool {

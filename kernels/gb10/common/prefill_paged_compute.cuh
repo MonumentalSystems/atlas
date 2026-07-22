@@ -167,13 +167,19 @@ extern "C" __global__ void KERNEL_NAME(
 #ifdef PREFILL_BATCHED
     // Q12 Phase 3: batched paged prefill.
     // - block_table_ptrs[b] is the per-stream paged-KV block table.
-    // - Q and O are stacked: [batch, q_len, num_q_heads, head_dim] flattened
-    //   contiguously. Each stream's Q/O lands at `b * q_len * q_seq_stride`.
-    // - All other parameters are SHARED across streams (same q_len, kv_len,
-    //   q_offset etc.). The scheduler enforces same-chunk-len batching.
-    // - Grid extended to (num_q_heads, q_chunks, batch_size); blockIdx.z = b.
+    // - Q and O are stacked contiguously.
+    //   UNIFORM (cu_seqlens == nullptr): every stream has the same length and
+    //   stream b lands at `b * q_len * q_seq_stride`.
+    //   VARLEN (cu_seqlens != nullptr): the buffer is PACKED by the prefix sum,
+    //   stream b lands at `cu_seqlens[b] * q_seq_stride` with its own length
+    //   `cu_seqlens[b+1] - cu_seqlens[b]`, and its own `kv_lens[b]`. Using the
+    //   uniform stride under ragged input reads the wrong rows and can walk
+    //   `batch * max_len` rows when only `sum(len)` exist.
+    // - Grid extended to (num_q_heads, ceil(max_len/BR), batch_size); z = b.
     const int* const* __restrict__ block_table_ptrs,
     const unsigned int batch_size,
+    const int* __restrict__ cu_seqlens,
+    const int* __restrict__ kv_lens,
 #else
     const int* __restrict__ block_table,
 #endif
@@ -194,6 +200,21 @@ extern "C" __global__ void KERNEL_NAME(
     const unsigned int b = blockIdx.z;
     if (b >= batch_size) return;
     const int* const __restrict__ block_table = block_table_ptrs[b];
+    // Per-stream geometry. VARLEN reads it from the staged arrays; UNIFORM
+    // keeps the legacy scalars so that path stays byte-identical.
+    unsigned int q_base_b = 0;
+    unsigned int q_len_eff = q_len;
+    if (cu_seqlens != nullptr) {
+        q_base_b = (unsigned int)cu_seqlens[b];
+        q_len_eff = (unsigned int)(cu_seqlens[b + 1] - cu_seqlens[b]);
+    } else {
+        q_base_b = b * q_len;
+    }
+    if (kv_lens != nullptr) {
+        kv_len = (unsigned int)kv_lens[b];
+    }
+#else
+    const unsigned int q_len_eff = q_len;
 #endif
     const unsigned int tid = threadIdx.x;
     const unsigned int warp_id = tid / 32;
@@ -201,14 +222,14 @@ extern "C" __global__ void KERNEL_NAME(
 
     if (q_head >= num_q_heads) return;
     const unsigned int q_start = q_block * BR;
-    if (q_start >= q_len) return;
-    const unsigned int q_tile_end = min(q_start + BR, q_len);
+    if (q_start >= q_len_eff) return;
+    const unsigned int q_tile_end = min(q_start + BR, q_len_eff);
     const unsigned int q_tile_len = q_tile_end - q_start;
     const unsigned int q_seq_stride = num_q_heads * head_dim;
     const unsigned int kv_head = q_head / (num_q_heads / num_kv_heads);
 #ifdef PREFILL_BATCHED
-    // Per-batch Q/O offsets — stacked [batch, q_len, num_q_heads, head_dim].
-    const unsigned long long q_batch_off = (unsigned long long)b * q_len * q_seq_stride;
+    // Packed (VARLEN) or strided (uniform) base row for this stream.
+    const unsigned long long q_batch_off = (unsigned long long)q_base_b * q_seq_stride;
 #endif
 
     __shared__ __nv_bfloat16 smem_Q[BR][HDIM_PAD];
@@ -271,7 +292,7 @@ extern "C" __global__ void KERNEL_NAME(
         const unsigned int cpr = HDIM / 8;
         for (unsigned int idx = tid; idx < TILE_CHUNKS; idx += blockDim.x) {
             unsigned int row = idx / cpr, col = (idx % cpr) * 8;
-            if (q_start + row < q_len) {
+            if (q_start + row < q_len_eff) {
 #ifdef PREFILL_BATCHED
                 const void* gm = (const void*)&Q[q_batch_off + (q_start+row)*q_seq_stride + q_head*head_dim + col];
 #else
@@ -549,12 +570,12 @@ extern "C" __global__ void KERNEL_NAME(
         for(int nt=0;nt<N_TILES_PER_WARP;nt++){
             unsigned int c0=(pv_n_start+nt)*8+tid_in_group*2;
             unsigned int gr0=q_start+r0, gr1=q_start+r1;
-            if(gr0<q_len&&r0<q_tile_len&&c0<head_dim){
+            if(gr0<q_len_eff&&r0<q_tile_len&&c0<head_dim){
                 unsigned int lo=(unsigned int)__bfloat16_as_ushort(__float2bfloat16(acc_o[nt][0]*il0));
                 unsigned int hi=(unsigned int)__bfloat16_as_ushort(__float2bfloat16(acc_o[nt][1]*il0));
                 *(unsigned int*)&ob[gr0*q_seq_stride+c0]=lo|(hi<<16);
             }
-            if(gr1<q_len&&r1<q_tile_len&&c0<head_dim){
+            if(gr1<q_len_eff&&r1<q_tile_len&&c0<head_dim){
                 unsigned int lo=(unsigned int)__bfloat16_as_ushort(__float2bfloat16(acc_o[nt][2]*il1));
                 unsigned int hi=(unsigned int)__bfloat16_as_ushort(__float2bfloat16(acc_o[nt][3]*il1));
                 *(unsigned int*)&ob[gr1*q_seq_stride+c0]=lo|(hi<<16);
@@ -608,6 +629,8 @@ extern "C" __global__ void PAGED_CONCAT(KERNEL_NAME, _64)(
 #ifdef PREFILL_BATCHED
     const int* const* __restrict__ block_table_ptrs,
     const unsigned int batch_size,
+    const int* __restrict__ cu_seqlens,
+    const int* __restrict__ kv_lens,
 #else
     const int* __restrict__ block_table,
 #endif
@@ -628,6 +651,20 @@ extern "C" __global__ void PAGED_CONCAT(KERNEL_NAME, _64)(
     const unsigned int b = blockIdx.z;
     if (b >= batch_size) return;
     const int* const __restrict__ block_table = block_table_ptrs[b];
+    // Per-stream geometry — see the BR=32 variant for the layout contract.
+    unsigned int q_base_b = 0;
+    unsigned int q_len_eff = q_len;
+    if (cu_seqlens != nullptr) {
+        q_base_b = (unsigned int)cu_seqlens[b];
+        q_len_eff = (unsigned int)(cu_seqlens[b + 1] - cu_seqlens[b]);
+    } else {
+        q_base_b = b * q_len;
+    }
+    if (kv_lens != nullptr) {
+        kv_len = (unsigned int)kv_lens[b];
+    }
+#else
+    const unsigned int q_len_eff = q_len;
 #endif
     const unsigned int tid = threadIdx.x;
     const unsigned int warp_id = tid / 32;
@@ -635,13 +672,13 @@ extern "C" __global__ void PAGED_CONCAT(KERNEL_NAME, _64)(
 
     if (q_head >= num_q_heads) return;
     const unsigned int q_start = q_block * BR64;
-    if (q_start >= q_len) return;
-    const unsigned int q_tile_end = min(q_start + BR64, q_len);
+    if (q_start >= q_len_eff) return;
+    const unsigned int q_tile_end = min(q_start + BR64, q_len_eff);
     const unsigned int q_tile_len = q_tile_end - q_start;
     const unsigned int q_seq_stride = num_q_heads * head_dim;
     const unsigned int kv_head = q_head / (num_q_heads / num_kv_heads);
 #ifdef PREFILL_BATCHED
-    const unsigned long long q_batch_off = (unsigned long long)b * q_len * q_seq_stride;
+    const unsigned long long q_batch_off = (unsigned long long)q_base_b * q_seq_stride;
 #endif
 
     __shared__ __nv_bfloat16 smem_Q64[BR64][HDIM_PAD];

@@ -51,7 +51,9 @@ pub fn q12_batched_scratch_bytes_varlen(
     // slot overlapped a live per-stream pointer table → cross-stream KV/GDN
     // bleed in decode (n<=3 clean, absorbed by over-provisioning slack).
     let cu_seqlens = (((n + 1) * 4) + 7) & !7;
-    let stage_meta = pos_streams * pos + slot + 2 * ptrs + cu_seqlens;
+    // VARLEN kv_lens [n] i32, staged immediately after cu_seqlens.
+    let kv_lens = ((n * 4) + 7) & !7;
+    let stage_meta = pos_streams * pos + slot + 2 * ptrs + cu_seqlens + kv_lens;
     // h_state_ptrs JIT slot consumed per SSM layer (N device pointers).
     let h_state_ptrs = n * std::mem::size_of::<u64>();
     moe + n * per_stream_meta + stage_meta + h_state_ptrs

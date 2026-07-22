@@ -20,11 +20,17 @@ impl TransformerModel {
     /// streams. Cheap upfront check — caller (dispatch) falls back to
     /// per-stream when false.
     pub(in crate::model) fn kernel_batched_eligible(&self, streams: &[PrefillSlice<'_>]) -> bool {
-        // Routed-MoE metadata still assumes a uniform per-stream layout.
-        // Keep the experimental ragged path on dense models until its MoE
-        // indexing is made cu_seqlens-aware; otherwise C=4 heterogeneous
-        // Laguna traffic can reach a CUDA illegal access after admission.
-        let varlen = varlen_prefill_enabled() && self.config.num_experts == 0;
+        // Routed-MoE prefill is a flat [total_tokens] sort/grouped-GEMM/scatter
+        // with no notion of stream boundaries (layers/moe/** contains no
+        // chunk_len / batch_size / stream_idx), so it needs no ragged
+        // awareness. The C=4 heterogeneous illegal access that motivated the
+        // original `num_experts == 0` restriction had two causes, both now
+        // fixed: the scratch SSOT divergence (charged n*max_chunk_len at
+        // runtime vs sum(chunk_len) at admission — fixed in the same commit
+        // that added the restriction) and the batched paged-attention kernel
+        // indexing Q/O at `b * max_len` on a buffer packed by sum(len), with a
+        // scalar kv_len at the max. The kernels are now cu_seqlens-aware.
+        let varlen = varlen_prefill_enabled();
         check_kernel_batched_eligible(
             streams
                 .iter()
@@ -123,9 +129,8 @@ impl TransformerModel {
 /// varied-length concurrent prefills into one forward (cu_seqlens geometry,
 /// FlashInfer ragged attention). Requires a FLASHINFER_HOME build.
 pub(in crate::model) fn varlen_prefill_enabled() -> bool {
-    std::env::var("ATLAS_PREFILL_VARLEN")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
+    // SSOT with the batched-attention layer's chunk-0 guard.
+    crate::layers::ops::prefill_varlen_enabled()
 }
 
 /// Pure-data predicate extracted from [`TransformerModel::kernel_batched_eligible`]
