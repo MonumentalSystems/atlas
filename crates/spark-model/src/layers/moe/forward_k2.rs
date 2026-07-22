@@ -424,6 +424,15 @@ impl MoeLayer {
         } else {
             // NVFP4 batch2 path (originals layout)
             let null_shared = QuantizedWeight::null();
+            // NOTE: `hidden_size >= 3072` is a proxy for "this model ships the
+            // 256-thread moe_shared_expert_fused_batch2 source" (e.g.
+            // kernels/gb10/qwen3.5-122b-a10b/nvfp4/, BLOCK_SIZE 256 +
+            // THREADS_PER_OUT 64). Laguna satisfies the proxy but ships NO
+            // override, so it resolves to kernels/gb10/common/ which is
+            // BLOCK_SIZE 128 => THREADS_PER_OUT 32, and warps 4-7 redundantly
+            // recompute the next block's columns. Output is value-identical and
+            // the re-read hits L2, so an A/B of 128-vs-256 here measured only
+            // +4% at C=4 and 0% at C=2 -- real but minor. See HANDOFF.md.
             let batch2_block = if ctx.config.hidden_size >= 3072 {
                 256u32
             } else {
