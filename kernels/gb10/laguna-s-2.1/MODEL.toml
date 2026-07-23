@@ -85,6 +85,16 @@ enable_think_loop_watchdog = false
 # for Laguna; other models keep the defaults (true).
 confidence_early_stop = false
 rollback_resteer = false
+# This model loops stochastically even at its recommended 0.7 sampling
+# ('TheTheThe' / 'I. ofA. of' repeat spam on long reasoning). Unlike the
+# qwen3.6-35b-a3b sibling (NVFP4 lm-head), we serve a BF16 lm-head, so the
+# drift is NOT the head -- it is the NVFP4 MoE / general FP-quant tail. A min_p
+# FLOOR truncates that tail; MEASURED here: min_p 0 -> most prompts degenerate,
+# 0.05 -> 1/6, 0.1 -> see below. It is a partial mitigation (the thinking
+# watchdogs above were the other, cruder catch). temperature_max caps runaway
+# client temps at the model's recommended ceiling.
+min_p_floor = 0.1
+temperature_max = 0.7
 thinking_in_tools = true
 max_thinking_budget = 8192
 # Poolside recommends thinking for agentic coding and preserving it between
