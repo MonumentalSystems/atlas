@@ -458,6 +458,7 @@ mod forward_prefill;
 mod forward_prefill_bf16;
 mod forward_prefill_fp8;
 mod forward_prefill_phase;
+mod forward_prefill_packed;
 mod forward_prefill_routed;
 mod forward_token_major;
 mod helpers_a;

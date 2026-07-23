@@ -28,6 +28,30 @@ pub fn q8_1_scratch_bytes(m: u32, k: u32) -> usize {
     (m as usize) * (kpad as usize) * 4 + (1 << 20)
 }
 
+/// Dequantize keep-packed Q6_K blocks (210B/256-elem super-blocks) into a
+/// provided BF16 scratch of `n_blocks * 256 * 2` bytes. Kernel
+/// `dequant_gguf_bf16 / dequant_q6_k_to_bf16` (grid=n_blocks, block=256,
+/// args: blocks, out, n_blocks, block_bytes=210). Used by the keep-packed MoE
+/// prefill arm for the Q6_K `down` projection (per-expert dequant-scratch then
+/// dense GEMM). `n_blocks = numel / 256`.
+pub fn dequant_q6k_into(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    blocks: DevicePtr,
+    out: DevicePtr,
+    n_blocks: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([n_blocks, 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(blocks)
+        .arg_ptr(out)
+        .arg_u32(n_blocks)
+        .arg_u32(210)
+        .launch(stream)
+}
+
 /// Dequantize NVFP4 weight [n, k] (packed E2M1 + E4M3 group scales + per-tensor scale2) -> bf16 [n, k].
 pub fn dequant_nvfp4_to_bf16(
     gpu: &dyn GpuBackend,

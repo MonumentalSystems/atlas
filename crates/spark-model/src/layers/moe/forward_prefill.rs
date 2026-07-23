@@ -367,21 +367,39 @@ impl MoeLayer {
         // 4-6. Routed grouped-GEMM phase (grid sizing → grouped gate+up
         // GEMM → SiLU → grouped down GEMM). Hoisted to forward_prefill_routed.rs
         // to keep this file under the 500 LoC cap; behavior identical.
-        self.run_routed_grouped_gemm(
-            expert_input,
-            expert_offsets,
-            sorted_token_ids,
-            n,
-            h,
-            inter,
-            num_experts,
-            top_k,
-            num_tokens,
-            ne,
-            &mut t0,
-            ctx,
-            stream,
-        )?;
+        // Keep-packed GGUF experts (Laguna Q4_K_M): swap the NVFP4 grouped GEMM
+        // for the native per-expert q4k_mmq compute. Same routing (above) and
+        // same post-blend (below) — only expert_down_out's producer changes.
+        if self.weights.packed_experts.is_some() {
+            self.run_routed_grouped_gemm_packed(
+                expert_input,
+                expert_offsets,
+                sorted_token_ids,
+                n,
+                h,
+                inter,
+                num_experts,
+                top_k,
+                ctx,
+                stream,
+            )?;
+        } else {
+            self.run_routed_grouped_gemm(
+                expert_input,
+                expert_offsets,
+                sorted_token_ids,
+                n,
+                h,
+                inter,
+                num_experts,
+                top_k,
+                num_tokens,
+                ne,
+                &mut t0,
+                ctx,
+                stream,
+            )?;
+        }
         let expert_down_out = ctx.buffers.expert_down_out();
 
         // Feature-1: fold the routed-expert down_proj LoRA deltas onto the sorted
