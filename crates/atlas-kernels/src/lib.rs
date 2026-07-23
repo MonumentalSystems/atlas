@@ -184,6 +184,10 @@ pub struct ModelBehavior {
     pub enable_loop_watchdog: bool,
     /// See build_parse.rs: gate for the THINKING-phase loop watchdog.
     pub enable_think_loop_watchdog: bool,
+    /// Cap the thinking budget at 90% of the request's `max_tokens` (true), or
+    /// let `max_thinking_budget` be the sole cap (false = vLLM single-budget:
+    /// reasoning may use the full generation budget). See thinking.rs::resolve.
+    pub cap_thinking_at_max_tokens: bool,
     /// Server-side min-p FLOOR (0.0 = disabled). Applied as `min_p.max(floor)`
     /// AFTER request/preset resolution, so it binds even when a client sends
     /// `min_p = 0` (or omits it on a server without `--default-min-p`). On
@@ -305,6 +309,7 @@ impl Default for ModelBehavior {
             tool_call_parser: "",
             enable_loop_watchdog: false,
             enable_think_loop_watchdog: true,
+            cap_thinking_at_max_tokens: true,
             min_p_floor: 0.0,
             temperature_max: 0.0,
             think_loop_min_repeats: 3,

@@ -97,6 +97,11 @@ min_p_floor = 0.1
 temperature_max = 0.7
 thinking_in_tools = true
 max_thinking_budget = 8192
+# vLLM single-budget: max_thinking_budget is the SOLE thinking cap. Real agents
+# set a small max_tokens per turn but still want full reasoning; the default
+# 90%-of-max_tokens secondary clamp (a budget vLLM does not have) truncated
+# thinking on those turns. False = reasoning bounded only by max_thinking_budget.
+cap_thinking_at_max_tokens = false
 # Poolside recommends thinking for agentic coding and preserving it between
 # tool calls. Clients can still opt out per request with enable_thinking=false.
 thinking_default = true

@@ -142,6 +142,9 @@ pub(super) struct ParsedBehavior {
     /// the model did not choose to end leaves it in a state it cannot continue
     /// from, and the post-close content degenerates into token spam.
     pub enable_think_loop_watchdog: bool,
+    /// Cap the thinking budget at 90% of the request's `max_tokens` (true), or
+    /// let `max_thinking_budget` be the sole cap (false, vLLM single-budget).
+    pub cap_thinking_at_max_tokens: bool,
     pub min_p_floor: f32,
     pub temperature_max: f32,
     pub think_loop_min_repeats: u32,
@@ -173,6 +176,7 @@ impl Default for ParsedBehavior {
             tool_call_parser: String::new(),
             enable_loop_watchdog: false,
             enable_think_loop_watchdog: true,
+            cap_thinking_at_max_tokens: true,
             min_p_floor: 0.0,
             temperature_max: 0.0,
             think_loop_min_repeats: 3,
@@ -257,6 +261,12 @@ pub(super) fn parse_behavior(model_dir: &std::path::Path) -> ParsedBehavior {
         .and_then(|v| v.get("enable_think_loop_watchdog"))
         .and_then(|v| v.as_bool())
         .unwrap_or(true);
+    // Default true: keep the 90%-of-max_tokens thinking cap. Set false for
+    // vLLM-style single-budget behavior (only max_thinking_budget caps).
+    let cap_thinking_at_max_tokens = b
+        .and_then(|v| v.get("cap_thinking_at_max_tokens"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
     // Server-side sampling safety floor/ceiling (0.0 = disabled). See
     // ModelBehavior::{min_p_floor,temperature_max} for rationale.
     let min_p_floor = b
@@ -335,6 +345,7 @@ pub(super) fn parse_behavior(model_dir: &std::path::Path) -> ParsedBehavior {
         tool_call_parser,
         enable_loop_watchdog,
         enable_think_loop_watchdog,
+        cap_thinking_at_max_tokens,
         min_p_floor,
         temperature_max,
         think_loop_min_repeats,
