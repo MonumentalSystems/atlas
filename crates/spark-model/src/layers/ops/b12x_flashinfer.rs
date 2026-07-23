@@ -123,6 +123,13 @@ pub(crate) fn max_tokens() -> Option<u32> {
     lib().map(|l| l.max_tokens)
 }
 
+// CUDA runtime: returns AND clears the last runtime error. Used to reset a stale
+// pending error before the b12x MLIR launcher reads it (cudart is linked into the
+// final `spark` binary).
+unsafe extern "C" {
+    fn cudaGetLastError() -> c_int;
+}
+
 /// Run one prefill through the b12x fused-MoE kernel, writing the routed-expert
 /// result into `out` (bf16 `[num_tokens, hidden]`). Routing (`ids`/`weights`) is
 /// Atlas's own renormalized `moe_topk_softmax_batched` output. Caller MUST gate on
@@ -139,11 +146,23 @@ pub(crate) fn b12x_moe_prefill(
     stream: u64,
 ) -> Result<()> {
     let l = lib().ok_or_else(|| anyhow!("FlashInfer b12x lib unavailable"))?;
-    let _ = gpu; // workspace is owned+cached inside the shim
     if n > l.max_tokens {
         bail!(
             "b12x_moe_prefill: n={n} exceeds shim capacity {}",
             l.max_tokens
+        );
+    }
+    // The b12x kernel's MLIR launcher captures its own status via the CUDA
+    // RUNTIME `cudaGetLastError()`. Atlas drives CUDA via the DRIVER API, so a
+    // benign STALE runtime error left pending by a prior op is never cleared on
+    // our side and the launcher returns it as a bogus `1` (cudaErrorInvalidValue)
+    // even when the launch is fine. Drain the stream, then read+clear the pending
+    // runtime error so the launcher starts from a clean slate.
+    gpu.synchronize(stream)?;
+    let pending = unsafe { cudaGetLastError() };
+    if pending != 0 {
+        tracing::warn!(
+            "ATLAS_LAGUNA_MOE_B12X: cleared stale CUDA runtime error {pending} before b12x launch"
         );
     }
     let ret = unsafe {
