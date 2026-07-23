@@ -12,7 +12,8 @@ use crate::layers::qwen3_attention::HeadGateActivation;
 use crate::layers::{DenseFfnLayer, FfnComponent, MoeLayer, Qwen3AttentionLayer};
 use crate::weight_map::{
     AttentionWeights, DenseWeight, ExpertWeight, MoeWeights, PackedExpertWeights, PackedQ4Weight,
-    PackedQ6Weight, QuantizedWeight, dense, dense_auto, quantize_to_nvfp4, quantized_v2,
+    PackedQ6Weight, QuantWeight, QuantizedWeight, dense, dense_auto, quantize_to_nvfp4,
+    quantized_v2,
 };
 
 /// Wrap a keep-packed Q4_K store tensor (`{prefix}.weight`, tagged
@@ -167,15 +168,22 @@ fn load_moe_ffn(
                 packed.push(PackedExpertWeights {
                     gate: PackedQ4Weight::null_view(),
                     up: PackedQ4Weight::null_view(),
-                    down: PackedQ6Weight::null_view(),
+                    down: QuantWeight::PackedQ6(PackedQ6Weight::null_view()),
                 });
                 continue;
             }
             let ep = format!("{mlp}.experts.{e}");
+            // down_proj is Q4_K on some layers, Q6_K on others (Q4_K_M mixed).
+            let down_prefix = format!("{ep}.down_proj");
+            let down = if store.get(&format!("{down_prefix}.weight"))?.is_packed_q4k() {
+                QuantWeight::PackedQ4(packed_q4_from_store(store, &down_prefix)?)
+            } else {
+                QuantWeight::PackedQ6(packed_q6_from_store(store, &down_prefix)?)
+            };
             packed.push(PackedExpertWeights {
                 gate: packed_q4_from_store(store, &format!("{ep}.gate_proj"))?,
                 up: packed_q4_from_store(store, &format!("{ep}.up_proj"))?,
-                down: packed_q6_from_store(store, &format!("{ep}.down_proj"))?,
+                down,
             });
         }
         let null_experts = (0..config.num_experts).map(|_| ExpertWeight::null()).collect();

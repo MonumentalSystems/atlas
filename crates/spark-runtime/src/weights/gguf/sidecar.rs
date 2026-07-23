@@ -58,6 +58,20 @@ pub fn open_gguf(path: &Path) -> Result<(std::fs::File, memmap2::Mmap, container
         std::fs::File::open(path).with_context(|| format!("Failed to open {}", path.display()))?;
     // SAFETY: same mmap contract as the safetensors loader.
     let mmap = unsafe { memmap2::MmapOptions::new().map(&file)? };
+    // NFS prefetch: the loader streams tensors in file order, so give the kernel
+    // the same SEQUENTIAL readahead the fast safetensors loader uses
+    // (`fast_weights::advise_prefetch_shard`, gated on `--fast-load-prefetch-
+    // shards`). On NFS this is latency-bound one-page-at-a-time faults (~300
+    // MB/s) vs bandwidth-bound streaming (~2 GB/s). NOTE: that helper ALSO
+    // POSIX_FADV_WILLNEEDs each shard, but it processes 44GB shards one at a time
+    // (evicting between); a GGUF is a SINGLE ~71GB file, so WILLNEED-ing it whole
+    // would hold 71GB in the page cache while the GPU also fills to ~71GB —
+    // exceeding the 128GB GB10 unified pool. SEQUENTIAL (grow the readahead
+    // window, drop pages behind) gets the bandwidth win without that pressure.
+    // Best-effort: a failed advise never blocks the load.
+    if let Err(e) = mmap.advise(memmap2::Advice::Sequential) {
+        tracing::debug!("madvise(SEQUENTIAL) on GGUF mmap failed (non-fatal): {e}");
+    }
     let gguf = container::GgufFile::parse(&mmap)
         .with_context(|| format!("Failed to parse GGUF container: {}", path.display()))?;
     Ok((file, mmap, gguf))

@@ -128,29 +128,60 @@ impl MoeLayer {
                 rows * inter,
                 stream,
             )?;
-            // down (Q6_K): dequant this expert's weight to BF16 scratch, dense GEMM.
-            ops::dequant_q6k_into(
-                ctx.gpu,
-                self.q6k_dequant_k,
-                pe.down.weight,
-                down_scratch,
-                n_down_blocks,
-                stream,
-            )?;
-            let down_w = crate::weight_map::DenseWeight {
-                weight: down_scratch,
-            };
-            ops::dense_gemm(
-                ctx.gpu,
-                self.dense_gemm,
-                g_off, // [rows, inter] post-silu
-                &down_w,
-                d_off, // [rows, h]
-                rows,
-                h,
-                inter,
-                stream,
-            )?;
+            // down: Q4_K_M mixes Q4_K and Q6_K here per layer.
+            //  - Q4_K: native q4k_mmq (q8_1-quantize the post-silu [rows,inter]
+            //    activation, reusing the `q8` scratch now that gate/up are done).
+            //  - Q6_K: dequant this expert's weight to BF16 scratch → dense GEMM.
+            match &pe.down {
+                crate::weight_map::QuantWeight::PackedQ4(w4) => {
+                    ops::quantize_act_q8_1(
+                        ctx.gpu,
+                        self.q4k_quant_act_k,
+                        g_off, // [rows, inter] post-silu
+                        q8,
+                        rows,
+                        inter,
+                        stream,
+                    )?;
+                    ops::q4k_mmq_gemm(
+                        ctx.gpu,
+                        self.q4k_mmq_nc_k,
+                        self.q4k_mmq_wc_k,
+                        q8,
+                        w4.weight,
+                        d_off,
+                        rows,
+                        h,
+                        inter,
+                        stream,
+                    )?;
+                }
+                crate::weight_map::QuantWeight::PackedQ6(w6) => {
+                    ops::dequant_q6k_into(
+                        ctx.gpu,
+                        self.q6k_dequant_k,
+                        w6.weight,
+                        down_scratch,
+                        n_down_blocks,
+                        stream,
+                    )?;
+                    let down_w = crate::weight_map::DenseWeight {
+                        weight: down_scratch,
+                    };
+                    ops::dense_gemm(
+                        ctx.gpu,
+                        self.dense_gemm,
+                        g_off, // [rows, inter] post-silu
+                        &down_w,
+                        d_off, // [rows, h]
+                        rows,
+                        h,
+                        inter,
+                        stream,
+                    )?;
+                }
+                other => anyhow::bail!("packed MoE down_proj: unexpected variant {other:?}"),
+            }
         }
 
         ctx.gpu.free(permuted)?;

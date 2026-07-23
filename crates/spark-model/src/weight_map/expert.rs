@@ -250,7 +250,11 @@ impl From<PackedQ6Weight> for QuantWeight {
 pub struct PackedExpertWeights {
     pub gate: PackedQ4Weight,
     pub up: PackedQ4Weight,
-    pub down: PackedQ6Weight,
+    /// `down_proj` — Q4_K_M uses MIXED precision here: Q6_K on some layers,
+    /// Q4_K on others (llama.cpp's per-layer rule). So `down` carries either a
+    /// [`QuantWeight::PackedQ4`] or [`QuantWeight::PackedQ6`]; the MoE arm
+    /// dispatches per variant (Q4_K → q4k_mmq, Q6_K → dequant-scratch + GEMM).
+    pub down: QuantWeight,
 }
 
 /// Per-expert weights in any supported quant format.
