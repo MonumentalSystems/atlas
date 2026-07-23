@@ -70,6 +70,11 @@ jobs:
             # to the sampler context; splitting risks inflating the
             # cross-file pub(super) surface.
             "crates/spark-server/src/scheduler/decode_logits_step.rs"
+            # 507 LoC — batched-decode dispatch + compute-main. Compute-heavy
+            # decode dispatcher (launch order read top-to-bottom); tipped over by
+            # rustfmt wrapping + the 2-line MoE-LoRA route init. Same rationale as
+            # the other allow-listed decode dispatchers. Clean split tracked as follow-up.
+            "crates/spark-model/src/model/trait_impl/decode_a2.rs"
             # 516 LoC — startup orchestration (12 phases, all named).
             # Already heavily split (`serve_phases`, `serve_router`); the
             # remaining body is the linear bootstrapping sequence.

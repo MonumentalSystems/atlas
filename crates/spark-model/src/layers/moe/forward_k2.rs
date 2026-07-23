@@ -18,6 +18,14 @@ impl MoeLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        // Feature-1: the fused batch2 fast path has no fold hook. When a MoE
+        // adapter is RESIDENT (install-time-fixed → graph-safe; graphs drain on
+        // rotate/swap), route to the per-row batched fallback which folds
+        // gate/up/down route-agnostically (base rows no-op) — same moe_output[2,H].
+        // forward_batched itself refuses a router-adapted adapter.
+        if self.lora.is_some() {
+            return self.forward_batched(input, 2, ctx, stream);
+        }
         // BF16 (FP8-dequant-on-load) experts. The FP8/NVFP4 batch2 branches
         // below read expert weights that were FREED at dequant-load, so they
         // must NOT run for a dequanted model. When the fused BF16 batch2
