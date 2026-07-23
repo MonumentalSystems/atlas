@@ -173,6 +173,12 @@ fn load_moe_ffn(
     if cutlass_grouped_moe_enabled() {
         layer.build_cutlass_grouped_sfb(gpu, config, gpu.default_stream())?;
     }
+    // b12x fused-MoE opt-in repack (ATLAS_LAGUNA_MOE_B12X). EP/null-expert/no-lib
+    // configs leave b12x=None (grouped path); it needs the transposed `_t` tables, so
+    // pair it with ATLAS_UNIFIED_MOE_LAYOUT=1. Logic lives in b12x_weights.rs.
+    if std::env::var("ATLAS_LAGUNA_MOE_B12X").as_deref() == Ok("1") {
+        layer.build_b12x_weights(gpu, config, gpu.default_stream())?;
+    }
     Ok(FfnComponent::Moe(layer))
 }
 

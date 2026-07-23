@@ -1,0 +1,2 @@
+E=256 H=3072 I=1024 top_k=10 max_tokens=1024
+REGEN routed_rows=10240 tile_m=128 tile_n=128 physical_tiles=REGEN gate_tile_cnt=8 max_tasks=REGEN rows_padded=REGEN cols_pad_k=192

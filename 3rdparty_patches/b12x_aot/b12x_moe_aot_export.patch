@@ -1,0 +1,20 @@
+--- a/flashinfer/fused_moe/cute_dsl/blackwell_sm12x/moe_dispatch.py	2026-07-10 22:20:18.100967806 -0400
++++ b/flashinfer/fused_moe/cute_dsl/blackwell_sm12x/moe_dispatch.py	2026-07-10 22:20:18.118118492 -0400
+@@ -1321,6 +1321,8 @@
+ # ---------------------------------------------------------------------------
+ 
+ 
++import cuda.bindings.driver as _cuda_aot  # AOT export: stream annotation
++
+ class _DynamicMoELaunch:
+     """Thin JIT wrapper that makes num_tokens and max_rows runtime Int32."""
+ 
+@@ -1380,7 +1382,7 @@
+         max_tasks: cutlass.Int32,
+         max_phys_tiles: cutlass.Int32,
+         max_active_clusters: cutlass.Constexpr,
+-        stream,
++        stream: _cuda_aot.CUstream,
+     ):
+         a_input = cute.make_tensor(
+             a_ptr, layout=cute.make_layout((num_tokens, self._k), stride=(self._k, 1))
