@@ -1,11 +1,4 @@
-// ⚠ STALE REFERENCE — this header was generated for the HOLO geometry
-// (E=256 H=2048 I=512 top_k=8). It is kept ONLY as an ABI-shape reference: the
-// b12x dynamic kernel renders every fixed-shape tensor arg as a degenerate
-// `{ void *data; }` struct (all shapes baked constexpr), so the arg COUNT/order
-// is geometry-independent, but the baked shapes inside the compiled `.o`/`.so`
-// are NOT. For Laguna-S-2.1 (E=256 H=3072 I=1024 top_k=10) the parent MUST
-// re-run `b12x_export.py` to regenerate this header + `b12x_dyn_0.o` +
-// `libatlasb12x.so`. See STATUS.md "PARENT GPU RECIPE".
+
 #pragma once
 
 #include <cuda_runtime.h>

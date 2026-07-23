@@ -142,4 +142,40 @@ geometry now baked into `b12x_export.py` / `b12x_shim.cpp` / `proof_sfb_atom.py`
     launches → 1 resident launch; no number promised until measured.
 
 ## Results log (parent appends)
-_(empty — export + validation are parent-GPU steps; not run in the port container.)_
+
+### 2026-07-22 — gx10/dgx-00 parent GPU validation (salvaged toolchain)
+Salvaged the prior agent's toolchain instead of rebuilding: 4.4.2 venv at
+`/home/ms/.claude/worktrees/agent-abfb7a22a294e8dc2/tmp/b12x-env`
+(`nvidia-cutlass-dsl==4.4.2` verified — NOT 4.5.x), sm_121a seds already applied,
+flashinfer `b12x_moe_aot_export.patch` already applied on `/home/ms/flashinfer`. The
+prior P3 export output at `/tmp/b12x_aot_laguna/` (regenerated `b12x_dyn_0.{h,o,geom.txt}`
++ relinked `libatlasb12x.so`) is Laguna-geometry (E=256 H=3072 I=1024 top_k=10,
+max_tokens=1024; physical_tiles=335 max_tasks=2680 rows_padded=42880). Native load-smoke
+(module load + workspace alloc) had already PASSED.
+
+- **Artifacts staged + committed** into this dir: regenerated `b12x_dyn_0.h` (stale Holo
+  banner gone) + `b12x_dyn_0.geom.txt` (REGEN placeholders filled) + built
+  `libatlasb12x.so`. Shim `cute_dsl_b12x_dyn_0_wrapper` **19-ptr / 16-`{void*data}` /
+  5-i32** arg mapping RE-CONFIRMED byte-for-byte against the regenerated `.h`
+  (`void*[42]`; count of degenerate structs in the header = 16, matches).
+- **P0 (SFB atom GO/NO-GO):** the standalone byte-identity proof `proof_sfb_atom.py` is
+  NOT runnable as written — it `import atlas_pack_sfb` (a ctypes wrapper around the
+  compiled `atlas_cutlass_pack_weight_sfb` symbol that does not exist) and its own header
+  (lines 43-56) directs to the FUNCTIONAL P0 instead. Per that guidance + the Holo
+  precedent (same `pack_weight_sfb` atom, ConcatReuse passed), **kept
+  `SfbStrategy::ConcatReuse` (default)**; the definitive GO/NO-GO is the routed-only cos in
+  the e2e A/B.
+- **P2 (alpha-bake census) — PASS.** On the real Laguna snapshot,
+  `gate_proj.weight_global_scale == up_proj.weight_global_scale` **EXACT for 12032/12032**
+  pairs (256 experts × 47 MoE layers), max rel-diff 0. The frozen `w1_alpha=ones` +
+  baked-scale2 decision is valid (no gate/up scale skew).
+- **cargo test -p spark-model b12x — PASS** (13 passed / 0 failed): fp4 + SF buffer
+  geometry asserts at Laguna dims, eligibility truth table, scale-bake codec, ConcatReuse
+  default.
+- **Atlas release build (`-p spark-server`, `ATLAS_TARGET_MODEL='*'`) — green.** Flag-unset
+  path is the untouched grouped-CUTLASS block (byte-identical; default-off).
+- **e2e correctness A/B + perf headline — BLOCKED on dgx-00; moved to gx10-9959.** dgx-00's
+  single GB10 (121 GB unified) is fully held by the protected `laguna-unified-candidate`
+  (97 GB resident, 95% util) — an 87 GB Laguna load cannot co-reside and that container must
+  not be touched. Validation relocated to the idle gx10-9959 (per MEMORY note).
+
