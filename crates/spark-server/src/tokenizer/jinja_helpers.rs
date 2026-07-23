@@ -330,8 +330,19 @@ pub(super) fn load_config_template(model_dir: &Path) -> Result<Option<String>> {
         std::fs::read_to_string(&config_path).context("Failed to read tokenizer_config.json")?;
     let config: serde_json::Value =
         serde_json::from_str(&config_json).context("Failed to parse tokenizer_config.json")?;
-    match config.get("chat_template").and_then(|v| v.as_str()) {
-        Some(t) => {
+    // A modern HF convention (e.g. Laguna-S-2.1) ships the real template as a
+    // standalone `chat_template.jinja` file and sets tokenizer_config's
+    // `chat_template` to just `{% include 'chat_template.jinja' %}`. minijinja
+    // cannot resolve that include (the file isn't registered as a template), so
+    // treat a bare-include config string the same as "no inline template" and
+    // load the standalone file directly.
+    let config_tmpl = config.get("chat_template").and_then(|v| v.as_str());
+    let is_bare_include = config_tmpl.is_some_and(|t| {
+        let s = t.trim();
+        s.contains("include") && s.contains(".jinja") && s.len() < 120
+    });
+    match config_tmpl {
+        Some(t) if !is_bare_include => {
             let converted = convert_python_jinja_to_minijinja(t);
             tracing::info!(
                 "Loaded Jinja chat template from tokenizer_config.json ({} chars)",
@@ -339,10 +350,10 @@ pub(super) fn load_config_template(model_dir: &Path) -> Result<Option<String>> {
             );
             Ok(Some(converted))
         }
-        None => {
-            // Some models ship chat_template.jinja as a standalone file
-            // (e.g., Nemotron-H Super 120B) instead of embedding it in
-            // tokenizer_config.json.
+        _ => {
+            // No inline template, OR a `{% include 'chat_template.jinja' %}`
+            // indirection: load the standalone file (e.g. Laguna-S-2.1,
+            // Nemotron-H Super 120B).
             let jinja_path = model_dir.join("chat_template.jinja");
             if jinja_path.exists() {
                 let raw = std::fs::read_to_string(&jinja_path)
