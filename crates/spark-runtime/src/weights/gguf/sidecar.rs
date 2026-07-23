@@ -139,6 +139,10 @@ pub fn load_pass(
     q2_group: usize,
     q2_variant: container::Q2Group,
     keep_packed_experts: bool,
+    // Consumer cursor for the NFS prefetch thread: after each tensor is copied,
+    // this is set to that tensor's end offset so the prefetcher stays a bounded
+    // window ahead (never racing to EOF and caching the whole file).
+    consumed: &std::sync::atomic::AtomicU64,
     weights: &mut HashMap<String, WeightTensor>,
     skipped: &mut usize,
 ) -> Result<()> {
@@ -156,6 +160,9 @@ pub fn load_pass(
             .tensor_byte_size(tensor, q2_variant)
             .with_context(|| format!("byte-len for tensor {}", tensor.name))?;
         let start = gguf.tensor_abs_offset(tensor);
+        // Advance the prefetch cursor to this tensor's start so the prefetcher
+        // keeps reading a bounded window ahead of us (see the prefetch thread).
+        consumed.store(start as u64, std::sync::atomic::Ordering::Relaxed);
         let raw = mmap
             .get(start..start + raw_len)
             .with_context(|| format!("tensor {} out of bounds in GGUF", tensor.name))?;
