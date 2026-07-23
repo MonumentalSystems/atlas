@@ -78,6 +78,16 @@ fn q2_group_usize() -> usize {
     }
 }
 
+/// When on, stacked MoE expert tensors quantized Q4_K (id 12) / Q6_K (id 14)
+/// are uploaded as raw K-quant blocks and tagged `PackedQ4K`/`PackedQ6K`
+/// (per-expert views), instead of dequant→BF16. Automatic for `arch = laguna`
+/// (its 256 routed experts are the whole ~219GB BF16 mass that would otherwise
+/// OOM a 128GB GB10); also opt-in for any MoE GGUF via `ATLAS_GGUF_KEEP_PACKED_MOE=1`.
+fn keep_packed_experts_enabled(arch: &str) -> bool {
+    arch == "laguna"
+        || std::env::var("ATLAS_GGUF_KEEP_PACKED_MOE").ok().as_deref() == Some("1")
+}
+
 /// Map a group size to the container's `Q2Group` (for on-disk byte sizing).
 fn q2_group_variant(g: usize) -> container::Q2Group {
     if g == 64 {
@@ -176,6 +186,55 @@ impl GgufLoader {
                     ptr,
                     shape: expert_shape.clone(),
                     dtype: WeightDtype::BF16,
+                },
+            );
+        }
+        Ok(())
+    }
+
+    /// Split a KEEP-PACKED stacked expert blob (raw GGUF K-quant blocks, uploaded
+    /// unchanged) into per-expert `WeightTensor`s aliasing block-aligned offsets
+    /// into the single packed device allocation. `shape[0]` is the expert count;
+    /// each expert is `shape[1..]` with a block footprint of `per_elems/256 *
+    /// {144 (Q4_K id 12) | 210 (Q6_K id 14)}` bytes. No BF16 expansion.
+    fn emit_experts_packed(
+        &self,
+        weights: &mut HashMap<String, WeightTensor>,
+        base_ptr: DevicePtr,
+        shape: &[usize],
+        layer: usize,
+        proj: &str,
+        id: u32,
+        skipped: &mut usize,
+    ) -> Result<()> {
+        let count = *shape
+            .first()
+            .context("stacked expert tensor has no leading expert dimension")?;
+        let per_elems: usize = shape[1..].iter().product();
+        let (block_bytes, dtype) = match id {
+            12 => (144usize, WeightDtype::PackedQ4K),
+            14 => (210usize, WeightDtype::PackedQ6K),
+            other => bail!("emit_experts_packed: unexpected ggml id {other} (want 12 or 14)"),
+        };
+        anyhow::ensure!(
+            per_elems % 256 == 0,
+            "keep-packed expert per_elems {per_elems} not a multiple of 256 (K-quant super-block)"
+        );
+        let per_bytes = (per_elems / 256) * block_bytes;
+        let expert_shape: Vec<usize> = shape[1..].to_vec();
+        for e in 0..count {
+            if self.should_skip_expert(e) {
+                *skipped += 1;
+                continue;
+            }
+            let ptr = base_ptr.offset(e * per_bytes);
+            let name = names::expert_name(layer, proj, e);
+            weights.insert(
+                name,
+                WeightTensor {
+                    ptr,
+                    shape: expert_shape.clone(),
+                    dtype,
                 },
             );
         }
@@ -281,6 +340,13 @@ impl super::WeightLoader for GgufLoader {
         // kernels expect (norm +1 offset, `A_log = ln(-ssm_a)`, and a value-head
         // reorder). Read the GDN head geometry once so `load_pass` can invert
         // them per tensor (see `value_transform`).
+        let keep_packed_experts = keep_packed_experts_enabled(&arch);
+        if keep_packed_experts {
+            tracing::info!(
+                "GGUF keep-packed MoE experts (arch={arch}): routed Q4_K/Q6_K experts stay \
+                 packed in VRAM (no BF16 expansion)"
+            );
+        }
         let is_qwen35 = value_transform::is_qwen35(&arch);
         let gdn = if is_qwen35 {
             value_transform::gdn_dims(&bb_gguf, &arch)
@@ -312,9 +378,9 @@ impl super::WeightLoader for GgufLoader {
         });
 
         // Pre-flight: combined BF16 footprint of both files.
-        let mut est = sidecar::est_bf16(&bb_gguf, &arch);
+        let mut est = sidecar::est_bf16(&bb_gguf, &arch, keep_packed_experts);
         if let (Some((_, _, mm_gguf)), Some(mm_arch)) = (mmproj.as_ref(), mmproj_arch.as_ref()) {
-            est += sidecar::est_bf16(mm_gguf, mm_arch);
+            est += sidecar::est_bf16(mm_gguf, mm_arch, false);
         }
         preflight_oom(gpu, est, oom_reserve_bytes, self.peak_memory_multiplier)?;
 
@@ -333,6 +399,7 @@ impl super::WeightLoader for GgufLoader {
             native_q2,
             q2_group,
             q2_variant,
+            keep_packed_experts,
             &mut weights,
             &mut skipped,
         )?;
@@ -358,6 +425,7 @@ impl super::WeightLoader for GgufLoader {
                 false,
                 q2_group,
                 q2_variant,
+                false,
                 &mut weights,
                 &mut skipped,
             )?;

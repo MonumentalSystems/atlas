@@ -66,7 +66,7 @@ pub fn open_gguf(path: &Path) -> Result<(std::fs::File, memmap2::Mmap, container
 /// Sum the BF16 footprint of every tensor a pass will actually keep (i.e. that
 /// `names::translate` maps to a stored tensor, plus the clip patch-embed frames
 /// that are fused rather than name-mapped), for the pre-flight OOM estimate.
-pub fn est_bf16(gguf: &container::GgufFile, arch: &str) -> usize {
+pub fn est_bf16(gguf: &container::GgufFile, arch: &str, keep_packed_experts: bool) -> usize {
     let is_clip = value_transform::is_clip(arch);
     gguf.tensors
         .iter()
@@ -77,7 +77,24 @@ pub fn est_bf16(gguf: &container::GgufFile, arch: &str) -> usize {
                     None | Some(names::GgufName::Drop)
                 )
         })
-        .map(|t| t.num_elements() * WeightDtype::BF16.byte_size())
+        .map(|t| {
+            // Keep-packed MoE experts stay PACKED in VRAM, so size them at their
+            // real (block) footprint — otherwise the pre-flight sees the full
+            // ~219GB BF16 expansion and bails before the keep-packed path runs.
+            let id = t.ggml_type.id();
+            if keep_packed_experts
+                && (id == 12 || id == 14)
+                && matches!(
+                    names::translate(&t.name, arch),
+                    Some(names::GgufName::ExpertStack { .. })
+                )
+            {
+                let n_blocks = t.num_elements() / 256;
+                n_blocks * if id == 12 { 144 } else { 210 }
+            } else {
+                t.num_elements() * WeightDtype::BF16.byte_size()
+            }
+        })
         .sum()
 }
 
@@ -104,6 +121,7 @@ pub fn load_pass(
     native_q2: bool,
     q2_group: usize,
     q2_variant: container::Q2Group,
+    keep_packed_experts: bool,
     weights: &mut HashMap<String, WeightTensor>,
     skipped: &mut usize,
 ) -> Result<()> {
@@ -151,6 +169,23 @@ pub fn load_pass(
 
         // GGUF dims are ggml-order; Atlas/HF shape is the reverse.
         let hf_shape: Vec<usize> = tensor.dims.iter().rev().copied().collect();
+
+        // ── Keep-packed MoE expert stacks (Q4_K id 12 / Q6_K id 14) ──
+        // The routed experts ARE the whole 219GB-of-BF16 mass of Laguna-S-2.1
+        // Q4_K_M (48 layers × 256 × {gate,up,down}). Upload the raw stacked
+        // block buffer UNCHANGED and emit per-expert PACKED views at
+        // block-aligned offsets (144B/256 Q4_K, 210B/256 Q6_K) — no BF16
+        // expansion. This is what lets a 117B model fit on one 128GB GB10.
+        // `raw` is already the packed byte range (tensor_byte_size).
+        if keep_packed_experts
+            && (id == 12 || id == 14)
+            && let names::GgufName::ExpertStack { layer, proj } = &target
+        {
+            let ptr = gpu.alloc(raw.len())?;
+            gpu.copy_h2d(raw, ptr)?;
+            loader.emit_experts_packed(weights, ptr, &hf_shape, *layer, proj, id, skipped)?;
+            continue;
+        }
 
         // ── Native keep-packed Q2_0 short-circuit ──
         // When `ATLAS_GGUF_NATIVE_Q2=1`, upload the raw `block_q2_0` bytes for
