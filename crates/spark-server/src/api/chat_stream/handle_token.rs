@@ -390,6 +390,16 @@ fn handle_token_inner(state: &mut StreamState, ctx: &StreamCtx, tok: u32) -> Del
             state.detok_prefix_offset = 0;
             state.detok_read_offset = 0;
         }
+        // Orphan tool-call markup in content when NO tools are defined: the
+        // model emits a spurious `<tool_call>…` block after a normal answer and
+        // the tool detector (which would strip it) is not running. Cut content
+        // at the opener — SSOT with the blocking path's strip_orphan_tool_markup.
+        // When tools ARE active the detector owns tool markup, so leave it.
+        let tools_active_request =
+            !ctx.tool_defs_for_backfill.is_empty() || state.detector.is_some();
+        if !tools_active_request {
+            delta = crate::api::strip::strip_orphan_tool_markup(&delta);
+        }
     }
 
     // Bare role-literal leak (Qwen3.5/3.6) — companion to the

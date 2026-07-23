@@ -443,6 +443,15 @@ async fn build_choice_message(
         }
     }
 
+    // Orphan tool-call markup: the model can emit a `<tool_call>…` block after
+    // a normal answer even when no tool call is used (tools inactive, or tools
+    // active but nothing valid parsed). The tools_active parser above only
+    // scrubbed content when it produced a call, so any surviving markup here is
+    // spurious — cut it from content so it does not reach the client.
+    if msg_tool_calls.is_none() {
+        msg_content = msg_content.map(|c| super::strip::strip_orphan_tool_markup(&c));
+    }
+
     // Refusal classifier: when the model's assistant text opens with
     // a known refusal pattern AND no tool call fired, populate
     // `refusal` and null out `content` per the OpenAI spec.

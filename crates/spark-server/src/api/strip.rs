@@ -111,3 +111,62 @@ mod scrub_think_tests {
         assert_eq!(scrub_think_markers("think about </thin"), "think about </thin");
     }
 }
+
+/// Truncate assistant `content` at the first tool-call opener.
+///
+/// This model (and other tool-trained models) sometimes emit a
+/// `<tool_call>…` block after a normal answer even when the request defined NO
+/// tools — observed live: `…the story you keep telling yourself."<tool_call>catch_error({…})`.
+/// When tools ARE active the tool parser extracts and strips these; when they
+/// are NOT active nothing runs, so the raw markup lands in `content`.
+///
+/// `<tool_call>` (token id 25) and `<function=` are control markers, not prose,
+/// so their presence in content is always spurious here. Everything from the
+/// first one onward is the orphan tool block; cut it and trim. Apply ONLY when
+/// no real tool call was produced (otherwise the tool parser already handled
+/// the content).
+pub(crate) fn strip_orphan_tool_markup(text: &str) -> String {
+    const OPENERS: [&str; 2] = ["<tool_call>", "<function="];
+    let cut = OPENERS
+        .iter()
+        .filter_map(|op| text.find(op))
+        .min()
+        .unwrap_or(text.len());
+    text[..cut].trim_end().to_string()
+}
+
+#[cfg(test)]
+mod orphan_tool_tests {
+    use super::strip_orphan_tool_markup;
+
+    #[test]
+    fn cuts_the_live_leak() {
+        let s = "You are the story you keep telling yourself.\
+                 <tool_call>catch_error({'error': {'message': \"nope\"}})";
+        assert_eq!(
+            strip_orphan_tool_markup(s),
+            "You are the story you keep telling yourself."
+        );
+    }
+
+    #[test]
+    fn cuts_at_function_opener() {
+        assert_eq!(
+            strip_orphan_tool_markup("Here you go.<function=foo>{}</function>"),
+            "Here you go."
+        );
+    }
+
+    #[test]
+    fn leaves_clean_content_untouched() {
+        let s = "The sky is blue due to Rayleigh scattering.";
+        assert_eq!(strip_orphan_tool_markup(s), s);
+    }
+
+    #[test]
+    fn does_not_trip_on_the_word_function() {
+        // Only the control markers "<tool_call>" / "<function=" cut; prose is safe.
+        let s = "You can call a function to do that.";
+        assert_eq!(strip_orphan_tool_markup(s), s);
+    }
+}
