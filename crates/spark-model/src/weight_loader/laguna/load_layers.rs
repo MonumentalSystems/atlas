@@ -236,7 +236,13 @@ fn load_moe_ffn(
     // decode; the quantized copies above are placeholders for fused routed
     // kernels and their shared contribution is overwritten before blending.
     layer.set_bf16_shared_expert(shared_gate, shared_up, shared_down)?;
-    if unified_moe_layout {
+    // Keep-packed GGUF experts: the routed experts are raw Q4_K/Q6_K blocks and
+    // carry NO NVFP4 scale tables, so the NVFP4-specific transpose and CUTLASS
+    // SFB swizzle below (which read the null NVFP4 expert scales) must be
+    // skipped — the keep-packed MoE prefill arm consumes the packed blocks via
+    // q4k_mmq instead.
+    let experts_keep_packed = layer.weights.packed_experts.is_some();
+    if unified_moe_layout && !experts_keep_packed {
         layer.transpose_for_prefill_unified(gpu, config)?;
     }
     // Native NVFP4 CUTLASS grouped MoE (ATLAS_HOLO_MOE_GROUPED_CUTLASS=1).
@@ -245,7 +251,7 @@ fn load_moe_ffn(
     // tile. The SFB swizzle is built from whichever scale tables exist —
     // transposed [K/16,N] under the unified layout, else the checkpoint's own
     // [N,K/16] via the src_n_major packer path.
-    if cutlass_grouped_moe_enabled() {
+    if cutlass_grouped_moe_enabled() && !experts_keep_packed {
         layer.build_cutlass_grouped_sfb(gpu, config, gpu.default_stream())?;
     }
     Ok(FfnComponent::Moe(layer))
