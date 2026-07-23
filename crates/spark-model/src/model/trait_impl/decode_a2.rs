@@ -20,6 +20,14 @@ use crate::layer::{ForwardContext, LayerState, SsmLayerState};
 use crate::layers::ops;
 use crate::traits::{Model, SequenceState};
 
+/// Route the BF16 lm_head decode through the batched GEMV (dense_gemv_bf16_batchm)
+/// instead of the scalar dense_gemm_bf16. Default ON. Mirrors PR #332's
+/// ATLAS_LMHEAD_BATCH_GEMV for the NVFP4 head; this is the BF16 sibling.
+fn lmhead_batch_gemv_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ATLAS_LMHEAD_BATCH_GEMV").ok().as_deref() != Some("0"))
+}
+
 impl TransformerModel {
     pub(super) fn decode_batch_dispatch(
         &self,
@@ -434,6 +442,29 @@ impl TransformerModel {
                     padded_n as u32,
                     v as u32,
                     h as u32,
+                    stream,
+                )?;
+            } else if self.dense_gemv_batchm_kernel.0 != 0
+                && (1..=8).contains(&padded_n)
+                && lmhead_batch_gemv_enabled()
+            {
+                // BF16 lm_head batched GEMV (mirrors PR #332's NVFP4
+                // w4a16_gemv_batch16). dense_gemm above is the SCALAR
+                // dense_gemm_bf16 (16x16 FFMA, 2-byte loads, ~89 GB/s on the
+                // 617 MB vocab weight); dense_gemv_bf16_batchm reads it once
+                // with coalesced uint4 loads (~254 GB/s). Bit-identical to the
+                // single-seq dense_gemv the M=1 path uses. logits rows are
+                // `v` BF16 elements apart.
+                ops::dense_gemv_batchm(
+                    self.gpu.as_ref(),
+                    self.dense_gemv_batchm_kernel,
+                    normed,
+                    &self.lm_head_weight,
+                    logits,
+                    padded_n as u32,
+                    v as u32,
+                    h as u32,
+                    v as u32,
                     stream,
                 )?;
             } else {
