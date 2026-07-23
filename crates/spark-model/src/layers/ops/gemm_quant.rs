@@ -165,7 +165,7 @@ pub fn dense_gemv_batch2(
         .launch(stream)
 }
 
-/// Dense BF16 batched GEMV (M rows): C[t] = A[t] @ B^T for t in [0, M).
+/// Dense BF16 batched GEMV (M rows): `C[t] = A[t] @ B^T` for `t` in `[0, M)`.
 ///
 /// The M-row generalisation of [`dense_gemv_batch2`]. Reads the BF16 weight
 /// matrix ONCE for all M rows instead of M times, which is the whole point:
