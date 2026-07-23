@@ -120,6 +120,21 @@ fn load_moe_ffn(
     let mlp = format!("{lp}.mlp");
     let gate = dense(store, &format!("{mlp}.gate.weight"))?;
     let correction_bias = dense(store, &format!("{mlp}.experts.e_score_correction_bias"))?;
+    let mi = config.moe_intermediate_size;
+    let h0 = config.hidden_size;
+    // A routed expert projection is stored either as pre-packed NVFP4
+    // (`.weight_packed` + scales — the poolside safetensors checkpoint) or as
+    // plain BF16 (`.weight` — e.g. a GGUF loaded through the dequant→BF16 path).
+    // Detect and quantize the BF16 form on the fly (mirrors the shared-expert
+    // path below) so both checkpoint kinds land in the same NVFP4 expert layout.
+    let expert_proj = |proj: &str, n: usize, k: usize| -> Result<QuantizedWeight> {
+        if store.contains(&format!("{proj}.weight_packed")) {
+            quantized_v2(store, proj, gpu)
+        } else {
+            let bf16 = dense_auto(store, &format!("{proj}.weight"), gpu)?;
+            quantize_to_nvfp4(&bf16, n, k, gpu, absmax_k, quantize_k, stream)
+        }
+    };
     let experts = (0..config.num_experts)
         .map(|e| {
             if !config.is_local_expert(e) {
@@ -127,9 +142,9 @@ fn load_moe_ffn(
             }
             let ep = format!("{mlp}.experts.{e}");
             Ok(ExpertWeight {
-                gate_proj: quantized_v2(store, &format!("{ep}.gate_proj"), gpu)?,
-                up_proj: quantized_v2(store, &format!("{ep}.up_proj"), gpu)?,
-                down_proj: quantized_v2(store, &format!("{ep}.down_proj"), gpu)?,
+                gate_proj: expert_proj(&format!("{ep}.gate_proj"), mi, h0)?,
+                up_proj: expert_proj(&format!("{ep}.up_proj"), mi, h0)?,
+                down_proj: expert_proj(&format!("{ep}.down_proj"), h0, mi)?,
             })
         })
         .collect::<Result<Vec<_>>>()?;
