@@ -213,6 +213,32 @@ impl MoeLayer {
             fc2_gs,
             max_tokens,
         });
+
+        // R&D b12x-only: free the raw per-expert fp4 originals now that they are
+        // repacked into the b12x [E,2I,H/2]/[E,H,I/2] slabs. Laguna's routed MoE
+        // is ~1.2 GB/layer, so holding BOTH the originals (or the unified-
+        // transpose copy) AND the b12x copy overflows the 128 GB unified GB10
+        // (~2 copies × ~60 GB total). b12x is the SOLE routed path when it
+        // builds, so the caller (`load_moe_ffn`) skips the unified transpose +
+        // grouped SFB and nothing reads these originals again. NOTE: this makes
+        // the grouped routed/decode path unavailable — a prefill-measurement
+        // build, not for production serving.
+        for expert in &mut self.weights.experts {
+            for proj in [
+                &mut expert.gate_proj,
+                &mut expert.up_proj,
+                &mut expert.down_proj,
+            ] {
+                if !proj.weight.is_null() {
+                    gpu.free(proj.weight)?;
+                    proj.weight = DevicePtr::NULL;
+                }
+                if !proj.weight_scale.is_null() {
+                    gpu.free(proj.weight_scale)?;
+                    proj.weight_scale = DevicePtr::NULL;
+                }
+            }
+        }
         Ok(())
     }
 }

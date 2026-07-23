@@ -170,20 +170,30 @@ fn load_moe_ffn(
     // eligibility null-guard pass naturally and needs no `_t` tables. EP/
     // null-expert/no-lib configs leave b12x=None (grouped path). Logic lives in
     // b12x_weights.rs.
+    let mut b12x_built = false;
     if std::env::var("ATLAS_LAGUNA_MOE_B12X").as_deref() == Ok("1") {
         layer.build_b12x_weights(gpu, config, gpu.default_stream())?;
+        b12x_built = layer.b12x.is_some();
     }
-    if unified_moe_layout {
-        layer.transpose_for_prefill_unified(gpu, config)?;
-    }
-    // Native NVFP4 CUTLASS grouped MoE (ATLAS_HOLO_MOE_GROUPED_CUTLASS=1).
-    // The routed grouped GEMMs are ~47% of Laguna's C=1 prefill GPU time and
-    // otherwise run on the w4a16 kernels, which LUT-dequant NVFP4 to FP8 per
-    // tile. The SFB swizzle is built from whichever scale tables exist —
-    // transposed [K/16,N] under the unified layout, else the checkpoint's own
-    // [N,K/16] via the src_n_major packer path.
-    if cutlass_grouped_moe_enabled() {
-        layer.build_cutlass_grouped_sfb(gpu, config, gpu.default_stream())?;
+    // When b12x builds it is the SOLE routed path (and has already freed the raw
+    // per-expert originals), so skip the unified transpose + grouped SFB: both
+    // would rebuild a second ~60 GB copy of the routed weights — which is what
+    // OOM'd the 128 GB GB10 — and would touch the now-freed pointers. If b12x
+    // self-disabled (null-expert / no-lib / EP), fall through to the grouped
+    // path as before.
+    if !b12x_built {
+        if unified_moe_layout {
+            layer.transpose_for_prefill_unified(gpu, config)?;
+        }
+        // Native NVFP4 CUTLASS grouped MoE (ATLAS_HOLO_MOE_GROUPED_CUTLASS=1).
+        // The routed grouped GEMMs are ~47% of Laguna's C=1 prefill GPU time and
+        // otherwise run on the w4a16 kernels, which LUT-dequant NVFP4 to FP8 per
+        // tile. The SFB swizzle is built from whichever scale tables exist —
+        // transposed [K/16,N] under the unified layout, else the checkpoint's own
+        // [N,K/16] via the src_n_major packer path.
+        if cutlass_grouped_moe_enabled() {
+            layer.build_cutlass_grouped_sfb(gpu, config, gpu.default_stream())?;
+        }
     }
     Ok(FfnComponent::Moe(layer))
 }
