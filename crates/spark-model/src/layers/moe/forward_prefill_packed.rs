@@ -72,6 +72,33 @@ impl MoeLayer {
             .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
 
+        // Defensive: the sort emits an exact prefix sum (offs[ne] == total_expanded,
+        // monotonic). A violation ⇒ a stale/aliased offsets buffer, and per-expert
+        // slicing below would run OOB (async CUDA_ERROR_ILLEGAL_ADDRESS). Fail loud.
+        let last = *offs.last().unwrap_or(&0);
+        let monotonic = offs.windows(2).all(|w| w[0] <= w[1]);
+        if last != total_expanded || !monotonic || offs.len() != ne + 1 {
+            anyhow::bail!(
+                "packed MoE: bad expert_offsets (len={}, last={last}, total_expanded={total_expanded}, \
+                 monotonic={monotonic}); first8={:?} last8={:?}",
+                offs.len(),
+                &offs[..offs.len().min(8)],
+                &offs[offs.len().saturating_sub(8)..],
+            );
+        }
+
+        // One-time diagnostic: dump the routing shape so a fault can be tied to
+        // concrete numbers (expert count with rows, max rows, total_expanded).
+        static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            let active = offs.windows(2).filter(|w| w[1] > w[0]).count();
+            let maxrows = offs.windows(2).map(|w| w[1] - w[0]).max().unwrap_or(0);
+            tracing::warn!(
+                "packed MoE arm: n={n} top_k={top_k} total_expanded={total_expanded} inter={inter} \
+                 h={h} ne={ne} active_experts={active} max_rows/expert={maxrows}"
+            );
+        }
+
         let expert_gate_out = ctx.buffers.expert_gate_out();
         let expert_up_out = ctx.buffers.expert_up_out();
         let expert_down_out = ctx.buffers.expert_down_out();

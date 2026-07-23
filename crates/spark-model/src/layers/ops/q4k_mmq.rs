@@ -135,7 +135,14 @@ pub fn q4k_mmq_gemm(
     k: u32,
     stream: u64,
 ) -> Result<()> {
-    let kernel = if !n.is_multiple_of(128) {
+    // `nc` (no-check) assumes BOTH the N tiles and the M (ncols_dst) tiles are
+    // full 128-wide; it is only safe when n % 128 == 0 AND m % 128 == 0. The
+    // dense-FFN caller always pads m, but the keep-packed MoE arm drives this
+    // per-expert with a RAGGED m (each expert's routed-row count), so force the
+    // bounds-checked `wc` variant whenever either dim is not tile-aligned —
+    // otherwise a ragged-m tile writes past the output slice into adjacent
+    // arena buffers (observed as a downstream CUDA_ERROR_ILLEGAL_ADDRESS).
+    let kernel = if !n.is_multiple_of(128) || !m.is_multiple_of(128) {
         kernel_wc
     } else {
         kernel_nc

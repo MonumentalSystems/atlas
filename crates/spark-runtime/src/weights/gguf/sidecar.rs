@@ -58,19 +58,22 @@ pub fn open_gguf(path: &Path) -> Result<(std::fs::File, memmap2::Mmap, container
         std::fs::File::open(path).with_context(|| format!("Failed to open {}", path.display()))?;
     // SAFETY: same mmap contract as the safetensors loader.
     let mmap = unsafe { memmap2::MmapOptions::new().map(&file)? };
-    // NFS prefetch: the loader streams tensors in file order, so give the kernel
-    // the same SEQUENTIAL readahead the fast safetensors loader uses
-    // (`fast_weights::advise_prefetch_shard`, gated on `--fast-load-prefetch-
-    // shards`). On NFS this is latency-bound one-page-at-a-time faults (~300
-    // MB/s) vs bandwidth-bound streaming (~2 GB/s). NOTE: that helper ALSO
-    // POSIX_FADV_WILLNEEDs each shard, but it processes 44GB shards one at a time
-    // (evicting between); a GGUF is a SINGLE ~71GB file, so WILLNEED-ing it whole
-    // would hold 71GB in the page cache while the GPU also fills to ~71GB —
-    // exceeding the 128GB GB10 unified pool. SEQUENTIAL (grow the readahead
-    // window, drop pages behind) gets the bandwidth win without that pressure.
-    // Best-effort: a failed advise never blocks the load.
+    // NFS prefetch — the same mechanism the fast safetensors loader uses
+    // (`fast_weights::advise_prefetch_shard`): SEQUENTIAL (grow the readahead
+    // window + drop pages behind the read cursor) + WILLNEED (KICK OFF async
+    // readahead of the whole file NOW, rather than waiting for per-page demand
+    // faults). SEQUENTIAL alone only widens the window on faults — it does not
+    // trigger prefetch, so it barely moves NFS latency-bound loading (~300MB/s);
+    // WILLNEED streams at NFS bandwidth (~2GB/s). Memory stays bounded even for a
+    // single 71GB file: once WILLNEED warms the cache the consumer reads warm
+    // pages + copies to GPU faster than NFS delivers, so it PACES with the
+    // readahead (the cache gap stays small) while SEQUENTIAL drops pages behind
+    // the cursor. Best-effort: a failed advise never blocks the load.
     if let Err(e) = mmap.advise(memmap2::Advice::Sequential) {
         tracing::debug!("madvise(SEQUENTIAL) on GGUF mmap failed (non-fatal): {e}");
+    }
+    if let Err(e) = mmap.advise(memmap2::Advice::WillNeed) {
+        tracing::debug!("madvise(WILLNEED) on GGUF mmap failed (non-fatal): {e}");
     }
     let gguf = container::GgufFile::parse(&mmap)
         .with_context(|| format!("Failed to parse GGUF container: {}", path.display()))?;
