@@ -708,17 +708,26 @@ impl Qwen3AttentionLayer {
         // ── 9b. Per-head attention gate (Step 3.7 g_proj) ──
         if let Some(ref g_proj) = self.head_gate_weight {
             let gate_buf = q_contiguous; // Q buffer free after attention
-            ops::dense_gemm_tc(
-                ctx.gpu,
-                self.dense_gemm_tc_k,
-                normed,
-                g_proj,
-                gate_buf,
-                n,
-                nq,
-                h,
-                stream,
-            )?;
+            // Route the tiny [n,72] head-gate projection through cuBLASLt like
+            // q/k/v/o: on dense_gemm_tc the N=72 output gives only 2 N-blocks
+            // (grid [2, ceil(n/16)]) so the kernel is badly underutilized.
+            // A/B (ISL 1024/8192, C=1): sTTFT 765->747 / 4177->4068 ms = ~2.5%.
+            // dense_gemm_tc stays as the fallback when cuBLAS is off.
+            if ops::cublas_gemm_enabled() {
+                ops::cublas_bf16_proj_dense(normed, g_proj.weight, gate_buf, n, nq, h, stream)?;
+            } else {
+                ops::dense_gemm_tc(
+                    ctx.gpu,
+                    self.dense_gemm_tc_k,
+                    normed,
+                    g_proj,
+                    gate_buf,
+                    n,
+                    nq,
+                    h,
+                    stream,
+                )?;
+            }
             match self.head_gate_activation {
                 super::super::types::HeadGateActivation::Sigmoid => {
                     ops::sigmoid_gate_mul_head_broadcast(
