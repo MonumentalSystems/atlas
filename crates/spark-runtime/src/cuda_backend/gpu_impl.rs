@@ -70,7 +70,7 @@ fn d2h_trace_tick() {
             std::backtrace::Backtrace::force_capture()
         );
     }
-    if n % 10_000 == 0 {
+    if n.is_multiple_of(10_000) {
         tracing::warn!("ATLAS_D2H_TRACE: {n} D2H copies so far (each forces a stream sync)");
     }
 }

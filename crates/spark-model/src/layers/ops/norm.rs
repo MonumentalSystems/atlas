@@ -76,7 +76,7 @@ pub fn rms_norm_short_row_eligible(num_rows: u32, hidden_size: u32) -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
     let on = *ON.get_or_init(|| std::env::var("ATLAS_RMS_NORM_WARP_ROW").as_deref() != Ok("0"));
-    on && hidden_size <= 256 && hidden_size % 2 == 0 && num_rows >= 1024
+    on && hidden_size <= 256 && hidden_size.is_multiple_of(2) && num_rows >= 1024
 }
 
 /// Fused RMS norm + residual save: normed = rms_norm(input), residual = input.

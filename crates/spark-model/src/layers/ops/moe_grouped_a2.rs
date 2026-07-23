@@ -14,12 +14,12 @@ use crate::weight_map::{DenseWeight, Fp8DenseWeight, Fp8Weight, QuantizedWeight}
 
 use super::*;
 
-/// Counting sort tokens by expert assignment.
-///
-/// Produces sorted_token_ids (grouped by expert), expert_offsets (prefix sum),
-/// and token_to_perm (reverse map for unpermute).
-///
-/// Grid: (1, 1, 1)  Block: (256, 1, 1)
+// Counting sort tokens by expert assignment.
+//
+// Produces sorted_token_ids (grouped by expert), expert_offsets (prefix sum),
+// and token_to_perm (reverse map for unpermute).
+//
+// Grid: (1, 1, 1)  Block: (256, 1, 1)
 
 /// Host snapshots of per-expert pointer/scale arrays, keyed by device pointer.
 ///

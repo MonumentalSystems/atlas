@@ -160,7 +160,15 @@ fn main() -> Result<()> {
             // ---- speed ----
             for _ in 0..WARMUP {
                 for t in 0..m {
-                    launch_m1(g, m1_k, ad.offset(t * k_dim * 2), wd, c_ref.offset(t * n * 2), n, k_dim)?;
+                    launch_m1(
+                        g,
+                        m1_k,
+                        ad.offset(t * k_dim * 2),
+                        wd,
+                        c_ref.offset(t * n * 2),
+                        n,
+                        k_dim,
+                    )?;
                 }
                 launch_batchm(g, bm_k, ad, wd, c_bat, m, n, k_dim, n)?;
             }
@@ -169,7 +177,15 @@ fn main() -> Result<()> {
             let t0 = std::time::Instant::now();
             for _ in 0..ITERS {
                 for t in 0..m {
-                    launch_m1(g, m1_k, ad.offset(t * k_dim * 2), wd, c_ref.offset(t * n * 2), n, k_dim)?;
+                    launch_m1(
+                        g,
+                        m1_k,
+                        ad.offset(t * k_dim * 2),
+                        wd,
+                        c_ref.offset(t * n * 2),
+                        n,
+                        k_dim,
+                    )?;
                 }
             }
             g.synchronize(0)?;

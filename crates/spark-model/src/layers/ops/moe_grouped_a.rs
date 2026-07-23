@@ -218,20 +218,6 @@ pub fn moe_w4a16_grouped_gemm_ptrtable_n128(
         .launch(stream)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::ptrtable_legacy_grid_x;
-
-    #[test]
-    fn legacy_ptrtable_grid_covers_every_64_column_tile() {
-        assert_eq!(ptrtable_legacy_grid_x(1), 1);
-        assert_eq!(ptrtable_legacy_grid_x(64), 1);
-        assert_eq!(ptrtable_legacy_grid_x(65), 2);
-        assert_eq!(ptrtable_legacy_grid_x(1024), 16);
-        assert_eq!(ptrtable_legacy_grid_x(3072), 48);
-    }
-}
-
 /// FP8-A pointer-table grouped GEMM with transposed NVFP4 weights.
 ///
 /// A must already be converted to FP8 E4M3. The launch shape mirrors
@@ -495,4 +481,18 @@ pub fn moe_silu_mul(
         .arg_ptr(output)
         .arg_u32(total_elements)
         .launch(stream)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ptrtable_legacy_grid_x;
+
+    #[test]
+    fn legacy_ptrtable_grid_covers_every_64_column_tile() {
+        assert_eq!(ptrtable_legacy_grid_x(1), 1);
+        assert_eq!(ptrtable_legacy_grid_x(64), 1);
+        assert_eq!(ptrtable_legacy_grid_x(65), 2);
+        assert_eq!(ptrtable_legacy_grid_x(1024), 16);
+        assert_eq!(ptrtable_legacy_grid_x(3072), 48);
+    }
 }

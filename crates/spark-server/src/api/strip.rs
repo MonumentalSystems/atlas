@@ -108,7 +108,10 @@ mod scrub_think_tests {
     #[test]
     fn does_not_eat_partial_or_lookalike_markers() {
         // An incomplete marker is not a complete one; leave it for the caller.
-        assert_eq!(scrub_think_markers("think about </thin"), "think about </thin");
+        assert_eq!(
+            scrub_think_markers("think about </thin"),
+            "think about </thin"
+        );
     }
 }
 

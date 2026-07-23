@@ -168,7 +168,9 @@ fn main() -> Result<()> {
     let ups_d = up_u64(g, &ups)?;
     let s2 = up_f32(g, &vec![1.0f32; POOL])?;
 
-    let a: Vec<bf16> = (0..2 * H).map(|i| bf16::from_f32((i % 7) as f32 * 0.01)).collect();
+    let a: Vec<bf16> = (0..2 * H)
+        .map(|i| bf16::from_f32((i % 7) as f32 * 0.01))
+        .collect();
     let a_d = up_bf16(g, &a)?;
     let gout = g.alloc(2 * TOP_K * INTER * 2)?;
     let uout = g.alloc(2 * TOP_K * INTER * 2)?;
@@ -187,7 +189,9 @@ fn main() -> Result<()> {
                     v.extend(ten);
                     v
                 } else {
-                    (0..distinct).map(|j| ((base + j * 3) % POOL) as u32).collect()
+                    (0..distinct)
+                        .map(|j| ((base + j * 3) % POOL) as u32)
+                        .collect()
                 }
             })
             .collect()
@@ -200,19 +204,37 @@ fn main() -> Result<()> {
         .iter()
         .map(|v| up_u32(g, v).unwrap())
         .collect();
-    let idx_dup: Vec<DevicePtr> = mk(true, 0)
-        .iter()
-        .map(|v| up_u32(g, v).unwrap())
-        .collect();
+    let idx_dup: Vec<DevicePtr> = mk(true, 0).iter().map(|v| up_u32(g, v).unwrap()).collect();
 
-    let run = |kern: KernelHandle, idxs: &[DevicePtr], grid_y: u32, label: &str, experts: f64| -> Result<()> {
+    let run = |kern: KernelHandle,
+               idxs: &[DevicePtr],
+               grid_y: u32,
+               label: &str,
+               experts: f64|
+     -> Result<()> {
         for it in 0..WARMUP {
-            launch(g, kern, a_d, gp_d, gs_d, s2, gout, upp_d, ups_d, s2, uout, idxs[it], grid_y)?;
+            launch(
+                g, kern, a_d, gp_d, gs_d, s2, gout, upp_d, ups_d, s2, uout, idxs[it], grid_y,
+            )?;
         }
         g.synchronize(0)?;
         let t0 = std::time::Instant::now();
         for it in 0..ITERS {
-            launch(g, kern, a_d, gp_d, gs_d, s2, gout, upp_d, ups_d, s2, uout, idxs[WARMUP + it], grid_y)?;
+            launch(
+                g,
+                kern,
+                a_d,
+                gp_d,
+                gs_d,
+                s2,
+                gout,
+                upp_d,
+                ups_d,
+                s2,
+                uout,
+                idxs[WARMUP + it],
+                grid_y,
+            )?;
         }
         g.synchronize(0)?;
         let ms = t0.elapsed().as_secs_f64() * 1e3 / ITERS as f64;
