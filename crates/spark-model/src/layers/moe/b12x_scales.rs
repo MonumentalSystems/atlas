@@ -172,24 +172,26 @@ pub(crate) fn bake_single(scale: &[u8], ws2: f32) -> Vec<u8> {
         .collect()
 }
 
-/// Swizzle a logical `[K/16, N]` scale (already on device at `logical_dev`) into the
-/// SFB atom at `out`. THE isolated atom seam. `ConcatReuse` reuses `pack_weight_sfb`;
+/// Swizzle a logical scale (already on device at `logical_dev`) into the SFB atom at
+/// `out`. THE isolated atom seam. `ConcatReuse` reuses `pack_weight_sfb`;
 /// `RebuildFromRaw` bails until the parent supplies an FI-matching layout.
 ///
-/// The baked logical buffers this port feeds in are K-major `[K/16, N]` (the bake
-/// preserves the transposed `_t`-table orientation), so `src_n_major = false`.
+/// `src_n_major` selects the SOURCE orientation of `logical_dev`: `true` = checkpoint-
+/// original n-major `[N, K/16]` (the Laguna b12x path, sourced before the unified
+/// transpose); `false` = Atlas-transposed K-major `[K/16, N]`. The swizzled SFB output
+/// is identical either way — it only tells the packer how to read the input.
 pub(crate) fn swizzle_sfb(
     logical_dev: u64,
     out: DevicePtr,
     n: u32,
     k: u32,
     strat: SfbStrategy,
+    src_n_major: bool,
     stream: u64,
 ) -> Result<()> {
     match strat {
         SfbStrategy::ConcatReuse => {
-            // `src_n_major = false`: the bake keeps the transposed `[K/16, N]` layout.
-            spark_runtime::cutlass::pack_weight_sfb(logical_dev, out.0, n, k, false, stream)
+            spark_runtime::cutlass::pack_weight_sfb(logical_dev, out.0, n, k, src_n_major, stream)
         }
         SfbStrategy::RebuildFromRaw => anyhow::bail!(
             "b12x SFB atom mismatch — gated on parent P0 proof; RebuildFromRaw path not yet \
@@ -199,13 +201,16 @@ pub(crate) fn swizzle_sfb(
     }
 }
 
-/// One expert's device scale pointers + per-projection `weight_scale_2` values.
+/// One expert's device scale pointers + per-projection `weight_scale_2` values. The
+/// pointer orientation (`src_n_major` on [`build_sf_tables`]) must match: the Laguna
+/// b12x path passes the checkpoint-original n-major scales (up/gate `[I, H/16]`, down
+/// `[H, I/16]`) with `src_n_major = true`.
 pub(crate) struct ExpertScaleSrc {
-    /// Transposed `[K/16, I]` e4m3 up-proj scale (device).
+    /// Up-proj block scale (device). n-major `[I, H/16]` (or transposed `[H/16, I]`).
     pub up: u64,
-    /// Transposed `[K/16, I]` e4m3 gate-proj scale (device).
+    /// Gate-proj block scale (device). n-major `[I, H/16]` (or transposed `[H/16, I]`).
     pub gate: u64,
-    /// Transposed `[K/16, H]` e4m3 down-proj scale (device).
+    /// Down-proj block scale (device). n-major `[H, I/16]` (or transposed `[I/16, H]`).
     pub down: u64,
     pub up_ws2: f32,
     pub gate_ws2: f32,
@@ -224,6 +229,7 @@ pub(crate) fn build_sf_tables(
     inter: usize,
     bake_w2: bool,
     strat: SfbStrategy,
+    src_n_major: bool,
     stream: u64,
 ) -> Result<(DevicePtr, DevicePtr, Vec<f32>)> {
     let e_count = experts.len();
@@ -231,17 +237,28 @@ pub(crate) fn build_sf_tables(
     let sfb2 = sfb_len(h, inter);
     let w13_sf = gpu.alloc(e_count * sfb13)?;
     let w2_sf = gpu.alloc(e_count * sfb2)?;
-    let up_bytes = (h / 16) * inter; // transposed [K/16, I]
-    let down_bytes = (inter / 16) * h; // transposed [K/16, H]
+    // Up/gate scales are `I * H/16` bytes each, down is `H * I/16` — the byte count is
+    // orientation-independent, only the element ordering differs.
+    let up_bytes = (h / 16) * inter;
+    let down_bytes = (inter / 16) * h;
     let mut w2_alpha = Vec::with_capacity(e_count);
 
     for (e, s) in experts.iter().enumerate() {
-        // ── w13: read up/gate transposed scales, bake, upload, swizzle ──
+        // ── w13: read up/gate scales, bake in scale2, upload, swizzle ──
         let mut up_h = vec![0u8; up_bytes];
         let mut gate_h = vec![0u8; up_bytes];
         gpu.copy_d2h(DevicePtr(s.up), &mut up_h)?;
         gpu.copy_d2h(DevicePtr(s.gate), &mut gate_h)?;
-        let baked = bake_w13_logical(&up_h, &gate_h, s.up_ws2, s.gate_ws2, h, inter);
+        let baked = if src_n_major {
+            // n-major `[I, H/16]` per half: the concat is a plain row-stack (UP rows
+            // `[0,I)`, then GATE rows `[I,2I)`), matching the fp4 w13 layout. bake_single
+            // scales each block by its projection's weight_scale_2 (element-wise).
+            let mut v = bake_single(&up_h, s.up_ws2);
+            v.extend(bake_single(&gate_h, s.gate_ws2));
+            v
+        } else {
+            bake_w13_logical(&up_h, &gate_h, s.up_ws2, s.gate_ws2, h, inter)
+        };
         let tmp = gpu.alloc(baked.len())?;
         gpu.copy_h2d(&baked, tmp)?;
         swizzle_sfb(
@@ -250,6 +267,7 @@ pub(crate) fn build_sf_tables(
             (2 * inter) as u32,
             h as u32,
             strat,
+            src_n_major,
             stream,
         )?;
         gpu.synchronize(stream)?;
@@ -275,6 +293,7 @@ pub(crate) fn build_sf_tables(
             h as u32,
             inter as u32,
             strat,
+            src_n_major,
             stream,
         )?;
         gpu.synchronize(stream)?;

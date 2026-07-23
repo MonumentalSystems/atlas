@@ -8,37 +8,21 @@ use super::*;
 #[test]
 fn eligibility_truth_table() {
     // Streamer + flag is ALWAYS a hard error, regardless of the other flags.
-    assert_eq!(
-        eligibility(true, 1, false, true),
-        B12xEligibility::ErrStreamer
-    );
-    assert_eq!(
-        eligibility(true, 4, true, false),
-        B12xEligibility::ErrStreamer
-    );
+    assert_eq!(eligibility(true, 1, false), B12xEligibility::ErrStreamer);
+    assert_eq!(eligibility(true, 4, true), B12xEligibility::ErrStreamer);
     // EP shard disables b12x.
-    assert_eq!(eligibility(false, 2, false, true), B12xEligibility::SkipEp);
+    assert_eq!(eligibility(false, 2, false), B12xEligibility::SkipEp);
     // Null/placeholder expert disables b12x.
-    assert_eq!(
-        eligibility(false, 1, true, true),
-        B12xEligibility::SkipNullExpert
-    );
-    // Missing transposed tables disable b12x.
-    assert_eq!(
-        eligibility(false, 1, false, false),
-        B12xEligibility::SkipNoTables
-    );
-    // All experts resident, tables present, single rank => build.
-    assert_eq!(eligibility(false, 1, false, true), B12xEligibility::Build);
+    assert_eq!(eligibility(false, 1, true), B12xEligibility::SkipNullExpert);
+    // All experts resident, single rank => build. b12x sources n-major original
+    // scales, so there is no transposed-`_t`-tables precondition.
+    assert_eq!(eligibility(false, 1, false), B12xEligibility::Build);
 }
 
 #[test]
 fn eligibility_precedence_streamer_over_all() {
-    // Even with EP + nulls + missing tables, the streamer error takes precedence.
-    assert_eq!(
-        eligibility(true, 8, true, true),
-        B12xEligibility::ErrStreamer
-    );
+    // Even with EP + nulls, the streamer error takes precedence.
+    assert_eq!(eligibility(true, 8, true), B12xEligibility::ErrStreamer);
 }
 
 #[test]

@@ -161,6 +161,18 @@ fn load_moe_ffn(
     // decode; the quantized copies above are placeholders for fused routed
     // kernels and their shared contribution is overwritten before blending.
     layer.set_bf16_shared_expert(shared_gate, shared_up, shared_down)?;
+    // b12x fused-MoE opt-in repack (ATLAS_LAGUNA_MOE_B12X). MUST run BEFORE the
+    // unified transpose: `transpose_for_prefill_unified` frees + NULLs each
+    // expert's raw gate/up/down `weight` + `weight_scale` (keep_originals=false),
+    // and b12x reads BOTH the raw fp4 `weight` bytes (D2D-copied into its
+    // `[E,2I,H/2]`/`[E,H,I/2]` slabs) AND the checkpoint-original n-major
+    // `[N,K/16]` block scales. Sourcing here (before the free) lets the
+    // eligibility null-guard pass naturally and needs no `_t` tables. EP/
+    // null-expert/no-lib configs leave b12x=None (grouped path). Logic lives in
+    // b12x_weights.rs.
+    if std::env::var("ATLAS_LAGUNA_MOE_B12X").as_deref() == Ok("1") {
+        layer.build_b12x_weights(gpu, config, gpu.default_stream())?;
+    }
     if unified_moe_layout {
         layer.transpose_for_prefill_unified(gpu, config)?;
     }
@@ -172,12 +184,6 @@ fn load_moe_ffn(
     // [N,K/16] via the src_n_major packer path.
     if cutlass_grouped_moe_enabled() {
         layer.build_cutlass_grouped_sfb(gpu, config, gpu.default_stream())?;
-    }
-    // b12x fused-MoE opt-in repack (ATLAS_LAGUNA_MOE_B12X). EP/null-expert/no-lib
-    // configs leave b12x=None (grouped path); it needs the transposed `_t` tables, so
-    // pair it with ATLAS_UNIFIED_MOE_LAYOUT=1. Logic lives in b12x_weights.rs.
-    if std::env::var("ATLAS_LAGUNA_MOE_B12X").as_deref() == Ok("1") {
-        layer.build_b12x_weights(gpu, config, gpu.default_stream())?;
     }
     Ok(FfnComponent::Moe(layer))
 }

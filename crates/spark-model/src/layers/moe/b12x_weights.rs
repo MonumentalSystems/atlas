@@ -54,18 +54,19 @@ pub(crate) enum B12xEligibility {
     SkipEp,
     /// Some expert is a NULL placeholder (partial residency) — skip, run grouped.
     SkipNullExpert,
-    /// Transposed `_t` scale tables absent (not unified-layout) — skip, run grouped.
-    SkipNoTables,
 }
 
 /// Pure eligibility decision. b12x's `num_local_experts == num_experts` enforcement makes
 /// the streamed/EP/null-expert configs fundamentally incompatible: streamer is a HARD
 /// error (never silently fall back on that combo), the rest silently disable b12x.
+///
+/// NOTE: b12x sources its block scales from the checkpoint-original n-major `[N,K/16]`
+/// tables (see `build_b12x_weights`), so it does NOT require the transposed `_t` scale
+/// tables and there is no `have_t` gate — it is built before the unified transpose runs.
 pub(crate) fn eligibility(
     has_streamer: bool,
     ep_world_size: usize,
     any_null_expert: bool,
-    have_t_tables: bool,
 ) -> B12xEligibility {
     if has_streamer {
         return B12xEligibility::ErrStreamer;
@@ -76,28 +77,20 @@ pub(crate) fn eligibility(
     if any_null_expert {
         return B12xEligibility::SkipNullExpert;
     }
-    if !have_t_tables {
-        return B12xEligibility::SkipNoTables;
-    }
     B12xEligibility::Build
 }
 
 impl MoeLayer {
-    /// Read a device `[num]` u64 pointer array into a host vec (mirrors
-    /// `build_cutlass_grouped_sfb`).
-    fn read_ptr_array(gpu: &dyn GpuBackend, arr: DevicePtr, num: usize) -> Result<Vec<u64>> {
-        let mut raw = vec![0u8; num * 8];
-        gpu.copy_d2h(arr, &mut raw)?;
-        Ok(raw
-            .chunks_exact(8)
-            .map(|c| u64::from_le_bytes(c.try_into().expect("8 bytes")))
-            .collect())
-    }
-
     /// Build b12x fused-MoE weights at load (behind `ATLAS_LAGUNA_MOE_B12X`). Sets
     /// `self.b12x = Some(..)` only when every expert is resident and the shim lib is
     /// loaded; otherwise leaves it `None` (grouped path). Hard-errors on the streamer
     /// combo (unreachable on the current Laguna tree — no streamer machinery).
+    ///
+    /// Runs BEFORE `transpose_for_prefill_unified` (which frees the raw experts): the
+    /// fp4 repack D2D-copies each expert's original n-major `[N,K/2]` `weight`, and the
+    /// SFB tables are baked from each expert's original n-major `[N,K/16]` `weight_scale`
+    /// (`src_n_major = true`) — so b12x needs neither the `_t` tables nor the unified
+    /// layout.
     pub(crate) fn build_b12x_weights(
         &mut self,
         gpu: &dyn GpuBackend,
@@ -108,9 +101,7 @@ impl MoeLayer {
         // eligibility truth-table stays the SSOT and a future streamer wires in here.
         let has_streamer = false;
         let any_null = self.weights.experts.iter().any(|e| e.gate_proj.is_null());
-        let have_t =
-            self.gate_ptrs_t.is_some() && self.up_ptrs_t.is_some() && self.down_ptrs_t.is_some();
-        match eligibility(has_streamer, config.ep_world_size, any_null, have_t) {
+        match eligibility(has_streamer, config.ep_world_size, any_null) {
             B12xEligibility::ErrStreamer => anyhow::bail!(
                 "ATLAS_LAGUNA_MOE_B12X=1 is incompatible with a streamed-expert config: b12x \
                  enforces num_local_experts == num_experts (fully-resident experts only)."
@@ -125,13 +116,6 @@ impl MoeLayer {
             B12xEligibility::SkipNullExpert => {
                 tracing::warn!(
                     "ATLAS_LAGUNA_MOE_B12X: null/placeholder expert(s) present — b12x disabled, grouped"
-                );
-                return Ok(());
-            }
-            B12xEligibility::SkipNoTables => {
-                tracing::warn!(
-                    "ATLAS_LAGUNA_MOE_B12X: transposed _t tables absent (need \
-                     ATLAS_UNIFIED_MOE_LAYOUT=1) — b12x disabled, grouped path runs"
                 );
                 return Ok(());
             }
@@ -181,22 +165,19 @@ impl MoeLayer {
             )?;
         }
 
-        // ── scale sources: transposed [K/16, N] scales + per-projection scale2 ──
-        let up_sf =
-            Self::read_ptr_array(gpu, self.up_ptrs_t.as_ref().unwrap().scale_ptrs, e_count)?;
-        let gate_sf =
-            Self::read_ptr_array(gpu, self.gate_ptrs_t.as_ref().unwrap().scale_ptrs, e_count)?;
-        let down_sf =
-            Self::read_ptr_array(gpu, self.down_ptrs_t.as_ref().unwrap().scale_ptrs, e_count)?;
+        // ── scale sources: checkpoint-original n-major [N, K/16] scales + scale2 ──
+        // Sourced straight off the resident experts (this runs before the unified
+        // transpose frees them). The n-major orientation matches the fp4 D2D repack
+        // above (UP rows then GATE) and is fed to the SFB packer with src_n_major=true,
+        // exactly mirroring build_cutlass_grouped_sfb's original-scale fallback.
         let srcs: Vec<ExpertScaleSrc> = self
             .weights
             .experts
             .iter()
-            .enumerate()
-            .map(|(e, expert)| ExpertScaleSrc {
-                up: up_sf[e],
-                gate: gate_sf[e],
-                down: down_sf[e],
+            .map(|expert| ExpertScaleSrc {
+                up: expert.up_proj.weight_scale.0,
+                gate: expert.gate_proj.weight_scale.0,
+                down: expert.down_proj.weight_scale.0,
                 up_ws2: expert.up_proj.weight_scale_2,
                 gate_ws2: expert.gate_proj.weight_scale_2,
                 down_ws2: expert.down_proj.weight_scale_2,
@@ -206,7 +187,7 @@ impl MoeLayer {
         let bake_w2 = std::env::var("ATLAS_B12X_BAKE_W2").as_deref() == Ok("1");
         let strat: SfbStrategy = sfb_strategy_from_env();
         let (w13_sf, w2_sf, w2_alpha_vals) =
-            b12x_scales::build_sf_tables(gpu, &srcs, h, inter, bake_w2, strat, stream)?;
+            b12x_scales::build_sf_tables(gpu, &srcs, h, inter, bake_w2, strat, true, stream)?;
 
         // ── alpha vectors: w1_alpha=ones (scale2 baked), fc2_gs=ones, w2_alpha ──
         let w1_alpha = gpu.alloc(e_count * 4)?;
