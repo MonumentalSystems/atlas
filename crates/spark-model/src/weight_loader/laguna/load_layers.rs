@@ -364,9 +364,20 @@ fn validate_matrix(store: &WeightStore, key: &str, rows: usize, cols: usize) -> 
 }
 
 fn load_kv_scales(store: &WeightStore, gpu: &dyn GpuBackend, prefix: &str) -> Result<(f32, f32)> {
+    // GGUF checkpoints carry no calibrated FP8 KV scales; default to 1.0 (no
+    // scaling) when absent so they load. The NVFP4 safetensors checkpoint ships
+    // real k_scale/v_scale and is unchanged. (FP8 KV without calibration clips —
+    // serve GGUF with --kv-cache-dtype bf16; the scales are then inert anyway.)
+    let load_opt = |name: String| -> Result<f32> {
+        if store.contains(&name) {
+            load_scalar(store, gpu, &name)
+        } else {
+            Ok(1.0)
+        }
+    };
     Ok((
-        load_scalar(store, gpu, &format!("{prefix}.k_scale"))?,
-        load_scalar(store, gpu, &format!("{prefix}.v_scale"))?,
+        load_opt(format!("{prefix}.k_scale"))?,
+        load_opt(format!("{prefix}.v_scale"))?,
     ))
 }
 

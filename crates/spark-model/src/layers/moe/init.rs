@@ -406,6 +406,16 @@ impl MoeLayer {
                 "moe_w4a16_down_t_k64_fp4",
             ),
             moe_permute_tokens_k: super::super::try_kernel(gpu, "moe", "moe_permute_tokens"),
+            // Keep-packed Q4_K_M expert kernels (Laguna GGUF); try_kernel so
+            // images without them stay at handle 0 (arm gated on packed_experts).
+            q4k_mmq_nc_k: super::super::try_kernel(gpu, "q4k_mmq", "atlas_q4k_mmq128_nc"),
+            q4k_mmq_wc_k: super::super::try_kernel(gpu, "q4k_mmq", "atlas_q4k_mmq128_wc"),
+            q4k_quant_act_k: super::super::try_kernel(gpu, "q4k_mmq", "atlas_q8_1_quantize_ds4_bf16"),
+            q6k_dequant_k: super::super::try_kernel(
+                gpu,
+                "dequant_gguf_bf16",
+                "dequant_q6_k_to_bf16",
+            ),
             // Phase 2.7 Tier C — set by loader after construction (qwen35.rs).
             is_dflash_capture_layer: false,
             lora: None,

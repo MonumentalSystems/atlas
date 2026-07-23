@@ -387,6 +387,14 @@ pub struct MoeLayer {
     /// path fuses the gather into its A-pack — kept for potential reuse.
     #[allow(dead_code)]
     pub(crate) moe_permute_tokens_k: KernelHandle,
+    // ── Keep-packed GGUF Q4_K_M experts (Laguna) ──
+    // Native per-expert W4A8 Q4_K MMQ (gate/up) + q8_1 activation quantizer +
+    // Q6_K dequant-scratch (down). Only non-zero when the layer is keep-packed
+    // (`weights.packed_experts.is_some()`); the packed MoE prefill arm uses them.
+    pub(crate) q4k_mmq_nc_k: KernelHandle,
+    pub(crate) q4k_mmq_wc_k: KernelHandle,
+    pub(crate) q4k_quant_act_k: KernelHandle,
+    pub(crate) q6k_dequant_k: KernelHandle,
     // Phase 2.7 Tier C — Frankenstein dispatch flag.
     // True when this layer's index is in `config.dflash_capture_layers`.
     // When the env var `ATLAS_FRANKENSTEIN_DECODE_VIA_PREFILL=1` is set,
