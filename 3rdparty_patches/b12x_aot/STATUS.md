@@ -174,8 +174,43 @@ max_tokens=1024; physical_tiles=335 max_tasks=2680 rows_padded=42880). Native lo
   default.
 - **Atlas release build (`-p spark-server`, `ATLAS_TARGET_MODEL='*'`) — green.** Flag-unset
   path is the untouched grouped-CUTLASS block (byte-identical; default-off).
-- **e2e correctness A/B + perf headline — BLOCKED on dgx-00; moved to gx10-9959.** dgx-00's
-  single GB10 (121 GB unified) is fully held by the protected `laguna-unified-candidate`
-  (97 GB resident, 95% util) — an 87 GB Laguna load cannot co-reside and that container must
-  not be touched. Validation relocated to the idle gx10-9959 (per MEMORY note).
+- **e2e correctness A/B + perf headline — BLOCKED by a real integration catch-22 (HARD
+  BLOCKER).** dgx-00's single GB10 was fully held by the protected `laguna-unified-candidate`
+  (97 GB, 95% util), so validation was relocated to the idle gx10-9959 (image + binary + .so
+  shipped via shared `/tank`). The Laguna model loaded there and **exposed a load-path bug
+  that makes b12x self-disable on EVERY MoE layer** — the exact silent-fallback the runbook
+  warns against:
+
+  `WARN ATLAS_LAGUNA_MOE_B12X: null/placeholder expert(s) present — b12x disabled, grouped`
+
+  **Root cause (catch-22):** `load_moe_ffn` runs `transpose_for_prefill_unified` (needed for
+  the `_t` scale tables b12x reads) which, via `transpose_for_prefill_unified_inner(...,
+  keep_originals=false)` Phase B (`helpers_a.rs:246-264`), **frees + NULLs each expert's
+  `gate_proj.weight` / `up_proj.weight`**. `build_b12x_weights` then runs *after* that free and
+  (a) its eligibility null-guard (`any_null = experts.any(gate_proj.is_null())`) trips →
+  `SkipNullExpert`, and (b) even if forced, its fp4 repack copies D2D *from* those freed
+  pointers (`b12x_weights.rs:167-181`). No env combination escapes it:
+  `ATLAS_UNIFIED_MOE_LAYOUT=0` ⇒ no `_t` tables ⇒ `SkipNoTables`; `=1` ⇒ raw gate/up freed ⇒
+  `SkipNullExpert`. b12x can therefore NEVER build on the Laguna tree as wired. (Worked on
+  Holo/PR #23 because that tree's hook ran against a layout that kept the originals; the
+  Laguna port inherited the unified-transpose free.)
+
+  **Fix direction (not a one-liner; needs memory analysis + rebuild + revalidate):** build
+  b12x's fp4 + SFB from the *checkpoint-original* per-expert weights/scales (n-major,
+  `src_n_major=true`) BEFORE the unified transpose frees them — i.e. either (i) run
+  `build_b12x_weights` ahead of the Phase-B free and source scales from
+  `expert.*.weight_scale` instead of the `_t` tables (relaxing the `have_t` gate), or (ii)
+  gate the transpose to `keep_originals=true` only for the tensors b12x consumes and free
+  them right after the b12x repack. Note Laguna's per-expert MoE is 4× Holo's
+  (H=3072/I=1024 vs 2048/512), so the transient raw+repacked coexistence must be
+  memory-budgeted on the 121 GB GB10.
+
+  **Secondary:** the gx10 serve also OOM'd at LM-head setup (`cuMemAlloc_v2 ... 805.9 MB free
+  / 121.6 GB total`) — `--gpu-memory-utilization 0.80` is too high given the box's ~26 GB
+  baseline; drop to ~0.70 for a clean gx10 load. (Independent of the b12x blocker.)
+
+  Net: **no honest b12x perf number is obtainable until the load-path catch-22 is fixed** —
+  every "passing" run is the grouped fallback, which the runbook defines as a FAIL of the
+  dispatch-gate step. Staged, reusable on gx10: `/tank/tmp/b12x_ship/` (image tar, `spark`
+  binary, `libatlasb12x.so`, cute runtime, serve/bench/correctness scripts).
 
