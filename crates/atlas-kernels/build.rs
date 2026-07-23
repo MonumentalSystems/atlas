@@ -300,9 +300,19 @@ fn main() {
                 cu_file.clone()
             };
 
+            // Every compile gets `-I<common_dir>` so any kernel (common or
+            // per-model) can include shared vendored headers there — e.g. the
+            // q4k_vendor/ llama headers used by both common/q4k_mmq.cu and the
+            // qwen3.6-27b nvfp4_mmq/q2_0_mmq kernels. nvcc's implicit source-dir
+            // include still covers same-dir headers.
+            let mut job_flags = target.extra_flags.clone();
+            if let Some(ref common) = target.common_kernel_dir {
+                job_flags.push(format!("-I{}", common.display()));
+            }
+
             // Dedup key: same (source, arch, sorted-flags) → identical
             // binary output. Sort flags so flag-order doesn't bust the cache.
-            let mut sorted_flags = target.extra_flags.clone();
+            let mut sorted_flags = job_flags.clone();
             sorted_flags.sort();
             let key = (compile_source.clone(), target.arch.clone(), sorted_flags);
 
@@ -312,7 +322,7 @@ fn main() {
                 compile_jobs.push(CompileJob {
                     cu_file: compile_source.clone(),
                     arch: target.arch.clone(),
-                    extra_flags: target.extra_flags.clone(),
+                    extra_flags: job_flags,
                     out_file: out_file.clone(),
                 });
                 compile_cache.insert(key, out_file);
