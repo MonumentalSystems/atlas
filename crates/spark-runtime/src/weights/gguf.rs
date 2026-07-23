@@ -101,28 +101,50 @@ fn spawn_gguf_prefetch(
     file_size: u64,
     consumed: std::sync::Arc<std::sync::atomic::AtomicU64>,
     done: std::sync::Arc<std::sync::atomic::AtomicBool>,
-) -> Option<std::thread::JoinHandle<()>> {
+) -> Vec<std::thread::JoinHandle<()>> {
     use std::os::unix::fs::FileExt;
-    use std::sync::atomic::Ordering;
-    let file = std::fs::File::open(&path).ok()?;
-    Some(std::thread::spawn(move || {
-        const WINDOW: u64 = 16 << 30; // 16 GB read-ahead cap
-        const CHUNK: usize = 32 << 20; // 32 MB reads
-        let mut buf = vec![0u8; CHUNK];
-        let mut pos: u64 = 0;
-        while !done.load(Ordering::Relaxed) && pos < file_size {
-            if pos > consumed.load(Ordering::Relaxed) + WINDOW {
-                std::thread::sleep(std::time::Duration::from_millis(1));
-                continue;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    const WINDOW: u64 = 16 << 30; // 16 GB read-ahead cap (bounds page cache)
+    const CHUNK: u64 = 32 << 20; // 32 MB reads (NFS batches to bandwidth)
+    // A SINGLE NFS read stream tops out well below link bandwidth (~300MB/s
+    // here); N parallel streams sharing one monotonically-advancing cursor
+    // aggregate to ~link speed while staying inside the window. Env override
+    // ATLAS_GGUF_PREFETCH_THREADS (default 8).
+    let n_threads = std::env::var("ATLAS_GGUF_PREFETCH_THREADS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n >= 1 && n <= 32)
+        .unwrap_or(8);
+    let next = std::sync::Arc::new(AtomicU64::new(0));
+    let mut handles = Vec::with_capacity(n_threads);
+    for _ in 0..n_threads {
+        let (next, consumed, done) = (next.clone(), consumed.clone(), done.clone());
+        let Ok(file) = std::fs::File::open(&path) else {
+            continue;
+        };
+        handles.push(std::thread::spawn(move || {
+            let mut buf = vec![0u8; CHUNK as usize];
+            loop {
+                if done.load(Ordering::Relaxed) {
+                    break;
+                }
+                let pos = next.fetch_add(CHUNK, Ordering::Relaxed);
+                if pos >= file_size {
+                    break;
+                }
+                // Throttle: hold this stripe until the consumer is within WINDOW.
+                while pos > consumed.load(Ordering::Relaxed) + WINDOW {
+                    if done.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                let want = ((file_size - pos).min(CHUNK)) as usize;
+                let _ = file.read_at(&mut buf[..want], pos);
             }
-            let want = ((file_size - pos) as usize).min(CHUNK);
-            match file.read_at(&mut buf[..want], pos) {
-                Ok(0) => break,
-                Ok(nr) => pos += nr as u64,
-                Err(_) => break,
-            }
-        }
-    }))
+        }));
+    }
+    handles
 }
 
 #[cfg(not(unix))]
@@ -131,8 +153,8 @@ fn spawn_gguf_prefetch(
     _file_size: u64,
     _consumed: std::sync::Arc<std::sync::atomic::AtomicU64>,
     _done: std::sync::Arc<std::sync::atomic::AtomicBool>,
-) -> Option<std::thread::JoinHandle<()>> {
-    None
+) -> Vec<std::thread::JoinHandle<()>> {
+    Vec::new()
 }
 
 /// Map a group size to the container's `Q2Group` (for on-disk byte sizing).
@@ -461,9 +483,9 @@ impl super::WeightLoader for GgufLoader {
             &mut weights,
             &mut skipped,
         );
-        // Stop + join the prefetcher before dropping the mmap/file.
+        // Stop + join the prefetch threads before dropping the mmap/file.
         prefetch_done.store(true, std::sync::atomic::Ordering::Relaxed);
-        if let Some(h) = prefetch {
+        for h in prefetch {
             let _ = h.join();
         }
         pass1?;
