@@ -1,0 +1,64 @@
+--- a/flashinfer/fused_moe/cute_dsl/blackwell_sm12x/moe_dispatch.py	2026-07-10 22:20:18.100967806 -0400
++++ b/flashinfer/fused_moe/cute_dsl/blackwell_sm12x/moe_dispatch.py	2026-07-10 22:20:18.118118492 -0400
+@@ -1321,6 +1321,8 @@
+ # ---------------------------------------------------------------------------
+ 
+ 
++import cuda.bindings.driver as _cuda_aot  # AOT export: stream annotation
++
+ class _DynamicMoELaunch:
+     """Thin JIT wrapper that makes num_tokens and max_rows runtime Int32."""
+ 
+@@ -1380,7 +1382,7 @@
+         max_tasks: cutlass.Int32,
+         max_phys_tiles: cutlass.Int32,
+         max_active_clusters: cutlass.Constexpr,
+-        stream,
++        stream: _cuda_aot.CUstream,
+     ):
+         a_input = cute.make_tensor(
+             a_ptr, layout=cute.make_layout((num_tokens, self._k), stride=(self._k, 1))
+diff --git a/flashinfer/fused_moe/cute_dsl/blackwell_sm12x/moe_dynamic_kernel.py b/flashinfer/fused_moe/cute_dsl/blackwell_sm12x/moe_dynamic_kernel.py
+index 284a2cf..8afd75b 100644
+--- a/flashinfer/fused_moe/cute_dsl/blackwell_sm12x/moe_dynamic_kernel.py
++++ b/flashinfer/fused_moe/cute_dsl/blackwell_sm12x/moe_dynamic_kernel.py
+@@ -380,6 +380,39 @@ class MoEDynamicKernel:
+             self.smem_capacity,
+             self.occupancy,
+         )
++        # _compute_stages budgets ONE B/SFB buffer per stage, but the gated
++        # kernel's StorageGated allocates doubled B-side buffers per stage
++        # (sB + sB_up, sSFB + sSFB_up), so its stage count can overshoot the
++        # per-block smem capacity (e.g. 3 stages -> 118784 B > 101376 B on
++        # sm_120/sm_121, which makes cudaLaunchKernelEx fail with
++        # cudaErrorInvalidValue). Re-fit ab_stage against the true footprint.
++        a_bytes = (
++            cute.size(cute.slice_(self.tile_shape_mnk, (None, 0, None)))
++            * self.a_dtype.width
++            // 8
++        )
++        b_bytes = (
++            cute.size(cute.slice_(self.tile_shape_mnk, (0, None, None)))
++            * self.b_dtype.width
++            // 8
++        )
++        sfa_bytes = (
++            cute.size(cute.filter_zeros(sfa_smem).shape) * self.sf_dtype.width // 8
++        )
++        sfb_bytes = (
++            cute.size(cute.filter_zeros(sfb_smem).shape) * self.sf_dtype.width // 8
++        )
++        b_side_copies = 2 if self.is_gated else 1
++        per_stage_bytes = (
++            a_bytes + b_side_copies * b_bytes + sfa_bytes + b_side_copies * sfb_bytes
++        )
++        epi_bytes = (
++            cute.size(self.epi_tile) * cutlass.BFloat16.width // 8
++        )  # epi_stage == 1
++        # control/route/pipeline/scatter buffers + alignment slack
++        smem_budget = self.smem_capacity - epi_bytes - 4096
++        while self.ab_stage > 1 and self.ab_stage * per_stage_bytes > smem_budget:
++            self.ab_stage -= 1
+         # ab_stage must divide k_tile_cnt evenly to avoid pipeline phase mismatch.
+         # _compute_stages returns the max that fits in smem, but it may not
+         # divide k_tile_cnt. Round down to the nearest divisor.
