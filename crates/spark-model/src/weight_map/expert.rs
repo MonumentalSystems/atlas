@@ -240,6 +240,19 @@ impl From<PackedQ6Weight> for QuantWeight {
     }
 }
 
+/// A single routed MoE expert kept PACKED (GGUF K-quant, no dequant at load):
+/// `gate`/`up` are Q4_K (144B/256-elem super-blocks), `down` is Q6_K (210B).
+/// Built by the Laguna GGUF loader from `WeightDtype::PackedQ4K`/`PackedQ6K`
+/// store tensors; the pointers alias the store's block buffers. Consumed by the
+/// MoE keep-packed prefill arm (per-expert dequant-scratch → dense GEMM), which
+/// runs whenever [`MoeWeights::packed_experts`] is `Some`.
+#[derive(Debug, Clone, Copy)]
+pub struct PackedExpertWeights {
+    pub gate: PackedQ4Weight,
+    pub up: PackedQ4Weight,
+    pub down: PackedQ6Weight,
+}
+
 /// Per-expert weights in any supported quant format.
 ///
 /// Replaces the separate `ExpertWeight` (NVFP4) and `Fp8ExpertWeight` (FP8)

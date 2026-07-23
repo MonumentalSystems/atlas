@@ -135,6 +135,15 @@ impl PackedQ4Weight {
     pub fn is_null(&self) -> bool {
         self.weight == DevicePtr::NULL
     }
+
+    /// NULL placeholder (remote EP expert or unused slot).
+    pub fn null_view() -> Self {
+        Self {
+            weight: DevicePtr::NULL,
+            n: 0,
+            k: 0,
+        }
+    }
 }
 
 /// Keep-packed GGUF Q6_K weight: raw `block_q6_K` super-blocks (210 bytes / 256
@@ -155,6 +164,15 @@ impl PackedQ6Weight {
     /// True if the backing buffer is NULL (unset placeholder).
     pub fn is_null(&self) -> bool {
         self.weight == DevicePtr::NULL
+    }
+
+    /// NULL placeholder (remote EP expert or unused slot).
+    pub fn null_view() -> Self {
+        Self {
+            weight: DevicePtr::NULL,
+            n: 0,
+            k: 0,
+        }
     }
 }
 

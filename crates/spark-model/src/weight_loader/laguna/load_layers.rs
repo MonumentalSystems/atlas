@@ -11,9 +11,35 @@ use crate::layers::dense_ffn::DenseFfnWeights;
 use crate::layers::qwen3_attention::HeadGateActivation;
 use crate::layers::{DenseFfnLayer, FfnComponent, MoeLayer, Qwen3AttentionLayer};
 use crate::weight_map::{
-    AttentionWeights, DenseWeight, ExpertWeight, MoeWeights, QuantizedWeight, dense, dense_auto,
-    quantize_to_nvfp4, quantized_v2,
+    AttentionWeights, DenseWeight, ExpertWeight, MoeWeights, PackedExpertWeights, PackedQ4Weight,
+    PackedQ6Weight, QuantizedWeight, dense, dense_auto, quantize_to_nvfp4, quantized_v2,
 };
+
+/// Wrap a keep-packed Q4_K store tensor (`{prefix}.weight`, tagged
+/// [`WeightDtype::PackedQ4K`] by the GGUF loader) into a [`PackedQ4Weight`]
+/// layer view. The pointer aliases the store's block buffer (no copy).
+fn packed_q4_from_store(store: &WeightStore, prefix: &str) -> Result<PackedQ4Weight> {
+    let t = store.get(&format!("{prefix}.weight"))?;
+    ensure!(t.is_packed_q4k(), "{prefix}.weight is not keep-packed Q4_K");
+    ensure!(t.shape.len() == 2, "{prefix}.weight is not 2D ({:?})", t.shape);
+    Ok(PackedQ4Weight {
+        weight: t.ptr,
+        n: t.shape[0] as u32,
+        k: t.shape[1] as u32,
+    })
+}
+
+/// Wrap a keep-packed Q6_K store tensor into a [`PackedQ6Weight`] layer view.
+fn packed_q6_from_store(store: &WeightStore, prefix: &str) -> Result<PackedQ6Weight> {
+    let t = store.get(&format!("{prefix}.weight"))?;
+    ensure!(t.is_packed_q6k(), "{prefix}.weight is not keep-packed Q6_K");
+    ensure!(t.shape.len() == 2, "{prefix}.weight is not 2D ({:?})", t.shape);
+    Ok(PackedQ6Weight {
+        weight: t.ptr,
+        n: t.shape[0] as u32,
+        k: t.shape[1] as u32,
+    })
+}
 
 pub(super) fn load_layers(
     store: &WeightStore,
@@ -122,32 +148,65 @@ fn load_moe_ffn(
     let correction_bias = dense(store, &format!("{mlp}.experts.e_score_correction_bias"))?;
     let mi = config.moe_intermediate_size;
     let h0 = config.hidden_size;
-    // A routed expert projection is stored either as pre-packed NVFP4
-    // (`.weight_packed` + scales — the poolside safetensors checkpoint) or as
-    // plain BF16 (`.weight` — e.g. a GGUF loaded through the dequant→BF16 path).
-    // Detect and quantize the BF16 form on the fly (mirrors the shared-expert
-    // path below) so both checkpoint kinds land in the same NVFP4 expert layout.
-    let expert_proj = |proj: &str, n: usize, k: usize| -> Result<QuantizedWeight> {
-        if store.contains(&format!("{proj}.weight_packed")) {
-            quantized_v2(store, proj, gpu)
-        } else {
-            let bf16 = dense_auto(store, &format!("{proj}.weight"), gpu)?;
-            quantize_to_nvfp4(&bf16, n, k, gpu, absmax_k, quantize_k, stream)
-        }
-    };
-    let experts = (0..config.num_experts)
-        .map(|e| {
+
+    // Keep-packed GGUF experts (Laguna Q4_K_M): the loader stored the routed
+    // experts as raw Q4_K (gate/up) / Q6_K (down) blocks — detect via the store
+    // dtype tag and build PackedExpertWeights so the MoE keep-packed prefill arm
+    // computes NATIVELY on the packed blocks (q4k_mmq W4A8; weights never
+    // dequant to a BF16 buffer, mirroring how the NVFP4 path computes on packed
+    // weights). `experts` is left null and packed_experts carries the layer.
+    let experts_keep_packed = store
+        .get(&format!("{mlp}.experts.0.gate_proj.weight"))
+        .map(|t| t.is_packed_q4k())
+        .unwrap_or(false);
+
+    let (experts, packed_experts) = if experts_keep_packed {
+        let mut packed = Vec::with_capacity(config.num_experts);
+        for e in 0..config.num_experts {
             if !config.is_local_expert(e) {
-                return Ok(ExpertWeight::null());
+                packed.push(PackedExpertWeights {
+                    gate: PackedQ4Weight::null_view(),
+                    up: PackedQ4Weight::null_view(),
+                    down: PackedQ6Weight::null_view(),
+                });
+                continue;
             }
             let ep = format!("{mlp}.experts.{e}");
-            Ok(ExpertWeight {
-                gate_proj: expert_proj(&format!("{ep}.gate_proj"), mi, h0)?,
-                up_proj: expert_proj(&format!("{ep}.up_proj"), mi, h0)?,
-                down_proj: expert_proj(&format!("{ep}.down_proj"), h0, mi)?,
+            packed.push(PackedExpertWeights {
+                gate: packed_q4_from_store(store, &format!("{ep}.gate_proj"))?,
+                up: packed_q4_from_store(store, &format!("{ep}.up_proj"))?,
+                down: packed_q6_from_store(store, &format!("{ep}.down_proj"))?,
+            });
+        }
+        let null_experts = (0..config.num_experts).map(|_| ExpertWeight::null()).collect();
+        (null_experts, Some(packed))
+    } else {
+        // Existing NVFP4/safetensors path: pre-packed NVFP4 (`.weight_packed`)
+        // or a BF16 GGUF (`.weight`) requantized to NVFP4 at load. Computed
+        // natively by the grouped NVFP4 GEMM — no dequant-to-BF16 buffer.
+        let expert_proj = |proj: &str, n: usize, k: usize| -> Result<QuantizedWeight> {
+            if store.contains(&format!("{proj}.weight_packed")) {
+                quantized_v2(store, proj, gpu)
+            } else {
+                let bf16 = dense_auto(store, &format!("{proj}.weight"), gpu)?;
+                quantize_to_nvfp4(&bf16, n, k, gpu, absmax_k, quantize_k, stream)
+            }
+        };
+        let experts = (0..config.num_experts)
+            .map(|e| {
+                if !config.is_local_expert(e) {
+                    return Ok(ExpertWeight::null());
+                }
+                let ep = format!("{mlp}.experts.{e}");
+                Ok(ExpertWeight {
+                    gate_proj: expert_proj(&format!("{ep}.gate_proj"), mi, h0)?,
+                    up_proj: expert_proj(&format!("{ep}.up_proj"), mi, h0)?,
+                    down_proj: expert_proj(&format!("{ep}.down_proj"), h0, mi)?,
+                })
             })
-        })
-        .collect::<Result<Vec<_>>>()?;
+            .collect::<Result<Vec<_>>>()?;
+        (experts, None)
+    };
 
     let shared = format!("{mlp}.shared_expert");
     let shared_gate = dense_auto(store, &format!("{shared}.gate_proj.weight"), gpu)?;
@@ -167,6 +226,7 @@ fn load_moe_ffn(
             weight: DevicePtr::NULL,
         },
         experts,
+        packed_experts,
         router_pre_norm: None,
         correction_bias: Some(correction_bias),
     };
