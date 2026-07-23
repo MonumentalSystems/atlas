@@ -1357,10 +1357,18 @@ impl DenseFfnLayer {
         // separate path, so TPOT is unaffected; BF16 MMA preserves coherence.
         if let Some(ref bf16w) = self.bf16_weights {
             let tc = self.dense_gemm_tc_k.0 != 0;
-            // helper: tensor-core GEMM when available, else scalar
+            // helper: cuBLASLt when enabled (the big win at prefill M), else the
+            // tensor-core MMA kernel, else scalar. dense_gemm_tc is ~1.4 TFLOP/s
+            // on the large dense-FFN shapes (e.g. Laguna layer-0 gate/up/down at
+            // N=12288/3072, K=3072) — nsys measured its 3 launches at ~100 ms
+            // EACH = 33% of the whole C=1 prefill. cuBLASLt runs the identical
+            // BF16×BF16→FP32 GEMM at 90+ TFLOP/s (~65× faster), the same path
+            // q/k/v/o and the head-gate already use. Gated on ATLAS_CUBLAS_GEMM.
             macro_rules! ffn_gemm {
                 ($a:expr, $b:expr, $c:expr, $n:expr, $k:expr) => {
-                    if tc {
+                    if ops::cublas_gemm_enabled() {
+                        ops::cublas_bf16_proj_dense($a, $b.weight, $c, m, $n, $k, stream)?;
+                    } else if tc {
                         ops::dense_gemm_tc(
                             ctx.gpu,
                             self.dense_gemm_tc_k,
