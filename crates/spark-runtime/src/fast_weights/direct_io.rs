@@ -10,11 +10,11 @@ use std::path::Path;
 /// O_DIRECT requires offsets, sizes, and buffers to be aligned to the
 /// filesystem block size. 4 KiB is the upper bound on every Linux arch we
 /// target and satisfies every fs we've seen.
-pub(super) const O_DIRECT_ALIGN: usize = 4096;
+pub(crate) const O_DIRECT_ALIGN: usize = 4096;
 
 /// Heap buffer aligned to [`O_DIRECT_ALIGN`]. `Send` so it can cross a channel
 /// from the reader thread to the copier thread.
-pub(super) struct AlignedBuffer {
+pub(crate) struct AlignedBuffer {
     ptr: *mut u8,
     cap: usize,
     layout: Layout,
@@ -40,7 +40,7 @@ impl AlignedBuffer {
         Self { ptr, cap, layout }
     }
 
-    pub(super) fn as_slice(&self) -> &[u8] {
+    pub(crate) fn as_slice(&self) -> &[u8] {
         unsafe { std::slice::from_raw_parts(self.ptr, self.cap) }
     }
 
@@ -56,7 +56,7 @@ impl Drop for AlignedBuffer {
 }
 
 #[cfg(target_os = "linux")]
-pub(super) fn open_direct(path: &Path) -> std::io::Result<File> {
+pub(crate) fn open_direct(path: &Path) -> std::io::Result<File> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::io::FromRawFd;
@@ -71,7 +71,7 @@ pub(super) fn open_direct(path: &Path) -> std::io::Result<File> {
 }
 
 #[cfg(not(target_os = "linux"))]
-pub(super) fn open_direct(_path: &Path) -> std::io::Result<File> {
+pub(crate) fn open_direct(_path: &Path) -> std::io::Result<File> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
         "O_DIRECT only supported on Linux",
@@ -87,7 +87,7 @@ pub(super) fn open_direct(_path: &Path) -> std::io::Result<File> {
 /// read for the trailing fragment (Linux ≥ 2.6 accepts this for O_DIRECT on
 /// mainstream filesystems — we only require that the tensor's exact bytes
 /// have been populated, which the post-loop check enforces).
-pub(super) fn read_tensor_aligned(
+pub(crate) fn read_tensor_aligned(
     fd: std::os::unix::io::RawFd,
     abs_offset: u64,
     len: usize,

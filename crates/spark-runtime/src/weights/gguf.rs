@@ -88,75 +88,6 @@ fn keep_packed_experts_enabled(arch: &str) -> bool {
         || std::env::var("ATLAS_GGUF_KEEP_PACKED_MOE").ok().as_deref() == Some("1")
 }
 
-/// Background NFS prefetch: read the GGUF sequentially with large `read()`s
-/// (which NFS batches to ~bandwidth) to warm the page cache AHEAD of the mmap
-/// consumer, which otherwise demand-faults page-by-page at NFS latency (~150
-/// MB/s vs ~2 GB/s streaming — `madvise` hints are unreliably honored over NFS,
-/// so we drive the reads explicitly). Stays a bounded 16 GB window ahead of
-/// `consumed` (set per tensor by `load_pass`) so a single 71 GB file is never
-/// cached whole while the GPU also fills — no OOM on the 128 GB unified pool.
-#[cfg(unix)]
-fn spawn_gguf_prefetch(
-    path: PathBuf,
-    file_size: u64,
-    consumed: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    done: std::sync::Arc<std::sync::atomic::AtomicBool>,
-) -> Vec<std::thread::JoinHandle<()>> {
-    use std::os::unix::fs::FileExt;
-    use std::sync::atomic::{AtomicU64, Ordering};
-    const WINDOW: u64 = 16 << 30; // 16 GB read-ahead cap (bounds page cache)
-    const CHUNK: u64 = 32 << 20; // 32 MB reads (NFS batches to bandwidth)
-    // A SINGLE NFS read stream tops out well below link bandwidth (~300MB/s
-    // here); N parallel streams sharing one monotonically-advancing cursor
-    // aggregate to ~link speed while staying inside the window. Env override
-    // ATLAS_GGUF_PREFETCH_THREADS (default 8).
-    let n_threads = std::env::var("ATLAS_GGUF_PREFETCH_THREADS")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|&n| n >= 1 && n <= 32)
-        .unwrap_or(8);
-    let next = std::sync::Arc::new(AtomicU64::new(0));
-    let mut handles = Vec::with_capacity(n_threads);
-    for _ in 0..n_threads {
-        let (next, consumed, done) = (next.clone(), consumed.clone(), done.clone());
-        let Ok(file) = std::fs::File::open(&path) else {
-            continue;
-        };
-        handles.push(std::thread::spawn(move || {
-            let mut buf = vec![0u8; CHUNK as usize];
-            loop {
-                if done.load(Ordering::Relaxed) {
-                    break;
-                }
-                let pos = next.fetch_add(CHUNK, Ordering::Relaxed);
-                if pos >= file_size {
-                    break;
-                }
-                // Throttle: hold this stripe until the consumer is within WINDOW.
-                while pos > consumed.load(Ordering::Relaxed) + WINDOW {
-                    if done.load(Ordering::Relaxed) {
-                        return;
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(1));
-                }
-                let want = ((file_size - pos).min(CHUNK)) as usize;
-                let _ = file.read_at(&mut buf[..want], pos);
-            }
-        }));
-    }
-    handles
-}
-
-#[cfg(not(unix))]
-fn spawn_gguf_prefetch(
-    _path: PathBuf,
-    _file_size: u64,
-    _consumed: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    _done: std::sync::Arc<std::sync::atomic::AtomicBool>,
-) -> Vec<std::thread::JoinHandle<()>> {
-    Vec::new()
-}
-
 /// Map a group size to the container's `Q2Group` (for on-disk byte sizing).
 fn q2_group_variant(g: usize) -> container::Q2Group {
     if g == 64 {
@@ -456,18 +387,20 @@ impl super::WeightLoader for GgufLoader {
         let mut weights: HashMap<String, WeightTensor> = HashMap::new();
         let mut skipped = 0usize;
 
-        // Start the bounded NFS prefetch thread for the backbone file.
-        let consumed = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let prefetch_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let prefetch = spawn_gguf_prefetch(
-            path.clone(),
-            bb_mmap.len() as u64,
-            consumed.clone(),
-            prefetch_done.clone(),
-        );
+        // Read tensor DATA through the fast safetensors loader's shared O_DIRECT
+        // + pipelined reader (`fast_weights::direct_io`) instead of demand-
+        // faulting mmap pages — the mmap path is NFS-latency-bound (~150MB/s),
+        // O_DIRECT streams at ~link bandwidth. The mmap stays for cheap metadata
+        // parsing only. `open_direct` falls back to a plain fd if O_DIRECT is
+        // unavailable (macOS / unsupported fs), so this is always safe.
+        #[cfg(unix)]
+        let data_file: Option<std::fs::File> =
+            crate::fast_weights::direct_io::open_direct(&path).ok();
+        #[cfg(not(unix))]
+        let data_file: Option<std::fs::File> = None;
 
         // Pass 1: backbone → weights.
-        let pass1 = sidecar::load_pass(
+        sidecar::load_pass(
             self,
             gpu,
             &bb_gguf,
@@ -479,16 +412,10 @@ impl super::WeightLoader for GgufLoader {
             q2_group,
             q2_variant,
             keep_packed_experts,
-            &consumed,
+            data_file.as_ref(),
             &mut weights,
             &mut skipped,
-        );
-        // Stop + join the prefetch threads before dropping the mmap/file.
-        prefetch_done.store(true, std::sync::atomic::Ordering::Relaxed);
-        for h in prefetch {
-            let _ = h.join();
-        }
-        pass1?;
+        )?;
         drop(bb_gguf);
         drop(bb_mmap);
         evict_page_cache(&bb_file);
@@ -500,9 +427,7 @@ impl super::WeightLoader for GgufLoader {
             let before = weights.len();
             // mmproj is a `clip` tower — no qwen35 FFN names, so native_q2 is
             // irrelevant there; pass false to keep it on the plain BF16 path.
-            // Small sidecar → no prefetch thread; a throwaway cursor satisfies
-            // the load_pass signature.
-            let mm_consumed = std::sync::atomic::AtomicU64::new(0);
+            // Small sidecar → mmap read path (no O_DIRECT file).
             sidecar::load_pass(
                 self,
                 gpu,
@@ -515,7 +440,7 @@ impl super::WeightLoader for GgufLoader {
                 q2_group,
                 q2_variant,
                 false,
-                &mm_consumed,
+                None,
                 &mut weights,
                 &mut skipped,
             )?;

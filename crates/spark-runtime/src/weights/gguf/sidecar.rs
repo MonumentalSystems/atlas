@@ -139,10 +139,11 @@ pub fn load_pass(
     q2_group: usize,
     q2_variant: container::Q2Group,
     keep_packed_experts: bool,
-    // Consumer cursor for the NFS prefetch thread: after each tensor is copied,
-    // this is set to that tensor's end offset so the prefetcher stays a bounded
-    // window ahead (never racing to EOF and caching the whole file).
-    consumed: &std::sync::atomic::AtomicU64,
+    // When `Some`, tensor DATA is read through the fast loader's shared O_DIRECT
+    // reader (`fast_weights::direct_io`) instead of demand-faulting mmap pages —
+    // the mmap is then used only for the (already-parsed) metadata. `None` keeps
+    // the pure-mmap path (mmproj sidecar, non-unix).
+    data_file: Option<&std::fs::File>,
     weights: &mut HashMap<String, WeightTensor>,
     skipped: &mut usize,
 ) -> Result<()> {
@@ -160,12 +161,39 @@ pub fn load_pass(
             .tensor_byte_size(tensor, q2_variant)
             .with_context(|| format!("byte-len for tensor {}", tensor.name))?;
         let start = gguf.tensor_abs_offset(tensor);
-        // Advance the prefetch cursor to this tensor's start so the prefetcher
-        // keeps reading a bounded window ahead of us (see the prefetch thread).
-        consumed.store(start as u64, std::sync::atomic::Ordering::Relaxed);
-        let raw = mmap
-            .get(start..start + raw_len)
-            .with_context(|| format!("tensor {} out of bounds in GGUF", tensor.name))?;
+        // Read this tensor's bytes: via the shared O_DIRECT reader when a data
+        // file is provided (fast on NFS), else borrow the mmap slice. The
+        // O_DIRECT read lands in an owned aligned buffer that must outlive `raw`,
+        // so it is held in `_direct` for the rest of the iteration.
+        #[cfg(unix)]
+        let _direct = match data_file {
+            Some(f) => {
+                use std::os::unix::io::AsRawFd;
+                Some(
+                    crate::fast_weights::direct_io::read_tensor_aligned(
+                        f.as_raw_fd(),
+                        start as u64,
+                        raw_len,
+                        true,
+                    )
+                    .with_context(|| format!("O_DIRECT read tensor {}", tensor.name))?,
+                )
+            }
+            None => None,
+        };
+        #[cfg(unix)]
+        let raw: &[u8] = match &_direct {
+            Some((buf, off)) => &buf.as_slice()[*off..*off + raw_len],
+            None => mmap
+                .get(start..start + raw_len)
+                .with_context(|| format!("tensor {} out of bounds in GGUF", tensor.name))?,
+        };
+        #[cfg(not(unix))]
+        let raw: &[u8] = {
+            let _ = data_file;
+            mmap.get(start..start + raw_len)
+                .with_context(|| format!("tensor {} out of bounds in GGUF", tensor.name))?
+        };
         let id = tensor.ggml_type.id();
 
         // Patch-embed temporal frames fan IN (many GGUF tensors → one HF tensor,
