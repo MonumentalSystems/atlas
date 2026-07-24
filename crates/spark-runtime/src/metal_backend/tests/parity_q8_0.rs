@@ -108,7 +108,7 @@ fn metal_gguf_q8_0_gemm_matches_reference() {
         .launch_typed(
             kernel,
             [n.div_ceil(16), m.div_ceil(16), 1],
-            [16, 16, 1],
+            [128, 1, 1],
             0,
             0,
             &[
@@ -125,6 +125,56 @@ fn metal_gguf_q8_0_gemm_matches_reference() {
     let mut raw = vec![0; (m * n) as usize * 2];
     backend.copy_d2h(y, &mut raw).unwrap();
     assert_close(&bytes_to_bf16_vec(&raw), &expected, "q8 gemm");
+}
+
+#[test]
+#[ignore = "manual production-shape Metal microbenchmark"]
+fn metal_gguf_q8_0_gemm_production_tile_bench() {
+    let Some(backend) = maybe_backend() else {
+        return;
+    };
+    let (m, n, k) = (2048u32, 3072u32, 3072u32);
+    let (packed, _) = fixture(n as usize, k as usize);
+    let x: Vec<half::bf16> = (0..m * k)
+        .map(|i| half::bf16::from_f32(((i % k) as f32 - 10.0) / 80.0))
+        .collect();
+    let w = backend.alloc(packed.len()).unwrap();
+    let xp = backend.alloc(x.len() * 2).unwrap();
+    let y = backend.alloc((m * n) as usize * 2).unwrap();
+    backend.copy_h2d(&packed, w).unwrap();
+    backend.copy_h2d(&bf16_slice_to_bytes(&x), xp).unwrap();
+    let kernel = backend.kernel("gguf_q8_0_gemm", "gguf_q8_0_gemm").unwrap();
+    let launch = || {
+        backend
+            .launch_typed(
+                kernel,
+                [n.div_ceil(16), m.div_ceil(16), 1],
+                [128, 1, 1],
+                0,
+                0,
+                &[
+                    KernelArg::Buffer(xp),
+                    KernelArg::Buffer(w),
+                    KernelArg::Buffer(y),
+                    KernelArg::Bytes(&m.to_le_bytes()),
+                    KernelArg::Bytes(&n.to_le_bytes()),
+                    KernelArg::Bytes(&k.to_le_bytes()),
+                ],
+            )
+            .unwrap();
+    };
+    launch();
+    backend.synchronize(0).unwrap();
+    let iterations = 5;
+    let start = std::time::Instant::now();
+    for _ in 0..iterations {
+        launch();
+    }
+    backend.synchronize(0).unwrap();
+    eprintln!(
+        "Q8_0 GEMM production tile: {:.3} ms/launch",
+        start.elapsed().as_secs_f64() * 1_000.0 / f64::from(iterations)
+    );
 }
 
 #[test]

@@ -138,8 +138,17 @@ fn metal_gguf_q4_k_grouped_gemm_uses_contiguous_expert_stride() {
     let Some(backend) = maybe_backend() else {
         return;
     };
-    let (experts, slots, n, k) = (3usize, 5usize, 5usize, 256usize);
-    let expert_ids = [2i32, 0, -1, 99, 1];
+    // More than 32 slots selects the production prefill tile. Expert runs
+    // deliberately cross 16-slot boundaries to cover the mixed-expert
+    // fallback as well as weight reuse within a sorted run.
+    let (experts, slots, n, k) = (3usize, 35usize, 5usize, 256usize);
+    let expert_ids: Vec<i32> = (0..slots)
+        .map(|slot| match slot {
+            0..11 => 0,
+            11..29 => 1,
+            _ => 2,
+        })
+        .collect();
     let input: Vec<half::bf16> = (0..slots * k)
         .map(|i| half::bf16::from_f32(((i % k) as f32 % 29.0 - 14.0) / 80.0))
         .collect();
@@ -179,11 +188,12 @@ fn metal_gguf_q4_k_grouped_gemm_uses_contiguous_expert_stride() {
     let slots_u32 = slots as u32;
     let n_u32 = n as u32;
     let k_u32 = k as u32;
+    let slots_per_tg = 16u32;
     let expert_stride = (n * k / QK * BLOCK_BYTES) as u64;
     backend
         .launch_typed(
             kernel,
-            [slots_u32, n_u32.div_ceil(4), 1],
+            [slots_u32.div_ceil(slots_per_tg), n_u32.div_ceil(16), 1],
             [128, 1, 1],
             0,
             0,
@@ -197,6 +207,7 @@ fn metal_gguf_q4_k_grouped_gemm_uses_contiguous_expert_stride() {
                 KernelArg::Bytes(&k_u32.to_le_bytes()),
                 KernelArg::Bytes(&(experts as u32).to_le_bytes()),
                 KernelArg::Bytes(&expert_stride.to_le_bytes()),
+                KernelArg::Bytes(&slots_per_tg.to_le_bytes()),
             ],
         )
         .unwrap();
@@ -204,4 +215,85 @@ fn metal_gguf_q4_k_grouped_gemm_uses_contiguous_expert_stride() {
     let mut raw = vec![0; expected.len() * 2];
     backend.copy_d2h(y, &mut raw).unwrap();
     assert_close(&bytes_to_bf16_vec(&raw), &expected, "q4_k grouped gemm");
+}
+
+#[test]
+#[ignore = "manual production-shape Metal microbenchmark"]
+fn metal_gguf_q4_k_grouped_gemm_production_tile_bench() {
+    let Some(backend) = maybe_backend() else {
+        return;
+    };
+    let (slots, n, k) = (160usize, 1024usize, 3072usize);
+    let (mut packed, _) = matrix_fixture(n, k, 31);
+    let expert_stride = packed.len() as u64;
+    packed.extend_from_slice(&matrix_fixture(n, k, 47).0);
+    let input: Vec<half::bf16> = (0..slots * k)
+        .map(|i| half::bf16::from_f32(((i % k) as f32 % 29.0 - 14.0) / 80.0))
+        .collect();
+    let expert_ids = vec![0i32; slots];
+    let w = backend.alloc(packed.len()).unwrap();
+    let x = backend.alloc(input.len() * 2).unwrap();
+    let ids = backend.alloc(expert_ids.len() * 4).unwrap();
+    let y = backend.alloc(slots * n * 2).unwrap();
+    backend.copy_h2d(&packed, w).unwrap();
+    backend.copy_h2d(&bf16_slice_to_bytes(&input), x).unwrap();
+    backend
+        .copy_h2d(&i32_slice_to_bytes(&expert_ids), ids)
+        .unwrap();
+    let kernel = backend
+        .kernel("gguf_q4_k_grouped_gemm", "gguf_q4_k_grouped_gemm")
+        .unwrap();
+    let (slots_u32, n_u32, k_u32) = (slots as u32, n as u32, k as u32);
+    let slots_per_tg = 16u32;
+    let launch = || {
+        backend
+            .launch_typed(
+                kernel,
+                [slots_u32.div_ceil(slots_per_tg), n_u32.div_ceil(16), 1],
+                [128, 1, 1],
+                0,
+                0,
+                &[
+                    KernelArg::Buffer(x),
+                    KernelArg::Buffer(w),
+                    KernelArg::Buffer(ids),
+                    KernelArg::Buffer(y),
+                    KernelArg::Bytes(&slots_u32.to_le_bytes()),
+                    KernelArg::Bytes(&n_u32.to_le_bytes()),
+                    KernelArg::Bytes(&k_u32.to_le_bytes()),
+                    KernelArg::Bytes(&2u32.to_le_bytes()),
+                    KernelArg::Bytes(&expert_stride.to_le_bytes()),
+                    KernelArg::Bytes(&slots_per_tg.to_le_bytes()),
+                ],
+            )
+            .unwrap();
+    };
+    launch();
+    backend.synchronize(0).unwrap();
+    let iterations = 10;
+    let start = std::time::Instant::now();
+    for _ in 0..iterations {
+        launch();
+    }
+    backend.synchronize(0).unwrap();
+    eprintln!(
+        "Q4_K grouped production tile (single expert): {:.3} ms/launch",
+        start.elapsed().as_secs_f64() * 1_000.0 / f64::from(iterations)
+    );
+
+    let mixed_ids: Vec<i32> = (0..slots).map(|slot| i32::from(slot % 16 >= 8)).collect();
+    backend
+        .copy_h2d(&i32_slice_to_bytes(&mixed_ids), ids)
+        .unwrap();
+    launch();
+    backend.synchronize(0).unwrap();
+    let start = std::time::Instant::now();
+    for _ in 0..iterations {
+        launch();
+    }
+    backend.synchronize(0).unwrap();
+    eprintln!(
+        "Q4_K grouped production tile (mixed experts): {:.3} ms/launch",
+        start.elapsed().as_secs_f64() * 1_000.0 / f64::from(iterations)
+    );
 }

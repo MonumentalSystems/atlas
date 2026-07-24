@@ -10,6 +10,7 @@ use crate::weight_map::PackedQ4Weight;
 
 const Q4_K_VALUES: u32 = 256;
 const Q4_K_BLOCK_BYTES: u64 = 144;
+const PREFILL_SLOTS_PER_THREADGROUP: u32 = 16;
 
 /// Decode projection: `y[N] = dequant(weight[N,K]) @ x[K]`.
 pub fn gguf_q4_k_gemv(
@@ -68,8 +69,18 @@ pub fn gguf_q4_k_grouped_gemm(
         "Q4_K expert stride {expert_stride_bytes} is smaller than matrix size {matrix_bytes}"
     );
     ensure!(num_experts > 0, "Q4_K expert stack must not be empty");
+    let slots_per_threadgroup = if total_slots <= 32 {
+        1
+    } else {
+        PREFILL_SLOTS_PER_THREADGROUP
+    };
+    let rows_per_threadgroup = if slots_per_threadgroup == 1 { 4 } else { 16 };
     KernelLaunch::new(gpu, kernel)
-        .grid([total_slots, div_ceil(n, 4), 1])
+        .grid([
+            div_ceil(total_slots, slots_per_threadgroup),
+            div_ceil(n, rows_per_threadgroup),
+            1,
+        ])
         .block([128, 1, 1])
         .arg_ptr(input)
         .arg_ptr(expert_base)
@@ -80,6 +91,7 @@ pub fn gguf_q4_k_grouped_gemm(
         .arg_u32(k)
         .arg_u32(num_experts)
         .arg_u64(expert_stride_bytes)
+        .arg_u32(slots_per_threadgroup)
         .launch(stream)
 }
 

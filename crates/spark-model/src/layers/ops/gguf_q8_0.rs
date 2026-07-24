@@ -48,7 +48,7 @@ pub fn gguf_q8_0_gemm(
     );
     KernelLaunch::new(gpu, kernel)
         .grid([div_ceil(weight.n, 16), div_ceil(m, 16), 1])
-        .block([16, 16, 1])
+        .block([128, 1, 1])
         .arg_ptr(input)
         .arg_ptr(weight.weight)
         .arg_ptr(output)
