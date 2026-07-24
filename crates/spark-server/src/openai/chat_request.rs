@@ -418,8 +418,15 @@ impl ChatCompletionRequest {
     }
 }
 
+/// Default output cap when the client omits `max_tokens`. Deliberately larger
+/// than any served context so it means "generate until EOS or the context is
+/// full" (vLLM parity) — the real bound is the remaining-context clamp in
+/// `chat/mod.rs` (`max_tokens.min(max_seq_len - prompt_len)`). Kept finite and
+/// `u32`-safe (< u32::MAX/10) so the thinking-budget `* safety_cap_pct` math in
+/// `chat/thinking.rs` cannot overflow; agents that want a hard per-turn cap set
+/// `max_tokens` explicitly.
 pub(super) fn default_max_tokens() -> usize {
-    4096
+    1_048_576
 }
 pub(super) fn default_n() -> usize {
     1

@@ -279,6 +279,14 @@ pub(crate) async fn chat_completions_inner(
         Err(resp) => return ChatOutcome::Http(resp),
     };
 
+    // Bound output to the remaining context (max_seq_len − prompt). This is
+    // always correct — a sequence can never emit past the context window — and
+    // it makes the large `default_max_tokens` resolve to "generate until EOS or
+    // context full" (vLLM parity) when the client omits max_tokens, instead of
+    // the old fixed 4096. `prompt_len < max_seq_len` is guaranteed above, so the
+    // remaining budget is ≥ 1.
+    let max_tokens = max_tokens.min(state.max_seq_len.saturating_sub(prompt_len)).max(1);
+
     // ── Phase 7: dispatch streaming or blocking ─────────────────
     if req.stream {
         return super::chat_stream_dispatch::dispatch_streaming(
