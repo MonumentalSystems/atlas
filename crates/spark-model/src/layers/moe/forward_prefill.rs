@@ -203,6 +203,21 @@ impl MoeLayer {
                 h,
                 stream,
             )?;
+        } else if n == 1 && self.weights.packed_experts.is_some() {
+            // Keep-packed DECODE router: the [1,h]x[h,num_experts] projection is a
+            // GEMV — dense_gemm_prefill is a poorly-shaped GEMM at M=1 (~135µs in
+            // profile). Use the dedicated warp-per-output BF16 GEMV instead
+            // (numerically a plain BF16 dot, same as the grouped router path).
+            ops::dense_gemv(
+                ctx.gpu,
+                self.dense_gemv,
+                router_in,
+                &self.weights.gate,
+                gate_logits,
+                num_experts,
+                h,
+                stream,
+            )?;
         } else if ops::cublas_gemm_enabled() && n > 1 {
             ops::cublas_bf16_proj_dense(
                 router_in,
