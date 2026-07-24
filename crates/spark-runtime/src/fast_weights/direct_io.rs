@@ -70,7 +70,22 @@ pub(crate) fn open_direct(path: &Path) -> std::io::Result<File> {
     Ok(unsafe { File::from_raw_fd(fd) })
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
+pub(crate) fn open_direct(path: &Path) -> std::io::Result<File> {
+    use std::os::unix::io::AsRawFd;
+
+    let file = File::open(path)?;
+    // Apple has no O_DIRECT. F_NOCACHE provides the equivalent property Atlas
+    // needs here: bounded pread data bypasses the unified file cache instead of
+    // displacing Metal allocations and other applications during a large load.
+    let rc = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_NOCACHE, 1) };
+    if rc == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(file)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub(crate) fn open_direct(_path: &Path) -> std::io::Result<File> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
@@ -142,4 +157,33 @@ pub(crate) fn read_tensor_aligned(
         );
     }
     Ok((buf, slice_off))
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use std::os::unix::io::AsRawFd;
+
+    #[test]
+    fn macos_uncached_file_supports_bounded_pread() {
+        let path = std::env::temp_dir().join(format!(
+            "atlas-uncached-read-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let bytes: Vec<u8> = (0..8192).map(|i| (i % 251) as u8).collect();
+        let mut writer = std::fs::File::create(&path).expect("create fixture");
+        writer.write_all(&bytes).expect("write fixture");
+        writer.sync_all().expect("sync fixture");
+        drop(writer);
+
+        let file = open_direct(&path).expect("open uncached data file");
+        let (buf, offset) =
+            read_tensor_aligned(file.as_raw_fd(), 123, 4097, true).expect("bounded uncached pread");
+        assert_eq!(&buf.as_slice()[offset..offset + 4097], &bytes[123..4220]);
+
+        drop(file);
+        std::fs::remove_file(path).expect("remove fixture");
+    }
 }

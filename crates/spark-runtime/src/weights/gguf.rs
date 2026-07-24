@@ -383,9 +383,10 @@ impl super::WeightLoader for GgufLoader {
         // Read tensor DATA through the fast safetensors loader's shared O_DIRECT
         // + pipelined reader (`fast_weights::direct_io`) instead of demand-
         // faulting mmap pages — the mmap path is NFS-latency-bound (~150MB/s),
-        // O_DIRECT streams at ~link bandwidth. The mmap stays for cheap metadata
-        // parsing only. `open_direct` falls back to a plain fd if O_DIRECT is
-        // unavailable (macOS / unsupported fs), so this is always safe.
+        // O_DIRECT streams at ~link bandwidth. On macOS the same helper uses
+        // F_NOCACHE so a 68+ GB load does not churn the unified file cache. The
+        // mmap stays for cheap metadata parsing only; unsupported platforms
+        // fall back to the bounded mmap path.
         #[cfg(unix)]
         let data_file: Option<std::fs::File> =
             crate::fast_weights::direct_io::open_direct(&path).ok();
