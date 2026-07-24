@@ -286,6 +286,12 @@ pub(crate) async fn chat_completions_inner(
     // the old fixed 4096. `prompt_len < max_seq_len` is guaranteed above, so the
     // remaining budget is ≥ 1.
     let max_tokens = max_tokens.min(state.max_seq_len.saturating_sub(prompt_len)).max(1);
+    tracing::debug!(
+        prompt_len,
+        max_seq_len = state.max_seq_len,
+        max_tokens,
+        "resolved output budget (max_tokens clamped to remaining context)"
+    );
 
     // ── Phase 7: dispatch streaming or blocking ─────────────────
     if req.stream {
