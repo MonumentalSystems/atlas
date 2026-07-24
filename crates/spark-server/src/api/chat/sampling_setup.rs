@@ -220,8 +220,11 @@ pub(super) fn build_sampling(
         }
     }
 
-    // max_tokens cap when tools are active.
-    let max_tokens = if tools_active {
+    // max_tokens cap when tools are active. `tool_max_tokens == 0` means
+    // UNLIMITED (vLLM parity) — the caller's max_tokens is the only bound,
+    // for models (e.g. poolside/Laguna) whose Write tool calls legitimately
+    // exceed the default 8192 cap.
+    let max_tokens = if tools_active && state.tool_max_tokens > 0 {
         let capped = req.max_tokens.min(state.tool_max_tokens);
         if capped < req.max_tokens {
             tracing::info!(

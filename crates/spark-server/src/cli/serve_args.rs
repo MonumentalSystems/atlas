@@ -295,7 +295,9 @@ pub struct ServeArgs {
     /// Maximum output tokens per tool-calling request. Caps max_tokens from the
     /// client when tools are active to prevent unbounded generation if the model
     /// doesn't emit a </tool_call> stop token. Must be high enough for Write
-    /// tool calls with large file content. Default 8192.
+    /// tool calls with large file content. `0` = UNLIMITED (vLLM parity — the
+    /// client's max_tokens is the only bound); use for models whose Write calls
+    /// exceed 8192. Default 8192.
     #[arg(long, default_value_t = 8192)]
     pub tool_max_tokens: usize,
 

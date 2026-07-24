@@ -666,7 +666,7 @@ pub fn update_tool_param_state(a: &mut ActiveSeq, tok: u32) {
     let (streak, exceeded) =
         advance_envelope_streak(a.inside_parameter_body, a.tool_body_streak_tokens);
     a.tool_body_streak_tokens = streak;
-    if exceeded {
+    if exceeded && crate::scheduler::helpers::tool_envelope_watchdog_enabled() {
         tracing::warn!(
             streak = a.tool_body_streak_tokens,
             "Stuck in tool-call ENVELOPE for {MAX_TOOL_BODY_TOKENS}+ tokens with no </tool_call> (excludes parameter-value content); ending response (model never closed the envelope — would otherwise burn to max_tokens). Sanitizer will salvage what it can."
