@@ -113,6 +113,12 @@ use_sampling_presets_for_core = true
 # OpenCode already supplies its cwd in the native system prompt. Reinjecting a
 # second Atlas-specific environment block made Laguna fixate on path discovery.
 disable_cwd_hint_injection = true
+# Laguna is a chatty planner: it writes a paragraph of reasoning/plan before each
+# tool call. The default 384-token inter-tool prose budget (a degeneration guard)
+# truncated legitimate planning mid-turn ("prose budget exhausted, ending
+# response"), forcing extra turns. Raise it to give real agentic prose headroom
+# while still catching a genuine run-on loop.
+max_inter_tool_prose = 2048
 
 [[model_types]]
 model_type = "laguna"
