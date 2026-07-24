@@ -166,7 +166,20 @@ impl StreamingToolDetector {
                 // (`<parameter=key>value</parameter>`) must be converted to JSON before
                 // emission. The name header is emitted immediately so clients get instant
                 // feedback that a tool call started.
+                //
+                // poolside_v1 guard: its function name is the bare identifier BEFORE the
+                // first `<arg_key>` — `extract_streaming_name` has no poolside branch, so
+                // once the body has reached `<arg_key>` it would only match a foreign name
+                // marker (`"name"` / `call:` / `<function`) lifted out of a large
+                // `<arg_value>` payload (source files routinely contain these). That
+                // spurious name seeds a `ToolCallStart` with empty arguments, then hard-
+                // fails validation at `</tool_call>` and the real args are dropped — the
+                // client is left with `arguments:""` → `unexpected end of JSON input`.
+                // Refuse name extraction once we're inside a poolside envelope, so the
+                // whole-body complete-call path (`parse_poolside_v1_call`) handles it
+                // atomically. Mirrors the flush guard below and `parse_dispatch.rs:151`.
                 if self.current_tc_name.is_none()
+                    && !self.buffer.contains("<arg_key>")
                     && let Some(name) = extract_streaming_name(&self.buffer)
                 {
                     let id = next_tool_call_id();
