@@ -6,6 +6,8 @@ use anyhow::{Result, ensure};
 use atlas_core::config::{LayerType, ModelConfig};
 use spark_runtime::kv_cache::{KvCacheConfig, KvCacheDtype, KvLayerRetention};
 
+const MIN_METAL_HEADROOM_BYTES: usize = 5 * 1024 * 1024 * 1024;
+
 pub fn validate_profile(
     kv_dtype: KvCacheDtype,
     max_seq_len: usize,
@@ -84,4 +86,23 @@ pub fn requested_kv_resident_bytes(
         .checked_mul(max_batch_size)
         .ok_or_else(|| anyhow::anyhow!("Laguna KV logical block count overflow"))?;
     kv_config(config, block_size, prefill_chunk_tokens).resident_bytes_for_blocks(logical_blocks)
+}
+
+pub fn audit_post_allocation(gpu: &dyn spark_runtime::gpu::GpuBackend) -> Result<()> {
+    let working_set = gpu.total_memory()?;
+    let headroom = gpu.free_memory()?;
+    let allocated = working_set.saturating_sub(headroom);
+    let gib = |bytes: usize| bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+    tracing::info!(
+        "Laguna Metal post-KV allocation: currentAllocatedSize={:.2} GiB, recommendedMaxWorkingSetSize={:.2} GiB, headroom={:.2} GiB",
+        gib(allocated),
+        gib(working_set),
+        gib(headroom),
+    );
+    ensure!(
+        headroom >= MIN_METAL_HEADROOM_BYTES,
+        "Laguna Metal startup leaves only {:.2} GiB below recommendedMaxWorkingSetSize; at least 5.00 GiB is required",
+        gib(headroom),
+    );
+    Ok(())
 }

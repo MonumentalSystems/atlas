@@ -553,6 +553,9 @@ pub fn build_model(
         }
     }
     let kv_cache = PagedKvCache::new(kv_config, num_kv_blocks, gpu.as_ref())?;
+    if config.model_type == "laguna" && gpu.supports_bounded_sliding_kv() {
+        super::laguna_metal::audit_post_allocation(gpu.as_ref())?;
+    }
 
     // ── Step 6: Assemble model ──
     // Capture pointers for any post-construction sharing (DFlash drafter
