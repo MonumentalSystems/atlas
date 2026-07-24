@@ -102,6 +102,8 @@ pub struct BufferArena {
     ffn_act_q8: DevicePtr,
     ffn_act_a: DevicePtr,
     ffn_act_scale: DevicePtr,
+    /// q8_1 activation scratch for the keep-packed GGUF grouped MoE (graph-safe).
+    moe_grouped_q8: DevicePtr,
     /// Persistent FP8 block-scaled activation scratch for prefill projections.
     fp8_act: DevicePtr,
     /// Persistent per-128-block FP32 scales paired with `fp8_act`.
@@ -161,6 +163,7 @@ impl BufferArena {
         let expert_gate_out = gpu.alloc(sizes.expert_gate_out)?;
         let expert_up_out = gpu.alloc(sizes.expert_up_out)?;
         let expert_down_out = gpu.alloc(sizes.expert_down_out)?;
+        let moe_grouped_q8 = gpu.alloc(sizes.moe_grouped_q8)?;
         let splitk_workspace = gpu.alloc(sizes.splitk_workspace)?;
         let o_latent = gpu.alloc(sizes.o_latent)?;
         // Zero-filled "weight" for unweighted RMSNorm under the offset-from-1
@@ -276,6 +279,7 @@ impl BufferArena {
             gdn_fla_scratch,
             ssd_scratch,
             token_ids,
+            moe_grouped_q8,
             ffn_act_q8,
             ffn_act_a,
             ffn_act_scale,

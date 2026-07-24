@@ -40,16 +40,17 @@ impl MoeLayer {
         })?;
         let total_expanded = n * top_k;
 
-        // Row count padded to the MMQ tile (128) so the grouped kernel's last
-        // per-expert tile can load activations without reading past the buffer.
-        let padded = total_expanded.next_multiple_of(128);
-
-        // Per-call scratch (first-correct; move to the arena later):
-        //  - permuted: [padded, h] BF16 (expert_input gathered by sorted_token_ids
-        //              into contiguous per-expert rows)
-        //  - q8:       q8_1 activations for the whole sorted buffer (quantized once)
-        let permuted = ctx.gpu.alloc(padded as usize * h as usize * 2)?;
-        let q8 = ctx.gpu.alloc(ops::q8_1_scratch_bytes(padded, h))?;
+        // All scratch is persistent arena — NO per-call alloc/free, so the whole
+        // arm is CUDA-graph-capture-legal (decode). `permuted` aliases
+        // `expert_down_out`: the gathered activations are consumed (quantized to
+        // q8) before the grouped down projection overwrites it with the real
+        // output, so the two uses never overlap in time. `q8` is a dedicated
+        // arena buffer sized for the whole sorted [k_max*top_k, h] tile.
+        let expert_gate_out = ctx.buffers.expert_gate_out();
+        let expert_up_out = ctx.buffers.expert_up_out();
+        let expert_down_out = ctx.buffers.expert_down_out();
+        let permuted = expert_down_out;
+        let q8 = ctx.buffers.moe_grouped_q8();
 
         // 1. Gather rows into expert-contiguous (sorted) order.
         ops::moe_permute_tokens(
@@ -62,10 +63,6 @@ impl MoeLayer {
             total_expanded,
             stream,
         )?;
-
-        let expert_gate_out = ctx.buffers.expert_gate_out();
-        let expert_up_out = ctx.buffers.expert_up_out();
-        let expert_down_out = ctx.buffers.expert_down_out();
 
         // 3. Gate/up: quantize the whole sorted activation buffer ONCE, then run
         // two DEVICE-SIDE GROUPED GEMMs (one launch each, grid.z=num_experts) that
@@ -182,8 +179,6 @@ impl MoeLayer {
             other => anyhow::bail!("packed MoE down_proj: unexpected variant {other:?}"),
         }
 
-        ctx.gpu.free(permuted)?;
-        ctx.gpu.free(q8)?;
         Ok(())
     }
 }
