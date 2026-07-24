@@ -38,6 +38,70 @@ fn read_f32(backend: &MetalGpuBackend, ptr: DevicePtr, len: usize) -> Vec<f32> {
 }
 
 #[test]
+fn metal_laguna_dense_router_gemv_covers_all_experts() {
+    let Some(backend) = maybe_backend() else {
+        return;
+    };
+    // Laguna's real router is [256, 3072]. Use that K and one extra output
+    // row so the final partially-active 4-row threadgroup is covered too.
+    let (experts, hidden) = (257u32, 3072u32);
+    let input: Vec<half::bf16> = (0..hidden)
+        .map(|i| half::bf16::from_f32(((i % 63) as f32 - 31.0) / 64.0))
+        .collect();
+    let weights: Vec<half::bf16> = (0..experts * hidden)
+        .map(|i| half::bf16::from_f32(((i % 29) as f32 - 14.0) / 128.0))
+        .collect();
+    let expected: Vec<half::bf16> = (0..experts as usize)
+        .map(|row| {
+            half::bf16::from_f32(
+                (0..hidden as usize)
+                    .map(|col| input[col].to_f32() * weights[row * hidden as usize + col].to_f32())
+                    .sum(),
+            )
+        })
+        .collect();
+    let input_ptr = backend.alloc(input.len() * 2).unwrap();
+    let weight_ptr = backend.alloc(weights.len() * 2).unwrap();
+    let output_ptr = backend.alloc(experts as usize * 2).unwrap();
+    backend
+        .copy_h2d(&bf16_slice_to_bytes(&input), input_ptr)
+        .unwrap();
+    backend
+        .copy_h2d(&bf16_slice_to_bytes(&weights), weight_ptr)
+        .unwrap();
+    backend
+        .memset(output_ptr, 0x7f, experts as usize * 2)
+        .unwrap();
+    let kernel = backend.kernel("gemv", "dense_gemv_bf16").unwrap();
+    backend
+        .launch_typed(
+            kernel,
+            [experts.div_ceil(4), 1, 1],
+            [256, 1, 1],
+            0,
+            0,
+            &[
+                KernelArg::Buffer(input_ptr),
+                KernelArg::Buffer(weight_ptr),
+                KernelArg::Buffer(output_ptr),
+                KernelArg::Bytes(&experts.to_le_bytes()),
+                KernelArg::Bytes(&hidden.to_le_bytes()),
+            ],
+        )
+        .unwrap();
+    backend.synchronize(0).unwrap();
+    let mut raw = vec![0; experts as usize * 2];
+    backend.copy_d2h(output_ptr, &mut raw).unwrap();
+    let actual = bytes_to_bf16_vec(&raw);
+    for (row, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+        assert!(
+            (actual.to_f32() - expected.to_f32()).abs() <= 0.125,
+            "router row {row} mismatch: actual={actual:?} expected={expected:?}"
+        );
+    }
+}
+
+#[test]
 fn metal_laguna_correction_biased_sigmoid_topk_matches_cpu() {
     let Some(backend) = maybe_backend() else {
         return;
