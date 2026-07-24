@@ -173,6 +173,57 @@ pub fn q4k_grouped_gemm(
         .launch(stream)
 }
 
+/// FUSED device-side GROUPED gate+up MoE MMQ: ONE launch computes BOTH the gate
+/// and up projections per CTA (shared empty-expert early-return + ids setup, then
+/// the verified `mul_mat_q_process_tile` twice). Halves the scheduled-CTA count
+/// vs two `q4k_grouped_gemm` calls and collapses two launches into one. gate and
+/// up share shape [inter, h], so every stride is identical; only the two weight
+/// bases and two sorted outputs differ. smem unchanged (Q4K_MMQ_SMEM); the
+/// accumulator resets between the two passes so no register spill.
+#[allow(clippy::too_many_arguments)]
+pub fn q4k_grouped_gemm_gate_up(
+    gpu: &dyn GpuBackend,
+    kernel_nc: KernelHandle,
+    kernel_wc: KernelHandle,
+    gate_base: DevicePtr,
+    up_base: DevicePtr,
+    a_q8: DevicePtr,
+    expert_offsets: DevicePtr,
+    gate_out: DevicePtr,
+    up_out: DevicePtr,
+    n_out: u32,
+    k: u32,
+    num_experts: u32,
+    total_expanded: u32,
+    stream: u64,
+) -> Result<()> {
+    let kernel = if n_out.is_multiple_of(128) {
+        kernel_nc
+    } else {
+        kernel_wc
+    };
+    let stride_row_x = k / QK_K;
+    let stride_channel_x = n_out * stride_row_x; // per-expert block stride (gate == up)
+    let max_m_tiles = div_ceil(total_expanded, 128);
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(n_out, 128), max_m_tiles, num_experts]) // grid.x NOT doubled
+        .block([32, 8, 1])
+        .shared_mem(Q4K_MMQ_SMEM)
+        .arg_ptr(gate_base)
+        .arg_ptr(up_base)
+        .arg_ptr(a_q8)
+        .arg_ptr(expert_offsets)
+        .arg_ptr(gate_out)
+        .arg_ptr(up_out)
+        .arg_u32(n_out) // nrows_x
+        .arg_u32(k) // ncols_x
+        .arg_u32(stride_row_x) // stride_row_x
+        .arg_u32(stride_channel_x) // stride_channel_x (both projections)
+        .arg_u32(total_expanded) // ncols_y
+        .arg_u32(n_out) // stride_col_dst
+        .launch(stream)
+}
+
 /// Q4_K MMQ GEMM: C\[m,n\] (bf16) = A_q8\[m,k\] x W_q4k\[n,k\]. Fused bf16 store.
 pub fn q4k_mmq_gemm(
     gpu: &dyn GpuBackend,

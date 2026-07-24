@@ -80,27 +80,18 @@ impl MoeLayer {
         )?;
         let gate_base = packed[0].gate.weight;
         let up_base = packed[0].up.weight;
-        ops::q4k_grouped_gemm(
+        // FUSED gate+up: ONE grouped launch; each CTA computes both projections
+        // (shared empty-expert early-return + ids setup → half the scheduled CTAs
+        // vs two separate launches). Numerically identical to the two-call path.
+        ops::q4k_grouped_gemm_gate_up(
             ctx.gpu,
-            self.q4k_grouped_nc_k,
-            self.q4k_grouped_wc_k,
+            self.q4k_grouped_gate_up_nc_k,
+            self.q4k_grouped_gate_up_wc_k,
             gate_base,
-            q8,
-            expert_offsets,
-            expert_gate_out,
-            inter,
-            h,
-            num_experts,
-            total_expanded,
-            stream,
-        )?;
-        ops::q4k_grouped_gemm(
-            ctx.gpu,
-            self.q4k_grouped_nc_k,
-            self.q4k_grouped_wc_k,
             up_base,
             q8,
             expert_offsets,
+            expert_gate_out,
             expert_up_out,
             inter,
             h,

@@ -420,6 +420,8 @@ impl MoeLayer {
             q4k_grouped_wc_k: super::super::try_kernel(gpu, "q4k_mmq", "atlas_q4k_mmq128_grouped_wc"),
             q6k_grouped_nc_k: super::super::try_kernel(gpu, "q4k_mmq", "atlas_q6k_mmq128_grouped_nc"),
             q6k_grouped_wc_k: super::super::try_kernel(gpu, "q4k_mmq", "atlas_q6k_mmq128_grouped_wc"),
+            q4k_grouped_gate_up_nc_k: super::super::try_kernel(gpu, "q4k_mmq", "atlas_q4k_mmq128_grouped_gate_up_nc"),
+            q4k_grouped_gate_up_wc_k: super::super::try_kernel(gpu, "q4k_mmq", "atlas_q4k_mmq128_grouped_gate_up_wc"),
             q4k_quant_act_d4_k: super::super::try_kernel(gpu, "q4k_mmq", "atlas_q8_1_quantize_d4_bf16"),
             // Phase 2.7 Tier C — set by loader after construction (qwen35.rs).
             is_dflash_capture_layer: false,

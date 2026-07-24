@@ -400,6 +400,7 @@ impl MoeLayer {
                 stream,
             )?;
         }
+        prof_step!("routed_compute");
         let expert_down_out = ctx.buffers.expert_down_out();
 
         // Feature-1: fold the routed-expert down_proj LoRA deltas onto the sorted
