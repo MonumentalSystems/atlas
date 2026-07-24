@@ -87,18 +87,6 @@ impl MoeLayer {
             );
         }
 
-        // One-time diagnostic: dump the routing shape so a fault can be tied to
-        // concrete numbers (expert count with rows, max rows, total_expanded).
-        static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-        if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-            let active = offs.windows(2).filter(|w| w[1] > w[0]).count();
-            let maxrows = offs.windows(2).map(|w| w[1] - w[0]).max().unwrap_or(0);
-            tracing::warn!(
-                "packed MoE arm: n={n} top_k={top_k} total_expanded={total_expanded} inter={inter} \
-                 h={h} ne={ne} active_experts={active} max_rows/expert={maxrows}"
-            );
-        }
-
         let expert_gate_out = ctx.buffers.expert_gate_out();
         let expert_up_out = ctx.buffers.expert_up_out();
         let expert_down_out = ctx.buffers.expert_down_out();

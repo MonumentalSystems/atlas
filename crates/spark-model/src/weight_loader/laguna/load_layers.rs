@@ -145,8 +145,6 @@ fn load_moe_ffn(
     unified_moe_layout: bool,
 ) -> Result<FfnComponent> {
     let mlp = format!("{lp}.mlp");
-    let gate = dense(store, &format!("{mlp}.gate.weight"))?;
-    let correction_bias = dense(store, &format!("{mlp}.experts.e_score_correction_bias"))?;
     let mi = config.moe_intermediate_size;
     let h0 = config.hidden_size;
 
@@ -160,6 +158,19 @@ fn load_moe_ffn(
         .get(&format!("{mlp}.experts.0.gate_proj.weight"))
         .map(|t| t.is_packed_q4k())
         .unwrap_or(false);
+
+    let gate = dense(store, &format!("{mlp}.gate.weight"))?;
+    // e_score_correction_bias: the GGUF loader dequants this originally-F32 tensor
+    // to a BF16 device buffer, but `moe_topk_sigmoid_batched` reads `bias` as
+    // `const float*` — handing it the BF16 buffer over-reads one buffer-length
+    // past the end (CUDA_ERROR_ILLEGAL_ADDRESS, surfacing at whichever layer's
+    // trailing bytes hit an unmapped page). Widen BF16→F32 into a correctly-sized
+    // device buffer. Safetensors already delivers F32 on-device, so keep `dense`.
+    let correction_bias = if experts_keep_packed {
+        dense_bias_to_device(store, &format!("{mlp}.experts.e_score_correction_bias"), gpu)?
+    } else {
+        dense(store, &format!("{mlp}.experts.e_score_correction_bias"))?
+    };
 
     let (experts, packed_experts) = if experts_keep_packed {
         let mut packed = Vec::with_capacity(config.num_experts);
@@ -467,6 +478,50 @@ fn cutlass_grouped_moe_enabled() -> bool {
         std::env::var("ATLAS_HOLO_MOE_GROUPED_CUTLASS").as_deref(),
         Ok("1") | Ok("true")
     )
+}
+
+/// Materialise the sigmoid router's `e_score_correction_bias` as an F32 device
+/// buffer for the keep-packed GGUF path.
+///
+/// The GGUF loader dequants this originally-F32 tensor to **BF16** on load (2
+/// bytes/elem), but `moe_topk_sigmoid_batched` reads `bias` as `const float*`
+/// (4 bytes/elem). Handing it the BF16 buffer makes the kernel over-read one
+/// buffer-length past the end — a CUDA_ERROR_ILLEGAL_ADDRESS that surfaces at
+/// whichever layer's trailing bytes land on an unmapped page (seen drifting
+/// across layers with prompt length). Widen BF16→F32 here into a correctly
+/// sized [num_experts] F32 device allocation. Safetensors already ships an F32
+/// device pointer and keeps `dense()`, so this runs on the keep-packed path only.
+fn dense_bias_to_device(
+    store: &WeightStore,
+    name: &str,
+    gpu: &dyn GpuBackend,
+) -> Result<crate::weight_map::DenseWeight> {
+    let t = store
+        .get(name)
+        .with_context(|| format!("keep-packed bias {name} missing"))?;
+    let n = t.num_elements();
+    let src_bytes = t.byte_size();
+    // `t.ptr` is a DEVICE buffer — the GGUF loader dequants this bias to BF16 on
+    // GPU. Copy it down at its true (BF16) size, widen on the host, upload as F32.
+    let mut host = vec![0u8; src_bytes];
+    gpu.copy_d2h(t.ptr, &mut host)
+        .with_context(|| format!("copy_d2h correction_bias {name} ({src_bytes}B)"))?;
+    let f32_bytes: Vec<u8> = match t.dtype {
+        WeightDtype::BF16 => host
+            .chunks_exact(2)
+            .flat_map(|c| {
+                let bf = u16::from_le_bytes([c[0], c[1]]);
+                f32::from_bits((bf as u32) << 16).to_le_bytes()
+            })
+            .collect(),
+        WeightDtype::FP32 => host,
+        d => anyhow::bail!("unexpected correction_bias dtype {d:?} for {name}"),
+    };
+    let ptr = gpu
+        .alloc(n * 4)
+        .with_context(|| format!("allocate F32 device copy of {name}"))?;
+    gpu.copy_h2d(&f32_bytes, ptr)?;
+    Ok(crate::weight_map::DenseWeight { weight: ptr })
 }
 
 fn compute_plain_inv_freq(theta: f64, dim: usize, gpu: &dyn GpuBackend) -> Result<DevicePtr> {
