@@ -122,6 +122,57 @@ pub fn quantize_act_q8_1(
         .launch(stream)
 }
 
+/// Device-side GROUPED MoE MMQ: one launch over (N-tiles, worst-case M-tiles,
+/// num_experts). Each CTA reads its expert's row range from `expert_offsets`
+/// (device i32\[ne+1\]) — NO host readback, so it is CUDA-graph-capture-legal.
+/// `weight_base` is expert 0's packed blocks (experts are one contiguous stack,
+/// stride `n_out*(k/256)` blocks apart). Activations `a_q8` are the whole sorted
+/// \[total_expanded, k\] q8_1 buffer (quantized once); output `dst_bf16` is written
+/// in SORTED order \[total_expanded, n_out\] for the caller's unpermute-reduce.
+/// `is_q6k` picks the Q6_K weight/vec_dot path (D4-quantized activations) vs Q4_K.
+#[allow(clippy::too_many_arguments)]
+pub fn q4k_grouped_gemm(
+    gpu: &dyn GpuBackend,
+    kernel_nc: KernelHandle,
+    kernel_wc: KernelHandle,
+    weight_base: DevicePtr,     // expert 0 packed blocks (contiguous stack)
+    a_q8: DevicePtr,            // sorted q8_1 activations [total_expanded, k]
+    expert_offsets: DevicePtr,  // [ne+1] i32 device (sorted cumulative counts)
+    dst_bf16: DevicePtr,        // sorted output [total_expanded, n_out]
+    n_out: u32,                 // output features per expert (nrows_x)
+    k: u32,                     // input features (ncols_x, %256==0)
+    num_experts: u32,
+    total_expanded: u32,        // sorted-buffer row count (worst-case M bound)
+    stream: u64,
+) -> Result<()> {
+    // nc assumes n_out % 128 == 0 (true for Laguna inter=1024 / hidden=3072);
+    // wc guards a ragged N. M raggedness is always handled in-kernel via
+    // per-expert tile_y_max_j, independent of this choice.
+    let kernel = if n_out.is_multiple_of(128) {
+        kernel_nc
+    } else {
+        kernel_wc
+    };
+    let stride_row_x = k / QK_K; // K-blocks per weight row
+    let stride_channel_x = n_out * stride_row_x; // per-expert block stride
+    let max_m_tiles = div_ceil(total_expanded, 128);
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(n_out, 128), max_m_tiles, num_experts])
+        .block([32, 8, 1])
+        .shared_mem(Q4K_MMQ_SMEM)
+        .arg_ptr(weight_base)
+        .arg_ptr(a_q8)
+        .arg_ptr(expert_offsets)
+        .arg_ptr(dst_bf16)
+        .arg_u32(n_out) // nrows_x
+        .arg_u32(k) // ncols_x
+        .arg_u32(stride_row_x) // stride_row_x
+        .arg_u32(stride_channel_x) // stride_channel_x
+        .arg_u32(total_expanded) // ncols_y (y-buffer row stride)
+        .arg_u32(n_out) // stride_col_dst (sorted dst row stride)
+        .launch(stream)
+}
+
 /// Q4_K MMQ GEMM: C\[m,n\] (bf16) = A_q8\[m,k\] x W_q4k\[n,k\]. Fused bf16 store.
 pub fn q4k_mmq_gemm(
     gpu: &dyn GpuBackend,

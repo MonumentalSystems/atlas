@@ -395,6 +395,13 @@ pub struct MoeLayer {
     pub(crate) q4k_mmq_wc_k: KernelHandle,
     pub(crate) q4k_quant_act_k: KernelHandle,
     pub(crate) q6k_dequant_k: KernelHandle,
+    /// Device-side grouped MoE MMQ (reads expert_offsets on-device; graph-safe).
+    pub(crate) q4k_grouped_nc_k: KernelHandle,
+    pub(crate) q4k_grouped_wc_k: KernelHandle,
+    pub(crate) q6k_grouped_nc_k: KernelHandle,
+    pub(crate) q6k_grouped_wc_k: KernelHandle,
+    /// D4-layout q8_1 activation quantizer (Q6_K MMQ input).
+    pub(crate) q4k_quant_act_d4_k: KernelHandle,
     // Phase 2.7 Tier C — Frankenstein dispatch flag.
     // True when this layer's index is in `config.dflash_capture_layers`.
     // When the env var `ATLAS_FRANKENSTEIN_DECODE_VIA_PREFILL=1` is set,
