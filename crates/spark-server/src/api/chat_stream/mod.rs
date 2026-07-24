@@ -230,6 +230,10 @@ pub(crate) async fn run_chat_stream(
         prompt_vocab,
         grammar_spec: grammar_spec_for_retry,
         max_tokens,
+        // Fixed-length request (ignore_eos folds to min_tokens==max_tokens, or an
+        // explicit min_tokens>=max_tokens): disable the content-loop watchdogs so
+        // the run reaches max_tokens like the blocking path does.
+        fixed_length_output: max_tokens > 0 && min_tokens >= max_tokens,
         timeout_at,
     };
 

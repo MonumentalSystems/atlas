@@ -120,6 +120,15 @@ pub struct ChatCompletionRequest {
     /// 0 = no minimum (default). Useful for preventing empty responses.
     #[serde(default)]
     pub min_tokens: usize,
+    /// vLLM-compatible (NOT OpenAI spec): when true, suppress the end-of-
+    /// sequence token so generation runs to `max_tokens` regardless of EOS.
+    /// Mirrors vLLM `SamplingParams.ignore_eos` — the field benchmark harnesses
+    /// reach for to force fixed-length runs. Lowered to `min_tokens = max_tokens`
+    /// in `to_ir` (EOS is already suppressed until `min_tokens`, so the two are
+    /// equivalent for any finite `max_tokens`), which ALSO disables the
+    /// streaming content-loop watchdogs so a fixed-length run is not cut short.
+    #[serde(default)]
+    pub ignore_eos: bool,
     /// Seed for deterministic sampling. When set, stochastic sampling uses this
     /// seed for the RNG, producing reproducible output for the same inputs.
     /// None = non-deterministic (default).

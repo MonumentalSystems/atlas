@@ -85,7 +85,7 @@ pub(super) fn handle_token(state: &mut StreamState, ctx: &StreamCtx, tok: u32) -
     // Suppressing forever (until max_tokens) burns the user's
     // patience and decode budget — observed live as an 8192-token
     // doom loop. If the streak exceeds the bound, end the stream.
-    if state.suppressing_param_leak && !state.stop_string_triggered {
+    if !ctx.fixed_length_output && state.suppressing_param_leak && !state.stop_string_triggered {
         state.suppress_streak_tokens = state.suppress_streak_tokens.saturating_add(1);
         if state.suppress_streak_tokens > MAX_SUPPRESS_STREAK_TOKENS {
             tracing::warn!(
@@ -536,8 +536,11 @@ fn process_detector_content(
     // post-sanitizer text in both call sites.
     let sanitized = sanitized_or_raw;
 
+    // Fixed-length output (ignore_eos / min_tokens>=max_tokens): the caller
+    // explicitly wants exactly max_tokens, so skip the content-loop watchdogs
+    // entirely — they would cancel the run early (the blocking path has none).
     // F4 SimHash guard.
-    let semantic_trip = if !state.loop_watchdog_triggered {
+    let semantic_trip = if !state.loop_watchdog_triggered && !ctx.fixed_length_output {
         state.simhash_pending.push_str(sanitized);
         let mut dup = false;
         if crate::loop_simhash::ends_at_sentence_boundary(&state.simhash_pending).is_some()
@@ -555,11 +558,15 @@ fn process_detector_content(
         false
     };
 
-    let token_trip = check_loop_watchdog(
-        sanitized,
-        &mut state.loop_scan_buf,
-        state.loop_watchdog_triggered,
-    );
+    let token_trip = if ctx.fixed_length_output {
+        false
+    } else {
+        check_loop_watchdog(
+            sanitized,
+            &mut state.loop_scan_buf,
+            state.loop_watchdog_triggered,
+        )
+    };
 
     if semantic_trip || token_trip {
         if semantic_trip {

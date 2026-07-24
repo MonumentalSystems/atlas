@@ -31,6 +31,13 @@ pub(super) struct StreamCtx {
     pub(super) prompt_vocab: Arc<HashSet<String>>,
     pub(super) grammar_spec: Option<crate::api::inference_types::GrammarSpec>,
     pub(super) max_tokens: usize,
+    /// Caller explicitly asked for a fixed-length generation (`ignore_eos`, or
+    /// `min_tokens >= max_tokens`). When set, the streaming content-loop
+    /// watchdogs (SimHash semantic guard, token-loop watchdog, orphan-suppress
+    /// streak) are disabled — they would cancel a legitimately fixed-length run
+    /// before `max_tokens`, and the blocking path has no such guards, so
+    /// leaving them armed breaks streaming/blocking parity.
+    pub(super) fixed_length_output: bool,
     pub(super) timeout_at: Option<std::time::Instant>,
     /// Number of trailing bytes to hold back from each streaming delta
     /// while stop-string matching is active. vLLM mirrors this in

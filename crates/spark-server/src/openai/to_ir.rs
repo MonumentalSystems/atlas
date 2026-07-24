@@ -109,7 +109,16 @@ impl From<ChatCompletionRequest> for ir::ChatRequest {
                 frequency_penalty: req.frequency_penalty,
             },
             max_tokens: req.max_tokens,
-            min_tokens: req.min_tokens,
+            // vLLM `ignore_eos` ≡ suppress EOS for the whole generation ≡
+            // `min_tokens == max_tokens` (the scheduler suppresses EOS until
+            // `min_tokens` is reached). Fold it into the fully-plumbed
+            // `min_tokens` path instead of threading a new flag through every
+            // scheduler struct. `.max()` keeps an explicit larger `min_tokens`.
+            min_tokens: if req.ignore_eos {
+                req.max_tokens.max(req.min_tokens)
+            } else {
+                req.min_tokens
+            },
             stop: req.stop,
             stream: req.stream,
             n: req.n,
