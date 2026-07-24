@@ -263,6 +263,30 @@ pub fn disable_watchdogs() -> bool {
     })
 }
 
+static TOOL_ENVELOPE_WATCHDOG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Whether the tool-call ENVELOPE-stuck watchdog (`MAX_TOOL_BODY_TOKENS`) is
+/// active. Enabled by default; disable with
+/// `ATLAS_TOOL_ENVELOPE_WATCHDOG=0`/`off`/`false`. The watchdog's
+/// parameter-body detection recognizes only the Qwen `<parameter=KEY>…`
+/// format — for models whose tool format differs (e.g. poolside_v1's
+/// `<arg_value>…</arg_value>`) it cannot tell a large arg value from stuck
+/// envelope junk and force-kills legitimate large Write calls at 1024 tokens.
+/// Disabling it gives vLLM parity (generation bounded only by max_tokens).
+pub fn tool_envelope_watchdog_enabled() -> bool {
+    *TOOL_ENVELOPE_WATCHDOG.get_or_init(|| {
+        !matches!(
+            std::env::var("ATLAS_TOOL_ENVELOPE_WATCHDOG")
+                .ok()
+                .as_deref()
+                .map(str::trim)
+                .map(str::to_ascii_lowercase)
+                .as_deref(),
+            Some("0") | Some("off") | Some("false") | Some("no")
+        )
+    })
+}
+
 static ENABLE_LOOP_WATCHDOG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 
 /// Set once at startup from the resolved `ModelBehavior.enable_loop_watchdog`.
