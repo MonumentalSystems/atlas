@@ -88,6 +88,8 @@ fn setup_model(
         dtype: spark_runtime::kv_cache::KvCacheDtype::Fp8,
         layer_dtypes: vec![],
         layer_dims: vec![],
+        layer_retention: vec![],
+        prefill_chunk_tokens: 0,
         cache_blocks_per_seq: None,
     };
     let num_blocks =

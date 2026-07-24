@@ -435,6 +435,19 @@ pub fn is_keep_packed_proj(hf: &str) -> bool {
         || hf.ends_with(".self_attn.o_proj.weight")
 }
 
+/// True when a Laguna rank-2 Q8_0 tensor has a native packed consumer.
+///
+/// This deliberately describes only matrix weights: embeddings, the untied
+/// LM head, attention projections, routed/shared FFN projections, and the MoE
+/// router. Norms, biases, and other vectors continue through normal BF16/F32
+/// materialization even when their GGUF storage type is Q8_0.
+pub fn is_laguna_packed_q8_matrix(hf: &str) -> bool {
+    hf == "model.embed_tokens.weight"
+        || hf == "lm_head.weight"
+        || hf.ends_with(".weight")
+            && (hf.contains(".self_attn.") || hf.contains(".mlp.") || hf.contains(".linear_attn."))
+}
+
 /// Expand an [`GgufName::ExpertStack`] into the concrete per-expert HF name for
 /// expert `e`. The loader calls this while slicing the stacked tensor so the
 /// naming convention lives next to the translation table it mirrors.

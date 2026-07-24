@@ -36,6 +36,9 @@ impl MoeLayer {
             config.num_experts_per_tok,
             num_experts,
         );
+        let packed_init =
+            super::init_packed::PackedGgufInit::new(weights.packed_experts.as_deref(), gpu)?;
+        let kernel = |module, function| packed_init.required_kernel(module, function);
         let gate_ptrs = build_ptr_table(&weights.experts, |e| &e.gate_proj, gpu)?;
         let up_ptrs = build_ptr_table(&weights.experts, |e| &e.up_proj, gpu)?;
         let down_ptrs = build_ptr_table(&weights.experts, |e| &e.down_proj, gpu)?;
@@ -48,7 +51,7 @@ impl MoeLayer {
             weights.correction_bias.map(|dw| dw.weight);
 
         let _ = num_experts;
-        let rms_norm_k = gpu.kernel("norm", "rms_norm")?;
+        let rms_norm_k = kernel("norm", "rms_norm")?;
         Ok(Self {
             weights,
             // Default: standard NVFP4 (FP8-E4M3 per-16 + f32 global). The
@@ -59,10 +62,10 @@ impl MoeLayer {
             gate_nvfp4,
             pre_expert_norm: None,
             pre_expert_norm_k: rms_norm_k,
-            dense_gemv: gpu.kernel("gemv", "dense_gemv_bf16")?,
-            w4a16_gemv: gpu.kernel("w4a16_gemv", "w4a16_gemv")?,
-            w4a16_gemm: gpu.kernel("w4a16", "w4a16_gemm")?,
-            dense_gemm: gpu.kernel("gemm", "dense_gemm_bf16")?,
+            dense_gemv: kernel("gemv", "dense_gemv_bf16")?,
+            w4a16_gemv: kernel("w4a16_gemv", "w4a16_gemv")?,
+            w4a16_gemm: kernel("w4a16", "w4a16_gemm")?,
+            dense_gemm: kernel("gemm", "dense_gemm_bf16")?,
             dense_gemm_pipelined: super::super::try_kernel(
                 gpu,
                 "gemm",
@@ -73,34 +76,56 @@ impl MoeLayer {
             dense_gemm_f32out: super::super::try_kernel(gpu, "gemm", "dense_gemm_bf16_f32out"),
             dense_gemm_f32in: super::super::try_kernel(gpu, "gemm", "dense_gemm_f32in_f32out"),
             moe_topk_f32: super::super::try_kernel(gpu, "moe_topk", "moe_topk_softmax_f32"),
-            moe_expert_gate_up_shared: gpu
-                .kernel("moe_shared_expert_fused", "moe_expert_gate_up_shared")?,
-            moe_expert_silu_down_shared: gpu
-                .kernel("moe_shared_expert_fused", "moe_expert_silu_down_shared")?,
-            moe_topk: gpu.kernel("moe_topk", "moe_topk_softmax")?,
-            moe_weighted_sum_blend: gpu.kernel("moe_expert_gemv", "moe_weighted_sum_blend")?,
-            residual_add: gpu.kernel("residual_add", "bf16_residual_add")?,
-            moe_topk_batched: gpu.kernel("moe_topk", "moe_topk_softmax_batched")?,
-            moe_expert_gate_up_shared_batch2: gpu
-                .kernel("moe_fused_batch2", "moe_expert_gate_up_shared_batch2")?,
-            moe_expert_silu_down_shared_batch2: gpu
-                .kernel("moe_fused_batch2", "moe_expert_silu_down_shared_batch2")?,
-            moe_weighted_sum_blend_batch2: gpu
-                .kernel("moe_fused_batch2", "moe_weighted_sum_blend_batch2")?,
-            w4a16_gemv_batch2: gpu.kernel("w4a16_gemv", "w4a16_gemv_batch2")?,
-            moe_expert_gate_up_shared_batch3: gpu
-                .kernel("moe_fused_batch3", "moe_expert_gate_up_shared_batch3")?,
-            moe_expert_silu_down_shared_batch3: gpu
-                .kernel("moe_fused_batch3", "moe_expert_silu_down_shared_batch3")?,
-            moe_weighted_sum_blend_batch3: gpu
-                .kernel("moe_fused_batch3", "moe_weighted_sum_blend_batch3")?,
-            w4a16_gemv_batch3: gpu.kernel("w4a16_gemv", "w4a16_gemv_batch3")?,
-            moe_expert_gate_up_shared_token_major: gpu
-                .kernel("moe_prefill", "moe_expert_gate_up_shared_prefill")?,
-            moe_expert_silu_down_shared_token_major: gpu
-                .kernel("moe_prefill", "moe_expert_silu_down_shared_prefill")?,
-            moe_weighted_sum_blend_token_major: gpu
-                .kernel("moe_prefill", "moe_weighted_sum_blend_prefill")?,
+            moe_expert_gate_up_shared: kernel(
+                "moe_shared_expert_fused",
+                "moe_expert_gate_up_shared",
+            )?,
+            moe_expert_silu_down_shared: kernel(
+                "moe_shared_expert_fused",
+                "moe_expert_silu_down_shared",
+            )?,
+            moe_topk: kernel("moe_topk", "moe_topk_softmax")?,
+            moe_weighted_sum_blend: kernel("moe_expert_gemv", "moe_weighted_sum_blend")?,
+            residual_add: kernel("residual_add", "bf16_residual_add")?,
+            moe_topk_batched: kernel("moe_topk", "moe_topk_softmax_batched")?,
+            moe_expert_gate_up_shared_batch2: kernel(
+                "moe_fused_batch2",
+                "moe_expert_gate_up_shared_batch2",
+            )?,
+            moe_expert_silu_down_shared_batch2: kernel(
+                "moe_fused_batch2",
+                "moe_expert_silu_down_shared_batch2",
+            )?,
+            moe_weighted_sum_blend_batch2: kernel(
+                "moe_fused_batch2",
+                "moe_weighted_sum_blend_batch2",
+            )?,
+            w4a16_gemv_batch2: kernel("w4a16_gemv", "w4a16_gemv_batch2")?,
+            moe_expert_gate_up_shared_batch3: kernel(
+                "moe_fused_batch3",
+                "moe_expert_gate_up_shared_batch3",
+            )?,
+            moe_expert_silu_down_shared_batch3: kernel(
+                "moe_fused_batch3",
+                "moe_expert_silu_down_shared_batch3",
+            )?,
+            moe_weighted_sum_blend_batch3: kernel(
+                "moe_fused_batch3",
+                "moe_weighted_sum_blend_batch3",
+            )?,
+            w4a16_gemv_batch3: kernel("w4a16_gemv", "w4a16_gemv_batch3")?,
+            moe_expert_gate_up_shared_token_major: kernel(
+                "moe_prefill",
+                "moe_expert_gate_up_shared_prefill",
+            )?,
+            moe_expert_silu_down_shared_token_major: kernel(
+                "moe_prefill",
+                "moe_expert_silu_down_shared_prefill",
+            )?,
+            moe_weighted_sum_blend_token_major: kernel(
+                "moe_prefill",
+                "moe_weighted_sum_blend_prefill",
+            )?,
             moe_decode_atomic_c4_silu_down_accum_k: super::super::try_kernel(
                 gpu,
                 "moe_decode_atomic_c4",
@@ -111,15 +136,14 @@ impl MoeLayer {
                 "moe_decode_atomic_c4",
                 "moe_decode_atomic_c4_finalize",
             ),
-            moe_sort_by_expert: gpu.kernel("moe", "moe_sort_by_expert")?,
-            moe_sorted_gate_up: gpu.kernel("moe_sorted", "moe_sorted_gate_up")?,
-            moe_sorted_silu_down: gpu.kernel("moe_sorted", "moe_sorted_silu_down")?,
-            moe_grouped_gemm: gpu.kernel("moe_w4a16", "moe_w4a16_grouped_gemm_ptrtable")?,
-            moe_grouped_gemm_t: gpu.kernel("moe_w4a16", "moe_w4a16_grouped_gemm_ptrtable_t")?,
-            moe_grouped_gemm_t_k64: gpu
-                .kernel("moe_w4a16", "moe_w4a16_grouped_gemm_ptrtable_t_k64")?,
-            moe_fused_gate_up_t: gpu.kernel("moe_w4a16", "moe_w4a16_fused_gate_up_t")?,
-            moe_fused_gate_up_t_k64: gpu.kernel("moe_w4a16", "moe_w4a16_fused_gate_up_t_k64")?,
+            moe_sort_by_expert: kernel("moe", "moe_sort_by_expert")?,
+            moe_sorted_gate_up: kernel("moe_sorted", "moe_sorted_gate_up")?,
+            moe_sorted_silu_down: kernel("moe_sorted", "moe_sorted_silu_down")?,
+            moe_grouped_gemm: kernel("moe_w4a16", "moe_w4a16_grouped_gemm_ptrtable")?,
+            moe_grouped_gemm_t: kernel("moe_w4a16", "moe_w4a16_grouped_gemm_ptrtable_t")?,
+            moe_grouped_gemm_t_k64: kernel("moe_w4a16", "moe_w4a16_grouped_gemm_ptrtable_t_k64")?,
+            moe_fused_gate_up_t: kernel("moe_w4a16", "moe_w4a16_fused_gate_up_t")?,
+            moe_fused_gate_up_t_k64: kernel("moe_w4a16", "moe_w4a16_fused_gate_up_t_k64")?,
             // ARM-2 Phase-K native-MXFP4 (E8M0) prefill variants — try_kernel:
             // only the deepseek-v4-flash target's moe_w4a16 module ships them.
             moe_grouped_gemm_e8m0: super::super::try_kernel(
@@ -163,7 +187,7 @@ impl MoeLayer {
                 "moe_w4a16",
                 "moe_w4a16_fused_gate_up_t_k64_fp4",
             ),
-            moe_fp8_grouped_gemm_t: gpu.kernel("moe_w4a16", "moe_fp8_grouped_gemm_ptrtable_t")?,
+            moe_fp8_grouped_gemm_t: kernel("moe_w4a16", "moe_fp8_grouped_gemm_ptrtable_t")?,
             // THE routed-expert FP8 prefill kernel: grid-compaction (persistent
             // 96-CTA grid over a compacted work-list). Handle may be 0 on older
             // images that don't ship it.
@@ -230,14 +254,14 @@ impl MoeLayer {
                 "moe_gate_topk",
                 "moe_gate_topk_fused",
             ),
-            w4a16_gemm_t: gpu.kernel("w4a16", "w4a16_gemm_t")?,
-            bf16_to_fp8_k: gpu.kernel("w4a16", "bf16_to_fp8")?,
-            fp8_gemm_k: gpu.kernel("w4a16", "fp8_gemm_t")?,
-            moe_silu_mul: gpu.kernel("moe_silu_mul", "moe_silu_mul")?,
-            moe_act_mul: gpu.kernel("moe_silu_mul", "moe_silu_mul")?, // default: SiLU
+            w4a16_gemm_t: kernel("w4a16", "w4a16_gemm_t")?,
+            bf16_to_fp8_k: kernel("w4a16", "bf16_to_fp8")?,
+            fp8_gemm_k: kernel("w4a16", "fp8_gemm_t")?,
+            moe_silu_mul: kernel("moe_silu_mul", "moe_silu_mul")?,
+            moe_act_mul: kernel("moe_silu_mul", "moe_silu_mul")?, // default: SiLU
             gelu_activation: false,
-            moe_unpermute_reduce: gpu.kernel("moe", "moe_unpermute_reduce_indexed")?,
-            moe_batched_blend: gpu.kernel("moe", "moe_batched_blend")?,
+            moe_unpermute_reduce: kernel("moe", "moe_unpermute_reduce_indexed")?,
+            moe_batched_blend: kernel("moe", "moe_batched_blend")?,
             gate_ptrs,
             up_ptrs,
             down_ptrs,
@@ -250,14 +274,20 @@ impl MoeLayer {
             _cutlass_sfb_owned: Vec::new(),
             down_t_scratch_packed: None,
             down_t_scratch_scale: None,
-            moe_transpose_u8_batched_k: gpu
-                .kernel("moe_transpose_batched", "moe_transpose_u8_batched")?,
+            moe_transpose_u8_batched_k: kernel(
+                "moe_transpose_batched",
+                "moe_transpose_u8_batched",
+            )?,
             // ── Phase 8a transposed-layout decode kernels ──
             // Module name = file stem (default convention in atlas-kernels).
-            moe_expert_gate_up_shared_t_k: gpu
-                .kernel("moe_shared_expert_fused_t", "moe_expert_gate_up_shared_t")?,
-            moe_expert_silu_down_shared_t_k: gpu
-                .kernel("moe_shared_expert_fused_t", "moe_expert_silu_down_shared_t")?,
+            moe_expert_gate_up_shared_t_k: kernel(
+                "moe_shared_expert_fused_t",
+                "moe_expert_gate_up_shared_t",
+            )?,
+            moe_expert_silu_down_shared_t_k: kernel(
+                "moe_shared_expert_fused_t",
+                "moe_expert_silu_down_shared_t",
+            )?,
             // ARM-2 Phase-K dual-format decode variants (E8M0 routed / NVFP4
             // shared). try_kernel — the entries are in the common .cu but load
             // by name; 0 where a target doesn't compile that module.
@@ -293,43 +323,43 @@ impl MoeLayer {
                 "moe_hash_route_batched",
             ),
             tid2eid_dev,
-            moe_expert_gate_up_shared_batch2_t_k: gpu.kernel(
+            moe_expert_gate_up_shared_batch2_t_k: kernel(
                 "moe_shared_expert_fused_batch2_t",
                 "moe_expert_gate_up_shared_batch2_t",
             )?,
-            moe_expert_silu_down_shared_batch2_t_k: gpu.kernel(
+            moe_expert_silu_down_shared_batch2_t_k: kernel(
                 "moe_shared_expert_fused_batch2_t",
                 "moe_expert_silu_down_shared_batch2_t",
             )?,
-            moe_expert_gate_up_shared_batch3_t_k: gpu.kernel(
+            moe_expert_gate_up_shared_batch3_t_k: kernel(
                 "moe_shared_expert_fused_batch3_t",
                 "moe_expert_gate_up_shared_batch3_t",
             )?,
-            moe_expert_silu_down_shared_batch3_t_k: gpu.kernel(
+            moe_expert_silu_down_shared_batch3_t_k: kernel(
                 "moe_shared_expert_fused_batch3_t",
                 "moe_expert_silu_down_shared_batch3_t",
             )?,
-            moe_expert_gate_up_shared_fp8_t_k: gpu.kernel(
+            moe_expert_gate_up_shared_fp8_t_k: kernel(
                 "moe_shared_expert_fused_fp8_t",
                 "moe_expert_gate_up_shared_fp8_t",
             )?,
-            moe_expert_silu_down_shared_fp8_t_k: gpu.kernel(
+            moe_expert_silu_down_shared_fp8_t_k: kernel(
                 "moe_shared_expert_fused_fp8_t",
                 "moe_expert_silu_down_shared_fp8_t",
             )?,
-            moe_expert_gate_up_shared_fp8_batch2_t_k: gpu.kernel(
+            moe_expert_gate_up_shared_fp8_batch2_t_k: kernel(
                 "moe_shared_expert_fused_fp8_batch2_t",
                 "moe_expert_gate_up_shared_fp8_batch2_t",
             )?,
-            moe_expert_silu_down_shared_fp8_batch2_t_k: gpu.kernel(
+            moe_expert_silu_down_shared_fp8_batch2_t_k: kernel(
                 "moe_shared_expert_fused_fp8_batch2_t",
                 "moe_expert_silu_down_shared_fp8_batch2_t",
             )?,
-            moe_expert_gate_up_shared_fp8_batch3_t_k: gpu.kernel(
+            moe_expert_gate_up_shared_fp8_batch3_t_k: kernel(
                 "moe_shared_expert_fused_fp8_batch3_t",
                 "moe_expert_gate_up_shared_fp8_batch3_t",
             )?,
-            moe_expert_silu_down_shared_fp8_batch3_t_k: gpu.kernel(
+            moe_expert_silu_down_shared_fp8_batch3_t_k: kernel(
                 "moe_shared_expert_fused_fp8_batch3_t",
                 "moe_expert_silu_down_shared_fp8_batch3_t",
             )?,
@@ -359,36 +389,36 @@ impl MoeLayer {
             prefill_stream: gpu.create_stream()?,
             event_a: gpu.create_event()?,
             event_b: gpu.create_event()?,
-            moe_expert_gate_up_shared_fp8: gpu.kernel(
+            moe_expert_gate_up_shared_fp8: kernel(
                 "moe_shared_expert_fused_fp8",
                 "moe_expert_gate_up_shared_fp8",
             )?,
-            moe_expert_silu_down_shared_fp8: gpu.kernel(
+            moe_expert_silu_down_shared_fp8: kernel(
                 "moe_shared_expert_fused_fp8",
                 "moe_expert_silu_down_shared_fp8",
             )?,
             // FP8 batch2/3 kernels for MTP verify
-            moe_expert_gate_up_shared_fp8_batch2: gpu.kernel(
+            moe_expert_gate_up_shared_fp8_batch2: kernel(
                 "moe_shared_expert_fused_fp8_batch2",
                 "moe_expert_gate_up_shared_fp8_batch2",
             )?,
-            moe_expert_silu_down_shared_fp8_batch2: gpu.kernel(
+            moe_expert_silu_down_shared_fp8_batch2: kernel(
                 "moe_shared_expert_fused_fp8_batch2",
                 "moe_expert_silu_down_shared_fp8_batch2",
             )?,
-            moe_weighted_sum_blend_fp8_batch2: gpu.kernel(
+            moe_weighted_sum_blend_fp8_batch2: kernel(
                 "moe_shared_expert_fused_fp8_batch2",
                 "moe_weighted_sum_blend_fp8_batch2",
             )?,
-            moe_expert_gate_up_shared_fp8_batch3: gpu.kernel(
+            moe_expert_gate_up_shared_fp8_batch3: kernel(
                 "moe_shared_expert_fused_fp8_batch3",
                 "moe_expert_gate_up_shared_fp8_batch3",
             )?,
-            moe_expert_silu_down_shared_fp8_batch3: gpu.kernel(
+            moe_expert_silu_down_shared_fp8_batch3: kernel(
                 "moe_shared_expert_fused_fp8_batch3",
                 "moe_expert_silu_down_shared_fp8_batch3",
             )?,
-            moe_weighted_sum_blend_fp8_batch3: gpu.kernel(
+            moe_weighted_sum_blend_fp8_batch3: kernel(
                 "moe_shared_expert_fused_fp8_batch3",
                 "moe_weighted_sum_blend_fp8_batch3",
             )?,
@@ -399,6 +429,7 @@ impl MoeLayer {
             bf16_up_weight_ptrs: None,
             bf16_down_weight_ptrs: None,
             bf16_shared_expert: None,
+            q8_shared_expert: None,
             fp8_shared_expert: None,
             moe_down_t_k64_fp4: super::super::try_kernel(
                 gpu,
@@ -406,25 +437,30 @@ impl MoeLayer {
                 "moe_w4a16_down_t_k64_fp4",
             ),
             moe_permute_tokens_k: super::super::try_kernel(gpu, "moe", "moe_permute_tokens"),
-            // Keep-packed Q4_K_M expert kernels (Laguna GGUF); try_kernel so
-            // images without them stay at handle 0 (arm gated on packed_experts).
-            q4k_mmq_nc_k: super::super::try_kernel(gpu, "q4k_mmq", "atlas_q4k_mmq128_nc"),
-            q4k_mmq_wc_k: super::super::try_kernel(gpu, "q4k_mmq", "atlas_q4k_mmq128_wc"),
-            q4k_quant_act_k: super::super::try_kernel(gpu, "q4k_mmq", "atlas_q8_1_quantize_ds4_bf16"),
-            q6k_dequant_k: super::super::try_kernel(
-                gpu,
-                "dequant_gguf_bf16",
-                "dequant_q6_k_to_bf16",
-            ),
-            q4k_grouped_nc_k: super::super::try_kernel(gpu, "q4k_mmq", "atlas_q4k_mmq128_grouped_nc"),
-            q4k_grouped_wc_k: super::super::try_kernel(gpu, "q4k_mmq", "atlas_q4k_mmq128_grouped_wc"),
-            q6k_grouped_nc_k: super::super::try_kernel(gpu, "q4k_mmq", "atlas_q6k_mmq128_grouped_nc"),
-            q6k_grouped_wc_k: super::super::try_kernel(gpu, "q4k_mmq", "atlas_q6k_mmq128_grouped_wc"),
-            q4k_grouped_gate_up_nc_k: super::super::try_kernel(gpu, "q4k_mmq", "atlas_q4k_mmq128_grouped_gate_up_nc"),
-            q4k_grouped_gate_up_wc_k: super::super::try_kernel(gpu, "q4k_mmq", "atlas_q4k_mmq128_grouped_gate_up_wc"),
-            q4k_decode_gate_up_k: super::super::try_kernel(gpu, "moe_q4k_decode_fused", "atlas_moe_q4k_decode_gate_up"),
-            q4k_decode_down_k: super::super::try_kernel(gpu, "moe_q4k_decode_fused", "atlas_moe_q4k_decode_down"),
-            q4k_quant_act_d4_k: super::super::try_kernel(gpu, "q4k_mmq", "atlas_q8_1_quantize_d4_bf16"),
+            q4k_mmq_nc_k: packed_init.kernel("q4k_mmq", "atlas_q4k_mmq128_nc"),
+            q4k_mmq_wc_k: packed_init.kernel("q4k_mmq", "atlas_q4k_mmq128_wc"),
+            q4k_quant_act_k: packed_init.kernel("q4k_mmq", "atlas_q8_1_quantize_ds4_bf16"),
+            q6k_dequant_k: packed_init.kernel("dequant_gguf_bf16", "dequant_q6_k_to_bf16"),
+            q4k_grouped_nc_k: packed_init.kernel("q4k_mmq", "atlas_q4k_mmq128_grouped_nc"),
+            q4k_grouped_wc_k: packed_init.kernel("q4k_mmq", "atlas_q4k_mmq128_grouped_wc"),
+            q6k_grouped_nc_k: packed_init.kernel("q4k_mmq", "atlas_q6k_mmq128_grouped_nc"),
+            q6k_grouped_wc_k: packed_init.kernel("q4k_mmq", "atlas_q6k_mmq128_grouped_wc"),
+            q4k_grouped_gate_up_nc_k: packed_init
+                .kernel("q4k_mmq", "atlas_q4k_mmq128_grouped_gate_up_nc"),
+            q4k_grouped_gate_up_wc_k: packed_init
+                .kernel("q4k_mmq", "atlas_q4k_mmq128_grouped_gate_up_wc"),
+            q4k_decode_gate_up_k: packed_init
+                .kernel("moe_q4k_decode_fused", "atlas_moe_q4k_decode_gate_up"),
+            q4k_decode_down_k: packed_init
+                .kernel("moe_q4k_decode_fused", "atlas_moe_q4k_decode_down"),
+            q4k_quant_act_d4_k: packed_init.kernel("q4k_mmq", "atlas_q8_1_quantize_d4_bf16"),
+            q8_gemv_k: packed_init.kernel("gguf_q8_0_gemv", "gguf_q8_0_gemv"),
+            q8_gemm_k: packed_init.kernel("gguf_q8_0_gemm", "gguf_q8_0_gemm"),
+            q4k_metal_grouped_k: packed_init
+                .kernel("gguf_q4_k_grouped_gemm", "gguf_q4_k_grouped_gemm"),
+            packed_gate_stack: packed_init.gate_stack,
+            packed_up_stack: packed_init.up_stack,
+            packed_down_stack: packed_init.down_stack,
             // Phase 2.7 Tier C — set by loader after construction (qwen35.rs).
             is_dflash_capture_layer: false,
             lora: None,

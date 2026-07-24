@@ -40,6 +40,15 @@ impl Qwen3AttentionLayer {
             return Ok(());
         }
 
+        if let (Some(k_q8), Some(v_q8)) = (
+            self.k_weight.as_ref().and_then(|w| w.as_packed_q8()),
+            self.v_weight.as_ref().and_then(|w| w.as_packed_q8()),
+        ) {
+            ops::gguf_q8_0_gemv(ctx.gpu, self.q8_gemv_k, normed, k_q8, k_out, stream)?;
+            ops::gguf_q8_0_gemv(ctx.gpu, self.q8_gemv_k, normed, v_q8, v_out, stream)?;
+            return Ok(());
+        }
+
         if let (Some(k_fp8), Some(v_fp8)) = (
             self.k_weight.as_ref().and_then(|w| w.as_fp8()),
             self.v_weight.as_ref().and_then(|w| w.as_fp8()),

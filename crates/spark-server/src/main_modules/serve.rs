@@ -212,8 +212,52 @@ pub(crate) async fn serve(mut args: cli::ServeArgs) -> Result<()> {
     };
 
     // 3. Load model weights
-    let oom_reserve_bytes = args.oom_guard_mb * 1024 * 1024;
-    tracing::info!("OOM guard reserve: {} MB", args.oom_guard_mb);
+    let configured_oom_guard_bytes = args.oom_guard_mb * 1024 * 1024;
+    #[cfg(all(feature = "metal", not(feature = "cuda")))]
+    let oom_reserve_bytes = if config.model_type == "laguna" {
+        const LAGUNA_METAL_SAFETY_BYTES: usize = 5 * 1024 * 1024 * 1024;
+        let effective_kv_dtype =
+            if args.kv_cache_dtype == "fp8" && !ptx_set.behavior.default_kv_dtype.is_empty() {
+                ptx_set.behavior.default_kv_dtype
+            } else {
+                &args.kv_cache_dtype
+            };
+        spark_model::factory::laguna_metal::validate_profile(
+            effective_kv_dtype.parse()?,
+            args.max_seq_len,
+            args.max_batch_size,
+            max_batch_tokens_pre,
+            args.speculative || args.self_speculative || args.ngram_speculative,
+            args.dflash,
+            !args.lora_adapter.is_empty(),
+        )?;
+        let kv_bytes = spark_model::factory::laguna_metal::requested_kv_resident_bytes(
+            &config,
+            args.block_size,
+            args.max_seq_len,
+            args.max_batch_size,
+            max_batch_tokens_pre,
+        )?;
+        let exact_runtime_reserve = total_reserve
+            .checked_add(kv_bytes)
+            .and_then(|bytes| bytes.checked_add(LAGUNA_METAL_SAFETY_BYTES))
+            .context("Laguna Metal runtime reserve overflow")?;
+        tracing::info!(
+            "Laguna Metal loading reserve: {:.2} GiB arena/runtime + {:.2} GiB exact BF16 KV + 5.00 GiB safety = {:.2} GiB",
+            total_reserve as f64 / (1024.0 * 1024.0 * 1024.0),
+            kv_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+            exact_runtime_reserve as f64 / (1024.0 * 1024.0 * 1024.0),
+        );
+        configured_oom_guard_bytes.max(exact_runtime_reserve)
+    } else {
+        configured_oom_guard_bytes
+    };
+    #[cfg(any(feature = "cuda", not(feature = "metal")))]
+    let oom_reserve_bytes = configured_oom_guard_bytes;
+    tracing::info!(
+        "OOM loading/runtime reserve: {:.2} GiB",
+        oom_reserve_bytes as f64 / (1024.0 * 1024.0 * 1024.0)
+    );
     let store = serve_phases::load_weight_store(
         &args,
         &config,

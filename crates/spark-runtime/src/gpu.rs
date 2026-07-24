@@ -177,6 +177,20 @@ pub trait GpuBackend: Send + Sync {
         false
     }
 
+    /// Whether this backend can capture and replay execution graphs.
+    ///
+    /// Backends are eager unless they explicitly advertise graph support.
+    fn supports_graph_capture(&self) -> bool {
+        false
+    }
+
+    /// Whether paged-attention kernels understand per-layer bounded KV rings.
+    /// False is the safe default: allocating a shorter pool without matching
+    /// append/read remapping would turn long-context writes into OOB accesses.
+    fn supports_bounded_sliding_kv(&self) -> bool {
+        false
+    }
+
     /// Synchronize a CUDA stream (blocks until all work completes).
     fn synchronize(&self, stream: u64) -> Result<()>;
 

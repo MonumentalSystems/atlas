@@ -11,7 +11,7 @@ use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 use crate::layer::ForwardContext;
 use crate::layers::ops;
 use crate::weight_map::{
-    DenseWeight, Fp8Weight, Fp8WeightTransposed, PackedQ2Weight, QuantizedWeight,
+    DenseWeight, Fp8Weight, Fp8WeightTransposed, PackedQ2Weight, PackedQ8Weight, QuantizedWeight,
 };
 
 pub struct DenseFfnWeights {
@@ -58,6 +58,13 @@ pub struct DenseFfnWeightsQ2 {
     pub gate_proj: PackedQ2Weight,
     pub up_proj: PackedQ2Weight,
     pub down_proj: PackedQ2Weight,
+}
+
+/// Native GGUF Q8_0 dense MLP weights used by Laguna's first dense layer.
+pub struct DenseFfnWeightsQ8 {
+    pub gate_proj: PackedQ8Weight,
+    pub up_proj: PackedQ8Weight,
+    pub down_proj: PackedQ8Weight,
 }
 
 /// Activation function for gated FFN (SiLU for Qwen/Llama, GELU for Gemma-4).
@@ -267,6 +274,9 @@ pub struct DenseFfnLayer {
     // KernelHandle(0) when absent → falls back to the transient-dequant path.
     q2_0_mmq_nc_k: KernelHandle,
     q2_0_mmq_wc_k: KernelHandle,
+    q8_weights: Option<DenseFfnWeightsQ8>,
+    q8_gemv_k: KernelHandle,
+    q8_gemm_k: KernelHandle,
 }
 
 impl DenseFfnLayer {
@@ -279,8 +289,17 @@ impl DenseFfnLayer {
         activation: FfnActivation,
         gpu: &dyn GpuBackend,
     ) -> Result<Self> {
+        let q8_gemv_k = super::try_kernel(gpu, "gguf_q8_0_gemv", "gguf_q8_0_gemv");
+        let packed_q8_path = q8_gemv_k.0 != 0;
+        let required = |module: &str, function: &str| {
+            if packed_q8_path {
+                Ok(super::try_kernel(gpu, module, function))
+            } else {
+                gpu.kernel(module, function)
+            }
+        };
         let act_mul = match activation {
-            FfnActivation::SiLU => gpu.kernel("moe_silu_mul", "moe_silu_mul")?,
+            FfnActivation::SiLU => required("moe_silu_mul", "moe_silu_mul")?,
             FfnActivation::GeLU => gpu.kernel("gelu", "gelu_mul")?,
         };
         // BF16 path kernels — optional (only loaded if available; gemma4
@@ -296,9 +315,9 @@ impl DenseFfnLayer {
         let layer = Self {
             weights,
             activation,
-            w4a16_gemv: gpu.kernel("w4a16_gemv", "w4a16_gemv")?,
-            w4a16_gemv_dual: gpu.kernel("w4a16_gemv_fused", "w4a16_gemv_dual")?,
-            w4a16_gemv_silu_input: gpu.kernel("w4a16_gemv_fused", "w4a16_gemv_silu_input")?,
+            w4a16_gemv: required("w4a16_gemv", "w4a16_gemv")?,
+            w4a16_gemv_dual: required("w4a16_gemv_fused", "w4a16_gemv_dual")?,
+            w4a16_gemv_silu_input: required("w4a16_gemv_fused", "w4a16_gemv_silu_input")?,
             w4a16_gemv_dual_sw: super::try_kernel(gpu, "w4a16_gemv_fused", "w4a16_gemv_dual_sw"),
             w4a16_gemv_silu_input_sw: super::try_kernel(
                 gpu,
@@ -306,12 +325,12 @@ impl DenseFfnLayer {
                 "w4a16_gemv_silu_input_sw",
             ),
             decode_opt: std::env::var_os("ATLAS_DECODE_OPT").is_some(),
-            w4a16_gemv_dual_batch2: gpu.kernel("w4a16_gemv", "w4a16_gemv_dual_batch2")?,
-            w4a16_gemv_dual_batch3: gpu.kernel("w4a16_gemv", "w4a16_gemv_dual_batch3")?,
-            w4a16_gemv_batch2: gpu.kernel("w4a16_gemv", "w4a16_gemv_batch2")?,
-            w4a16_gemv_batch3: gpu.kernel("w4a16_gemv", "w4a16_gemv_batch3")?,
+            w4a16_gemv_dual_batch2: required("w4a16_gemv", "w4a16_gemv_dual_batch2")?,
+            w4a16_gemv_dual_batch3: required("w4a16_gemv", "w4a16_gemv_dual_batch3")?,
+            w4a16_gemv_batch2: required("w4a16_gemv", "w4a16_gemv_batch2")?,
+            w4a16_gemv_batch3: required("w4a16_gemv", "w4a16_gemv_batch3")?,
             w4a16_gemv_batch4: super::try_kernel(gpu, "w4a16_gemv", "w4a16_gemv_batch4"),
-            w4a16_gemm: gpu.kernel("w4a16", "w4a16_gemm")?,
+            w4a16_gemm: required("w4a16", "w4a16_gemm")?,
             w4a16_gemm_t_m128_k: super::try_kernel(gpu, "w4a16", "w4a16_gemm_t_m128"),
             w4a16_gemm_t_m128_v2_k: super::try_kernel(gpu, "w4a16_v2", "w4a16_gemm_t_m128_v2"),
             w4a16_gemm_t_m128_bf16_k: super::try_kernel(gpu, "w4a16", "w4a16_gemm_t_m128_bf16"),
@@ -383,6 +402,9 @@ impl DenseFfnLayer {
             ),
             q2_0_mmq_nc_k: super::try_kernel(gpu, "q2_0_mmq", "atlas_q2_0_mmq128_nc"),
             q2_0_mmq_wc_k: super::try_kernel(gpu, "q2_0_mmq", "atlas_q2_0_mmq128_wc"),
+            q8_weights: None,
+            q8_gemv_k,
+            q8_gemm_k: super::try_kernel(gpu, "gguf_q8_0_gemm", "gguf_q8_0_gemm"),
         };
         Ok(layer)
     }
@@ -649,6 +671,19 @@ impl DenseFfnLayer {
         });
     }
 
+    pub fn set_q8_weights(
+        &mut self,
+        gate: PackedQ8Weight,
+        up: PackedQ8Weight,
+        down: PackedQ8Weight,
+    ) {
+        self.q8_weights = Some(DenseFfnWeightsQ8 {
+            gate_proj: gate,
+            up_proj: up,
+            down_proj: down,
+        });
+    }
+
     /// Install BF16 dense MLP weights. After this call, the forward paths
     /// dispatch to the BF16 GEMV/GEMM kernels instead of w4a16. The
     /// caller must ensure the BF16 kernels are loaded (see
@@ -760,6 +795,39 @@ impl DenseFfnLayer {
 
         let gate_out = ctx.buffers.expert_gate_out();
         let up_out = ctx.buffers.expert_up_out();
+
+        if let Some(ref q8w) = self.q8_weights {
+            anyhow::ensure!(self.q8_gemv_k.0 != 0, "GGUF Q8_0 GEMV kernel unavailable");
+            anyhow::ensure!(self.act_mul.0 != 0, "SiLU multiply kernel unavailable");
+            let output = ctx.buffers.moe_output();
+            ops::gguf_q8_0_gemv(
+                ctx.gpu,
+                self.q8_gemv_k,
+                input,
+                &q8w.gate_proj,
+                gate_out,
+                stream,
+            )?;
+            ops::gguf_q8_0_gemv(ctx.gpu, self.q8_gemv_k, input, &q8w.up_proj, up_out, stream)?;
+            ops::silu_mul(
+                ctx.gpu,
+                self.act_mul,
+                gate_out,
+                up_out,
+                gate_out,
+                inter,
+                stream,
+            )?;
+            ops::gguf_q8_0_gemv(
+                ctx.gpu,
+                self.q8_gemv_k,
+                gate_out,
+                &q8w.down_proj,
+                output,
+                stream,
+            )?;
+            return Ok(output);
+        }
 
         // Native keep-packed Q2_0 dispatch (highest priority). Per-projection
         // `q2_0_gemv`: BF16 activation × packed 2-bit weight, dequant in the
@@ -1189,6 +1257,49 @@ impl DenseFfnLayer {
         let inter = ctx.config.intermediate_size as u32;
         let gate_out = ctx.buffers.expert_gate_out();
         let up_out = ctx.buffers.expert_up_out();
+
+        if let Some(ref q8w) = self.q8_weights {
+            anyhow::ensure!(self.q8_gemm_k.0 != 0, "GGUF Q8_0 GEMM kernel unavailable");
+            anyhow::ensure!(self.act_mul.0 != 0, "SiLU multiply kernel unavailable");
+            let output = ctx.buffers.moe_output();
+            ops::gguf_q8_0_gemm(
+                ctx.gpu,
+                self.q8_gemm_k,
+                input,
+                &q8w.gate_proj,
+                gate_out,
+                m,
+                stream,
+            )?;
+            ops::gguf_q8_0_gemm(
+                ctx.gpu,
+                self.q8_gemm_k,
+                input,
+                &q8w.up_proj,
+                up_out,
+                m,
+                stream,
+            )?;
+            ops::silu_mul(
+                ctx.gpu,
+                self.act_mul,
+                gate_out,
+                up_out,
+                gate_out,
+                m * inter,
+                stream,
+            )?;
+            ops::gguf_q8_0_gemm(
+                ctx.gpu,
+                self.q8_gemm_k,
+                gate_out,
+                &q8w.down_proj,
+                output,
+                m,
+                stream,
+            )?;
+            return Ok(());
+        }
         let batchm = |w: &PackedQ2Weight, inp: DevicePtr, out: DevicePtr| -> Result<()> {
             ops::q2_0_gemv_vec_batchm(ctx.gpu, self.q2_0_gemv_batchm_k, inp, w, out, m, stream)
         };

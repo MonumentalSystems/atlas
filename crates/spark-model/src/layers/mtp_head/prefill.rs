@@ -282,6 +282,7 @@ impl MtpHead {
                 kv_dim as u32,
                 kv_dim as u32,
                 kv_cache.cache_stride() as u64,
+                kv_cache.physical_blocks_for_layer(self.attn_layer_idx) as u32,
                 stream,
             )?;
             // The async H2D sources (positions/slots) are Vec-backed; the

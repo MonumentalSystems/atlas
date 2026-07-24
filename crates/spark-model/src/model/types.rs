@@ -20,7 +20,7 @@ use crate::layer::{
 use crate::layers::ops;
 use crate::speculative::DraftProposer;
 use crate::traits::{ChunkedPrefillPageMetadata, Model, SequenceState};
-use crate::weight_map::{DenseWeight, Fp8DenseWeight, MtpWeights, QuantizedWeight};
+use crate::weight_map::{DenseWeight, Fp8DenseWeight, MtpWeights, PackedQ8Weight, QuantizedWeight};
 
 /// Architecture-agnostic transformer model.
 ///
@@ -35,8 +35,10 @@ pub(super) const MTP_CATCHUP_RING_ROWS: usize = 512;
 pub struct TransformerModel {
     pub(super) config: ModelConfig,
     pub(super) embed_tokens: DenseWeight,
+    pub(super) embed_packed_q8: Option<PackedQ8Weight>,
     pub(super) final_norm: DenseWeight,
     pub(super) lm_head_weight: DenseWeight,
+    pub(super) lm_head_packed_q8: Option<PackedQ8Weight>,
     pub(super) lm_head_nvfp4: Option<QuantizedWeight>,
     /// Runtime FP8 E4M3 LM head (per-row scales), decoded via `w8a16_gemv`.
     /// `Some` only when `--lm-head-dtype fp8` was requested; mutually exclusive
@@ -61,6 +63,9 @@ pub struct TransformerModel {
     pub(super) gpu: Box<dyn GpuBackend>,
     pub(super) rms_norm_kernel: KernelHandle,
     pub(super) dense_gemv_kernel: KernelHandle,
+    pub(super) q8_gemv_kernel: KernelHandle,
+    pub(super) q8_gemm_kernel: KernelHandle,
+    pub(super) q8_embedding_kernel: KernelHandle,
     /// FP32-output variant of dense_gemv_bf16. Used by the LM head when
     /// `use_fp32_logits` is true, so the FP32 accumulator is preserved across
     /// the BF16-storage rounding boundary that flips greedy argmax tiebreaks

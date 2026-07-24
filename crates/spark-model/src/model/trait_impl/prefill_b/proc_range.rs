@@ -37,7 +37,6 @@ impl TransformerModel {
         hidden_dst: DevicePtr,
         stream: u64,
     ) -> Result<ProcRange> {
-        let h = self.config.hidden_size;
         // DEFECT 1 fix: re-embed into the caller-provided per-stream hidden slot
         // (the proc_off slot in the kernel-batched path), NOT the offset-0 base
         // buffer. Single-stream / per-stream-fallback callers pass the base
@@ -79,16 +78,7 @@ impl TransformerModel {
                     let token_id_dev = self.buffers.scratch();
                     self.gpu
                         .copy_h2d_async(last_tok_bytes, token_id_dev, stream)?;
-                    ops::batched_embed(
-                        self.gpu.as_ref(),
-                        self.batched_embed_kernel,
-                        token_id_dev,
-                        self.embed_tokens.weight,
-                        hidden,
-                        1,
-                        h as u32,
-                        stream,
-                    )?;
+                    self.embed_batch(token_id_dev, hidden, 1, stream)?;
                     self.scale_embeddings(hidden, 1usize, stream)?;
                     Ok(ProcRange::Compute {
                         proc_start: chunk_start + chunk_len - 1,
@@ -112,16 +102,7 @@ impl TransformerModel {
                 let token_ids_dev = self.buffers.scratch();
                 self.gpu
                     .copy_h2d_async(token_ids_bytes, token_ids_dev, stream)?;
-                ops::batched_embed(
-                    self.gpu.as_ref(),
-                    self.batched_embed_kernel,
-                    token_ids_dev,
-                    self.embed_tokens.weight,
-                    hidden,
-                    uncached_count as u32,
-                    h as u32,
-                    stream,
-                )?;
+                self.embed_batch(token_ids_dev, hidden, uncached_count as u32, stream)?;
                 self.scale_embeddings(hidden, uncached_count, stream)?;
                 // Real prefill path: KV written for [uncached_start, end).
                 seq.kv_valid_tokens = seq.kv_valid_tokens.max(uncached_start + uncached_count);

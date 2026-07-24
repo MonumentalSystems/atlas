@@ -16,6 +16,8 @@ fn test_config() -> KvCacheConfig {
         dtype: KvCacheDtype::Fp8,
         layer_dtypes: vec![],
         layer_dims: vec![],
+        layer_retention: vec![],
+        prefill_chunk_tokens: 0,
         cache_blocks_per_seq: None,
     }
 }
@@ -316,6 +318,8 @@ fn test_mixed_dtype_pool_allocation() {
         dtype: KvCacheDtype::Fp8,
         layer_dtypes,
         layer_dims: vec![],
+        layer_retention: vec![],
+        prefill_chunk_tokens: 0,
         cache_blocks_per_seq: None,
     };
     let cache = PagedKvCache::new(cfg, 4, &gpu).unwrap();
@@ -375,6 +379,74 @@ fn sliding_window_recycles_blocks() {
     }
     // After both sequences finish, all 8 blocks are free.
     assert_eq!(cache.num_free_blocks(), 8);
+}
+
+#[test]
+fn sliding_layer_allocates_bounded_ring_and_remaps_blocks() {
+    let gpu = MockGpuBackend::new();
+    let cfg = KvCacheConfig {
+        block_size: 16,
+        num_kv_heads: 2,
+        head_dim: 8,
+        num_layers: 2,
+        dtype: KvCacheDtype::Bf16,
+        layer_dtypes: vec![],
+        layer_dims: vec![],
+        layer_retention: vec![
+            KvLayerRetention::Full,
+            KvLayerRetention::Sliding { window_tokens: 32 },
+        ],
+        prefill_chunk_tokens: 0,
+        cache_blocks_per_seq: None,
+    };
+    let cache = PagedKvCache::new(cfg, 10, &gpu).unwrap();
+
+    assert_eq!(cache.physical_blocks_for_layer(0), 10);
+    assert_eq!(cache.physical_blocks_for_layer(1), 3);
+    assert_eq!(cache.physical_block_for_layer(0, 7), 7);
+    assert_eq!(cache.physical_block_for_layer(1, 7), 1);
+    assert_eq!(cache.k_cache_ptr(1, 7), cache.k_cache_ptr(1, 1));
+}
+
+#[test]
+fn sliding_ring_reserves_the_full_inflight_prefill_chunk() {
+    let cfg = KvCacheConfig {
+        block_size: 16,
+        num_kv_heads: 8,
+        head_dim: 128,
+        num_layers: 1,
+        dtype: KvCacheDtype::Bf16,
+        layer_dtypes: vec![],
+        layer_dims: vec![],
+        layer_retention: vec![KvLayerRetention::Sliding { window_tokens: 512 }],
+        prefill_chunk_tokens: 2_048,
+        cache_blocks_per_seq: None,
+    };
+    assert_eq!(cfg.physical_blocks_for_layer(0, 4_096), 161);
+}
+
+#[test]
+fn block_budget_charges_sliding_layers_once() {
+    let cfg = KvCacheConfig {
+        block_size: 16,
+        num_kv_heads: 1,
+        head_dim: 8,
+        num_layers: 2,
+        dtype: KvCacheDtype::Bf16,
+        layer_dtypes: vec![],
+        layer_dims: vec![],
+        layer_retention: vec![
+            KvLayerRetention::Full,
+            KvLayerRetention::Sliding { window_tokens: 32 },
+        ],
+        prefill_chunk_tokens: 0,
+        cache_blocks_per_seq: None,
+    };
+    // One K+V block per layer is 512 bytes. The sliding layer consumes a
+    // fixed three-block ring (1536 bytes); the remaining 5120 bytes fund ten
+    // logical blocks for the full-attention layer.
+    assert_eq!(PagedKvCache::compute_num_blocks(&cfg, 6656).unwrap(), 10);
+    assert_eq!(cfg.resident_bytes_for_blocks(10).unwrap(), 6656);
 }
 
 /// Phase 6.3 sliding-window precondition: after `free_block` returns

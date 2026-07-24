@@ -129,7 +129,8 @@ extern "C" __global__ void moe_batched_blend(
     const __nv_bfloat16* __restrict__ normed,     // [num_tokens, hidden_size]
     const __nv_bfloat16* __restrict__ gate_weight, // [hidden_size] shared expert gate
     unsigned int hidden_size,
-    unsigned int num_tokens
+    unsigned int num_tokens,
+    unsigned int has_gate
 ) {
     __shared__ float s_dot_partial[8]; // one per warp (256/32=8)
 
@@ -147,7 +148,7 @@ extern "C" __global__ void moe_batched_blend(
     // Phase 1: dot product normed[token] . gate_weight
     // NULL gate_weight = no gate modulation → sigmoid=1.0 (always include shared expert)
     float local_dot = 0.0f;
-    if (gate_weight != 0) {
+    if (has_gate) {
         for (unsigned int i = tid; i < hidden_size; i += blockDim.x) {
             float n = __bfloat162float(my_normed[i]);
             float g = __bfloat162float(gate_weight[i]);
@@ -166,7 +167,7 @@ extern "C" __global__ void moe_batched_blend(
     // Cross-warp sum (thread 0)
     float gate_scalar;
     if (tid == 0) {
-        if (gate_weight == 0) {
+        if (!has_gate) {
             // No gate: always include shared expert at full weight
             gate_scalar = 1.0f;
         } else {

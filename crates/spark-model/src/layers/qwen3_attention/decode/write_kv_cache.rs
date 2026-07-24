@@ -475,6 +475,7 @@ impl Qwen3AttentionLayer {
                 key_stride,
                 value_stride,
                 kv_cache.cache_stride() as u64,
+                kv_cache.physical_blocks_for_layer(self.attn_layer_idx) as u32,
                 stream,
             ),
             _ => {

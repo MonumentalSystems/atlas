@@ -175,7 +175,8 @@ impl TransformerModel {
         // Graph decision, computed BEFORE padded_n so eager can drop pad lanes.
         let ms_profile = std::env::var("ATLAS_MS_PROFILE").ok().as_deref() == Some("1");
         let lora_eager = self.lora.is_some() && crate::lora::lora_eager_env();
-        let use_graphs = !ms_profile
+        let use_graphs = self.gpu.supports_graph_capture()
+            && !ms_profile
             && !lora_eager
             && std::env::var("ATLAS_DECODE_GRAPHS_MULTISEQ")
                 .ok()

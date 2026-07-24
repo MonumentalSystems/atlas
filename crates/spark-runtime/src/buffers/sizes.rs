@@ -495,9 +495,12 @@ impl BufferSizes {
             + self.expert_gate_out
             + self.expert_up_out
             + self.expert_down_out
+            + self.moe_grouped_q8
             + self.splitk_workspace
             + self.gdn_fla_scratch
             + self.ssd_scratch
+            + self.o_latent
+            + self.norm_unit_w
             + self.hc_streams
             + self.hc_post
             + self.hc_comb

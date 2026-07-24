@@ -4,75 +4,12 @@
 // keeps the public types small enough to read at a glance. The struct
 // definition lives in the parent.
 
-use anyhow::{Result, bail};
+use anyhow::Result;
 
-use super::{KvCacheConfig, KvCacheDtype, LayerPool, PagedKvCache};
+use super::{KvCacheConfig, KvCacheDtype, PagedKvCache};
 use crate::gpu::{DevicePtr, GpuBackend};
 
 impl PagedKvCache {
-    /// Allocate the KV cache pool on the GPU.
-    pub fn new(config: KvCacheConfig, num_blocks: usize, gpu: &dyn GpuBackend) -> Result<Self> {
-        let mut layers = Vec::with_capacity(config.num_layers);
-        let mut total_bytes: usize = 0;
-        for i in 0..config.num_layers {
-            // Per-side block_bytes: for symmetric dtypes both are equal; for
-            // asymmetric (e.g. Bf16KTurbo3V) the K pool is allocated bf16-sized
-            // and the V pool is allocated turbo3-sized — avoids the 4× V over-
-            // allocation that would result from a single MAX-sized stride.
-            let k_block_bytes = config.k_block_bytes_for_layer(i);
-            let v_block_bytes = config.v_block_bytes_for_layer(i);
-            let k_pool_bytes = num_blocks * k_block_bytes;
-            let v_pool_bytes = num_blocks * v_block_bytes;
-            let k_pool = gpu.alloc(k_pool_bytes)?;
-            let v_pool = gpu.alloc(v_pool_bytes)?;
-            total_bytes += k_pool_bytes + v_pool_bytes;
-            layers.push(LayerPool {
-                k_pool,
-                v_pool,
-                k_block_stride: k_block_bytes,
-                v_block_stride: v_block_bytes,
-                dtype: config.dtype_for_layer(i),
-            });
-        }
-
-        let free_blocks: Vec<u32> = (0..num_blocks as u32).rev().collect();
-        let block_ref_counts = vec![0u32; num_blocks];
-
-        let has_mixed = !config.layer_dtypes.is_empty()
-            && config.layer_dtypes.iter().any(|d| *d != config.dtype);
-        if has_mixed {
-            let hp_count = config
-                .layer_dtypes
-                .iter()
-                .filter(|d| **d != config.dtype)
-                .count();
-            tracing::info!(
-                "KV cache: {} blocks × {} layers ({} high-precision) = {:.1} GB total (mixed dtype)",
-                num_blocks,
-                config.num_layers,
-                hp_count,
-                total_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
-            );
-        } else {
-            tracing::info!(
-                "KV cache: {} blocks × {} layers × {} bytes/block = {:.1} GB total",
-                num_blocks,
-                config.num_layers,
-                config.block_bytes_kv(),
-                (num_blocks * config.num_layers * config.block_bytes_kv()) as f64
-                    / (1024.0 * 1024.0 * 1024.0),
-            );
-        }
-
-        Ok(Self {
-            layers,
-            num_blocks,
-            free_blocks,
-            block_ref_counts,
-            config,
-        })
-    }
-
     /// Allocate a free block. Returns block index.
     pub fn alloc_block(&mut self) -> Result<u32> {
         let idx = self
@@ -92,9 +29,10 @@ impl PagedKvCache {
         gpu: &dyn crate::gpu::GpuBackend,
         stream: u64,
     ) -> anyhow::Result<()> {
-        for layer in &self.layers {
-            let k_offset = block_idx as usize * layer.k_block_stride;
-            let v_offset = block_idx as usize * layer.v_block_stride;
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            let physical = self.physical_block_for_layer(layer_idx, block_idx) as usize;
+            let k_offset = physical * layer.k_block_stride;
+            let v_offset = physical * layer.v_block_stride;
             gpu.memset_async(
                 layer.k_pool.offset(k_offset),
                 0,
@@ -125,9 +63,10 @@ impl PagedKvCache {
         gpu: &dyn crate::gpu::GpuBackend,
         stream: u64,
     ) -> anyhow::Result<()> {
-        for layer in &self.layers {
-            let k_offset = block_idx as usize * layer.k_block_stride;
-            let v_offset = block_idx as usize * layer.v_block_stride;
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            let physical = self.physical_block_for_layer(layer_idx, block_idx) as usize;
+            let k_offset = physical * layer.k_block_stride;
+            let v_offset = physical * layer.v_block_stride;
             gpu.memset_async(
                 layer.k_pool.offset(k_offset),
                 0xFF,
@@ -207,17 +146,15 @@ impl PagedKvCache {
     /// Get K cache pointer for a layer and block.
     pub fn k_cache_ptr(&self, layer_idx: usize, block_idx: u32) -> DevicePtr {
         let layer = &self.layers[layer_idx];
-        layer
-            .k_pool
-            .offset(block_idx as usize * layer.k_block_stride)
+        let block_idx = self.physical_block_for_layer(layer_idx, block_idx) as usize;
+        layer.k_pool.offset(block_idx * layer.k_block_stride)
     }
 
     /// Get V cache pointer for a layer and block.
     pub fn v_cache_ptr(&self, layer_idx: usize, block_idx: u32) -> DevicePtr {
         let layer = &self.layers[layer_idx];
-        layer
-            .v_pool
-            .offset(block_idx as usize * layer.v_block_stride)
+        let block_idx = self.physical_block_for_layer(layer_idx, block_idx) as usize;
+        layer.v_pool.offset(block_idx * layer.v_block_stride)
     }
 
     /// DEBUG: decode a BF16 KV block buffer into (sum, ssq, sabs) reductions.
@@ -479,15 +416,5 @@ impl PagedKvCache {
         gpu.copy_h2d(k_data, k_ptr)?;
         gpu.copy_h2d(v_data, v_ptr)?;
         Ok(())
-    }
-
-    /// Compute how many blocks can fit given available GPU memory.
-    /// Accounts for mixed dtypes when layer_dtypes is set.
-    pub fn compute_num_blocks(config: &KvCacheConfig, available_bytes: usize) -> Result<usize> {
-        let bytes_per_block = config.block_bytes_kv_all_layers();
-        if bytes_per_block == 0 {
-            bail!("KV cache block size is zero");
-        }
-        Ok(available_bytes / bytes_per_block)
     }
 }

@@ -60,6 +60,11 @@ pub enum WeightDtype {
     /// 256 elements. Same keep-packed contract as [`WeightDtype::PackedQ4K`];
     /// used for the Q4_K_M `ffn_down_exps` (the dominant Q6_K mass).
     PackedQ6K,
+    /// Keep-packed GGUF Q8_0 (ggml id 8): raw 34-byte blocks of 32 elements
+    /// (fp16 scale + 32 signed int8 quants). Laguna keeps eligible rank-2
+    /// matrices in this form so embeddings and linear projections do not
+    /// expand to BF16 in Apple unified memory.
+    PackedQ8_0,
 }
 
 impl WeightDtype {
@@ -78,7 +83,7 @@ impl WeightDtype {
             Self::Int64 => 8,
             Self::PackedQ2_0 { .. } => 0,
             // Block-based (256-elem super-blocks); real size via WeightTensor.
-            Self::PackedQ4K | Self::PackedQ6K => 0,
+            Self::PackedQ4K | Self::PackedQ6K | Self::PackedQ8_0 => 0,
         }
     }
 
@@ -162,6 +167,7 @@ impl WeightTensor {
             // GGUF K-quants: 256 elems/super-block, 144B (Q4_K) / 210B (Q6_K).
             WeightDtype::PackedQ4K => (self.num_elements() / 256) * 144,
             WeightDtype::PackedQ6K => (self.num_elements() / 256) * 210,
+            WeightDtype::PackedQ8_0 => (self.num_elements() / 32) * 34,
             d => self.num_elements() * d.byte_size(),
         }
     }
@@ -187,6 +193,11 @@ impl WeightTensor {
     /// True if this tensor holds keep-packed GGUF Q6_K super-blocks (id 14).
     pub fn is_packed_q6k(&self) -> bool {
         matches!(self.dtype, WeightDtype::PackedQ6K)
+    }
+
+    /// True if this tensor holds keep-packed GGUF Q8_0 blocks (id 8).
+    pub fn is_packed_q8_0(&self) -> bool {
+        matches!(self.dtype, WeightDtype::PackedQ8_0)
     }
 }
 

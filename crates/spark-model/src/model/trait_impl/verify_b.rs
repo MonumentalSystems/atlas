@@ -196,7 +196,8 @@ impl TransformerModel {
         let k2_diag_eager = std::env::var("ATLAS_K2_DIAG").ok().as_deref() == Some("1");
         // ATLAS_LORA_EAGER: LoRA graph-vs-eager debugging hatch (see decode_a).
         let lora_eager = self.lora.is_some() && crate::lora::lora_eager_env();
-        let use_graphs = self.comm.is_none()
+        let use_graphs = self.gpu.supports_graph_capture()
+            && self.comm.is_none()
             && !self
                 .suppress_graphs
                 .load(std::sync::atomic::Ordering::Relaxed)

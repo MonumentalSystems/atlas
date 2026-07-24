@@ -68,6 +68,7 @@ pub fn reshape_and_cache(
     key_stride: u32,
     value_stride: u32,
     _cache_stride: u64,
+    physical_blocks: u32,
     stream: u64,
 ) -> Result<()> {
     KernelLaunch::new(gpu, kernel)
@@ -83,6 +84,7 @@ pub fn reshape_and_cache(
         .arg_u32(block_size)
         .arg_u32(key_stride)
         .arg_u32(value_stride)
+        .arg_u32(physical_blocks)
         .launch(stream)
 }
 

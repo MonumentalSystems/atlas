@@ -131,6 +131,7 @@ pub fn prefill_attention_paged_64(
     cache_block_size: u32,
     sliding_window: u32,
     inv_sqrt_d: f32,
+    physical_blocks: u32,
     stream: u64,
 ) -> Result<()> {
     // Paged prefill kernels clamp BR64 64->32 on AMD (gfx1151 LDS cap;
@@ -159,6 +160,7 @@ pub fn prefill_attention_paged_64(
         // pass 0 via dedicated dispatchers (`prefill_attention_paged_dflash_*`).
         .arg_u32(1u32)
         .arg_f32(inv_sqrt_d)
+        .arg_u32(physical_blocks)
         .launch(stream)
 }
 

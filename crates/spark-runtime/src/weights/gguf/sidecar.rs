@@ -58,20 +58,17 @@ pub fn open_gguf(path: &Path) -> Result<(std::fs::File, memmap2::Mmap, container
         std::fs::File::open(path).with_context(|| format!("Failed to open {}", path.display()))?;
     // SAFETY: same mmap contract as the safetensors loader.
     let mmap = unsafe { memmap2::MmapOptions::new().map(&file)? };
-    // NFS prefetch — the same mechanism the fast safetensors loader uses
-    // (`fast_weights::advise_prefetch_shard`): SEQUENTIAL (grow the readahead
-    // window + drop pages behind the read cursor) + WILLNEED (KICK OFF async
-    // readahead of the whole file NOW, rather than waiting for per-page demand
-    // faults). SEQUENTIAL alone only widens the window on faults — it does not
-    // trigger prefetch, so it barely moves NFS latency-bound loading (~300MB/s);
-    // WILLNEED streams at NFS bandwidth (~2GB/s). Memory stays bounded even for a
-    // single 71GB file: once WILLNEED warms the cache the consumer reads warm
-    // pages + copies to GPU faster than NFS delivers, so it PACES with the
-    // readahead (the cache gap stays small) while SEQUENTIAL drops pages behind
-    // the cursor. Best-effort: a failed advise never blocks the load.
+    // Consume tensor data in file order and let the kernel discard pages behind
+    // the cursor. On Linux, where production checkpoints commonly live on NFS,
+    // WILLNEED retains the existing whole-file throughput optimization. Do not
+    // issue it on macOS: Apple Silicon uses unified memory, so eagerly paging a
+    // 68+ GB GGUF into the file cache competes directly with Metal's working set.
+    // There the load loop demand-faults one bounded tensor slice at a time.
+    // Best-effort: a failed advise never blocks the load.
     if let Err(e) = mmap.advise(memmap2::Advice::Sequential) {
         tracing::debug!("madvise(SEQUENTIAL) on GGUF mmap failed (non-fatal): {e}");
     }
+    #[cfg(target_os = "linux")]
     if let Err(e) = mmap.advise(memmap2::Advice::WillNeed) {
         tracing::debug!("madvise(WILLNEED) on GGUF mmap failed (non-fatal): {e}");
     }
@@ -80,39 +77,90 @@ pub fn open_gguf(path: &Path) -> Result<(std::fs::File, memmap2::Mmap, container
     Ok((file, mmap, gguf))
 }
 
-/// Sum the BF16 footprint of every tensor a pass will actually keep (i.e. that
-/// `names::translate` maps to a stored tensor, plus the clip patch-embed frames
-/// that are fused rather than name-mapped), for the pre-flight OOM estimate.
-pub fn est_bf16(gguf: &container::GgufFile, arch: &str, keep_packed_experts: bool) -> usize {
+/// Exact resident and one-tensor loading footprint for a parsed GGUF.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemoryFootprint {
+    /// Bytes retained by the final [`crate::weights::WeightStore`].
+    pub resident_bytes: usize,
+    /// Largest raw on-disk tensor slice touched by this pass.
+    pub max_tensor_transient_bytes: usize,
+}
+
+fn keeps_laguna_q8_packed(
+    arch: &str,
+    ggml_type_id: u32,
+    rank: usize,
+    columns: usize,
+    target: &names::GgufName,
+) -> bool {
+    arch == "laguna"
+        && ggml_type_id == 8
+        && rank == 2
+        && columns.is_multiple_of(32)
+        && matches!(
+            target,
+            names::GgufName::Direct(hf)
+                if names::is_laguna_packed_q8_matrix(hf) && !value_transform::needs(hf)
+        )
+}
+
+/// Compute the exact resident footprint of every tensor a pass will keep and
+/// the largest single raw tensor that can coexist with it during loading.
+///
+/// `names::translate` is the authoritative keep/drop decision. Clip patch
+/// frames are included because they are fused into one resident projection.
+/// Packed Laguna matrices and expert stacks retain their GGUF block footprint;
+/// every other recognized tensor materializes as BF16.
+pub fn memory_footprint(
+    gguf: &container::GgufFile,
+    arch: &str,
+    keep_packed_experts: bool,
+    q2_variant: container::Q2Group,
+) -> Result<MemoryFootprint> {
     let is_clip = value_transform::is_clip(arch);
-    gguf.tensors
-        .iter()
-        .filter(|t| {
-            (is_clip && value_transform::vision_patch_frame(&t.name).is_some())
-                || !matches!(
-                    names::translate(&t.name, arch),
-                    None | Some(names::GgufName::Drop)
-                )
-        })
-        .map(|t| {
-            // Keep-packed MoE experts stay PACKED in VRAM, so size them at their
-            // real (block) footprint — otherwise the pre-flight sees the full
-            // ~219GB BF16 expansion and bails before the keep-packed path runs.
-            let id = t.ggml_type.id();
-            if keep_packed_experts
-                && (id == 12 || id == 14)
-                && matches!(
-                    names::translate(&t.name, arch),
-                    Some(names::GgufName::ExpertStack { .. })
-                )
-            {
-                let n_blocks = t.num_elements() / 256;
-                n_blocks * if id == 12 { 144 } else { 210 }
-            } else {
-                t.num_elements() * WeightDtype::BF16.byte_size()
-            }
-        })
-        .sum()
+    let mut resident_bytes = 0usize;
+    let mut max_tensor_transient_bytes = 0usize;
+    for t in &gguf.tensors {
+        let target = names::translate(&t.name, arch);
+        let kept = (is_clip && value_transform::vision_patch_frame(&t.name).is_some())
+            || !matches!(target.as_ref(), None | Some(names::GgufName::Drop));
+        if !kept {
+            continue;
+        }
+
+        let raw_bytes = gguf
+            .tensor_byte_size(t, q2_variant)
+            .with_context(|| format!("memory footprint for tensor {}", t.name))?;
+        max_tensor_transient_bytes = max_tensor_transient_bytes.max(raw_bytes);
+
+        // Keep-packed tensors stay at their exact GGUF block footprint.
+        let id = t.ggml_type.id();
+        let packed = target.as_ref().is_some_and(|target| {
+            keeps_laguna_q8_packed(
+                arch,
+                id,
+                t.dims.len(),
+                t.dims.first().copied().unwrap_or(0),
+                target,
+            )
+        }) || (keep_packed_experts
+            && (id == 12 || id == 14)
+            && matches!(target.as_ref(), Some(names::GgufName::ExpertStack { .. })));
+        let tensor_resident = if packed {
+            raw_bytes
+        } else {
+            t.num_elements()
+                .checked_mul(WeightDtype::BF16.byte_size())
+                .with_context(|| format!("resident byte size overflow for tensor {}", t.name))?
+        };
+        resident_bytes = resident_bytes
+            .checked_add(tensor_resident)
+            .context("GGUF resident byte total overflow")?;
+    }
+    Ok(MemoryFootprint {
+        resident_bytes,
+        max_tensor_transient_bytes,
+    })
 }
 
 /// Load every recognized tensor from one already-parsed GGUF into `weights`,
@@ -222,6 +270,32 @@ pub fn load_pass(
         // GGUF dims are ggml-order; Atlas/HF shape is the reverse.
         let hf_shape: Vec<usize> = tensor.dims.iter().rev().copied().collect();
 
+        // Laguna's signal-path matrices are Q8_0 in Q4_K_M. Keep their native
+        // 34-byte blocks resident so Apple UMA does not pay the ~1.88x BF16
+        // expansion. Vectors/scalars intentionally fall through and
+        // materialize normally; the Metal packed kernels consume only rank-2
+        // `[N, K]` matrices with whole 32-element blocks per row.
+        if keeps_laguna_q8_packed(
+            arch,
+            id,
+            hf_shape.len(),
+            hf_shape.last().copied().unwrap_or(0),
+            &target,
+        ) && let names::GgufName::Direct(ref hf_name) = target
+        {
+            let ptr = gpu.alloc(raw.len())?;
+            gpu.copy_h2d(raw, ptr)?;
+            weights.insert(
+                hf_name.clone(),
+                WeightTensor {
+                    ptr,
+                    shape: hf_shape,
+                    dtype: WeightDtype::PackedQ8_0,
+                },
+            );
+            continue;
+        }
+
         // ── Keep-packed MoE expert stacks (Q4_K id 12 / Q6_K id 14) ──
         // The routed experts ARE the whole 219GB-of-BF16 mass of Laguna-S-2.1
         // Q4_K_M (48 layers × 256 × {gate,up,down}). Upload the raw stacked
@@ -235,7 +309,17 @@ pub fn load_pass(
         {
             let ptr = gpu.alloc(raw.len())?;
             gpu.copy_h2d(raw, ptr)?;
-            loader.emit_experts_packed(weights, ptr, &hf_shape, *layer, proj, id, skipped)?;
+            loader.emit_experts_packed(
+                weights,
+                ptr,
+                &hf_shape,
+                super::PackedExpertSpec {
+                    layer: *layer,
+                    proj,
+                    ggml_type_id: id,
+                },
+                skipped,
+            )?;
             continue;
         }
 

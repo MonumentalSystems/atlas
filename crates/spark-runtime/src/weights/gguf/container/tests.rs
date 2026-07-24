@@ -68,6 +68,7 @@ fn parses_metadata_and_tensor_dir() {
     assert_eq!(f.get_str("general.architecture"), Some("llama"));
     assert_eq!(f.get_u32("llama.block_count"), Some(32));
     assert_eq!(f.get_u32_array("test.answer"), Some(vec![1, 2, 3]));
+    assert_eq!(f.get_u64_array("test.answer"), Some(vec![1, 2, 3]));
     assert_eq!(f.get_bool("test.flag"), Some(true));
     assert_eq!(f.get_str("missing"), None);
 

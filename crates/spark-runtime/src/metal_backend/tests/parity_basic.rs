@@ -8,6 +8,76 @@ use super::helpers::*;
 #[allow(unused_imports)]
 use crate::gpu::{DevicePtr, GpuBackend, KernelArg};
 
+#[test]
+fn metal_kernel_handle_zero_is_reserved() {
+    let Some(backend) = maybe_backend() else {
+        return;
+    };
+
+    let first = backend
+        .kernel("noop_smoke", "noop_smoke")
+        .expect("kernel lookup");
+    assert_ne!(first.0, 0, "Metal must reserve KernelHandle(0)");
+
+    let err = backend
+        .launch_typed(
+            KernelHandle(0),
+            [1, 1, 1],
+            [1, 1, 1],
+            0,
+            backend.default_stream(),
+            &[],
+        )
+        .expect_err("reserved kernel handle must not launch");
+    assert!(err.to_string().contains("invalid kernel handle 0"));
+}
+
+#[test]
+fn metal_launch_resolves_only_referenced_buffers() {
+    let Some(backend) = maybe_backend() else {
+        return;
+    };
+
+    let referenced = backend.alloc(64).expect("referenced alloc");
+    let unrelated = backend.alloc(64).expect("unrelated alloc");
+    let scalar = 7u32.to_le_bytes();
+    let args = [
+        KernelArg::Bytes(&scalar),
+        KernelArg::Buffer(referenced.offset(16)),
+    ];
+    let resolved = backend
+        .resolve_buffer_args(&args)
+        .expect("resolve buffer args");
+
+    assert_eq!(resolved.len(), 1);
+    assert_eq!(resolved[0].0, 1);
+    assert_eq!(resolved[0].1.gpuAddress(), referenced.0);
+    assert_eq!(resolved[0].2, 16);
+    drop(resolved);
+
+    backend.free(referenced).expect("free referenced");
+    backend.free(unrelated).expect("free unrelated");
+}
+
+#[test]
+fn metal_memory_info_separates_physical_and_working_set_capacity() {
+    let Some(backend) = maybe_backend() else {
+        return;
+    };
+
+    let info = backend.memory_info();
+    assert!(info.recommended_max_working_set_bytes > 0);
+    assert_eq!(
+        info.recommended_headroom_bytes(),
+        info.recommended_max_working_set_bytes
+            .saturating_sub(info.current_allocated_bytes)
+    );
+    if let Some(physical) = info.physical_memory_bytes {
+        assert!(physical > 0);
+    }
+    assert!(!backend.supports_graph_capture());
+}
+
 /// End-to-end check: alloc → memcpy → kernel launch → memcpy back.
 /// The kernel is `noop_smoke` from `kernels/metal/common/`. It
 /// writes 0.0 to the first `n` floats of `out`, so after launching

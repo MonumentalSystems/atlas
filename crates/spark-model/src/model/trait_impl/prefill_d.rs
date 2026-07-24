@@ -42,16 +42,7 @@ impl TransformerModel {
         let token_id_dev = self.buffers.scratch();
         self.gpu
             .copy_h2d_async(last_tok_bytes, token_id_dev, stream)?;
-        ops::batched_embed(
-            self.gpu.as_ref(),
-            self.batched_embed_kernel,
-            token_id_dev,
-            self.embed_tokens.weight,
-            hidden,
-            1,
-            h,
-            stream,
-        )?;
+        self.embed_batch(token_id_dev, hidden, 1, stream)?;
         self.scale_embeddings(hidden, 1usize, stream)?;
         // Run final norm + LM head on the single re-embedded token.
         let normed = self.buffers.norm_output();

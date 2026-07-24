@@ -139,6 +139,8 @@ impl DeepseekV4MtpHead {
             dtype: KvCacheDtype::Bf16,
             layer_dtypes: vec![],
             layer_dims: vec![],
+            layer_retention: vec![],
+            prefill_chunk_tokens: 0,
             cache_blocks_per_seq: None,
         };
         let mtp_num_blocks = max_seq_len / kv_config.block_size + 1;

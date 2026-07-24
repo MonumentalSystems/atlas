@@ -200,6 +200,8 @@ impl Qwen3AttentionLayer {
                 gpu.kernel("norm", "rms_norm_residual")?
             },
             dense_gemv_k: gpu.kernel("gemv", "dense_gemv_bf16")?,
+            q8_gemv_k: super::super::try_kernel(gpu, "gguf_q8_0_gemv", "gguf_q8_0_gemv"),
+            q8_gemm_k: super::super::try_kernel(gpu, "gguf_q8_0_gemm", "gguf_q8_0_gemm"),
             dense_gemv_batchm_k: gpu
                 .kernel("dense_gemv_bf16_batchm", "dense_gemv_bf16_batchm")
                 .unwrap_or(KernelHandle(0)),

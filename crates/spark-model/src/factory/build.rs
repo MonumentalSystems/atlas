@@ -59,6 +59,17 @@ pub fn build_model(
     // encoder-decoder checkpoint). `None` = base model.
     nllb_lora_dir: Option<std::path::PathBuf>,
 ) -> Result<Box<dyn Model>> {
+    if config.model_type == "laguna" && gpu.supports_bounded_sliding_kv() {
+        super::laguna_metal::validate_profile(
+            kv_dtype,
+            max_seq_len,
+            max_batch_size,
+            max_batch_tokens,
+            use_speculative,
+            dflash_args.is_some(),
+            lora_args.is_some(),
+        )?;
+    }
     // NLLB / M2M-100 is an encoder-decoder model that cannot be represented by
     // the decoder-only TransformerModel stack. Serve it with the dedicated
     // `NllbGpuModel`, which reads its weights from the standard `store` — this
@@ -160,8 +171,10 @@ pub fn build_model(
 
     let mut layers = loader.load_layers(store, &config, gpu.as_ref(), &attn_layer_dtypes)?;
     let embed = loader.load_embedding(store, &config, gpu.as_ref())?;
+    let embed_packed_q8 = loader.load_packed_q8_embedding(store)?;
     let final_norm = loader.load_final_norm(store, &config, gpu.as_ref())?;
     let lm_head = loader.load_lm_head(store, &config, gpu.as_ref())?;
+    let lm_head_packed_q8 = loader.load_packed_q8_lm_head(store)?;
     let mtp_weights = loader.load_mtp_weights_multi(store, &config, gpu.as_ref())?;
 
     // DeepSeek-V4 ships an architecturally distinct MTP module (MLA + mHC), not
@@ -241,14 +254,18 @@ pub fn build_model(
     // ── Step 3: LM-head quantization (NVFP4 / FP8 / BF16-skip) + the
     // draft-only NVFP4 head for MTP — extracted to lm_head_setup.rs
     // (file-size cap; pure code move).
-    let (lm_head_nvfp4, lm_head_fp8, mtp_lm_head_nvfp4) = super::lm_head_setup::setup_lm_heads(
-        store,
-        &lm_head,
-        &config,
-        gpu.as_ref(),
-        use_speculative,
-        !mtp_weights.is_empty(),
-    )?;
+    let (lm_head_nvfp4, lm_head_fp8, mtp_lm_head_nvfp4) = if lm_head_packed_q8.is_some() {
+        (None, None, None)
+    } else {
+        super::lm_head_setup::setup_lm_heads(
+            store,
+            &lm_head,
+            &config,
+            gpu.as_ref(),
+            use_speculative,
+            !mtp_weights.is_empty(),
+        )?
+    };
 
     // Capture the shared embed + resolved draft NVFP4 head for the DeepSeek-V4
     // MTP proposer BEFORE `embed` / `lm_head_nvfp4` / `mtp_lm_head_nvfp4` are
@@ -297,6 +314,11 @@ pub fn build_model(
     } else {
         (config.num_key_value_heads, config.head_dim)
     };
+    let layer_retention = if config.model_type == "laguna" && gpu.supports_bounded_sliding_kv() {
+        super::laguna_metal::layer_retention(&config)
+    } else {
+        vec![]
+    };
     let kv_config = KvCacheConfig {
         block_size: kv_block_size,
         num_kv_heads: kv_num_heads,
@@ -305,6 +327,8 @@ pub fn build_model(
         dtype: kv_dtype,
         layer_dtypes: layer_dtypes.clone(),
         layer_dims: config.kv_layer_dims.clone(),
+        layer_retention,
+        prefill_chunk_tokens: max_batch_tokens,
         cache_blocks_per_seq: hss_cache_blocks_per_seq,
     };
 
@@ -544,8 +568,10 @@ pub fn build_model(
     let mut model = TransformerModel::new(
         config,
         embed,
+        embed_packed_q8,
         final_norm,
         lm_head,
+        lm_head_packed_q8,
         lm_head_nvfp4,
         lm_head_fp8,
         mtp_lm_head_nvfp4,

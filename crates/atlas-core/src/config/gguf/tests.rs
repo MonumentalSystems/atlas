@@ -7,6 +7,7 @@ use std::collections::HashMap;
 #[derive(Default)]
 struct Meta {
     u: HashMap<String, u64>,
+    ua: HashMap<String, Vec<u64>>,
     f: HashMap<String, f64>,
     s: HashMap<String, String>,
     arr: HashMap<String, usize>,
@@ -20,6 +21,10 @@ impl Meta {
         self.f.insert(k.into(), v);
         self
     }
+    fn ua(mut self, k: &str, v: &[u64]) -> Self {
+        self.ua.insert(k.into(), v.to_vec());
+        self
+    }
     fn s(mut self, k: &str, v: &str) -> Self {
         self.s.insert(k.into(), v.into());
         self
@@ -28,6 +33,9 @@ impl Meta {
 impl GgufMeta for Meta {
     fn get_u64(&self, k: &str) -> Option<u64> {
         self.u.get(k).copied()
+    }
+    fn get_u64_array(&self, k: &str) -> Option<Vec<u64>> {
+        self.ua.get(k).cloned()
     }
     fn get_f64(&self, k: &str) -> Option<f64> {
         self.f.get(k).copied()
@@ -38,6 +46,99 @@ impl GgufMeta for Meta {
     fn get_arr_len(&self, k: &str) -> Option<usize> {
         self.arr.get(k).copied()
     }
+}
+
+#[test]
+fn laguna_populates_heterogeneous_attention_moe_and_yarn() {
+    let heads = [
+        48, 72, 72, 72, 48, 72, 72, 72, 48, 72, 72, 72, 48, 72, 72, 72, 48, 72, 72, 72, 48, 72, 72,
+        72, 48, 72, 72, 72, 48, 72, 72, 72, 48, 72, 72, 72, 48, 72, 72, 72, 48, 72, 72, 72, 48, 72,
+        72, 72,
+    ];
+    let mut m = Meta::default()
+        .s("general.architecture", "laguna")
+        .u("laguna.block_count", 48)
+        .u("laguna.context_length", 262_144)
+        .u("laguna.embedding_length", 3072)
+        .u("laguna.feed_forward_length", 12_288)
+        .ua("laguna.attention.head_count", &heads)
+        .u("laguna.attention.head_count_kv", 8)
+        .s("laguna.rope.scaling.type", "yarn")
+        .f("laguna.rope.scaling.factor", 32.0)
+        .u("laguna.rope.scaling.original_context_length", 8192)
+        .f("laguna.rope.scaling.yarn_attn_factor", 1.0)
+        .f("laguna.rope.scaling.yarn_beta_fast", 32.0)
+        .f("laguna.rope.scaling.yarn_beta_slow", 1.0)
+        .f("laguna.rope.freq_base", 500_000.0)
+        .f("laguna.rope.freq_base_swa", 10_000.0)
+        .f("laguna.attention.layer_norm_rms_epsilon", 1e-6)
+        .u("laguna.expert_count", 256)
+        .u("laguna.expert_used_count", 10)
+        .u("laguna.attention.key_length", 128)
+        .u("laguna.attention.value_length", 128)
+        .u("laguna.vocab_size", 100_352)
+        .u("laguna.attention.sliding_window", 512)
+        .u("laguna.expert_feed_forward_length", 1024)
+        .u("laguna.expert_shared_feed_forward_length", 1024)
+        .u("laguna.expert_weights_norm", 1)
+        .f("laguna.expert_weights_scale", 2.5)
+        .u("laguna.expert_gating_func", 2)
+        .u("laguna.leading_dense_block_count", 1)
+        .u("laguna.rope.dimension_count", 64)
+        .u("laguna.rope.dimension_count_swa", 128)
+        .u("tokenizer.ggml.bos_token_id", 2)
+        .u("tokenizer.ggml.eos_token_id", 2);
+    let c = config_from_gguf(&GgufConfigInputs {
+        meta: &m,
+        token_embd_vocab: None,
+        has_output_weight: true,
+    })
+    .expect("parse official Laguna metadata shape");
+
+    assert_eq!(c.model_type, "laguna");
+    assert_eq!(c.num_hidden_layers, 48);
+    assert_eq!(c.num_attention_heads, 72);
+    assert_eq!(c.num_attention_heads_per_layer, heads.map(|v| v as usize));
+    assert_eq!(
+        c.layer_types
+            .iter()
+            .filter(|t| matches!(t, super::super::LayerType::FullAttention))
+            .count(),
+        12
+    );
+    assert_eq!(
+        c.layer_types
+            .iter()
+            .filter(|t| matches!(t, super::super::LayerType::SlidingAttention))
+            .count(),
+        36
+    );
+    assert_eq!(c.mlp_only_layers, [0]);
+    assert_eq!(c.num_experts, 256);
+    assert_eq!(c.num_experts_per_tok, 10);
+    assert_eq!(c.shared_expert_intermediate_size, 1024);
+    assert_eq!(c.sliding_window, 512);
+    assert_eq!(c.max_position_embeddings, 262_144);
+    assert_eq!(c.rotary_dim(), 64);
+    assert_eq!(c.yarn_factor, 32.0);
+    assert_eq!(c.yarn_original_max_position_embeddings, 8192);
+    assert_eq!(c.yarn_attention_factor, 1.0);
+    assert_eq!(c.scoring_func, "sigmoid");
+    assert!(c.use_routing_bias);
+    assert_eq!(c.routed_scaling_factor, 2.5);
+
+    m.ua.get_mut("laguna.attention.head_count").unwrap()[1] = 48;
+    let error = config_from_gguf(&GgufConfigInputs {
+        meta: &m,
+        token_embd_vocab: None,
+        has_output_weight: true,
+    })
+    .expect_err("reject invalid full/sliding layer pattern");
+    assert!(
+        error
+            .to_string()
+            .contains("one full layer then three sliding")
+    );
 }
 
 fn llama_meta() -> Meta {

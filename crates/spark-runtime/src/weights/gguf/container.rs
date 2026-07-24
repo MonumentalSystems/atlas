@@ -428,10 +428,17 @@ impl GgufFile {
     }
 
     pub fn get_u32_array(&self, key: &str) -> Option<Vec<u32>> {
+        self.get_u64_array(key)?
+            .into_iter()
+            .map(|v| u32::try_from(v).ok())
+            .collect()
+    }
+
+    pub fn get_u64_array(&self, key: &str) -> Option<Vec<u64>> {
         self.get(key)?
             .as_array()?
             .iter()
-            .map(|e| e.as_u64().and_then(|v| u32::try_from(v).ok()))
+            .map(MetaValue::as_u64)
             .collect()
     }
 

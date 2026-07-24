@@ -374,6 +374,7 @@ pub struct MoeLayer {
     // Checkpoint-native BF16 shared expert. Independent of routed-expert
     // precision so mixed NVFP4-routed/BF16-shared checkpoints stay faithful.
     bf16_shared_expert: Option<Bf16SharedExpert>,
+    q8_shared_expert: Option<crate::weight_map::PackedQ8SharedExpert>,
     // FP8 shared expert weights (None when shared expert is NVFP4)
     fp8_shared_expert: Option<Fp8ExpertWeight>,
     /// FP4 down kernel handle (`moe_w4a16_down_t_k64_fp4`). `try_kernel` =>
@@ -408,6 +409,12 @@ pub struct MoeLayer {
     pub(crate) q4k_decode_down_k: KernelHandle,
     /// D4-layout q8_1 activation quantizer (Q6_K MMQ input).
     pub(crate) q4k_quant_act_d4_k: KernelHandle,
+    pub(crate) q8_gemv_k: KernelHandle,
+    pub(crate) q8_gemm_k: KernelHandle,
+    pub(crate) q4k_metal_grouped_k: KernelHandle,
+    packed_gate_stack: Option<crate::weight_map::PackedExpertStack>,
+    packed_up_stack: Option<crate::weight_map::PackedExpertStack>,
+    packed_down_stack: Option<crate::weight_map::PackedExpertStack>,
     // Phase 2.7 Tier C — Frankenstein dispatch flag.
     // True when this layer's index is in `config.dflash_capture_layers`.
     // When the env var `ATLAS_FRANKENSTEIN_DECODE_VIA_PREFILL=1` is set,
@@ -470,14 +477,15 @@ mod forward_phase;
 mod forward_prefill;
 mod forward_prefill_bf16;
 mod forward_prefill_fp8;
-mod forward_prefill_phase;
 mod forward_prefill_packed;
+mod forward_prefill_phase;
 mod forward_prefill_routed;
 mod forward_token_major;
 mod helpers_a;
 mod helpers_b;
 mod helpers_c;
 mod init;
+mod init_packed;
 #[cfg(test)]
 mod mod_tests;
 mod ptr_table_build;
