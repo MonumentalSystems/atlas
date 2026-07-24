@@ -83,6 +83,43 @@ fn metal_memory_info_separates_physical_and_working_set_capacity() {
 }
 
 #[test]
+fn metal_cross_stream_event_publishes_producer_command_buffer() {
+    let Some(backend) = maybe_backend() else {
+        return;
+    };
+    let producer = backend.create_stream().unwrap();
+    let event = backend.create_event().unwrap();
+    let output = backend.alloc(4).unwrap();
+    backend.copy_h2d(&1.0f32.to_le_bytes(), output).unwrap();
+
+    let kernel = backend.kernel("noop_smoke", "noop_smoke").unwrap();
+    backend
+        .launch_typed(
+            kernel,
+            [1, 1, 1],
+            [1, 1, 1],
+            0,
+            producer,
+            &[
+                KernelArg::Buffer(output),
+                KernelArg::Bytes(&1u32.to_le_bytes()),
+            ],
+        )
+        .unwrap();
+    backend.record_event(event, producer).unwrap();
+    backend
+        .stream_wait_event(backend.default_stream(), event)
+        .unwrap();
+    backend.synchronize(backend.default_stream()).unwrap();
+
+    let mut actual = [0u8; 4];
+    backend.copy_d2h(output, &mut actual).unwrap();
+    assert_eq!(f32::from_le_bytes(actual), 0.0);
+    backend.destroy_event(event).unwrap();
+    backend.free(output).unwrap();
+}
+
+#[test]
 fn metal_vanilla_residual_add_rms_norm_matches_reference() {
     let Some(backend) = maybe_backend() else {
         return;

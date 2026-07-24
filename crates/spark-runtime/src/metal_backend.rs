@@ -44,9 +44,10 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSString;
 use objc2_metal::{
-    MTLBlitCommandEncoder, MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
-    MTLComputeCommandEncoder, MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDevice,
-    MTLEvent, MTLLibrary, MTLResource, MTLResourceOptions, MTLSharedEvent, MTLSize,
+    MTLBlitCommandEncoder, MTLBuffer, MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandEncoder,
+    MTLCommandQueue, MTLComputeCommandEncoder, MTLComputePipelineState,
+    MTLCreateSystemDefaultDevice, MTLDevice, MTLEvent, MTLLibrary, MTLResource, MTLResourceOptions,
+    MTLSharedEvent, MTLSize,
 };
 use parking_lot::Mutex;
 
@@ -604,6 +605,13 @@ impl GpuBackend for MetalGpuBackend {
     fn synchronize(&self, stream: u64) -> Result<()> {
         if let Some(cb) = self.commit_in_flight(stream)? {
             cb.waitUntilCompleted();
+            if cb.status() == MTLCommandBufferStatus::Error {
+                let message = cb
+                    .error()
+                    .map(|error| error.localizedDescription().to_string())
+                    .unwrap_or_else(|| "unknown Metal command-buffer error".to_string());
+                bail!("Metal command buffer failed on stream {stream}: {message}");
+            }
         }
         Ok(())
     }
@@ -758,6 +766,11 @@ impl GpuBackend for MetalGpuBackend {
         // up to this point has completed.
         let proto: &ProtocolObject<dyn MTLEvent> = ProtocolObject::from_ref(&*event_obj);
         cmd_buf.encodeSignalEvent_value(proto, value);
+        // A signal on an uncommitted command buffer can never become visible.
+        // The consumer stream would wait forever and eventually trip macOS's
+        // GPU watchdog. Publish the producer buffer after encoding the signal;
+        // the consumer's encoded wait preserves cross-stream ordering.
+        self.commit_in_flight(stream)?;
         Ok(())
     }
 
