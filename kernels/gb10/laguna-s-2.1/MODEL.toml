@@ -34,7 +34,7 @@ mtp_layers = 0
 [sampling.thinking_text]
 temperature = 0.7
 top_p = 0.95
-top_k = 50
+top_k = 20
 presence_penalty = 0.0
 repetition_penalty = 1.0
 dry_multiplier = 0.0
@@ -42,7 +42,7 @@ dry_multiplier = 0.0
 [sampling.thinking_coding]
 temperature = 0.7
 top_p = 0.95
-top_k = 50
+top_k = 20
 presence_penalty = 0.0
 repetition_penalty = 1.0
 dry_multiplier = 0.0
@@ -50,7 +50,7 @@ dry_multiplier = 0.0
 [sampling.non_thinking]
 temperature = 0.7
 top_p = 0.95
-top_k = 50
+top_k = 20
 presence_penalty = 0.0
 repetition_penalty = 1.0
 dry_multiplier = 0.0
@@ -58,7 +58,7 @@ dry_multiplier = 0.0
 [sampling.tools]
 temperature = 0.7
 top_p = 0.95
-top_k = 50
+top_k = 20
 presence_penalty = 0.0
 frequency_penalty = 0.0
 repetition_penalty = 1.0
