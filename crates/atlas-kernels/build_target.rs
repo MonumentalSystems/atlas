@@ -19,13 +19,6 @@ use super::build_codegen::find_cuda_dir;
 pub(super) trait ComputeTarget: Send + Sync {
     fn source_extension(&self) -> &str;
     fn output_extension(&self) -> &str;
-    /// Whether this backend exposes the CUDA module API — i.e. the
-    /// runtime loads kernels via `cuModuleLoadData` and the codegen must
-    /// emit the `all_ptx_sets()` registry. True for NVIDIA and for SCALE
-    /// (SCALE is CUDA-compatible; it just emits AMD-GPU binary objects
-    /// instead of PTX text). False for Metal, which has its own module
-    /// API and registry path.
-    fn uses_cuda_module_api(&self) -> bool;
     fn compile(
         &self,
         source: &std::path::Path,
@@ -45,9 +38,6 @@ impl ComputeTarget for NvidiaTarget {
     }
     fn output_extension(&self) -> &str {
         "ptx"
-    }
-    fn uses_cuda_module_api(&self) -> bool {
-        true
     }
 
     fn compile(
@@ -99,9 +89,6 @@ impl ComputeTarget for AppleTarget {
     }
     fn output_extension(&self) -> &str {
         "metallib"
-    }
-    fn uses_cuda_module_api(&self) -> bool {
-        false
     }
 
     fn compile(
@@ -182,11 +169,6 @@ impl ComputeTarget for ScaleTarget {
         // AMD GPU ELF relocatable produced by `--cuda-device-only -c`.
         "o"
     }
-    fn uses_cuda_module_api(&self) -> bool {
-        // SCALE is a CUDA-compatible toolkit: the runtime loads these
-        // AMD-GPU code objects via `cuModuleLoadData`, same as NVIDIA.
-        true
-    }
 
     fn compile(
         &self,
@@ -258,11 +240,6 @@ impl ComputeTarget for HipTarget {
     fn output_extension(&self) -> &str {
         // HIP code object (loadable by hipModuleLoadData via the libcuda shim).
         "co"
-    }
-    fn uses_cuda_module_api(&self) -> bool {
-        // The runtime still calls the CUDA driver API; the libcuda→HIP shim
-        // maps cuModuleLoadData/cuLaunchKernel/… onto HIP. Same registry path.
-        true
     }
 
     fn compile(
