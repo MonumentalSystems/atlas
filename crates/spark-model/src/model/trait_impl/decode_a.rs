@@ -457,9 +457,11 @@ impl TransformerModel {
             eps,
             stream,
         )?;
-
         // LM head reads from normed directly (no D2D copy needed)
         self.lm_head(normed, stream)?;
+        if self.config.model_type == "laguna" && self.gpu.supports_bounded_sliding_kv() {
+            self.gpu.synchronize(stream)?;
+        }
         Ok(())
     }
 }

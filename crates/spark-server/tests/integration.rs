@@ -103,6 +103,7 @@ fn setup_model(
         &store,
         gpu,
         4,          // max_batch_tokens: up to 3 spec-decode verification tokens
+        0,          // prefill_chunk_tokens
         block_size, // kv_block_size = 16
         4096,       // max_seq_len
         8,          // max_batch_size

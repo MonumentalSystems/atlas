@@ -75,3 +75,33 @@ kernel void rms_norm_residual_vanilla(
         output[base + col] = bfloat(float(x) * float(weight[col]) * inv);
     }
 }
+
+kernel void residual_add_rms_norm_vanilla(
+    device bfloat *hidden [[buffer(0)]],
+    device const bfloat *src [[buffer(1)]],
+    device const bfloat *weight [[buffer(2)]],
+    device bfloat *output [[buffer(3)]],
+    device bfloat *residual [[buffer(4)]],
+    constant uint &hidden_size [[buffer(5)]],
+    constant float &eps [[buffer(6)]],
+    uint token [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint threads [[threads_per_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simd [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float partial[MAX_SIMDGROUPS];
+    const ulong base = ulong(token) * hidden_size;
+    for (uint col = tid; col < hidden_size; col += threads) {
+        hidden[base + col] = bfloat(float(hidden[base + col]) + float(src[base + col]));
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float total = rms_reduce(
+        hidden + base, hidden_size, tid, threads, lane, simd, partial);
+    const float inv = rsqrt(total / float(hidden_size) + eps);
+    for (uint col = tid; col < hidden_size; col += threads) {
+        const bfloat value = hidden[base + col];
+        residual[base + col] = value;
+        output[base + col] = bfloat(float(value) * float(weight[col]) * inv);
+    }
+}

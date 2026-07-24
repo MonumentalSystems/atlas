@@ -1258,48 +1258,6 @@ impl DenseFfnLayer {
         let gate_out = ctx.buffers.expert_gate_out();
         let up_out = ctx.buffers.expert_up_out();
 
-        if let Some(ref q8w) = self.q8_weights {
-            anyhow::ensure!(self.q8_gemm_k.0 != 0, "GGUF Q8_0 GEMM kernel unavailable");
-            anyhow::ensure!(self.act_mul.0 != 0, "SiLU multiply kernel unavailable");
-            let output = ctx.buffers.moe_output();
-            ops::gguf_q8_0_gemm(
-                ctx.gpu,
-                self.q8_gemm_k,
-                input,
-                &q8w.gate_proj,
-                gate_out,
-                m,
-                stream,
-            )?;
-            ops::gguf_q8_0_gemm(
-                ctx.gpu,
-                self.q8_gemm_k,
-                input,
-                &q8w.up_proj,
-                up_out,
-                m,
-                stream,
-            )?;
-            ops::silu_mul(
-                ctx.gpu,
-                self.act_mul,
-                gate_out,
-                up_out,
-                gate_out,
-                m * inter,
-                stream,
-            )?;
-            ops::gguf_q8_0_gemm(
-                ctx.gpu,
-                self.q8_gemm_k,
-                gate_out,
-                &q8w.down_proj,
-                output,
-                m,
-                stream,
-            )?;
-            return Ok(());
-        }
         let batchm = |w: &PackedQ2Weight, inp: DevicePtr, out: DevicePtr| -> Result<()> {
             ops::q2_0_gemv_vec_batchm(ctx.gpu, self.q2_0_gemv_batchm_k, inp, w, out, m, stream)
         };
@@ -1599,6 +1557,49 @@ impl DenseFfnLayer {
 
         let gate_out = ctx.buffers.expert_gate_out();
         let up_out = ctx.buffers.expert_up_out();
+
+        if let Some(ref q8w) = self.q8_weights {
+            anyhow::ensure!(self.q8_gemm_k.0 != 0, "GGUF Q8_0 GEMM kernel unavailable");
+            anyhow::ensure!(self.act_mul.0 != 0, "SiLU multiply kernel unavailable");
+            let output = ctx.buffers.moe_output();
+            ops::gguf_q8_0_gemm(
+                ctx.gpu,
+                self.q8_gemm_k,
+                input,
+                &q8w.gate_proj,
+                gate_out,
+                m,
+                stream,
+            )?;
+            ops::gguf_q8_0_gemm(
+                ctx.gpu,
+                self.q8_gemm_k,
+                input,
+                &q8w.up_proj,
+                up_out,
+                m,
+                stream,
+            )?;
+            ops::silu_mul(
+                ctx.gpu,
+                self.act_mul,
+                gate_out,
+                up_out,
+                gate_out,
+                m * inter,
+                stream,
+            )?;
+            ops::gguf_q8_0_gemm(
+                ctx.gpu,
+                self.q8_gemm_k,
+                gate_out,
+                &q8w.down_proj,
+                output,
+                m,
+                stream,
+            )?;
+            return Ok(());
+        }
 
         // Native keep-packed Q2_0 prefill (Tier-1): the resident weight stays
         // 2-bit, but prefill has no packed-MMQ kernel yet (that's Tier-2). So we

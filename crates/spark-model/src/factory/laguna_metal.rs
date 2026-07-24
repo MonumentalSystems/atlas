@@ -89,7 +89,7 @@ pub fn requested_kv_resident_bytes(
 }
 
 pub fn audit_post_allocation(gpu: &dyn spark_runtime::gpu::GpuBackend) -> Result<()> {
-    let working_set = gpu.total_memory()?;
+    let working_set = gpu.allocation_capacity()?;
     let headroom = gpu.free_memory()?;
     let allocated = working_set.saturating_sub(headroom);
     let gib = |bytes: usize| bytes as f64 / (1024.0 * 1024.0 * 1024.0);

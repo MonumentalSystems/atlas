@@ -146,6 +146,7 @@ mod tests {
             &store,
             Box::new(gpu),
             1,
+            1,
             16,
             4096,
             8,

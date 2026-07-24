@@ -289,6 +289,13 @@ pub trait GpuBackend: Send + Sync {
     /// Total device memory in bytes.
     fn total_memory(&self) -> Result<usize>;
 
+    /// Capacity used for admission and allocation budgeting. Discrete GPUs use
+    /// total device memory; unified-memory backends may expose a smaller
+    /// recommended working set.
+    fn allocation_capacity(&self) -> Result<usize> {
+        self.total_memory()
+    }
+
     /// Free device memory in bytes.
     fn free_memory(&self) -> Result<usize>;
 

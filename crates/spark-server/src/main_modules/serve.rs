@@ -490,6 +490,7 @@ pub(crate) async fn serve(mut args: cli::ServeArgs) -> Result<()> {
         &store,
         gpu,
         max_batch_tokens,
+        prefill_budget,
         kv_dtype,
         inference_reserve,
         layer_dtypes,

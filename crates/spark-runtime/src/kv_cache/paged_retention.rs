@@ -76,12 +76,10 @@ impl PagedKvCache {
             );
         } else {
             tracing::info!(
-                "KV cache: {} blocks × {} layers × {} bytes/block = {:.1} GB total",
+                "KV cache: {} logical blocks × {} layers = {:.1} GB resident",
                 num_blocks,
                 config.num_layers,
-                config.block_bytes_kv(),
-                (num_blocks * config.num_layers * config.block_bytes_kv()) as f64
-                    / (1024.0 * 1024.0 * 1024.0),
+                total_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
             );
         }
 

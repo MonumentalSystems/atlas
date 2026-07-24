@@ -26,6 +26,7 @@ pub fn build_model(
     store: &WeightStore,
     gpu: Box<dyn GpuBackend>,
     max_batch_tokens: usize,
+    prefill_chunk_tokens: usize,
     kv_block_size: usize,
     max_seq_len: usize,
     max_batch_size: usize,
@@ -64,7 +65,7 @@ pub fn build_model(
             kv_dtype,
             max_seq_len,
             max_batch_size,
-            max_batch_tokens,
+            prefill_chunk_tokens,
             use_speculative,
             dflash_args.is_some(),
             lora_args.is_some(),
@@ -328,7 +329,7 @@ pub fn build_model(
         layer_dtypes: layer_dtypes.clone(),
         layer_dims: config.kv_layer_dims.clone(),
         layer_retention,
-        prefill_chunk_tokens: max_batch_tokens,
+        prefill_chunk_tokens,
         cache_blocks_per_seq: hss_cache_blocks_per_seq,
     };
 
@@ -347,7 +348,7 @@ pub fn build_model(
     // clamp ensures we never exceed what the device can physically provide
     // right now (handles external memory pressure on shared-memory /
     // unified-memory systems like GB10).
-    let total_mem = gpu.total_memory()?;
+    let total_mem = gpu.allocation_capacity()?;
     let actual_free = gpu.free_memory()?;
     let gib = |b: usize| b as f64 / (1024.0 * 1024.0 * 1024.0);
     let mut used_so_far = total_mem.saturating_sub(actual_free);
@@ -458,6 +459,29 @@ pub fn build_model(
                 "--high-speed-swap: HBM cache sized to {n} blocks ({} batch × max(cap={cap}+1, max_seq_len_blocks={max_seq_blocks}) + 1 dummy); \
                  prefill grows monotonically, decode shrinks to cap × bs and streams older blocks from disk via the orchestrator",
                 max_batch_size
+            );
+            n
+        }
+        None if config.model_type == "laguna" && gpu.supports_bounded_sliding_kv() => {
+            let n = max_seq_len
+                .div_ceil(kv_block_size)
+                .checked_mul(max_batch_size)
+                .ok_or_else(|| anyhow::anyhow!("Laguna KV logical block count overflow"))?;
+            let resident_bytes = kv_config.resident_bytes_for_blocks(n)?;
+            if resident_bytes > kv_budget {
+                anyhow::bail!(
+                    "Laguna Metal KV cache requires {:.2} GiB for {} context tokens, but only {:.2} GiB is available inside the configured working-set budget",
+                    resident_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+                    max_seq_len,
+                    kv_budget as f64 / (1024.0 * 1024.0 * 1024.0),
+                );
+            }
+            tracing::info!(
+                "Laguna Metal KV cache: {} logical blocks × {} tok/block = {} max KV tokens; {:.2} GiB exact mixed-retention resident bytes",
+                n,
+                kv_block_size,
+                n * kv_block_size,
+                resident_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
             );
             n
         }

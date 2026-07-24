@@ -345,6 +345,9 @@ impl GpuBackend for MetalGpuBackend {
         if src.is_empty() {
             return Ok(());
         }
+        // A synchronous host write must not race queued GPU readers/writers of
+        // the same shared UMA allocation.
+        self.synchronize(0)?;
         let allocs = self.allocations.lock();
         let (buf, offset) = Self::find_buffer(&allocs, dst)
             .ok_or_else(|| anyhow!("copy_h2d: ptr {dst} not in any allocation"))?;
@@ -364,10 +367,58 @@ impl GpuBackend for MetalGpuBackend {
         Ok(())
     }
 
+    fn copy_h2d_async(&self, src: &[u8], dst: DevicePtr, stream: u64) -> Result<()> {
+        if src.is_empty() {
+            return Ok(());
+        }
+        let allocs = self.allocations.lock();
+        let (dst_buf, dst_off) = Self::find_buffer(&allocs, dst)
+            .ok_or_else(|| anyhow!("copy_h2d_async: dst {dst} not allocated"))?;
+        if dst_off + src.len() > dst_buf.length() {
+            bail!(
+                "copy_h2d_async: write overflows buffer ({} + {} > {})",
+                dst_off,
+                src.len(),
+                dst_buf.length()
+            );
+        }
+        drop(allocs);
+
+        // `newBufferWithBytes` snapshots stack/pinned input immediately. The
+        // command buffer retains this staging resource until its ordered blit
+        // completes, so callers need not extend the host slice lifetime.
+        let source = unsafe {
+            self.device.newBufferWithBytes_length_options(
+                NonNull::new(src.as_ptr() as *mut c_void).expect("non-empty source"),
+                src.len(),
+                MTLResourceOptions::StorageModeShared,
+            )
+        }
+        .ok_or_else(|| anyhow!("newBufferWithBytes failed for {} bytes", src.len()))?;
+        let cmd_buf = self.current_cmd_buf(stream)?;
+        let enc = cmd_buf
+            .blitCommandEncoder()
+            .ok_or_else(|| anyhow!("blitCommandEncoder returned null"))?;
+        unsafe {
+            enc.copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size(
+                &source,
+                0,
+                &dst_buf,
+                dst_off,
+                src.len(),
+            );
+        }
+        enc.endEncoding();
+        Ok(())
+    }
+
     fn copy_d2h(&self, src: DevicePtr, dst: &mut [u8]) -> Result<()> {
         if dst.is_empty() {
             return Ok(());
         }
+        // Match the synchronous CUDA copy contract: commit and wait for prior
+        // work on the default stream before reading shared UMA bytes on CPU.
+        self.synchronize(0)?;
         let allocs = self.allocations.lock();
         let (buf, offset) = Self::find_buffer(&allocs, src)
             .ok_or_else(|| anyhow!("copy_d2h: ptr {src} not in any allocation"))?;
@@ -639,6 +690,10 @@ impl GpuBackend for MetalGpuBackend {
         Ok(info
             .physical_memory_bytes
             .unwrap_or(info.recommended_max_working_set_bytes))
+    }
+
+    fn allocation_capacity(&self) -> Result<usize> {
+        Ok(self.memory_info().recommended_max_working_set_bytes)
     }
 
     fn free_memory(&self) -> Result<usize> {
