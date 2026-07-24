@@ -123,7 +123,11 @@ pub(crate) async fn serve(mut args: cli::ServeArgs) -> Result<()> {
     // before any weight loading runs and any silent garbage path can
     // be entered. A future refinement moves the compat list into
     // MODEL.toml `[kernel].supported_quants`.
-    let model_quant = canonicalize_model_quant(&config);
+    let bare_gguf_path = config_json
+        .is_empty()
+        .then(|| spark_runtime::weights::find_gguf(&model_dir))
+        .flatten();
+    let model_quant = canonicalize_model_quant(&config, bare_gguf_path.as_deref());
     let kernel_quant = ptx_set.target.quant;
     if !quant_pair_compatible(kernel_quant, &model_quant) {
         anyhow::bail!(
@@ -134,7 +138,7 @@ pub(crate) async fn serve(mut args: cli::ServeArgs) -> Result<()> {
              Rebuild with ATLAS_TARGET_QUANT={model_quant} (or =* to bundle multiple \
              variants) and restart.",
             ptx_set.target,
-            describe_quant_source(&config),
+            describe_quant_source(&config, bare_gguf_path.as_deref()),
         );
     }
     tracing::info!(
@@ -1051,9 +1055,21 @@ fn resolve_vision_max_pixels(args: &cli::ServeArgs) -> Result<Option<usize>> {
 /// the heuristics needed across ModelOpt + compressed-tensors checkpoints.
 /// Returns `"bf16"` when no quant config is present (the HF default for
 /// unquantized BF16 weights).
-fn canonicalize_model_quant(config: &atlas_core::config::ModelConfig) -> String {
+fn canonicalize_model_quant(
+    config: &atlas_core::config::ModelConfig,
+    bare_gguf_path: Option<&std::path::Path>,
+) -> String {
     let Some(qc) = config.quantization_config.as_ref() else {
-        return "bf16".to_string();
+        return bare_gguf_path
+            .and_then(std::path::Path::file_name)
+            .and_then(std::ffi::OsStr::to_str)
+            .and_then(serve_phases::canonicalize_gguf_filename_quant)
+            .unwrap_or(if bare_gguf_path.is_some() {
+                "unknown"
+            } else {
+                "bf16"
+            })
+            .to_string();
     };
     let method = qc.quant_method.to_ascii_lowercase();
     let algo = qc.quant_algo.to_ascii_lowercase();
@@ -1101,13 +1117,24 @@ fn canonicalize_model_quant(config: &atlas_core::config::ModelConfig) -> String 
 /// QV1 helper: short debug string of where the quant declaration came
 /// from, used in the bail message so the operator can locate the
 /// mis-declared field quickly.
-fn describe_quant_source(config: &atlas_core::config::ModelConfig) -> String {
+fn describe_quant_source(
+    config: &atlas_core::config::ModelConfig,
+    bare_gguf_path: Option<&std::path::Path>,
+) -> String {
     match config.quantization_config.as_ref() {
         Some(qc) => format!(
             "quant_method={:?}, quant_algo={:?}, format={:?}",
             qc.quant_method, qc.quant_algo, qc.format
         ),
-        None => "no quantization_config in config.json".into(),
+        None => bare_gguf_path.map_or_else(
+            || "no quantization_config in config.json".into(),
+            |path| {
+                format!(
+                    "bare GGUF filename={:?}",
+                    path.file_name().unwrap_or_default()
+                )
+            },
+        ),
     }
 }
 
@@ -1171,5 +1198,11 @@ mod qv1_tests {
     fn incompat_unknown_rejected() {
         assert!(!quant_pair_compatible("nvfp4", "gptq-4bit"));
         assert!(!quant_pair_compatible("fp8", "nvfp4"));
+    }
+
+    #[test]
+    fn incompatible_gguf_quant_rejected() {
+        assert!(!quant_pair_compatible("gguf_q4_k_m", "gguf_q8_0"));
+        assert!(!quant_pair_compatible("gguf_q4_k_m", "gguf_f16"));
     }
 }
