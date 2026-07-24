@@ -304,6 +304,7 @@ pub fn paged_decode_attn_bf16(
     inv_sqrt_d: f32,
     q_stride: u32,
     sliding_window: u32, // 0 = full attention; >0 = window size (Gemma-4 sliding layers)
+    physical_blocks: u32,
     stream: u64,
 ) -> Result<()> {
     KernelLaunch::new(gpu, kernel)
@@ -323,6 +324,7 @@ pub fn paged_decode_attn_bf16(
         .arg_f32(inv_sqrt_d)
         .arg_u32(q_stride)
         .arg_u32(sliding_window)
+        .arg_u32(physical_blocks)
         .launch(stream)
 }
 

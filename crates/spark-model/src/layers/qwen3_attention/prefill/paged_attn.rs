@@ -424,6 +424,7 @@ impl Qwen3AttentionLayer {
                     bs_u,
                     self.sliding_window.unwrap_or(0),
                     inv_sqrt_d,
+                    kv_cache.physical_blocks_for_layer(self.attn_layer_idx) as u32,
                     stream,
                 )?,
                 (KvCacheDtype::Bf16, false) => ops::prefill_attention_paged(
@@ -443,6 +444,7 @@ impl Qwen3AttentionLayer {
                     bs_u,
                     self.sliding_window.unwrap_or(0),
                     inv_sqrt_d,
+                    kv_cache.physical_blocks_for_layer(self.attn_layer_idx) as u32,
                     stream,
                 )?,
                 (_, true) => ops::prefill_attention_paged_fp8_64(

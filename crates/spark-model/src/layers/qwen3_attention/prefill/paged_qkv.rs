@@ -193,6 +193,9 @@ impl Qwen3AttentionLayer {
             let act_q8 = ctx.buffers.q2_act_q8();
             return self.q2_prefill_gemm(ctx.gpu, q2, normed, out, scratch, act_q8, n, stream);
         }
+        if let Some(q8) = weight_opt.and_then(|w| w.as_packed_q8()) {
+            return ops::gguf_q8_0_gemm(ctx.gpu, self.q8_gemm_k, normed, q8, out, n, stream);
+        }
 
         // Native FP4: pre-quantized activations x original NVFP4 weights.
         if let (Some((a4p, a4sf)), Some(nvfp4)) = (a4, weight_opt.and_then(|w| w.as_nvfp4())) {

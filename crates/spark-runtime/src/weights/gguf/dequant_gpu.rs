@@ -35,6 +35,23 @@ pub(crate) fn supports(id: u32) -> bool {
     matches!(id, 8 | 12 | 14 | 42)
 }
 
+fn symbol(id: u32) -> Option<&'static str> {
+    match id {
+        8 => Some("dequant_q8_0_to_bf16"),
+        12 => Some("dequant_q4_k_to_bf16"),
+        14 => Some("dequant_q6_k_to_bf16"),
+        42 => Some("dequant_q2_0_gn_to_bf16"),
+        _ => None,
+    }
+}
+
+/// Whether this concrete backend has the module and function required for
+/// `id`. Metal targets intentionally omit the CUDA dequant module and should
+/// use the CPU reference path instead of failing during kernel lookup.
+pub(crate) fn available(gpu: &dyn GpuBackend, id: u32) -> bool {
+    symbol(id).is_some_and(|name| gpu.kernel(MODULE, name).is_ok())
+}
+
 /// Dequant a tensor's raw quant blocks (already uploaded to `q_ptr`) to a fresh
 /// BF16 device buffer via the GPU kernel for `id`. `q2_group` is the id-42
 /// group size (ignored for other types). Errors if `id` has no GPU kernel.
@@ -57,8 +74,8 @@ pub(crate) fn dequant_q8_0(
     blocks: DevicePtr,
     n_blocks: usize,
 ) -> Result<DevicePtr> {
-    let out = gpu.alloc(n_blocks * 32 * 2)?; // BF16 = 2 B/elem
     let kernel = gpu.kernel(MODULE, "dequant_q8_0_to_bf16")?;
+    let out = gpu.alloc(n_blocks * 32 * 2)?; // BF16 = 2 B/elem
     let stream = gpu.default_stream();
     KernelLaunch::new(gpu, kernel)
         .grid([n_blocks as u32, 1, 1])
@@ -78,8 +95,8 @@ pub(crate) fn dequant_q4_k(
     blocks: DevicePtr,
     n_blocks: usize,
 ) -> Result<DevicePtr> {
-    let out = gpu.alloc(n_blocks * 256 * 2)?;
     let kernel = gpu.kernel(MODULE, "dequant_q4_k_to_bf16")?;
+    let out = gpu.alloc(n_blocks * 256 * 2)?;
     let stream = gpu.default_stream();
     KernelLaunch::new(gpu, kernel)
         .grid([n_blocks as u32, 1, 1])
@@ -99,8 +116,8 @@ pub(crate) fn dequant_q6_k(
     blocks: DevicePtr,
     n_blocks: usize,
 ) -> Result<DevicePtr> {
-    let out = gpu.alloc(n_blocks * 256 * 2)?;
     let kernel = gpu.kernel(MODULE, "dequant_q6_k_to_bf16")?;
+    let out = gpu.alloc(n_blocks * 256 * 2)?;
     let stream = gpu.default_stream();
     KernelLaunch::new(gpu, kernel)
         .grid([n_blocks as u32, 1, 1])
@@ -123,8 +140,8 @@ pub(crate) fn dequant_q2_0_gn(
     group_size: usize,
 ) -> Result<DevicePtr> {
     let block_bytes = 2 + group_size / 4;
-    let out = gpu.alloc(n_blocks * group_size * 2)?;
     let kernel = gpu.kernel(MODULE, "dequant_q2_0_gn_to_bf16")?;
+    let out = gpu.alloc(n_blocks * group_size * 2)?;
     let stream = gpu.default_stream();
     KernelLaunch::new(gpu, kernel)
         .grid([n_blocks as u32, 1, 1])
@@ -173,6 +190,13 @@ mod tests {
         for id in [0u32, 1, 30, 35, 999] {
             assert!(!supports(id), "id {id} must not claim GPU support");
         }
+    }
+
+    #[test]
+    fn availability_checks_the_backend_kernel() {
+        let gpu = MockGpuBackend::new();
+        assert!(available(&gpu, 8));
+        assert!(!available(&gpu, 999));
     }
 
     #[test]

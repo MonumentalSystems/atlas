@@ -118,6 +118,7 @@ pub fn loader_for_config(config: &ModelConfig) -> Result<Box<dyn ModelWeightLoad
 }
 
 mod build;
+pub mod laguna_metal;
 mod lm_head_setup;
 mod m2_setup;
 
@@ -144,6 +145,7 @@ mod tests {
             config,
             &store,
             Box::new(gpu),
+            1,
             1,
             16,
             4096,

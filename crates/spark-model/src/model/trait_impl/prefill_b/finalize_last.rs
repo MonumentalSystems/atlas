@@ -141,7 +141,6 @@ impl TransformerModel {
             eps,
             stream,
         )?;
-
         // Diagnostic: post-norm hidden state
         if std::env::var("ATLAS_DIAG_GEMMA4").is_ok_and(|v| v == "1" || v == "true") {
             self.gpu.synchronize(stream)?;
@@ -214,6 +213,12 @@ impl TransformerModel {
             self.lm_head_batched(normed, 1, dst, stream)?;
             dst
         };
+        if self.config.model_type == "laguna" && self.gpu.supports_bounded_sliding_kv() {
+            // Sampling reads logits on the host/default stream. The prefill
+            // command buffer may be a separate Metal stream, so publish the LM
+            // head result before returning it to the scheduler.
+            self.gpu.synchronize(stream)?;
+        }
 
         // Per-layer divergence dump: full logits vector + top-10 token IDs.
         if let Ok(dir) = std::env::var("ATLAS_NEMO_DUMP")

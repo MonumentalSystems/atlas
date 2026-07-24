@@ -132,6 +132,19 @@ impl Qwen3AttentionLayer {
         self.o_weight = Some(QuantWeight::PackedQ2(o));
     }
 
+    pub fn set_packed_q8_weights(
+        &mut self,
+        q: crate::weight_map::PackedQ8Weight,
+        k: crate::weight_map::PackedQ8Weight,
+        v: crate::weight_map::PackedQ8Weight,
+        o: crate::weight_map::PackedQ8Weight,
+    ) {
+        self.q_weight = Some(QuantWeight::PackedQ8(q));
+        self.k_weight = Some(QuantWeight::PackedQ8(k));
+        self.v_weight = Some(QuantWeight::PackedQ8(v));
+        self.o_weight = Some(QuantWeight::PackedQ8(o));
+    }
+
     /// Transient-dequant prefill GEMM for a keep-packed Q2_0 projection: dequant
     /// the 2-bit weight `[n, k]` into the caller-provided PERSISTENT BF16
     /// `scratch` (the arena `q2_dequant_scratch`, sized to the largest packed

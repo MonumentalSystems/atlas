@@ -31,8 +31,10 @@ impl TransformerModel {
     pub fn new(
         config: ModelConfig,
         embed_tokens: DenseWeight,
+        embed_packed_q8: Option<crate::weight_map::PackedQ8Weight>,
         final_norm: DenseWeight,
         lm_head_weight: DenseWeight,
+        lm_head_packed_q8: Option<crate::weight_map::PackedQ8Weight>,
         lm_head_nvfp4: Option<QuantizedWeight>,
         // Runtime FP8 LM head (`--lm-head-dtype fp8`). Mutually exclusive with
         // `lm_head_nvfp4`; `None` for the NVFP4/BF16/default paths (byte-identical).
@@ -70,6 +72,12 @@ impl TransformerModel {
             gpu.kernel("norm", "rms_norm")?
         };
         let dense_gemv_kernel = gpu.kernel("gemv", "dense_gemv_bf16")?;
+        let q8_gemv_kernel =
+            crate::layers::try_kernel(gpu.as_ref(), "gguf_q8_0_gemv", "gguf_q8_0_gemv");
+        let q8_gemm_kernel =
+            crate::layers::try_kernel(gpu.as_ref(), "gguf_q8_0_gemm", "gguf_q8_0_gemm");
+        let q8_embedding_kernel =
+            crate::layers::try_kernel(gpu.as_ref(), "gguf_q8_0_embedding", "gguf_q8_0_embedding");
         // FP32-output dense GEMV — the FP32 logits path required an FP32
         // residual stream, which no longer exists, so this stays
         // KernelHandle(0) and the BF16 path is always taken.
@@ -489,8 +497,10 @@ impl TransformerModel {
         Ok(Self {
             config,
             embed_tokens,
+            embed_packed_q8,
             final_norm,
             lm_head_weight,
+            lm_head_packed_q8,
             lm_head_nvfp4,
             lm_head_fp8,
             layers,
@@ -501,6 +511,9 @@ impl TransformerModel {
             gpu,
             rms_norm_kernel,
             dense_gemv_kernel,
+            q8_gemv_kernel,
+            q8_gemm_kernel,
+            q8_embedding_kernel,
             dense_gemv_fp32out_kernel,
             w4a16_gemv_kernel,
             w4a16_gemv_logits_kernel,

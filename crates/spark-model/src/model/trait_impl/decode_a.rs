@@ -206,7 +206,8 @@ impl TransformerModel {
         // capture-safe (pool weights / arena scratch / f32 scale are all
         // load-time-fixed). Folded in as one more suppressor.
         let lora_eager = self.lora.is_some() && crate::lora::lora_eager_env();
-        let use_graphs = (self.comm.is_none() || ep_graphs || gdn_graphs)
+        let use_graphs = self.gpu.supports_graph_capture()
+            && (self.comm.is_none() || ep_graphs || gdn_graphs)
             && !self.profile
             && !self
                 .suppress_graphs
@@ -456,9 +457,11 @@ impl TransformerModel {
             eps,
             stream,
         )?;
-
         // LM head reads from normed directly (no D2D copy needed)
         self.lm_head(normed, stream)?;
+        if self.config.model_type == "laguna" && self.gpu.supports_bounded_sliding_kv() {
+            self.gpu.synchronize(stream)?;
+        }
         Ok(())
     }
 }

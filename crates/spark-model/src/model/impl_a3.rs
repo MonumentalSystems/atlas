@@ -29,12 +29,49 @@ use crate::weight_map::{DenseWeight, MtpWeights, QuantizedWeight};
 
 impl TransformerModel {
     pub(super) fn embed(&self, token: u32, output: DevicePtr, stream: u64) -> Result<()> {
-        let h = self.config.hidden_size;
-        let row_bytes = h * 2; // BF16 embedding row
-        let src = self.embed_tokens.weight.offset(token as usize * row_bytes);
-        self.gpu.copy_d2d_async(src, output, row_bytes, stream)?;
+        if self.embed_packed_q8.is_some() {
+            let token_ids = self.buffers.token_ids();
+            self.gpu.copy_h2d(&token.to_le_bytes(), token_ids)?;
+            self.embed_batch(token_ids, output, 1, stream)?;
+        } else {
+            let h = self.config.hidden_size;
+            let row_bytes = h * 2;
+            let src = self.embed_tokens.weight.offset(token as usize * row_bytes);
+            self.gpu.copy_d2d_async(src, output, row_bytes, stream)?;
+        }
         // Scale embeddings (Gemma-4: sqrt(hidden_size))
         self.scale_embeddings(output, 1, stream)
+    }
+
+    pub(super) fn embed_batch(
+        &self,
+        token_ids: DevicePtr,
+        output: DevicePtr,
+        num_tokens: u32,
+        stream: u64,
+    ) -> Result<()> {
+        if let Some(ref table) = self.embed_packed_q8 {
+            ops::gguf_q8_0_embedding(
+                self.gpu.as_ref(),
+                self.q8_embedding_kernel,
+                token_ids,
+                table,
+                output,
+                num_tokens,
+                stream,
+            )
+        } else {
+            ops::batched_embed(
+                self.gpu.as_ref(),
+                self.batched_embed_kernel,
+                token_ids,
+                self.embed_tokens.weight,
+                output,
+                num_tokens,
+                self.config.hidden_size as u32,
+                stream,
+            )
+        }
     }
 
     /// Scale in-place embeddings by config.embed_scale. The residual stream
@@ -83,7 +120,28 @@ impl TransformerModel {
         // aliasing: all streams' first token collapsed to one). Verify/decode
         // callers pass `self.buffers.logits()` (base) — unchanged behaviour.
         let logits = logits_dst;
-        if let Some(ref fp8) = self.lm_head_fp8 {
+        if let Some(ref q8) = self.lm_head_packed_q8 {
+            if num_tokens == 1 {
+                ops::gguf_q8_0_gemv(
+                    self.gpu.as_ref(),
+                    self.q8_gemv_kernel,
+                    hidden,
+                    q8,
+                    logits,
+                    stream,
+                )?;
+            } else {
+                ops::gguf_q8_0_gemm(
+                    self.gpu.as_ref(),
+                    self.q8_gemm_kernel,
+                    hidden,
+                    q8,
+                    logits,
+                    num_tokens,
+                    stream,
+                )?;
+            }
+        } else if let Some(ref fp8) = self.lm_head_fp8 {
             // FP8 E4M3 LM head. The dual-GEMV (batch=2) reads the FP8 weight
             // once for both K=2 verify tokens — bit-identical to two M=1 GEMVs
             // but halves the full-vocab weight bandwidth. Falls back to the
@@ -226,7 +284,17 @@ impl TransformerModel {
         } else {
             (self.buffers.logits(), false)
         };
-        if let Some(ref fp8) = self.lm_head_fp8 {
+        if let Some(ref q8) = self.lm_head_packed_q8 {
+            anyhow::ensure!(!fp32, "packed Q8_0 LM head requires BF16 logits");
+            ops::gguf_q8_0_gemv(
+                self.gpu.as_ref(),
+                self.q8_gemv_kernel,
+                hidden,
+                q8,
+                logits,
+                stream,
+            )?;
+        } else if let Some(ref fp8) = self.lm_head_fp8 {
             // FP8 E4M3 LM head (`--lm-head-dtype fp8`). `w8a16_gemv` has no
             // FP32-output variant — it writes to whichever buffer is passed.
             // `use_fp32_logits` is false in production, so `logits` is the

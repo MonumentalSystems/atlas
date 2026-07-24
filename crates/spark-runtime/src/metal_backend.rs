@@ -44,9 +44,10 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSString;
 use objc2_metal::{
-    MTLBlitCommandEncoder, MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
-    MTLComputeCommandEncoder, MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDevice,
-    MTLEvent, MTLLibrary, MTLResource, MTLResourceOptions, MTLSharedEvent, MTLSize,
+    MTLBlitCommandEncoder, MTLBuffer, MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandEncoder,
+    MTLCommandQueue, MTLComputeCommandEncoder, MTLComputePipelineState,
+    MTLCreateSystemDefaultDevice, MTLDevice, MTLEvent, MTLLibrary, MTLResource, MTLResourceOptions,
+    MTLSharedEvent, MTLSize,
 };
 use parking_lot::Mutex;
 
@@ -61,6 +62,25 @@ type ObjCmdBuf = Retained<ProtocolObject<dyn MTLCommandBuffer>>;
 type ObjLibrary = Retained<ProtocolObject<dyn MTLLibrary>>;
 type ObjPipeline = Retained<ProtocolObject<dyn MTLComputePipelineState>>;
 type ObjSharedEvent = Retained<ProtocolObject<dyn MTLSharedEvent>>;
+
+/// Metal UMA capacity snapshot.
+///
+/// Physical RAM and Metal's recommended working set are deliberately separate:
+/// the former describes the machine, while the latter is the allocation budget
+/// applications should use for admission control.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MetalMemoryInfo {
+    pub physical_memory_bytes: Option<usize>,
+    pub recommended_max_working_set_bytes: usize,
+    pub current_allocated_bytes: usize,
+}
+
+impl MetalMemoryInfo {
+    pub fn recommended_headroom_bytes(self) -> usize {
+        self.recommended_max_working_set_bytes
+            .saturating_sub(self.current_allocated_bytes)
+    }
+}
 
 // ── Stream + slab types ──────────────────────────────────────────────────
 
@@ -105,6 +125,9 @@ pub struct MetalGpuBackend {
     /// Both are mutexed so `kernel()` can be called from any thread.
     pipeline_cache: Arc<Mutex<HashMap<PipelineKey, KernelHandle>>>,
     pipeline_slab: Arc<Mutex<Vec<ObjPipeline>>>,
+    /// Packed Laguna deliberately ships a sparse active kernel set; CUDA-only
+    /// lookups resolve to the invalid sentinel and are never materialized.
+    sparse_kernel_set: bool,
     /// Shared-event slab for cross-stream synchronization.
     events: Arc<Mutex<Vec<EventSlot>>>,
 }
@@ -159,11 +182,15 @@ impl MetalGpuBackend {
         }];
 
         tracing::info!(
-            "MetalGpuBackend initialized on device '{}' with {} metallib modules",
-            device.name().to_string(),
-            libraries.len()
+            device = %device.name().to_string(),
+            metallib_modules = libraries.len(),
+            physical_memory_bytes = ?sysctl_memsize(),
+            recommended_max_working_set_bytes = device.recommendedMaxWorkingSetSize(),
+            current_allocated_bytes = device.currentAllocatedSize(),
+            "MetalGpuBackend initialized"
         );
 
+        let sparse_kernel_set = libraries.contains_key("laguna_marker");
         Ok(Self {
             device,
             allocations: Arc::new(Mutex::new(BTreeMap::new())),
@@ -171,6 +198,7 @@ impl MetalGpuBackend {
             libraries,
             pipeline_cache: Arc::new(Mutex::new(HashMap::new())),
             pipeline_slab: Arc::new(Mutex::new(Vec::new())),
+            sparse_kernel_set,
             events: Arc::new(Mutex::new(Vec::new())),
         })
     }
@@ -179,6 +207,15 @@ impl MetalGpuBackend {
     /// use cases — graph capture, custom resource creation, etc.).
     pub fn raw_device(&self) -> &ProtocolObject<dyn MTLDevice> {
         &self.device
+    }
+
+    /// Snapshot physical UMA capacity and Metal's recommended allocation budget.
+    pub fn memory_info(&self) -> MetalMemoryInfo {
+        MetalMemoryInfo {
+            physical_memory_bytes: sysctl_memsize(),
+            recommended_max_working_set_bytes: self.device.recommendedMaxWorkingSetSize() as usize,
+            current_allocated_bytes: self.device.currentAllocatedSize(),
+        }
     }
 
     // ── Internal helpers ────────────────────────────────────────────
@@ -229,6 +266,27 @@ impl MetalGpuBackend {
         Ok(cb)
     }
 
+    /// Resolve only buffer arguments referenced by one launch. This keeps the
+    /// allocation registry lock out of encoder calls without cloning/scanning
+    /// unrelated model allocations.
+    fn resolve_buffer_args(
+        &self,
+        args: &[KernelArg<'_>],
+    ) -> Result<Vec<(usize, ObjBuffer, usize)>> {
+        let allocs = self.allocations.lock();
+        args.iter()
+            .enumerate()
+            .filter_map(|(idx, arg)| match arg {
+                KernelArg::Buffer(ptr) => Some(
+                    Self::find_buffer(&allocs, *ptr)
+                        .map(|(buffer, offset)| (idx, buffer, offset))
+                        .ok_or_else(|| anyhow!("launch_typed: arg #{idx} ptr {ptr} not allocated")),
+                ),
+                KernelArg::Bytes(_) => None,
+            })
+            .collect()
+    }
+
     /// Commit the in-flight buffer on `stream_handle` (no wait). Used
     /// internally by `synchronize` and `record_event`. Returns the
     /// committed buffer so callers that need to `waitUntilCompleted()`
@@ -248,6 +306,9 @@ impl MetalGpuBackend {
 // ── GpuBackend impl ──────────────────────────────────────────────────────
 
 impl GpuBackend for MetalGpuBackend {
+    fn supports_bounded_sliding_kv(&self) -> bool {
+        true
+    }
     fn alloc(&self, bytes: usize) -> Result<DevicePtr> {
         // StorageModeShared is the UMA-friendly mode: `contents()`
         // returns a CPU-mappable pointer that aliases GPU memory.
@@ -285,6 +346,9 @@ impl GpuBackend for MetalGpuBackend {
         if src.is_empty() {
             return Ok(());
         }
+        // A synchronous host write must not race queued GPU readers/writers of
+        // the same shared UMA allocation.
+        self.synchronize(0)?;
         let allocs = self.allocations.lock();
         let (buf, offset) = Self::find_buffer(&allocs, dst)
             .ok_or_else(|| anyhow!("copy_h2d: ptr {dst} not in any allocation"))?;
@@ -304,10 +368,58 @@ impl GpuBackend for MetalGpuBackend {
         Ok(())
     }
 
+    fn copy_h2d_async(&self, src: &[u8], dst: DevicePtr, stream: u64) -> Result<()> {
+        if src.is_empty() {
+            return Ok(());
+        }
+        let allocs = self.allocations.lock();
+        let (dst_buf, dst_off) = Self::find_buffer(&allocs, dst)
+            .ok_or_else(|| anyhow!("copy_h2d_async: dst {dst} not allocated"))?;
+        if dst_off + src.len() > dst_buf.length() {
+            bail!(
+                "copy_h2d_async: write overflows buffer ({} + {} > {})",
+                dst_off,
+                src.len(),
+                dst_buf.length()
+            );
+        }
+        drop(allocs);
+
+        // `newBufferWithBytes` snapshots stack/pinned input immediately. The
+        // command buffer retains this staging resource until its ordered blit
+        // completes, so callers need not extend the host slice lifetime.
+        let source = unsafe {
+            self.device.newBufferWithBytes_length_options(
+                NonNull::new(src.as_ptr() as *mut c_void).expect("non-empty source"),
+                src.len(),
+                MTLResourceOptions::StorageModeShared,
+            )
+        }
+        .ok_or_else(|| anyhow!("newBufferWithBytes failed for {} bytes", src.len()))?;
+        let cmd_buf = self.current_cmd_buf(stream)?;
+        let enc = cmd_buf
+            .blitCommandEncoder()
+            .ok_or_else(|| anyhow!("blitCommandEncoder returned null"))?;
+        unsafe {
+            enc.copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size(
+                &source,
+                0,
+                &dst_buf,
+                dst_off,
+                src.len(),
+            );
+        }
+        enc.endEncoding();
+        Ok(())
+    }
+
     fn copy_d2h(&self, src: DevicePtr, dst: &mut [u8]) -> Result<()> {
         if dst.is_empty() {
             return Ok(());
         }
+        // Match the synchronous CUDA copy contract: commit and wait for prior
+        // work on the default stream before reading shared UMA bytes on CPU.
+        self.synchronize(0)?;
         let allocs = self.allocations.lock();
         let (buf, offset) = Self::find_buffer(&allocs, src)
             .ok_or_else(|| anyhow!("copy_d2h: ptr {src} not in any allocation"))?;
@@ -423,16 +535,16 @@ impl GpuBackend for MetalGpuBackend {
         // Resolve the pipeline state.
         let pipeline = {
             let slab = self.pipeline_slab.lock();
-            slab.get(func.0 as usize)
+            let slab_idx = func
+                .0
+                .checked_sub(1)
+                .ok_or_else(|| anyhow!("launch_typed: invalid kernel handle 0"))?;
+            slab.get(slab_idx as usize)
                 .cloned()
                 .ok_or_else(|| anyhow!("launch_typed: unknown kernel handle {}", func.0))?
         };
 
-        // Snapshot the alloc registry so we can resolve Buffer args
-        // (and so the encoder can `useResource:` every live buffer
-        // without holding the alloc lock during encoding).
-        let live_buffers: Vec<ObjBuffer> = self.allocations.lock().values().cloned().collect();
-        let allocs_snapshot: BTreeMap<u64, ObjBuffer> = self.allocations.lock().clone();
+        let referenced_buffers = self.resolve_buffer_args(args)?;
 
         let cmd_buf = self.current_cmd_buf(stream)?;
         let enc = cmd_buf
@@ -440,10 +552,10 @@ impl GpuBackend for MetalGpuBackend {
             .ok_or_else(|| anyhow!("computeCommandEncoder returned null"))?;
         enc.setComputePipelineState(&pipeline);
 
-        // Mark every live allocation as in-use so Metal's automatic
-        // hazard tracking keeps them resident. Cheap on Apple Silicon
-        // because `useResource:` is a hint, not a copy.
-        for buf in &live_buffers {
+        // Mark only resources referenced by this dispatch. `setBuffer` retains
+        // the same objects for command execution; `useResource` supplies the
+        // conservative read/write residency and hazard declaration.
+        for (_, buf, _) in &referenced_buffers {
             let resource: &ProtocolObject<dyn MTLResource> = ProtocolObject::from_ref(&**buf);
             enc.useResource_usage(
                 resource,
@@ -451,12 +563,16 @@ impl GpuBackend for MetalGpuBackend {
             );
         }
 
+        let mut referenced_buffers = referenced_buffers.into_iter();
         // Bind each typed arg to its index.
         for (idx, arg) in args.iter().enumerate() {
             match arg {
-                KernelArg::Buffer(p) => {
-                    let (buf, offset) = Self::find_buffer(&allocs_snapshot, *p)
-                        .ok_or_else(|| anyhow!("launch_typed: arg #{idx} ptr {p} not allocated"))?;
+                KernelArg::Buffer(_) => {
+                    let (resolved_idx, buf, offset) =
+                        referenced_buffers.next().ok_or_else(|| {
+                            anyhow!("launch_typed: missing resolved buffer for arg #{idx}")
+                        })?;
+                    debug_assert_eq!(resolved_idx, idx);
                     unsafe {
                         enc.setBuffer_offset_atIndex(Some(&buf), offset, idx);
                     }
@@ -489,6 +605,13 @@ impl GpuBackend for MetalGpuBackend {
     fn synchronize(&self, stream: u64) -> Result<()> {
         if let Some(cb) = self.commit_in_flight(stream)? {
             cb.waitUntilCompleted();
+            if cb.status() == MTLCommandBufferStatus::Error {
+                let message = cb
+                    .error()
+                    .map(|error| error.localizedDescription().to_string())
+                    .unwrap_or_else(|| "unknown Metal command-buffer error".to_string());
+                bail!("Metal command buffer failed on stream {stream}: {message}");
+            }
         }
         Ok(())
     }
@@ -502,14 +625,21 @@ impl GpuBackend for MetalGpuBackend {
         if let Some(handle) = self.pipeline_cache.lock().get(&key) {
             return Ok(*handle);
         }
-        let lib = self
-            .libraries
-            .get(module)
-            .ok_or_else(|| anyhow!("Metal: unknown module '{module}'"))?;
+        let Some(lib) = self.libraries.get(module) else {
+            if self.sparse_kernel_set {
+                return Ok(KernelHandle(0));
+            }
+            return Err(anyhow!("Metal: unknown module '{module}'"));
+        };
         let ns_name = NSString::from_str(func_name);
-        let function = lib.newFunctionWithName(&ns_name).ok_or_else(|| {
-            anyhow!("Metal: function '{func_name}' not found in module '{module}'")
-        })?;
+        let Some(function) = lib.newFunctionWithName(&ns_name) else {
+            if self.sparse_kernel_set {
+                return Ok(KernelHandle(0));
+            }
+            return Err(anyhow!(
+                "Metal: function '{func_name}' not found in module '{module}'"
+            ));
+        };
         let pipeline = self
             .device
             .newComputePipelineStateWithFunction_error(&function)
@@ -520,7 +650,9 @@ impl GpuBackend for MetalGpuBackend {
                 )
             })?;
         let mut slab = self.pipeline_slab.lock();
-        let handle = KernelHandle(slab.len() as u64);
+        // KernelHandle(0) is the cross-backend sentinel for "disabled".
+        // Metal slab indices are therefore encoded as index + 1.
+        let handle = KernelHandle(slab.len() as u64 + 1);
         slab.push(pipeline);
         drop(slab);
         self.pipeline_cache.lock().insert(key, handle);
@@ -562,7 +694,14 @@ impl GpuBackend for MetalGpuBackend {
         // On Apple Silicon UMA, "device memory" = system RAM. Probe
         // hw.memsize via sysctl for the authoritative number; fall
         // back to MTLDevice.recommendedMaxWorkingSetSize otherwise.
-        Ok(sysctl_memsize().unwrap_or_else(|| self.device.recommendedMaxWorkingSetSize() as usize))
+        let info = self.memory_info();
+        Ok(info
+            .physical_memory_bytes
+            .unwrap_or(info.recommended_max_working_set_bytes))
+    }
+
+    fn allocation_capacity(&self) -> Result<usize> {
+        Ok(self.memory_info().recommended_max_working_set_bytes)
     }
 
     fn free_memory(&self) -> Result<usize> {
@@ -570,9 +709,7 @@ impl GpuBackend for MetalGpuBackend {
         // `recommendedMaxWorkingSetSize - currentAllocatedSize`,
         // which matches the headroom Metal will let us allocate
         // before performance degrades.
-        let max = self.device.recommendedMaxWorkingSetSize() as usize;
-        let used = self.device.currentAllocatedSize();
-        Ok(max.saturating_sub(used))
+        Ok(self.memory_info().recommended_headroom_bytes())
     }
 
     fn create_stream(&self) -> Result<u64> {
@@ -629,6 +766,11 @@ impl GpuBackend for MetalGpuBackend {
         // up to this point has completed.
         let proto: &ProtocolObject<dyn MTLEvent> = ProtocolObject::from_ref(&*event_obj);
         cmd_buf.encodeSignalEvent_value(proto, value);
+        // A signal on an uncommitted command buffer can never become visible.
+        // The consumer stream would wait forever and eventually trip macOS's
+        // GPU watchdog. Publish the producer buffer after encoding the signal;
+        // the consumer's encoded wait preserves cross-stream ordering.
+        self.commit_in_flight(stream)?;
         Ok(())
     }
 

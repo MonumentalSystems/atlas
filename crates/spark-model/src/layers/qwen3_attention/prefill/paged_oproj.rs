@@ -36,6 +36,10 @@ impl Qwen3AttentionLayer {
             self.q2_prefill_gemm(ctx.gpu, q2, attn_out, o_out, scratch, act_q8, n, stream)?;
             return Ok(o_out);
         }
+        if let Some(q8) = self.o_weight.as_ref().and_then(|w| w.as_packed_q8()) {
+            ops::gguf_q8_0_gemm(ctx.gpu, self.q8_gemm_k, attn_out, q8, o_out, n, stream)?;
+            return Ok(o_out);
+        }
         let force_w8a8 = ops::fp8_blockscaled_prefill_enabled();
         // Native FP4 o_proj: quantize attn_out to NVFP4 and consume o_proj in
         // its original NVFP4 form. OPT-IN ONLY -- see the QKV path's comment.

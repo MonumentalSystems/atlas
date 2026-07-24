@@ -7,40 +7,14 @@ use spark_runtime::kv_cache::KvCacheDtype;
 use spark_runtime::weights::{WeightDtype, WeightStore};
 
 use crate::layer::TransformerLayer;
-use crate::layers::dense_ffn::DenseFfnWeights;
 use crate::layers::qwen3_attention::HeadGateActivation;
-use crate::layers::{DenseFfnLayer, FfnComponent, MoeLayer, Qwen3AttentionLayer};
+use crate::layers::{FfnComponent, MoeLayer, Qwen3AttentionLayer};
 use crate::weight_map::{
-    AttentionWeights, DenseWeight, ExpertWeight, MoeWeights, PackedExpertWeights, PackedQ4Weight,
-    PackedQ6Weight, QuantWeight, QuantizedWeight, dense, dense_auto, quantize_to_nvfp4,
-    quantized_v2,
+    AttentionWeights, DenseWeight, ExpertWeight, MoeWeights, QuantizedWeight, dense, dense_auto,
+    quantize_to_nvfp4, quantized_v2,
 };
 
-/// Wrap a keep-packed Q4_K store tensor (`{prefix}.weight`, tagged
-/// [`WeightDtype::PackedQ4K`] by the GGUF loader) into a [`PackedQ4Weight`]
-/// layer view. The pointer aliases the store's block buffer (no copy).
-fn packed_q4_from_store(store: &WeightStore, prefix: &str) -> Result<PackedQ4Weight> {
-    let t = store.get(&format!("{prefix}.weight"))?;
-    ensure!(t.is_packed_q4k(), "{prefix}.weight is not keep-packed Q4_K");
-    ensure!(t.shape.len() == 2, "{prefix}.weight is not 2D ({:?})", t.shape);
-    Ok(PackedQ4Weight {
-        weight: t.ptr,
-        n: t.shape[0] as u32,
-        k: t.shape[1] as u32,
-    })
-}
-
-/// Wrap a keep-packed Q6_K store tensor into a [`PackedQ6Weight`] layer view.
-fn packed_q6_from_store(store: &WeightStore, prefix: &str) -> Result<PackedQ6Weight> {
-    let t = store.get(&format!("{prefix}.weight"))?;
-    ensure!(t.is_packed_q6k(), "{prefix}.weight is not keep-packed Q6_K");
-    ensure!(t.shape.len() == 2, "{prefix}.weight is not 2D ({:?})", t.shape);
-    Ok(PackedQ6Weight {
-        weight: t.ptr,
-        n: t.shape[0] as u32,
-        k: t.shape[1] as u32,
-    })
-}
+use super::packed_gguf;
 
 pub(super) fn load_layers(
     store: &WeightStore,
@@ -57,8 +31,8 @@ pub(super) fn load_layers(
         "laguna fused shared-expert path requires equal shared/routed widths"
     );
 
-    let absmax_k = gpu.kernel("quantize_nvfp4", "nvfp4_global_absmax")?;
-    let quantize_k = gpu.kernel("quantize_nvfp4", "quantize_bf16_to_nvfp4")?;
+    let absmax_k = crate::layers::try_kernel(gpu, "quantize_nvfp4", "nvfp4_global_absmax");
+    let quantize_k = crate::layers::try_kernel(gpu, "quantize_nvfp4", "quantize_bf16_to_nvfp4");
     let stream = gpu.default_stream();
     let yarn_inv_freq = compute_yarn_inv_freq(config, gpu)?;
     // Sliding layers: theta=10000 over the full head_dim, no YaRN ramp.
@@ -81,7 +55,7 @@ pub(super) fn load_layers(
         let input_norm = dense(store, &format!("{lp}.input_layernorm.weight"))?;
         let post_attn_norm = dense(store, &format!("{lp}.post_attention_layernorm.weight"))?;
         let ffn = if config.mlp_only_layers.contains(&i) {
-            load_dense_ffn(store, gpu, &lp)?
+            packed_gguf::load_dense_ffn(store, gpu, &lp)?
         } else {
             load_moe_ffn(
                 store,
@@ -110,27 +84,6 @@ pub(super) fn load_layers(
         layers.push(Box::new(layer));
     }
     Ok(layers)
-}
-
-fn null_dense_ffn_weights() -> DenseFfnWeights {
-    DenseFfnWeights {
-        gate_proj: QuantizedWeight::null(),
-        up_proj: QuantizedWeight::null(),
-        down_proj: QuantizedWeight::null(),
-        gate_proj_t: None,
-        up_proj_t: None,
-        down_proj_t: None,
-    }
-}
-
-fn load_dense_ffn(store: &WeightStore, gpu: &dyn GpuBackend, lp: &str) -> Result<FfnComponent> {
-    let mut layer = DenseFfnLayer::new(null_dense_ffn_weights(), gpu)?;
-    layer.set_bf16_weights(
-        dense_auto(store, &format!("{lp}.mlp.gate_proj.weight"), gpu)?,
-        dense_auto(store, &format!("{lp}.mlp.up_proj.weight"), gpu)?,
-        dense_auto(store, &format!("{lp}.mlp.down_proj.weight"), gpu)?,
-    );
-    Ok(FfnComponent::Dense(layer))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -167,42 +120,31 @@ fn load_moe_ffn(
     // trailing bytes hit an unmapped page). Widen BF16→F32 into a correctly-sized
     // device buffer. Safetensors already delivers F32 on-device, so keep `dense`.
     let correction_bias = if experts_keep_packed {
-        dense_bias_to_device(store, &format!("{mlp}.experts.e_score_correction_bias"), gpu)?
+        packed_gguf::load_correction_bias(
+            store,
+            &format!("{mlp}.experts.e_score_correction_bias"),
+            gpu,
+        )?
     } else {
         dense(store, &format!("{mlp}.experts.e_score_correction_bias"))?
     };
 
     let (experts, packed_experts) = if experts_keep_packed {
-        let mut packed = Vec::with_capacity(config.num_experts);
-        for e in 0..config.num_experts {
-            if !config.is_local_expert(e) {
-                packed.push(PackedExpertWeights {
-                    gate: PackedQ4Weight::null_view(),
-                    up: PackedQ4Weight::null_view(),
-                    down: QuantWeight::PackedQ6(PackedQ6Weight::null_view()),
-                });
-                continue;
-            }
-            let ep = format!("{mlp}.experts.{e}");
-            // down_proj is Q4_K on some layers, Q6_K on others (Q4_K_M mixed).
-            let down_prefix = format!("{ep}.down_proj");
-            let down = if store.get(&format!("{down_prefix}.weight"))?.is_packed_q4k() {
-                QuantWeight::PackedQ4(packed_q4_from_store(store, &down_prefix)?)
-            } else {
-                QuantWeight::PackedQ6(packed_q6_from_store(store, &down_prefix)?)
-            };
-            packed.push(PackedExpertWeights {
-                gate: packed_q4_from_store(store, &format!("{ep}.gate_proj"))?,
-                up: packed_q4_from_store(store, &format!("{ep}.up_proj"))?,
-                down,
-            });
-        }
-        let null_experts = (0..config.num_experts).map(|_| ExpertWeight::null()).collect();
-        (null_experts, Some(packed))
+        let null_experts = (0..config.num_experts)
+            .map(|_| ExpertWeight::null())
+            .collect();
+        (
+            null_experts,
+            Some(packed_gguf::load_routed_experts(store, config, &mlp)?),
+        )
     } else {
         // Existing NVFP4/safetensors path: pre-packed NVFP4 (`.weight_packed`)
         // or a BF16 GGUF (`.weight`) requantized to NVFP4 at load. Computed
         // natively by the grouped NVFP4 GEMM — no dequant-to-BF16 buffer.
+        ensure!(
+            absmax_k.0 != 0 && quantize_k.0 != 0,
+            "Laguna NVFP4 expert path requires quantize_nvfp4 kernels"
+        );
         let expert_proj = |proj: &str, n: usize, k: usize| -> Result<QuantizedWeight> {
             if store.contains(&format!("{proj}.weight_packed")) {
                 quantized_v2(store, proj, gpu)
@@ -228,15 +170,28 @@ fn load_moe_ffn(
     };
 
     let shared = format!("{mlp}.shared_expert");
-    let shared_gate = dense_auto(store, &format!("{shared}.gate_proj.weight"), gpu)?;
-    let shared_up = dense_auto(store, &format!("{shared}.up_proj.weight"), gpu)?;
-    let shared_down = dense_auto(store, &format!("{shared}.down_proj.weight"), gpu)?;
-    let si = config.shared_expert_intermediate_size;
-    let h = config.hidden_size;
-    let shared_expert = ExpertWeight {
-        gate_proj: quantize_to_nvfp4(&shared_gate, si, h, gpu, absmax_k, quantize_k, stream)?,
-        up_proj: quantize_to_nvfp4(&shared_up, si, h, gpu, absmax_k, quantize_k, stream)?,
-        down_proj: quantize_to_nvfp4(&shared_down, h, si, gpu, absmax_k, quantize_k, stream)?,
+    let shared_gate_name = format!("{shared}.gate_proj.weight");
+    let shared_is_q8 = store.get(&shared_gate_name)?.is_packed_q8_0();
+    let (shared_expert, shared_bf16) = if shared_is_q8 {
+        (ExpertWeight::null(), None)
+    } else {
+        ensure!(
+            absmax_k.0 != 0 && quantize_k.0 != 0,
+            "Laguna shared expert requantization requires NVFP4 kernels"
+        );
+        let gate = dense_auto(store, &shared_gate_name, gpu)?;
+        let up = dense_auto(store, &format!("{shared}.up_proj.weight"), gpu)?;
+        let down = dense_auto(store, &format!("{shared}.down_proj.weight"), gpu)?;
+        let si = config.shared_expert_intermediate_size;
+        let h = config.hidden_size;
+        (
+            ExpertWeight {
+                gate_proj: quantize_to_nvfp4(&gate, si, h, gpu, absmax_k, quantize_k, stream)?,
+                up_proj: quantize_to_nvfp4(&up, si, h, gpu, absmax_k, quantize_k, stream)?,
+                down_proj: quantize_to_nvfp4(&down, h, si, gpu, absmax_k, quantize_k, stream)?,
+            },
+            Some((gate, up, down)),
+        )
     };
     let weights = MoeWeights {
         gate,
@@ -254,7 +209,11 @@ fn load_moe_ffn(
     // compression. Keep its BF16 weights authoritative for both prefill and
     // decode; the quantized copies above are placeholders for fused routed
     // kernels and their shared contribution is overwritten before blending.
-    layer.set_bf16_shared_expert(shared_gate, shared_up, shared_down)?;
+    if shared_is_q8 {
+        packed_gguf::set_q8_shared_expert(&mut layer, store, &shared)?;
+    } else if let Some((gate, up, down)) = shared_bf16 {
+        layer.set_bf16_shared_expert(gate, up, down)?;
+    }
     // Keep-packed GGUF experts: the routed experts are raw Q4_K/Q6_K blocks and
     // carry NO NVFP4 scale tables, so the NVFP4-specific transpose and CUTLASS
     // SFB swizzle below (which read the null NVFP4 expert scales) must be
@@ -316,10 +275,21 @@ fn load_attention(
         q_width,
     )?;
 
-    let q_proj = dense_auto(store, &format!("{p}.q_proj.weight"), gpu)?;
-    let k_proj = dense_auto(store, &format!("{p}.k_proj.weight"), gpu)?;
-    let v_proj = dense_auto(store, &format!("{p}.v_proj.weight"), gpu)?;
-    let o_proj = dense_auto(store, &format!("{p}.o_proj.weight"), gpu)?;
+    let q_name = format!("{p}.q_proj.weight");
+    let packed_q8 = store.get(&q_name)?.is_packed_q8_0();
+    let null_dense = DenseWeight {
+        weight: DevicePtr::NULL,
+    };
+    let (q_proj, k_proj, v_proj, o_proj) = if packed_q8 {
+        (null_dense, null_dense, null_dense, null_dense)
+    } else {
+        (
+            dense_auto(store, &q_name, gpu)?,
+            dense_auto(store, &format!("{p}.k_proj.weight"), gpu)?,
+            dense_auto(store, &format!("{p}.v_proj.weight"), gpu)?,
+            dense_auto(store, &format!("{p}.o_proj.weight"), gpu)?,
+        )
+    };
     let (k_scale, v_scale) = load_kv_scales(store, gpu, &p)?;
     let attn = AttentionWeights {
         q_proj,
@@ -348,11 +318,15 @@ fn load_attention(
         config,
     )?;
     layer.set_dimension_overrides(config.head_dim, heads, config.num_key_value_heads);
-    layer.set_o_dense_bf16(o_proj);
-    layer.set_head_gate_weight(
-        dense_auto(store, &format!("{p}.g_proj.weight"), gpu)?,
-        HeadGateActivation::Softplus,
-    );
+    if packed_q8 {
+        packed_gguf::set_q8_attention(&mut layer, store, &p)?;
+    } else {
+        layer.set_o_dense_bf16(o_proj);
+        layer.set_head_gate_weight(
+            dense_auto(store, &format!("{p}.g_proj.weight"), gpu)?,
+            HeadGateActivation::Softplus,
+        );
+    }
     match config.layer_types[i] {
         LayerType::SlidingAttention => {
             layer.set_sliding_window(Some(config.sliding_window));
@@ -478,50 +452,6 @@ fn cutlass_grouped_moe_enabled() -> bool {
         std::env::var("ATLAS_HOLO_MOE_GROUPED_CUTLASS").as_deref(),
         Ok("1") | Ok("true")
     )
-}
-
-/// Materialise the sigmoid router's `e_score_correction_bias` as an F32 device
-/// buffer for the keep-packed GGUF path.
-///
-/// The GGUF loader dequants this originally-F32 tensor to **BF16** on load (2
-/// bytes/elem), but `moe_topk_sigmoid_batched` reads `bias` as `const float*`
-/// (4 bytes/elem). Handing it the BF16 buffer makes the kernel over-read one
-/// buffer-length past the end — a CUDA_ERROR_ILLEGAL_ADDRESS that surfaces at
-/// whichever layer's trailing bytes land on an unmapped page (seen drifting
-/// across layers with prompt length). Widen BF16→F32 here into a correctly
-/// sized [num_experts] F32 device allocation. Safetensors already ships an F32
-/// device pointer and keeps `dense()`, so this runs on the keep-packed path only.
-fn dense_bias_to_device(
-    store: &WeightStore,
-    name: &str,
-    gpu: &dyn GpuBackend,
-) -> Result<crate::weight_map::DenseWeight> {
-    let t = store
-        .get(name)
-        .with_context(|| format!("keep-packed bias {name} missing"))?;
-    let n = t.num_elements();
-    let src_bytes = t.byte_size();
-    // `t.ptr` is a DEVICE buffer — the GGUF loader dequants this bias to BF16 on
-    // GPU. Copy it down at its true (BF16) size, widen on the host, upload as F32.
-    let mut host = vec![0u8; src_bytes];
-    gpu.copy_d2h(t.ptr, &mut host)
-        .with_context(|| format!("copy_d2h correction_bias {name} ({src_bytes}B)"))?;
-    let f32_bytes: Vec<u8> = match t.dtype {
-        WeightDtype::BF16 => host
-            .chunks_exact(2)
-            .flat_map(|c| {
-                let bf = u16::from_le_bytes([c[0], c[1]]);
-                f32::from_bits((bf as u32) << 16).to_le_bytes()
-            })
-            .collect(),
-        WeightDtype::FP32 => host,
-        d => anyhow::bail!("unexpected correction_bias dtype {d:?} for {name}"),
-    };
-    let ptr = gpu
-        .alloc(n * 4)
-        .with_context(|| format!("allocate F32 device copy of {name}"))?;
-    gpu.copy_h2d(&f32_bytes, ptr)?;
-    Ok(crate::weight_map::DenseWeight { weight: ptr })
 }
 
 fn compute_plain_inv_freq(theta: f64, dim: usize, gpu: &dyn GpuBackend) -> Result<DevicePtr> {

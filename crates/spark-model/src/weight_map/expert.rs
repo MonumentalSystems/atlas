@@ -128,6 +128,10 @@ pub enum QuantWeight {
     /// dequants to BF16 then runs `dense_gemm`. Tier-1c attention path.
     PackedQ2(PackedQ2Weight),
 
+    /// Keep-packed GGUF Q8_0 (34 bytes per 32 values). Metal consumes the
+    /// blocks directly for attention, dense FFN, embeddings, and LM head.
+    PackedQ8(PackedQ8Weight),
+
     /// Keep-packed GGUF Q4_K (id 12): raw `block_q4_K` bytes. Consumed by the
     /// per-expert Q4_K MMQ GEMM (routed MoE gate/up, Laguna-S-2.1 Q4_K_M).
     PackedQ4(PackedQ4Weight),
@@ -150,6 +154,7 @@ impl QuantWeight {
             Self::Fp8(w) => w.weight.is_null(),
             Self::Dense(w) => w.weight.is_null(),
             Self::PackedQ2(w) => w.is_null(),
+            Self::PackedQ8(w) => w.is_null(),
             Self::PackedQ4(w) => w.is_null(),
             Self::PackedQ6(w) => w.is_null(),
         }
@@ -159,6 +164,13 @@ impl QuantWeight {
     pub fn as_packed_q2(&self) -> Option<&PackedQ2Weight> {
         match self {
             Self::PackedQ2(w) => Some(w),
+            _ => None,
+        }
+    }
+
+    pub fn as_packed_q8(&self) -> Option<&PackedQ8Weight> {
+        match self {
+            Self::PackedQ8(w) => Some(w),
             _ => None,
         }
     }
@@ -225,6 +237,12 @@ impl From<DenseWeight> for QuantWeight {
 impl From<PackedQ2Weight> for QuantWeight {
     fn from(w: PackedQ2Weight) -> Self {
         Self::PackedQ2(w)
+    }
+}
+
+impl From<PackedQ8Weight> for QuantWeight {
+    fn from(w: PackedQ8Weight) -> Self {
+        Self::PackedQ8(w)
     }
 }
 

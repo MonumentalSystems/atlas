@@ -7,7 +7,8 @@
 //! sibling `config.json`. This module reads those keys through the
 //! [`GgufMeta`] accessor (implemented by the GGUF parser in spark-runtime, so
 //! atlas-core keeps no GGUF dependency) and produces a validated
-//! [`ModelConfig`] for the llama / qwen2 / qwen3 / gemma decoder families.
+//! [`ModelConfig`] for the llama / qwen2 / qwen3 / gemma decoder families and
+//! Laguna-S-2.1's heterogeneous full/sliding-attention MoE architecture.
 //!
 //! Strategy: synthesize an HF-config-shaped JSON object from the GGUF keys and
 //! deserialize it into `ModelConfig` (serde `#[serde(default)]` fills the many
@@ -17,10 +18,10 @@
 //! [`super::finalize_config`]. No silent production defaults: every value GGUF
 //! omits is either derived by an explicit documented rule or is an error.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Map, Value, json};
 
-use super::{ModelConfig, finalize_config};
+use super::{ModelConfig, finalize_config, parse_laguna};
 
 /// Typed read access to GGUF metadata. Implemented by the spark-runtime GGUF
 /// parser over its parsed key/value table. All getters return `None` when the
@@ -29,6 +30,8 @@ use super::{ModelConfig, finalize_config};
 pub trait GgufMeta {
     /// Any unsigned/signed integer metadata value, widened to u64.
     fn get_u64(&self, key: &str) -> Option<u64>;
+    /// An array of non-negative integer metadata values, widened to u64.
+    fn get_u64_array(&self, key: &str) -> Option<Vec<u64>>;
     /// Any float metadata value (f32/f64), widened to f64.
     fn get_f64(&self, key: &str) -> Option<f64>;
     /// A string metadata value.
@@ -86,6 +89,9 @@ pub fn config_from_gguf(inputs: &GgufConfigInputs) -> Result<ModelConfig> {
         .get_str("general.architecture")
         .context("GGUF metadata missing required key 'general.architecture'")?
         .to_string();
+    if arch == "laguna" {
+        return config_from_laguna_gguf(inputs);
+    }
     let (model_type, attn_gated) = arch_to_model_type(&arch)?;
 
     // Namespaced key helper: `{arch}.<suffix>`.
@@ -226,12 +232,157 @@ pub fn config_from_gguf(inputs: &GgufConfigInputs) -> Result<ModelConfig> {
     Ok(config)
 }
 
+/// Build Laguna-S-2.1's heterogeneous HF-shaped config from its native GGUF
+/// metadata. Unlike homogeneous GGUF decoders, Laguna encodes Q-head counts as
+/// one integer per layer and carries separate full/SWA RoPE parameters.
+fn config_from_laguna_gguf(inputs: &GgufConfigInputs) -> Result<ModelConfig> {
+    let meta = inputs.meta;
+    let req_u64 = |suffix: &str| -> Result<u64> {
+        meta.get_u64(&format!("laguna.{suffix}"))
+            .with_context(|| format!("GGUF metadata missing required key 'laguna.{suffix}'"))
+    };
+    let req_f64 = |suffix: &str| -> Result<f64> {
+        meta.get_f64(&format!("laguna.{suffix}"))
+            .with_context(|| format!("GGUF metadata missing required key 'laguna.{suffix}'"))
+    };
+
+    let num_hidden_layers = req_u64("block_count")? as usize;
+    ensure!(
+        num_hidden_layers == 48,
+        "Laguna-S-2.1 GGUF must contain 48 layers, found {num_hidden_layers}"
+    );
+    let heads_u64 = meta
+        .get_u64_array("laguna.attention.head_count")
+        .context("GGUF metadata missing required integer array 'laguna.attention.head_count'")?;
+    ensure!(
+        heads_u64.len() == num_hidden_layers,
+        "laguna.attention.head_count length ({}) does not match block_count ({num_hidden_layers})",
+        heads_u64.len()
+    );
+    let heads: Vec<usize> = heads_u64
+        .into_iter()
+        .map(|v| usize::try_from(v).context("laguna attention head count does not fit usize"))
+        .collect::<Result<_>>()?;
+    let full_heads = heads[0];
+    let sliding_heads = heads
+        .iter()
+        .copied()
+        .max()
+        .context("empty Laguna head array")?;
+    ensure!(
+        full_heads > 0 && sliding_heads > full_heads,
+        "Laguna GGUF must declare distinct non-zero full and sliding Q-head counts"
+    );
+    ensure!(
+        heads
+            .iter()
+            .enumerate()
+            .all(|(i, &h)| if i.is_multiple_of(4) {
+                h == full_heads
+            } else {
+                h == sliding_heads
+            }),
+        "Laguna GGUF attention heads must follow one full layer then three sliding layers"
+    );
+    let layer_types: Vec<&str> = heads
+        .iter()
+        .map(|&h| {
+            if h == full_heads {
+                "full_attention"
+            } else {
+                "sliding_attention"
+            }
+        })
+        .collect();
+
+    let head_dim = req_u64("attention.key_length")?;
+    ensure!(head_dim > 0, "laguna.attention.key_length must be non-zero");
+    ensure!(
+        req_u64("attention.value_length")? == head_dim,
+        "Laguna GGUF key/value head dimensions must match"
+    );
+    let full_rope_dim = req_u64("rope.dimension_count")?;
+    let sliding_rope_dim = req_u64("rope.dimension_count_swa")?;
+    ensure!(
+        full_rope_dim > 0 && full_rope_dim <= head_dim,
+        "laguna.rope.dimension_count must be in 1..=head_dim"
+    );
+    ensure!(
+        sliding_rope_dim == head_dim,
+        "laguna.rope.dimension_count_swa must equal head_dim"
+    );
+    ensure!(
+        meta.get_str("laguna.rope.scaling.type") == Some("yarn"),
+        "laguna.rope.scaling.type must be 'yarn'"
+    );
+    ensure!(
+        req_u64("expert_gating_func")? == 2,
+        "Laguna GGUF expert_gating_func must be sigmoid (2)"
+    );
+
+    let leading_dense = req_u64("leading_dense_block_count")? as usize;
+    ensure!(
+        leading_dense <= num_hidden_layers,
+        "laguna.leading_dense_block_count exceeds block_count"
+    );
+    let mlp_only_layers: Vec<usize> = (0..leading_dense).collect();
+    let bos_token_id = meta.get_u64("tokenizer.ggml.bos_token_id").unwrap_or(0);
+    let eos_token_id = meta.get_u64("tokenizer.ggml.eos_token_id").unwrap_or(0);
+
+    let raw = json!({
+        "model_type": "laguna",
+        "hidden_size": req_u64("embedding_length")?,
+        "intermediate_size": req_u64("feed_forward_length")?,
+        "num_hidden_layers": num_hidden_layers,
+        "vocab_size": req_u64("vocab_size")?,
+        "num_attention_heads": sliding_heads,
+        "num_attention_heads_per_layer": heads,
+        "num_key_value_heads": req_u64("attention.head_count_kv")?,
+        "head_dim": head_dim,
+        "num_experts": req_u64("expert_count")?,
+        "num_experts_per_tok": req_u64("expert_used_count")?,
+        "moe_intermediate_size": req_u64("expert_feed_forward_length")?,
+        "shared_expert_intermediate_size": req_u64("expert_shared_feed_forward_length")?,
+        "norm_topk_prob": req_u64("expert_weights_norm")? != 0,
+        "decoder_sparse_step": 1,
+        "mlp_only_layers": mlp_only_layers,
+        "layer_types": layer_types,
+        "sliding_window": req_u64("attention.sliding_window")?,
+        "max_position_embeddings": req_u64("context_length")?,
+        "rms_norm_eps": req_f64("attention.layer_norm_rms_epsilon")?,
+        "bos_token_id": bos_token_id,
+        "eos_token_id": eos_token_id,
+        "tie_word_embeddings": !inputs.has_output_weight,
+        "gating": "per-head",
+        "moe_routed_scaling_factor": req_f64("expert_weights_scale")?,
+        "rope_parameters": {
+            "full_attention": {
+                "rope_type": "yarn",
+                "rope_theta": req_f64("rope.freq_base")?,
+                "factor": req_f64("rope.scaling.factor")?,
+                "original_max_position_embeddings": req_u64("rope.scaling.original_context_length")?,
+                "beta_slow": req_f64("rope.scaling.yarn_beta_slow")?,
+                "beta_fast": req_f64("rope.scaling.yarn_beta_fast")?,
+                "attention_factor": req_f64("rope.scaling.yarn_attn_factor")?,
+                "partial_rotary_factor": full_rope_dim as f64 / head_dim as f64
+            },
+            "sliding_attention": {
+                "rope_type": "default",
+                "rope_theta": req_f64("rope.freq_base_swa")?,
+                "partial_rotary_factor": sliding_rope_dim as f64 / head_dim as f64
+            }
+        }
+    });
+    parse_laguna(&raw).context("failed to build Laguna ModelConfig from GGUF metadata")
+}
+
 // ── Fields GGUF does NOT provide, and how they are set (explicit, no silent
 //    prod defaults) ──
 //   * partial_rotary_factor / rotary_dim: left at struct default 1.0 (full
 //     RoPE). `{arch}.rope.dimension_count` could refine this for partial-rotary
 //     models; deliberately NOT auto-applied here until a target arch needs it.
-//   * layer_types / hybrid fields: left empty (homogeneous decoder).
+//   * layer_types / hybrid fields: left empty for homogeneous decoders;
+//     Laguna constructs them from its per-layer head-count array.
 //   * All SSM/MLA/DeepSeek/MiniMax/vision fields: 0 / empty — not applicable to
 //     the llama/qwen/gemma decoder families this builder targets.
 //   * ep_rank/ep_world_size/tp_*: set at runtime by the caller, not here.

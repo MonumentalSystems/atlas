@@ -457,14 +457,27 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires nvcc and ATLAS_SKIP_BUILD unset"]
+    #[ignore = "requires a kernel compiler and ATLAS_SKIP_BUILD unset"]
     fn available_targets_non_empty() {
         let targets = available_targets();
         assert!(!targets.is_empty(), "No kernel targets available");
         assert!(
-            targets.iter().any(|t| t.target.quant == "nvfp4"),
-            "Expected at least one NVFP4 target"
+            targets.iter().all(|t| !t.target.model.is_empty()
+                && !t.target.quant.is_empty()
+                && !t.modules.is_empty()),
+            "Every compiled target must carry identity metadata and modules"
         );
+        for target in &targets {
+            for model_match in &target.model_type_matches {
+                let hidden_size = model_match.hidden_size.unwrap_or(1);
+                assert!(
+                    ptx_for_config(model_match.model_type, hidden_size).is_some(),
+                    "Compiled target {} is not selectable by model_type={} / hidden_size={hidden_size}",
+                    target.target,
+                    model_match.model_type,
+                );
+            }
+        }
     }
 
     #[test]

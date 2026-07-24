@@ -290,9 +290,13 @@ impl BlockDiffusionDraftHead {
             }
 
             if commit {
-                let (k_pool, v_pool) = {
+                let (k_pool, v_pool, physical_blocks) = {
                     let cache = self.kv_cache.lock();
-                    (cache.k_pool_ptr(l), cache.v_pool_ptr(l))
+                    (
+                        cache.k_pool_ptr(l),
+                        cache.v_pool_ptr(l),
+                        cache.physical_blocks_for_layer(l) as u32,
+                    )
                 };
                 ops::reshape_and_cache(
                     gpu,
@@ -309,6 +313,7 @@ impl BlockDiffusionDraftHead {
                     kv_dim,
                     kv_dim,
                     0,
+                    physical_blocks,
                     stream,
                 )?;
             }

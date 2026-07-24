@@ -180,6 +180,12 @@ pub trait ModelWeightLoader {
         config: &ModelConfig,
         gpu: &dyn GpuBackend,
     ) -> Result<DenseWeight>;
+    fn load_packed_q8_embedding(
+        &self,
+        _store: &WeightStore,
+    ) -> Result<Option<crate::weight_map::PackedQ8Weight>> {
+        Ok(None)
+    }
     /// Load the final RMSNorm weight used before the LM head.
     ///
     /// `gpu` is passed so model-specific loaders can do on-device weight
@@ -199,6 +205,12 @@ pub trait ModelWeightLoader {
         config: &ModelConfig,
         gpu: &dyn GpuBackend,
     ) -> Result<DenseWeight>;
+    fn load_packed_q8_lm_head(
+        &self,
+        _store: &WeightStore,
+    ) -> Result<Option<crate::weight_map::PackedQ8Weight>> {
+        Ok(None)
+    }
 
     /// Load MTP head weights (returns None if no MTP weights in store).
     fn load_mtp_weights(

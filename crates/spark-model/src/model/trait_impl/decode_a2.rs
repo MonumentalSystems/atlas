@@ -175,7 +175,8 @@ impl TransformerModel {
         // Graph decision, computed BEFORE padded_n so eager can drop pad lanes.
         let ms_profile = std::env::var("ATLAS_MS_PROFILE").ok().as_deref() == Some("1");
         let lora_eager = self.lora.is_some() && crate::lora::lora_eager_env();
-        let use_graphs = !ms_profile
+        let use_graphs = self.gpu.supports_graph_capture()
+            && !ms_profile
             && !lora_eager
             && std::env::var("ATLAS_DECODE_GRAPHS_MULTISEQ")
                 .ok()
@@ -425,7 +426,6 @@ impl TransformerModel {
                 self.config.rms_norm_eps as f32,
                 stream,
             )?;
-
             // LM head: ONE batched [eff_n, vocab] GEMM so the ~254 MB
             // vocab weight is read ONCE per step instead of once per sequence
             // (the per-row GEMV loop re-read it N times — a major C>=2 cost:
@@ -434,7 +434,17 @@ impl TransformerModel {
             // on the model, and Holo's lm_head is NVFP4 anyway).
             let logits = self.buffers.logits();
             let v = self.config.vocab_size;
-            if let Some(ref fp8) = self.lm_head_fp8 {
+            if let Some(ref q8) = self.lm_head_packed_q8 {
+                ops::gguf_q8_0_gemm(
+                    self.gpu.as_ref(),
+                    self.q8_gemm_kernel,
+                    normed,
+                    q8,
+                    logits,
+                    eff_n as u32,
+                    stream,
+                )?;
+            } else if let Some(ref fp8) = self.lm_head_fp8 {
                 for i in 0..eff_n {
                     ops::dense_gemv_fp8w(
                         self.gpu.as_ref(),
@@ -494,6 +504,9 @@ impl TransformerModel {
                     h as u32,
                     stream,
                 )?;
+            }
+            if self.config.model_type == "laguna" && self.gpu.supports_bounded_sliding_kv() {
+                self.gpu.synchronize(stream)?;
             }
             if let Some(t0) = lmhead_t0 {
                 self.gpu.synchronize(stream).ok();

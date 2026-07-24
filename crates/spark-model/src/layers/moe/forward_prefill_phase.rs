@@ -42,6 +42,31 @@ impl MoeLayer {
         let shared_gate_out = ctx.buffers.ssm_deinterleaved();
         let shared_up_out = ctx.buffers.ssm_qkvz();
         let shared_down_out = ctx.buffers.attn_output();
+        if let Some(shared) = self.q8_shared_expert {
+            let project = |activation, weight, output| {
+                if n == 1 {
+                    ops::gguf_q8_0_gemv(ctx.gpu, self.q8_gemv_k, activation, weight, output, aux)
+                } else {
+                    ops::gguf_q8_0_gemm(ctx.gpu, self.q8_gemm_k, activation, weight, output, n, aux)
+                }
+            };
+            project(input, &shared.gate_proj, shared_gate_out)?;
+            project(input, &shared.up_proj, shared_up_out)?;
+            ops::silu_mul(
+                ctx.gpu,
+                self.moe_act_mul,
+                shared_gate_out,
+                shared_up_out,
+                shared_gate_out,
+                n * shared_inter,
+                aux,
+            )?;
+            project(shared_gate_out, &shared.down_proj, shared_down_out)?;
+            if use_overlap {
+                ctx.gpu.record_event(self.event_b, aux)?;
+            }
+            return Ok(());
+        }
         if self.run_bf16_shared_expert(
             input,
             n,

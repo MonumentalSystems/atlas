@@ -64,6 +64,8 @@ impl Qwen3AttentionLayer {
         } else if let Some(q2) = self.o_weight.as_ref().and_then(|w| w.as_packed_q2()) {
             // Keep-packed Q2_0 (Tier-1c): 2-bit o_proj GEMV.
             ops::q2_0_gemv_vec(ctx.gpu, self.q2_0_gemv_k, attn_out, q2, o_out, stream)?;
+        } else if let Some(q8) = self.o_weight.as_ref().and_then(|w| w.as_packed_q8()) {
+            ops::gguf_q8_0_gemv(ctx.gpu, self.q8_gemv_k, attn_out, q8, o_out, stream)?;
         } else if let Some(fp8) = self.o_weight.as_ref().and_then(|w| w.as_fp8()) {
             ops::w8a16_gemv(
                 ctx.gpu,

@@ -137,16 +137,7 @@ impl TransformerModel {
             let token_ids_dev = self.buffers.norm_output();
             self.gpu
                 .copy_h2d_async(token_ids_bytes, token_ids_dev, stream)?;
-            ops::batched_embed(
-                self.gpu.as_ref(),
-                self.batched_embed_kernel,
-                token_ids_dev,
-                self.embed_tokens.weight,
-                prefill_hidden,
-                n_prefill as u32,
-                h as u32,
-                stream,
-            )?;
+            self.embed_batch(token_ids_dev, prefill_hidden, n_prefill as u32, stream)?;
             self.scale_embeddings(prefill_hidden, n_prefill, stream)?;
         }
 

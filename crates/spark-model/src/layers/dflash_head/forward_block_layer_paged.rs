@@ -409,9 +409,13 @@ impl BlockDiffusionDraftHead {
         //   noise K/V written here at slots [ctx_count..ctx_count+γ).
         //   Paged attention then reads the whole kv_len=ctx_count+γ range.
         // Slot mapping is provided by the caller (built once per propose).
-        let (k_pool, v_pool) = {
+        let (k_pool, v_pool, physical_blocks) = {
             let cache = self.kv_cache.lock();
-            (cache.k_pool_ptr(layer_idx), cache.v_pool_ptr(layer_idx))
+            (
+                cache.k_pool_ptr(layer_idx),
+                cache.v_pool_ptr(layer_idx),
+                cache.physical_blocks_for_layer(layer_idx) as u32,
+            )
         };
         ops::reshape_and_cache(
             gpu,
@@ -428,6 +432,7 @@ impl BlockDiffusionDraftHead {
             kv_dim,
             kv_dim,
             0,
+            physical_blocks,
             stream,
         )?;
 

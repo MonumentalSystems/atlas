@@ -29,6 +29,8 @@ mod moe;
 mod nemotron;
 #[path = "weight_map/nvfp4_detect.rs"]
 mod nvfp4_detect;
+#[path = "weight_map/packed_gguf.rs"]
+mod packed_gguf;
 #[path = "weight_map/quant_helpers.rs"]
 mod quant_helpers;
 #[path = "weight_map/quantize_fns.rs"]
@@ -52,6 +54,7 @@ pub use model_a::*;
 pub use moe::*;
 pub use nemotron::*;
 pub use nvfp4_detect::*;
+pub use packed_gguf::*;
 pub use quantize_fns::*;
 pub use quantized::*;
 pub use ssm_qwen35::*;

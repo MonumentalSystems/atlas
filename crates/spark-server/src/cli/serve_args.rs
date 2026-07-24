@@ -10,7 +10,7 @@ use std::path::PathBuf;
 #[derive(Parser, Debug)]
 pub struct ServeArgs {
     /// HuggingFace model ID (e.g. "nvidia/Qwen3-Next-80B-A3B-Instruct-NVFP4")
-    /// or a local directory path containing config.json.
+    /// or a local directory containing config.json, params.json, or a GGUF.
     #[arg(value_name = "MODEL", required_unless_present = "model_from_path")]
     pub model: Option<String>,
 

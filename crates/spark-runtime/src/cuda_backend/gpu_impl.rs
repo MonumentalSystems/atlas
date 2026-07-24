@@ -353,6 +353,10 @@ impl GpuBackend for AtlasCudaBackend {
         Ok(())
     }
 
+    fn supports_graph_capture(&self) -> bool {
+        true
+    }
+
     fn end_capture(&self, stream: u64) -> Result<GraphHandle> {
         let mut graph: u64 = 0;
         let status = unsafe { cuStreamEndCapture(stream, &mut graph) };

@@ -51,6 +51,10 @@ mod gemm_quant;
 mod gemv_q2;
 #[path = "ops/gemv_q2_vec.rs"]
 mod gemv_q2_vec;
+#[path = "ops/gguf_q4_k.rs"]
+mod gguf_q4_k;
+#[path = "ops/gguf_q8_0.rs"]
+mod gguf_q8_0;
 #[path = "ops/hyper_connection.rs"]
 mod hyper_connection;
 #[path = "ops/kv_cache.rs"]
@@ -135,6 +139,8 @@ pub use gemm_fp8_prefill::*;
 pub use gemm_quant::*;
 pub use gemv_q2::*;
 pub use gemv_q2_vec::*;
+pub use gguf_q4_k::*;
+pub use gguf_q8_0::*;
 pub use hyper_connection::*;
 pub use kv_cache::*;
 pub use kv_cache_fp8k::*;

@@ -251,16 +251,7 @@ impl TransformerModel {
             // layers read `tid2eid[token_id]` per token, in this same order.
             self.gpu
                 .copy_h2d_async(token_ids_bytes, self.buffers.token_ids(), stream)?;
-            ops::batched_embed(
-                self.gpu.as_ref(),
-                self.batched_embed_kernel,
-                token_ids_dev,
-                self.embed_tokens.weight,
-                hidden,
-                proc_count as u32,
-                h as u32,
-                stream,
-            )?;
+            self.embed_batch(token_ids_dev, hidden, proc_count as u32, stream)?;
             self.scale_embeddings(hidden, proc_count, stream)?;
         }
 

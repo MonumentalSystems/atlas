@@ -26,6 +26,7 @@ pub fn build_model(
     store: &WeightStore,
     gpu: Box<dyn GpuBackend>,
     max_batch_tokens: usize,
+    prefill_chunk_tokens: usize,
     kv_block_size: usize,
     max_seq_len: usize,
     max_batch_size: usize,
@@ -59,6 +60,17 @@ pub fn build_model(
     // encoder-decoder checkpoint). `None` = base model.
     nllb_lora_dir: Option<std::path::PathBuf>,
 ) -> Result<Box<dyn Model>> {
+    if config.model_type == "laguna" && gpu.supports_bounded_sliding_kv() {
+        super::laguna_metal::validate_profile(
+            kv_dtype,
+            max_seq_len,
+            max_batch_size,
+            prefill_chunk_tokens,
+            use_speculative,
+            dflash_args.is_some(),
+            lora_args.is_some(),
+        )?;
+    }
     // NLLB / M2M-100 is an encoder-decoder model that cannot be represented by
     // the decoder-only TransformerModel stack. Serve it with the dedicated
     // `NllbGpuModel`, which reads its weights from the standard `store` — this
@@ -160,8 +172,10 @@ pub fn build_model(
 
     let mut layers = loader.load_layers(store, &config, gpu.as_ref(), &attn_layer_dtypes)?;
     let embed = loader.load_embedding(store, &config, gpu.as_ref())?;
+    let embed_packed_q8 = loader.load_packed_q8_embedding(store)?;
     let final_norm = loader.load_final_norm(store, &config, gpu.as_ref())?;
     let lm_head = loader.load_lm_head(store, &config, gpu.as_ref())?;
+    let lm_head_packed_q8 = loader.load_packed_q8_lm_head(store)?;
     let mtp_weights = loader.load_mtp_weights_multi(store, &config, gpu.as_ref())?;
 
     // DeepSeek-V4 ships an architecturally distinct MTP module (MLA + mHC), not
@@ -241,14 +255,18 @@ pub fn build_model(
     // ── Step 3: LM-head quantization (NVFP4 / FP8 / BF16-skip) + the
     // draft-only NVFP4 head for MTP — extracted to lm_head_setup.rs
     // (file-size cap; pure code move).
-    let (lm_head_nvfp4, lm_head_fp8, mtp_lm_head_nvfp4) = super::lm_head_setup::setup_lm_heads(
-        store,
-        &lm_head,
-        &config,
-        gpu.as_ref(),
-        use_speculative,
-        !mtp_weights.is_empty(),
-    )?;
+    let (lm_head_nvfp4, lm_head_fp8, mtp_lm_head_nvfp4) = if lm_head_packed_q8.is_some() {
+        (None, None, None)
+    } else {
+        super::lm_head_setup::setup_lm_heads(
+            store,
+            &lm_head,
+            &config,
+            gpu.as_ref(),
+            use_speculative,
+            !mtp_weights.is_empty(),
+        )?
+    };
 
     // Capture the shared embed + resolved draft NVFP4 head for the DeepSeek-V4
     // MTP proposer BEFORE `embed` / `lm_head_nvfp4` / `mtp_lm_head_nvfp4` are
@@ -297,6 +315,11 @@ pub fn build_model(
     } else {
         (config.num_key_value_heads, config.head_dim)
     };
+    let layer_retention = if config.model_type == "laguna" && gpu.supports_bounded_sliding_kv() {
+        super::laguna_metal::layer_retention(&config)
+    } else {
+        vec![]
+    };
     let kv_config = KvCacheConfig {
         block_size: kv_block_size,
         num_kv_heads: kv_num_heads,
@@ -305,6 +328,8 @@ pub fn build_model(
         dtype: kv_dtype,
         layer_dtypes: layer_dtypes.clone(),
         layer_dims: config.kv_layer_dims.clone(),
+        layer_retention,
+        prefill_chunk_tokens,
         cache_blocks_per_seq: hss_cache_blocks_per_seq,
     };
 
@@ -323,7 +348,7 @@ pub fn build_model(
     // clamp ensures we never exceed what the device can physically provide
     // right now (handles external memory pressure on shared-memory /
     // unified-memory systems like GB10).
-    let total_mem = gpu.total_memory()?;
+    let total_mem = gpu.allocation_capacity()?;
     let actual_free = gpu.free_memory()?;
     let gib = |b: usize| b as f64 / (1024.0 * 1024.0 * 1024.0);
     let mut used_so_far = total_mem.saturating_sub(actual_free);
@@ -437,6 +462,29 @@ pub fn build_model(
             );
             n
         }
+        None if config.model_type == "laguna" && gpu.supports_bounded_sliding_kv() => {
+            let n = max_seq_len
+                .div_ceil(kv_block_size)
+                .checked_mul(max_batch_size)
+                .ok_or_else(|| anyhow::anyhow!("Laguna KV logical block count overflow"))?;
+            let resident_bytes = kv_config.resident_bytes_for_blocks(n)?;
+            if resident_bytes > kv_budget {
+                anyhow::bail!(
+                    "Laguna Metal KV cache requires {:.2} GiB for {} context tokens, but only {:.2} GiB is available inside the configured working-set budget",
+                    resident_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+                    max_seq_len,
+                    kv_budget as f64 / (1024.0 * 1024.0 * 1024.0),
+                );
+            }
+            tracing::info!(
+                "Laguna Metal KV cache: {} logical blocks × {} tok/block = {} max KV tokens; {:.2} GiB exact mixed-retention resident bytes",
+                n,
+                kv_block_size,
+                n * kv_block_size,
+                resident_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+            );
+            n
+        }
         None => {
             if kv_budget == 0 {
                 anyhow::bail!(
@@ -529,6 +577,9 @@ pub fn build_model(
         }
     }
     let kv_cache = PagedKvCache::new(kv_config, num_kv_blocks, gpu.as_ref())?;
+    if config.model_type == "laguna" && gpu.supports_bounded_sliding_kv() {
+        super::laguna_metal::audit_post_allocation(gpu.as_ref())?;
+    }
 
     // ── Step 6: Assemble model ──
     // Capture pointers for any post-construction sharing (DFlash drafter
@@ -544,8 +595,10 @@ pub fn build_model(
     let mut model = TransformerModel::new(
         config,
         embed,
+        embed_packed_q8,
         final_norm,
         lm_head,
+        lm_head_packed_q8,
         lm_head_nvfp4,
         lm_head_fp8,
         mtp_lm_head_nvfp4,

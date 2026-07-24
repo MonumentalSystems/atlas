@@ -304,6 +304,7 @@ impl MtpHead {
                 kv_stride,
                 kv_stride,
                 kv_cache.cache_stride() as u64,
+                kv_cache.physical_blocks_for_layer(self.attn_layer_idx) as u32,
                 stream,
             )?;
             ops::paged_decode_attn_bf16(
@@ -324,6 +325,7 @@ impl MtpHead {
                 inv_sqrt_d,
                 nq * hd, // q_stride
                 0,       // sliding_window (full attention)
+                kv_cache.physical_blocks_for_layer(self.attn_layer_idx) as u32,
                 stream,
             )?;
         } else {

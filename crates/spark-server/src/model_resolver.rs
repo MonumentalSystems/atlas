@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 //! Resolves a model specifier (HuggingFace ID or local path) to a
-//! validated directory containing `config.json` and weight files.
+//! validated directory containing a model config source and weight files.
 
 use std::path::{Path, PathBuf};
 
@@ -10,7 +10,8 @@ use anyhow::{Context, Result, bail};
 /// Resolve a model specifier to a local directory path.
 ///
 /// Resolution order:
-/// 1. If the specifier is an existing directory with `config.json`, use it directly.
+/// 1. If the specifier is an existing directory with `config.json` or a bare
+///    GGUF, use it directly.
 /// 2. Otherwise, treat it as a HuggingFace model ID and look up the local cache.
 pub fn resolve_model_dir(model: &str, cache_dir: Option<&Path>) -> Result<PathBuf> {
     let as_path = Path::new(model);
@@ -71,9 +72,12 @@ fn resolve_from_hf_cache(model_id: &str, cache_dir: Option<&Path>) -> Result<Pat
         );
     }
 
-    if !snapshot_dir.join("config.json").exists() && !snapshot_dir.join("params.json").exists() {
+    if !snapshot_dir.join("config.json").exists()
+        && !snapshot_dir.join("params.json").exists()
+        && spark_runtime::weights::find_gguf(&snapshot_dir).is_none()
+    {
         bail!(
-            "Model directory exists but is missing config.json or params.json: {}\n\
+            "Model directory exists but is missing config.json, params.json, or a GGUF: {}\n\
              The download may be incomplete.",
             snapshot_dir.display(),
         );
@@ -331,6 +335,29 @@ mod tests {
         let result = resolve_model_dir(tmp.path().to_str().unwrap(), None);
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), tmp.path());
+    }
+
+    #[test]
+    fn resolve_local_bare_gguf_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("laguna-s-2.1-Q4_K_M.gguf"), b"GGUF").unwrap();
+
+        let result = resolve_model_dir(tmp.path().to_str().unwrap(), None);
+        assert_eq!(result.unwrap(), tmp.path());
+    }
+
+    #[test]
+    fn resolve_hf_cached_bare_gguf_snapshot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let model_cache = tmp.path().join("models--poolside--Laguna-S-2.1-GGUF");
+        let snapshot = model_cache.join("snapshots/abc123");
+        fs::create_dir_all(&snapshot).unwrap();
+        fs::create_dir_all(model_cache.join("refs")).unwrap();
+        fs::write(model_cache.join("refs/main"), "abc123").unwrap();
+        fs::write(snapshot.join("laguna-s-2.1-Q4_K_M.gguf"), b"GGUF").unwrap();
+
+        let result = resolve_model_dir("poolside/Laguna-S-2.1-GGUF", Some(tmp.path()));
+        assert_eq!(result.unwrap(), snapshot);
     }
 
     #[test]

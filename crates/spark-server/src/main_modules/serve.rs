@@ -123,7 +123,11 @@ pub(crate) async fn serve(mut args: cli::ServeArgs) -> Result<()> {
     // before any weight loading runs and any silent garbage path can
     // be entered. A future refinement moves the compat list into
     // MODEL.toml `[kernel].supported_quants`.
-    let model_quant = canonicalize_model_quant(&config);
+    let bare_gguf_path = config_json
+        .is_empty()
+        .then(|| spark_runtime::weights::find_gguf(&model_dir))
+        .flatten();
+    let model_quant = canonicalize_model_quant(&config, bare_gguf_path.as_deref());
     let kernel_quant = ptx_set.target.quant;
     if !quant_pair_compatible(kernel_quant, &model_quant) {
         anyhow::bail!(
@@ -134,7 +138,7 @@ pub(crate) async fn serve(mut args: cli::ServeArgs) -> Result<()> {
              Rebuild with ATLAS_TARGET_QUANT={model_quant} (or =* to bundle multiple \
              variants) and restart.",
             ptx_set.target,
-            describe_quant_source(&config),
+            describe_quant_source(&config, bare_gguf_path.as_deref()),
         );
     }
     tracing::info!(
@@ -212,8 +216,52 @@ pub(crate) async fn serve(mut args: cli::ServeArgs) -> Result<()> {
     };
 
     // 3. Load model weights
-    let oom_reserve_bytes = args.oom_guard_mb * 1024 * 1024;
-    tracing::info!("OOM guard reserve: {} MB", args.oom_guard_mb);
+    let configured_oom_guard_bytes = args.oom_guard_mb * 1024 * 1024;
+    #[cfg(all(feature = "metal", not(feature = "cuda")))]
+    let oom_reserve_bytes = if config.model_type == "laguna" {
+        const LAGUNA_METAL_SAFETY_BYTES: usize = 5 * 1024 * 1024 * 1024;
+        let effective_kv_dtype =
+            if args.kv_cache_dtype == "fp8" && !ptx_set.behavior.default_kv_dtype.is_empty() {
+                ptx_set.behavior.default_kv_dtype
+            } else {
+                &args.kv_cache_dtype
+            };
+        spark_model::factory::laguna_metal::validate_profile(
+            effective_kv_dtype.parse()?,
+            args.max_seq_len,
+            args.max_batch_size,
+            max_batch_tokens_pre,
+            args.speculative || args.self_speculative || args.ngram_speculative,
+            args.dflash,
+            !args.lora_adapter.is_empty(),
+        )?;
+        let kv_bytes = spark_model::factory::laguna_metal::requested_kv_resident_bytes(
+            &config,
+            args.block_size,
+            args.max_seq_len,
+            args.max_batch_size,
+            max_batch_tokens_pre,
+        )?;
+        let exact_runtime_reserve = total_reserve
+            .checked_add(kv_bytes)
+            .and_then(|bytes| bytes.checked_add(LAGUNA_METAL_SAFETY_BYTES))
+            .context("Laguna Metal runtime reserve overflow")?;
+        tracing::info!(
+            "Laguna Metal loading reserve: {:.2} GiB arena/runtime + {:.2} GiB exact BF16 KV + 5.00 GiB safety = {:.2} GiB",
+            total_reserve as f64 / (1024.0 * 1024.0 * 1024.0),
+            kv_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+            exact_runtime_reserve as f64 / (1024.0 * 1024.0 * 1024.0),
+        );
+        configured_oom_guard_bytes.max(exact_runtime_reserve)
+    } else {
+        configured_oom_guard_bytes
+    };
+    #[cfg(any(feature = "cuda", not(feature = "metal")))]
+    let oom_reserve_bytes = configured_oom_guard_bytes;
+    tracing::info!(
+        "OOM loading/runtime reserve: {:.2} GiB",
+        oom_reserve_bytes as f64 / (1024.0 * 1024.0 * 1024.0)
+    );
     let store = serve_phases::load_weight_store(
         &args,
         &config,
@@ -442,6 +490,7 @@ pub(crate) async fn serve(mut args: cli::ServeArgs) -> Result<()> {
         &store,
         gpu,
         max_batch_tokens,
+        prefill_budget,
         kv_dtype,
         inference_reserve,
         layer_dtypes,
@@ -1007,9 +1056,21 @@ fn resolve_vision_max_pixels(args: &cli::ServeArgs) -> Result<Option<usize>> {
 /// the heuristics needed across ModelOpt + compressed-tensors checkpoints.
 /// Returns `"bf16"` when no quant config is present (the HF default for
 /// unquantized BF16 weights).
-fn canonicalize_model_quant(config: &atlas_core::config::ModelConfig) -> String {
+fn canonicalize_model_quant(
+    config: &atlas_core::config::ModelConfig,
+    bare_gguf_path: Option<&std::path::Path>,
+) -> String {
     let Some(qc) = config.quantization_config.as_ref() else {
-        return "bf16".to_string();
+        return bare_gguf_path
+            .and_then(std::path::Path::file_name)
+            .and_then(std::ffi::OsStr::to_str)
+            .and_then(serve_phases::canonicalize_gguf_filename_quant)
+            .unwrap_or(if bare_gguf_path.is_some() {
+                "unknown"
+            } else {
+                "bf16"
+            })
+            .to_string();
     };
     let method = qc.quant_method.to_ascii_lowercase();
     let algo = qc.quant_algo.to_ascii_lowercase();
@@ -1057,13 +1118,24 @@ fn canonicalize_model_quant(config: &atlas_core::config::ModelConfig) -> String 
 /// QV1 helper: short debug string of where the quant declaration came
 /// from, used in the bail message so the operator can locate the
 /// mis-declared field quickly.
-fn describe_quant_source(config: &atlas_core::config::ModelConfig) -> String {
+fn describe_quant_source(
+    config: &atlas_core::config::ModelConfig,
+    bare_gguf_path: Option<&std::path::Path>,
+) -> String {
     match config.quantization_config.as_ref() {
         Some(qc) => format!(
             "quant_method={:?}, quant_algo={:?}, format={:?}",
             qc.quant_method, qc.quant_algo, qc.format
         ),
-        None => "no quantization_config in config.json".into(),
+        None => bare_gguf_path.map_or_else(
+            || "no quantization_config in config.json".into(),
+            |path| {
+                format!(
+                    "bare GGUF filename={:?}",
+                    path.file_name().unwrap_or_default()
+                )
+            },
+        ),
     }
 }
 
@@ -1127,5 +1199,11 @@ mod qv1_tests {
     fn incompat_unknown_rejected() {
         assert!(!quant_pair_compatible("nvfp4", "gptq-4bit"));
         assert!(!quant_pair_compatible("fp8", "nvfp4"));
+    }
+
+    #[test]
+    fn incompatible_gguf_quant_rejected() {
+        assert!(!quant_pair_compatible("gguf_q4_k_m", "gguf_q8_0"));
+        assert!(!quant_pair_compatible("gguf_q4_k_m", "gguf_f16"));
     }
 }

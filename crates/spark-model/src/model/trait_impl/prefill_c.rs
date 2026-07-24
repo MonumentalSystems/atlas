@@ -115,16 +115,7 @@ impl TransformerModel {
             let token_ids_dev = self.buffers.scratch();
             self.gpu
                 .copy_h2d_async(token_ids_bytes, token_ids_dev, stream)?;
-            ops::batched_embed(
-                self.gpu.as_ref(),
-                self.batched_embed_kernel,
-                token_ids_dev,
-                self.embed_tokens.weight,
-                hidden,
-                total_len as u32,
-                h as u32,
-                stream,
-            )?;
+            self.embed_batch(token_ids_dev, hidden, total_len as u32, stream)?;
             self.scale_embeddings(hidden, total_len, stream)?;
         }
 
@@ -266,16 +257,7 @@ impl TransformerModel {
             let token_ids_dev = self.buffers.scratch();
             self.gpu
                 .copy_h2d_async(token_ids_bytes, token_ids_dev, stream)?;
-            ops::batched_embed(
-                self.gpu.as_ref(),
-                self.batched_embed_kernel,
-                token_ids_dev,
-                self.embed_tokens.weight,
-                hidden,
-                proc_count as u32,
-                h as u32,
-                stream,
-            )?;
+            self.embed_batch(token_ids_dev, hidden, proc_count as u32, stream)?;
             self.scale_embeddings(hidden, proc_count, stream)?;
         }
 

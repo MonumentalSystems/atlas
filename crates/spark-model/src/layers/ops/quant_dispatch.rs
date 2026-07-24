@@ -51,6 +51,9 @@ pub fn quant_gemv(
         QuantWeight::PackedQ2(_) => anyhow::bail!(
             "quant_gemv: PackedQ2 not routed through the generic dispatcher; use q2_0_gemv_vec"
         ),
+        QuantWeight::PackedQ8(_) => {
+            anyhow::bail!("quant_gemv: PackedQ8 requires the GGUF Q8_0 dispatcher")
+        }
         // Keep-packed K-quants are routed through the MoE keep-packed prefill
         // arm (per-expert Q4_K MMQ / Q6_K dequant-scratch), never this helper.
         QuantWeight::PackedQ4(_) | QuantWeight::PackedQ6(_) => anyhow::bail!(
@@ -97,6 +100,9 @@ pub fn quant_gemm(
             "quant_gemm: PackedQ2 not routed through the generic dispatcher; \
              use the layer's transient-dequant prefill path"
         ),
+        QuantWeight::PackedQ8(_) => {
+            anyhow::bail!("quant_gemm: PackedQ8 requires the GGUF Q8_0 dispatcher")
+        }
         QuantWeight::PackedQ4(_) | QuantWeight::PackedQ6(_) => anyhow::bail!(
             "quant_gemm: PackedQ4/Q6 not routed through the generic dispatcher; \
              use the MoE keep-packed prefill arm"

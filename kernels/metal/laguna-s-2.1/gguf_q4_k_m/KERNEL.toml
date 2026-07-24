@@ -1,0 +1,6 @@
+[build]
+# Laguna uses the shared Metal kernel set. Target-specific kernels can be
+# added here without changing target registration or behavior metadata.
+extra_metal_flags = []
+
+[modules]

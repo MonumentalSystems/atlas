@@ -555,6 +555,7 @@ impl Qwen3AttentionLayer {
                     inv_sqrt_d,
                     q_stride,
                     sliding,
+                    kv_cache.physical_blocks_for_layer(self.attn_layer_idx) as u32,
                     stream,
                 )
             }

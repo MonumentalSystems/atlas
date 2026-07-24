@@ -497,6 +497,7 @@ impl Qwen3AttentionLayer {
             d.inv_sqrt_d,
             d.nq * d.mla_cache_dim,
             0,
+            kv_cache.physical_blocks_for_layer(self.attn_layer_idx) as u32,
             stream,
         )?;
 

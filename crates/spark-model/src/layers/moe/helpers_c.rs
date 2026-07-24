@@ -127,6 +127,19 @@ impl MoeLayer {
         Ok(())
     }
 
+    pub fn set_q8_shared_expert(
+        &mut self,
+        gate_proj: crate::weight_map::PackedQ8Weight,
+        up_proj: crate::weight_map::PackedQ8Weight,
+        down_proj: crate::weight_map::PackedQ8Weight,
+    ) {
+        self.q8_shared_expert = Some(crate::weight_map::PackedQ8SharedExpert {
+            gate_proj,
+            up_proj,
+            down_proj,
+        });
+    }
+
     /// Whether a BF16 shared expert must overwrite the contribution produced
     /// by a quantized fused routed-expert kernel.
     pub(super) fn has_mixed_bf16_shared_expert(&self) -> bool {

@@ -217,6 +217,7 @@ pub fn prefill_attention_paged(
     cache_block_size: u32,
     sliding_window: u32,
     inv_sqrt_d: f32,
+    physical_blocks: u32,
     stream: u64,
 ) -> Result<()> {
     let br = 32u32;
@@ -240,6 +241,7 @@ pub fn prefill_attention_paged(
         // pass 0 via dedicated dispatchers (`prefill_attention_paged_dflash_*`).
         .arg_u32(1u32)
         .arg_f32(inv_sqrt_d)
+        .arg_u32(physical_blocks)
         .launch(stream)
 }
 

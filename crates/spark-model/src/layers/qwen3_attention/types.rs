@@ -60,7 +60,7 @@ pub struct Qwen3AttentionLayer {
     /// Shape: [num_q_heads, hidden_size] BF16. Applied as:
     /// attn_out = attn_out * sigmoid(g_proj @ hidden_states)
     /// with broadcast over head_dim.
-    pub(crate) head_gate_weight: Option<DenseWeight>,
+    pub(crate) head_gate_weight: Option<QuantWeight>,
     pub(crate) head_gate_activation: HeadGateActivation,
     /// Kernel handle for per-head sigmoid gate broadcast multiply.
     pub(super) sigmoid_gate_head_broadcast_k: KernelHandle,
@@ -146,6 +146,8 @@ pub struct Qwen3AttentionLayer {
     /// Gemma-4 FP32-input rms_norm (absolute formula).
     pub(super) rms_norm_f32_in_k: KernelHandle,
     pub(super) dense_gemv_k: KernelHandle,
+    pub(super) q8_gemv_k: KernelHandle,
+    pub(super) q8_gemm_k: KernelHandle,
     /// Batched BF16 GEMV (M rows, one weight pass). Multi-seq decode q/k/v for
     /// models whose attention weights are plain BF16 -- the quantized paths have
     /// w4a16/w8a16 batch tiers, BF16 had none.

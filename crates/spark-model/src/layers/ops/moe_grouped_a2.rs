@@ -138,15 +138,21 @@ pub fn moe_batched_blend(
     num_tokens: u32,
     stream: u64,
 ) -> Result<()> {
+    // Metal cannot bind a null MTLBuffer. Keep absence explicit in the ABI and
+    // bind an already-valid buffer for the ignored pointer slot. CUDA receives
+    // the same flag, eliminating backend-specific null-pointer semantics.
+    let has_gate = !gate_weight.is_null();
+    let bound_gate_weight = if has_gate { gate_weight } else { normed };
     KernelLaunch::new(gpu, kernel)
         .grid([num_tokens, 1, 1])
         .block([256, 1, 1])
         .arg_ptr(output)
         .arg_ptr(shared_out)
         .arg_ptr(normed)
-        .arg_ptr(gate_weight)
+        .arg_ptr(bound_gate_weight)
         .arg_u32(hidden_size)
         .arg_u32(num_tokens)
+        .arg_u32(u32::from(has_gate))
         .launch(stream)
 }
 

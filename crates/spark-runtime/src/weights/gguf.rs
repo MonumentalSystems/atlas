@@ -26,6 +26,7 @@ mod config;
 mod container;
 mod dequant_cpu;
 mod dequant_gpu;
+mod memory;
 mod names;
 mod sidecar;
 mod value_transform;
@@ -84,8 +85,7 @@ fn q2_group_usize() -> usize {
 /// (its 256 routed experts are the whole ~219GB BF16 mass that would otherwise
 /// OOM a 128GB GB10); also opt-in for any MoE GGUF via `ATLAS_GGUF_KEEP_PACKED_MOE=1`.
 fn keep_packed_experts_enabled(arch: &str) -> bool {
-    arch == "laguna"
-        || std::env::var("ATLAS_GGUF_KEEP_PACKED_MOE").ok().as_deref() == Some("1")
+    arch == "laguna" || std::env::var("ATLAS_GGUF_KEEP_PACKED_MOE").ok().as_deref() == Some("1")
 }
 
 /// Map a group size to the container's `Q2Group` (for on-disk byte sizing).
@@ -109,8 +109,15 @@ pub struct GgufLoader {
     pub ep_world_size: usize,
     /// Total number of MoE experts in the model (for EP partitioning).
     pub num_experts: usize,
-    /// Override for the peak-memory multiplier in the pre-flight OOM check.
+    /// Legacy compatibility field. GGUF admission uses exact resident and
+    /// single-tensor transient bytes rather than a multiplicative heuristic.
     pub peak_memory_multiplier: Option<f64>,
+}
+
+struct PackedExpertSpec<'a> {
+    layer: usize,
+    proj: &'a str,
+    ggml_type_id: u32,
 }
 
 impl Default for GgufLoader {
@@ -202,22 +209,20 @@ impl GgufLoader {
         weights: &mut HashMap<String, WeightTensor>,
         base_ptr: DevicePtr,
         shape: &[usize],
-        layer: usize,
-        proj: &str,
-        id: u32,
+        spec: PackedExpertSpec<'_>,
         skipped: &mut usize,
     ) -> Result<()> {
         let count = *shape
             .first()
             .context("stacked expert tensor has no leading expert dimension")?;
         let per_elems: usize = shape[1..].iter().product();
-        let (block_bytes, dtype) = match id {
+        let (block_bytes, dtype) = match spec.ggml_type_id {
             12 => (144usize, WeightDtype::PackedQ4K),
             14 => (210usize, WeightDtype::PackedQ6K),
             other => bail!("emit_experts_packed: unexpected ggml id {other} (want 12 or 14)"),
         };
         anyhow::ensure!(
-            per_elems % 256 == 0,
+            per_elems.is_multiple_of(256),
             "keep-packed expert per_elems {per_elems} not a multiple of 256 (K-quant super-block)"
         );
         let per_bytes = (per_elems / 256) * block_bytes;
@@ -228,7 +233,7 @@ impl GgufLoader {
                 continue;
             }
             let ptr = base_ptr.offset(e * per_bytes);
-            let name = names::expert_name(layer, proj, e);
+            let name = names::expert_name(spec.layer, spec.proj, e);
             weights.insert(
                 name,
                 WeightTensor {
@@ -253,7 +258,7 @@ fn dequant_to_device(
     q2_group: usize,
     force_cpu: bool,
 ) -> Result<DevicePtr> {
-    if !force_cpu && dequant_gpu::supports(id) {
+    if !force_cpu && dequant_gpu::supports(id) && dequant_gpu::available(gpu, id) {
         let q_ptr = gpu.alloc(raw.len())?;
         gpu.copy_h2d(raw, q_ptr)?;
         let bf16_ptr = dequant_gpu::to_bf16(gpu, id, q_ptr, num_elements, q2_group)
@@ -270,41 +275,6 @@ fn dequant_to_device(
     } else {
         bail!("No GPU or CPU dequant available for ggml type {id}");
     }
-}
-
-/// Pre-flight: estimate the total BF16 footprint (dequant expands quantized
-/// blocks) and bail before allocating if it won't fit under the reserve.
-fn preflight_oom(
-    gpu: &dyn GpuBackend,
-    est_bf16_bytes: usize,
-    reserve_bytes: usize,
-    multiplier: Option<f64>,
-) -> Result<()> {
-    // Small transient overhead: the raw quantized scratch buffer coexists with
-    // its BF16 output for one tensor at a time (freed immediately after).
-    let overhead = multiplier.unwrap_or(1.1);
-    let peak = (est_bf16_bytes as f64 * overhead) as usize;
-    let free = gpu.free_memory()?;
-    let gb = |b: usize| b as f64 / (1024.0 * 1024.0 * 1024.0);
-    tracing::info!(
-        "GGUF pre-flight: ~{:.2} GB BF16 after dequant, {:.1}x overhead = {:.2} GB peak, \
-         {:.2} GB free, {:.1} GB reserve",
-        gb(est_bf16_bytes),
-        overhead,
-        gb(peak),
-        gb(free),
-        gb(reserve_bytes),
-    );
-    if peak + reserve_bytes > free {
-        bail!(
-            "Pre-flight OOM: GGUF dequant to BF16 needs ~{:.2} GB peak + {:.1} GB reserve, \
-             only {:.2} GB free. Use a smaller model or lower --oom-guard-mb.",
-            gb(peak),
-            gb(reserve_bytes),
-            gb(free),
-        );
-    }
-    Ok(())
 }
 
 impl super::WeightLoader for GgufLoader {
@@ -377,12 +347,35 @@ impl super::WeightLoader for GgufLoader {
                 .to_lowercase()
         });
 
-        // Pre-flight: combined BF16 footprint of both files.
-        let mut est = sidecar::est_bf16(&bb_gguf, &arch, keep_packed_experts);
+        // Pre-flight: exact combined resident bytes plus the largest raw tensor
+        // that can coexist with them while one tensor is being loaded.
+        let mut footprint =
+            sidecar::memory_footprint(&bb_gguf, &arch, keep_packed_experts, q2_variant)?;
         if let (Some((_, _, mm_gguf)), Some(mm_arch)) = (mmproj.as_ref(), mmproj_arch.as_ref()) {
-            est += sidecar::est_bf16(mm_gguf, mm_arch, false);
+            let mm_footprint = sidecar::memory_footprint(mm_gguf, mm_arch, false, q2_variant)?;
+            footprint.resident_bytes = footprint
+                .resident_bytes
+                .checked_add(mm_footprint.resident_bytes)
+                .context("combined GGUF resident byte total overflow")?;
+            footprint.max_tensor_transient_bytes = footprint
+                .max_tensor_transient_bytes
+                .max(mm_footprint.max_tensor_transient_bytes);
         }
-        preflight_oom(gpu, est, oom_reserve_bytes, self.peak_memory_multiplier)?;
+        let guard_bytes = memory::effective_guard_bytes(&arch, oom_reserve_bytes);
+        if guard_bytes != oom_reserve_bytes {
+            tracing::info!(
+                "Laguna GGUF requires at least 5 GiB post-load headroom; raising the \
+                 configured guard from {:.2} GiB to {:.2} GiB",
+                oom_reserve_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+                guard_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+            );
+        }
+        memory::preflight_oom(
+            gpu,
+            footprint.resident_bytes,
+            footprint.max_tensor_transient_bytes,
+            guard_bytes,
+        )?;
 
         let mut weights: HashMap<String, WeightTensor> = HashMap::new();
         let mut skipped = 0usize;
@@ -390,9 +383,10 @@ impl super::WeightLoader for GgufLoader {
         // Read tensor DATA through the fast safetensors loader's shared O_DIRECT
         // + pipelined reader (`fast_weights::direct_io`) instead of demand-
         // faulting mmap pages — the mmap path is NFS-latency-bound (~150MB/s),
-        // O_DIRECT streams at ~link bandwidth. The mmap stays for cheap metadata
-        // parsing only. `open_direct` falls back to a plain fd if O_DIRECT is
-        // unavailable (macOS / unsupported fs), so this is always safe.
+        // O_DIRECT streams at ~link bandwidth. On macOS the same helper uses
+        // F_NOCACHE so a 68+ GB load does not churn the unified file cache. The
+        // mmap stays for cheap metadata parsing only; unsupported platforms
+        // fall back to the bounded mmap path.
         #[cfg(unix)]
         let data_file: Option<std::fs::File> =
             crate::fast_weights::direct_io::open_direct(&path).ok();
@@ -457,7 +451,7 @@ impl super::WeightLoader for GgufLoader {
         if skipped > 0 {
             tracing::info!("EP: skipped {} remote expert slices", skipped);
         }
-        check_oom_guard(gpu, oom_reserve_bytes, "weight loading (GGUF)")?;
+        check_oom_guard(gpu, guard_bytes, "weight loading (GGUF)")?;
         tracing::info!("Loaded {} weight tensors (GGUF → BF16)", weights.len());
         Ok(WeightStore::from_map(weights))
     }

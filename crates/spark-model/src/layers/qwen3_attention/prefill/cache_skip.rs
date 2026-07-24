@@ -732,7 +732,7 @@ impl Qwen3AttentionLayer {
         // ── 9b. Per-head attention gate (Step 3.7 g_proj) ──
         // g_proj produces one scalar per head from the normed hidden states.
         // Applied as: attn_out = attn_out * sigmoid(gate).broadcast_over(hd)
-        if let Some(ref g_proj) = self.head_gate_weight {
+        if self.head_gate_weight.is_some() {
             // Reuse q_contiguous as scratch for gate output [n, nq] BF16.
             // Q buffer is no longer needed after flash attention.
             let gate_buf = q_contiguous;
@@ -742,21 +742,7 @@ impl Qwen3AttentionLayer {
             // through the same cuBLASLt path q/k/v/o use (bf16_gemm_act_weight_t),
             // which handles small N better (~2.5% C=1 prefill, A/B ISL 1024/8192);
             // dense_gemm_tc stays as the fallback when cuBLAS is off.
-            if ops::cublas_gemm_enabled() {
-                ops::cublas_bf16_proj_dense(normed, g_proj.weight, gate_buf, n, nq, h, stream)?;
-            } else {
-                ops::dense_gemm_tc(
-                    ctx.gpu,
-                    self.dense_gemm_tc_k,
-                    normed,
-                    g_proj,
-                    gate_buf,
-                    n,
-                    nq,
-                    h,
-                    stream,
-                )?;
-            }
+            self.project_head_gate(ctx.gpu, normed, gate_buf, n, nq, h, stream)?;
             // Sigmoid + broadcast multiply: attn_out[t,h,d] *= sigmoid(gate[t,h])
             match self.head_gate_activation {
                 super::super::types::HeadGateActivation::Sigmoid => {

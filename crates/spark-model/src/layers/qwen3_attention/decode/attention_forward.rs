@@ -109,6 +109,18 @@ impl Qwen3AttentionLayer {
                     nq * hd * 2,
                     stream,
                 )?;
+            } else if let Some(q8) = self.q_weight.as_ref().and_then(|w| w.as_packed_q8()) {
+                ops::gguf_q8_0_gemv(ctx.gpu, self.q8_gemv_k, normed, q8, q_out, stream)?;
+                ops::deinterleave_qg(
+                    ctx.gpu,
+                    self.deinterleave_qg_k,
+                    q_out,
+                    1,
+                    nq,
+                    hd,
+                    nq * hd * 2,
+                    stream,
+                )?;
             } else if let Some(fp8) = self.q_weight.as_ref().and_then(|w| w.as_fp8()) {
                 // FP8 native: w8a16_gemv + separate deinterleave (no fused QG variant yet)
                 ops::w8a16_gemv(
@@ -202,6 +214,8 @@ impl Qwen3AttentionLayer {
             // Ungated: Q projection only (no gate)
             if let Some(q2) = self.q_weight.as_ref().and_then(|w| w.as_packed_q2()) {
                 ops::q2_0_gemv_vec(ctx.gpu, self.q2_0_gemv_k, normed, q2, q_out, stream)?;
+            } else if let Some(q8) = self.q_weight.as_ref().and_then(|w| w.as_packed_q8()) {
+                ops::gguf_q8_0_gemv(ctx.gpu, self.q8_gemv_k, normed, q8, q_out, stream)?;
             } else if let Some(fp8) = self.q_weight.as_ref().and_then(|w| w.as_fp8()) {
                 ops::w8a16_gemv(
                     ctx.gpu,
@@ -682,39 +696,14 @@ impl Qwen3AttentionLayer {
 
         // Per-head attention gate (Step 3.7 g_proj) — decode path.
         // Same logic as prefill: gate[h] = g_proj(normed), apply sigmoid broadcast.
-        if let Some(ref g_proj) = self.head_gate_weight {
+        if self.head_gate_weight.is_some() {
             // For decode, n=1 (single token). Reuse q_out scratch for gate [1, nq].
             let gate_buf = q_out;
             // N = nq = 72, so dense_gemm_tc's grid (ceil(N/64) x ceil(M/16)) is
             // TWO CTAs on a 48-SM part, latency-bound over a K=3072 loop. The
             // batched GEMV grids at ceil(N/4) with coalesced uint4 loads and is
             // bit-identical to dense_gemv_bf16 at M=1.
-            if self.dense_gemv_batchm_k.0 != 0 {
-                ops::dense_gemv_batchm(
-                    ctx.gpu,
-                    self.dense_gemv_batchm_k,
-                    normed,
-                    g_proj,
-                    gate_buf,
-                    1, // decode: single token
-                    nq,
-                    h,
-                    nq, // one row, stride unused
-                    stream,
-                )?;
-            } else {
-                ops::dense_gemm_tc(
-                    ctx.gpu,
-                    self.dense_gemm_tc_k,
-                    normed,
-                    g_proj,
-                    gate_buf,
-                    1, // decode: single token
-                    nq,
-                    h,
-                    stream,
-                )?;
-            }
+            self.project_head_gate(ctx.gpu, normed, gate_buf, 1, nq, h, stream)?;
             match self.head_gate_activation {
                 super::super::types::HeadGateActivation::Sigmoid => {
                     ops::sigmoid_gate_mul_head_broadcast(

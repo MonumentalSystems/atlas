@@ -197,7 +197,6 @@ fn main() {
     }
     let compute_target = resolve_compute_target(vendor_str);
     let output_ext = compute_target.output_extension();
-    let uses_cuda_api = compute_target.uses_cuda_module_api();
 
     // Per-target: (target_idx, vec of (stem, module_name))
     let mut all_target_modules: Vec<Vec<(String, String)>> = Vec::new();
@@ -450,8 +449,7 @@ fn main() {
     }
 
     // ── Generate target_ptx.rs ──
-    let generated =
-        generate_target_ptx_rs(&targets, &all_target_modules, output_ext, uses_cuda_api);
+    let generated = generate_target_ptx_rs(&targets, &all_target_modules, output_ext);
     let gen_path = out_dir.join("target_ptx.rs");
     std::fs::write(&gen_path, &generated)
         .unwrap_or_else(|e| panic!("Failed to write {}: {e}", gen_path.display()));

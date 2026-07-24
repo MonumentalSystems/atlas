@@ -20,6 +20,9 @@ impl GgufMeta for GgufFile {
     fn get_u64(&self, key: &str) -> Option<u64> {
         GgufFile::get_u64(self, key)
     }
+    fn get_u64_array(&self, key: &str) -> Option<Vec<u64>> {
+        GgufFile::get_u64_array(self, key)
+    }
     fn get_f64(&self, key: &str) -> Option<f64> {
         GgufFile::get_f64(self, key)
     }
@@ -102,5 +105,27 @@ mod tests {
         assert_eq!(m.get_u64("qwen3.block_count"), Some(28));
         assert_eq!(m.get_arr_len("tokenizer.ggml.tokens"), Some(3));
         assert_eq!(m.get_str("nonexistent"), None);
+    }
+
+    #[test]
+    fn gguf_meta_bridge_forwards_integer_arrays() {
+        let gguf = GgufFile {
+            version: 3,
+            metadata: vec![(
+                "laguna.attention.head_count".into(),
+                super::super::container::MetaValue::Array(vec![
+                    super::super::container::MetaValue::U32(48),
+                    super::super::container::MetaValue::U64(72),
+                ]),
+            )],
+            tensors: vec![],
+            alignment: 32,
+            data_offset: 0,
+        };
+        let m: &dyn GgufMeta = &gguf;
+        assert_eq!(
+            m.get_u64_array("laguna.attention.head_count"),
+            Some(vec![48, 72])
+        );
     }
 }

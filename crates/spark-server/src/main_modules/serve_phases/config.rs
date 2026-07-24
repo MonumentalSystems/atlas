@@ -89,6 +89,24 @@ pub(crate) fn resolve_model_dir(args: &cli::ServeArgs) -> Result<std::path::Path
     }
 }
 
+/// Canonicalize a terminal GGUF filename quant tag without inspecting model
+/// contents or accepting a quant marker embedded elsewhere in the name.
+///
+/// This deliberately recognizes only formats with an Atlas launch-policy
+/// decision. Unknown tags return `None`, so the pre-load compatibility guard
+/// fails closed instead of treating a quantized bare GGUF as BF16.
+pub(crate) fn canonicalize_gguf_filename_quant(filename: &str) -> Option<&'static str> {
+    if filename.ends_with("-Q4_K_M.gguf") {
+        Some("gguf_q4_k_m")
+    } else if filename.ends_with("-Q8_0.gguf") {
+        Some("gguf_q8_0")
+    } else if filename.ends_with("-F16.gguf") {
+        Some("gguf_f16")
+    } else {
+        None
+    }
+}
+
 pub(crate) fn cap_vocab_size_to_tokenizer(model_dir: &Path, config: &mut ModelConfig) {
     let tok_path = model_dir.join("tokenizer.json");
     if tok_path.exists()
@@ -119,6 +137,43 @@ pub(crate) fn apply_model_default_num_drafts(
                 model_default + 1,
             );
             args.num_drafts = model_default;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::canonicalize_gguf_filename_quant;
+
+    #[test]
+    fn official_laguna_filename_declares_q4_k_m() {
+        assert_eq!(
+            canonicalize_gguf_filename_quant("laguna-s-2.1-Q4_K_M.gguf"),
+            Some("gguf_q4_k_m")
+        );
+    }
+
+    #[test]
+    fn incompatible_known_quants_remain_distinct() {
+        assert_eq!(
+            canonicalize_gguf_filename_quant("laguna-s-2.1-Q8_0.gguf"),
+            Some("gguf_q8_0")
+        );
+        assert_eq!(
+            canonicalize_gguf_filename_quant("laguna-s-2.1-F16.gguf"),
+            Some("gguf_f16")
+        );
+    }
+
+    #[test]
+    fn unknown_or_ambiguous_names_fail_closed() {
+        for filename in [
+            "laguna-s-2.1-Q4_K_S.gguf",
+            "laguna-s-2.1-Q4_K_M-copy.gguf",
+            "laguna-s-2.1-Q4_K_M.bin",
+            "laguna-s-2.1-q4_k_m.gguf",
+        ] {
+            assert_eq!(canonicalize_gguf_filename_quant(filename), None);
         }
     }
 }

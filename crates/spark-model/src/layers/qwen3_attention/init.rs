@@ -195,11 +195,13 @@ impl Qwen3AttentionLayer {
             },
             norm_vanilla: crate::ships_vanilla_norm_weights(config),
             rms_norm_residual_k: if crate::ships_vanilla_norm_weights(config) {
-                gpu.kernel("norm", "rms_norm_residual_vanilla")?
+                gpu.kernel("rms_norm_vanilla", "rms_norm_residual_vanilla")?
             } else {
                 gpu.kernel("norm", "rms_norm_residual")?
             },
             dense_gemv_k: gpu.kernel("gemv", "dense_gemv_bf16")?,
+            q8_gemv_k: super::super::try_kernel(gpu, "gguf_q8_0_gemv", "gguf_q8_0_gemv"),
+            q8_gemm_k: super::super::try_kernel(gpu, "gguf_q8_0_gemm", "gguf_q8_0_gemm"),
             dense_gemv_batchm_k: gpu
                 .kernel("dense_gemv_bf16_batchm", "dense_gemv_bf16_batchm")
                 .unwrap_or(KernelHandle(0)),
@@ -433,7 +435,7 @@ impl Qwen3AttentionLayer {
             deinterleave_qg_k: gpu.kernel("ssm_preprocess", "deinterleave_qg")?,
             w4a16_gemv_qg_k: gpu.kernel("w4a16_gemv", "w4a16_gemv_qg")?,
             residual_add_rms_norm_k: if crate::ships_vanilla_norm_weights(config) {
-                gpu.kernel("norm", "residual_add_rms_norm_vanilla")?
+                gpu.kernel("rms_norm_vanilla", "residual_add_rms_norm_vanilla")?
             } else {
                 gpu.kernel("norm", "residual_add_rms_norm")?
             },

@@ -46,6 +46,61 @@ fn test_buffer_sizes_qwen3() {
 }
 
 #[test]
+fn total_bytes_includes_every_arena_buffer() {
+    let cfg = ModelConfig::qwen3_next_80b_nvfp4();
+    let sizes = BufferSizes::from_config(&cfg, 4, 4096, 16);
+    let expected = [
+        sizes.hidden_states,
+        sizes.residual,
+        sizes.norm_output,
+        sizes.qkv_output,
+        sizes.attn_output,
+        sizes.gate_logits,
+        sizes.gate_logits_f32,
+        sizes.moe_router_in_f32,
+        sizes.moe_output,
+        sizes.logits,
+        sizes.ssm_qkvz,
+        sizes.ssm_ba,
+        sizes.ssm_deinterleaved,
+        sizes.ssm_gates,
+        sizes.ssm_conv_out_f32,
+        sizes.scratch,
+        sizes.expert_gate_out,
+        sizes.expert_up_out,
+        sizes.expert_down_out,
+        sizes.moe_grouped_q8,
+        sizes.splitk_workspace,
+        sizes.gdn_fla_scratch,
+        sizes.ssd_scratch,
+        sizes.o_latent,
+        sizes.norm_unit_w,
+        sizes.hc_streams,
+        sizes.hc_post,
+        sizes.hc_comb,
+        sizes.token_ids,
+        sizes.ffn_act_q8,
+        sizes.ffn_act_a,
+        sizes.ffn_act_scale,
+        sizes.fp8_act,
+        sizes.fp8_act_scale,
+        sizes.lora_xa,
+        sizes.lora_delta,
+        sizes.lora_hact,
+        sizes.lora_seq_slot,
+        sizes.q2_dequant_scratch,
+        sizes.q2_act_q8,
+    ]
+    .into_iter()
+    .sum::<usize>();
+
+    assert!(sizes.moe_grouped_q8 > 0);
+    assert!(sizes.o_latent > 0);
+    assert!(sizes.norm_unit_w > 0);
+    assert_eq!(sizes.total_bytes(), expected);
+}
+
+#[test]
 fn test_buffer_arena_alloc() {
     let cfg = ModelConfig::qwen3_next_80b_nvfp4();
     let gpu = MockGpuBackend::new();
@@ -68,7 +123,8 @@ fn test_buffer_arena_alloc() {
     // plus 2 added by the Holo-3.1/Ornith GB10 enablement (buffers.rs):
     //   - fp8_act + fp8_act_scale (persistent FP8 prefill-projection scratch,
     //     allocated unconditionally). 27 + 2 = 29.
-    assert_eq!(gpu.alloc_count(), 29);
+    // plus 1 grouped-MoE q8 activation scratch for MoE configurations.
+    assert_eq!(gpu.alloc_count(), 30);
 }
 
 #[test]

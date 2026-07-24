@@ -41,6 +41,66 @@ impl MoeLayer {
         })?;
         let total_expanded = n * top_k;
 
+        // Metal consumes the contiguous GGUF expert tensors directly. Unlike
+        // CUDA's pointer-table/MMQ path this correctness-first path projects
+        // BF16 sorted activations without allocating or quantizing a second
+        // activation representation.
+        if self.q4k_metal_grouped_k.0 != 0 {
+            let gate = self.packed_gate_stack.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("Metal Laguna missing contiguous Q4_K gate stack")
+            })?;
+            let up = self
+                .packed_up_stack
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("Metal Laguna missing contiguous Q4_K up stack"))?;
+            let down = self.packed_down_stack.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("Metal Laguna currently requires Q4_K down experts")
+            })?;
+            let gate_out = ctx.buffers.expert_gate_out();
+            let up_out = ctx.buffers.expert_up_out();
+            let down_out = ctx.buffers.expert_down_out();
+            let permuted = down_out;
+            ops::moe_permute_tokens(
+                ctx.gpu,
+                self.moe_permute_tokens_k,
+                expert_input,
+                permuted,
+                sorted_token_ids,
+                h,
+                total_expanded,
+                stream,
+            )?;
+            let project = |input, stack: &crate::weight_map::PackedExpertStack, output| {
+                ops::gguf_q4_k_grouped_gemm(
+                    ctx.gpu,
+                    self.q4k_metal_grouped_k,
+                    input,
+                    stack.base,
+                    stack.expert_stride_bytes,
+                    sorted_expert_ids,
+                    output,
+                    total_expanded,
+                    stack.n,
+                    stack.k,
+                    stack.num_experts,
+                    stream,
+                )
+            };
+            project(permuted, gate, gate_out)?;
+            project(permuted, up, up_out)?;
+            ops::silu_mul(
+                ctx.gpu,
+                self.moe_silu_mul,
+                gate_out,
+                up_out,
+                gate_out,
+                total_expanded * inter,
+                stream,
+            )?;
+            project(gate_out, down, down_out)?;
+            return Ok(());
+        }
+
         // Fused n=1 DECODE path: at small te (decode, n≈1) the grouped MMQ wastes
         // ~2000 CTAs (127/128 of each 128-row tensor-core tile idle). Two
         // output-tiled GEMV kernels that gather+dequant directly (no permute, no

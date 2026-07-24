@@ -177,6 +177,20 @@ pub trait GpuBackend: Send + Sync {
         false
     }
 
+    /// Whether this backend can capture and replay execution graphs.
+    ///
+    /// Backends are eager unless they explicitly advertise graph support.
+    fn supports_graph_capture(&self) -> bool {
+        false
+    }
+
+    /// Whether paged-attention kernels understand per-layer bounded KV rings.
+    /// False is the safe default: allocating a shorter pool without matching
+    /// append/read remapping would turn long-context writes into OOB accesses.
+    fn supports_bounded_sliding_kv(&self) -> bool {
+        false
+    }
+
     /// Synchronize a CUDA stream (blocks until all work completes).
     fn synchronize(&self, stream: u64) -> Result<()>;
 
@@ -274,6 +288,13 @@ pub trait GpuBackend: Send + Sync {
 
     /// Total device memory in bytes.
     fn total_memory(&self) -> Result<usize>;
+
+    /// Capacity used for admission and allocation budgeting. Discrete GPUs use
+    /// total device memory; unified-memory backends may expose a smaller
+    /// recommended working set.
+    fn allocation_capacity(&self) -> Result<usize> {
+        self.total_memory()
+    }
 
     /// Free device memory in bytes.
     fn free_memory(&self) -> Result<usize>;

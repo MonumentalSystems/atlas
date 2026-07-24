@@ -70,8 +70,76 @@ impl Qwen3AttentionLayer {
     /// Set per-head attention gate weight (Step 3.7 g_proj).
     /// The weight is BF16 shape [num_q_heads, hidden_size].
     pub(crate) fn set_head_gate_weight(&mut self, w: DenseWeight, activation: HeadGateActivation) {
-        self.head_gate_weight = Some(w);
+        self.head_gate_weight = Some(crate::weight_map::QuantWeight::Dense(w));
         self.head_gate_activation = activation;
+    }
+
+    pub(crate) fn set_packed_q8_head_gate_weight(
+        &mut self,
+        w: crate::weight_map::PackedQ8Weight,
+        activation: HeadGateActivation,
+    ) {
+        self.head_gate_weight = Some(crate::weight_map::QuantWeight::PackedQ8(w));
+        self.head_gate_activation = activation;
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn project_head_gate(
+        &self,
+        gpu: &dyn spark_runtime::gpu::GpuBackend,
+        input: spark_runtime::gpu::DevicePtr,
+        output: spark_runtime::gpu::DevicePtr,
+        tokens: u32,
+        heads: u32,
+        hidden: u32,
+        stream: u64,
+    ) -> anyhow::Result<()> {
+        let weight = self
+            .head_gate_weight
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("head-gate projection is not installed"))?;
+        if let Some(q8) = weight.as_packed_q8() {
+            if tokens == 1 {
+                crate::layers::ops::gguf_q8_0_gemv(gpu, self.q8_gemv_k, input, q8, output, stream)
+            } else {
+                crate::layers::ops::gguf_q8_0_gemm(
+                    gpu,
+                    self.q8_gemm_k,
+                    input,
+                    q8,
+                    output,
+                    tokens,
+                    stream,
+                )
+            }
+        } else if let Some(dense) = weight.as_dense() {
+            if tokens == 1 {
+                crate::layers::ops::dense_gemv(
+                    gpu,
+                    self.dense_gemv_k,
+                    input,
+                    dense,
+                    output,
+                    heads,
+                    hidden,
+                    stream,
+                )
+            } else {
+                crate::layers::ops::dense_gemm_tc(
+                    gpu,
+                    self.dense_gemm_tc_k,
+                    input,
+                    dense,
+                    output,
+                    tokens,
+                    heads,
+                    hidden,
+                    stream,
+                )
+            }
+        } else {
+            anyhow::bail!("unsupported head-gate quantization")
+        }
     }
 
     pub(crate) fn set_yarn_rope(&mut self, inv_freq: DevicePtr, attention_factor: f32) {

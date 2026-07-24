@@ -168,7 +168,8 @@ impl TransformerModel {
         let hss_engaged = kv_cache.config().cache_blocks_per_seq.is_some();
         // ATLAS_LORA_EAGER: LoRA graph-vs-eager debugging hatch (see decode_a).
         let lora_eager = self.lora.is_some() && crate::lora::lora_eager_env();
-        let use_graphs = self.comm.is_none() && !hss_engaged && !lora_eager;
+        let use_graphs =
+            self.gpu.supports_graph_capture() && self.comm.is_none() && !hss_engaged && !lora_eager;
 
         let ctx = ForwardContext {
             buffers: &self.buffers,

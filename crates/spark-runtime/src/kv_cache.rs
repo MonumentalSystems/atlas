@@ -73,6 +73,19 @@ pub enum KvCacheDtype {
     Fp8KTurbo2V,
 }
 
+/// Physical retention policy for one attention layer's KV pool.
+///
+/// Full-attention layers allocate one physical cache block for every block in
+/// the shared logical allocator. Sliding-attention layers allocate only a
+/// fixed ring large enough for the requested window plus one write block; the
+/// backend-specific attention path remaps logical block ids through
+/// [`PagedKvCache::physical_block_for_layer`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KvLayerRetention {
+    Full,
+    Sliding { window_tokens: usize },
+}
+
 impl std::fmt::Display for KvCacheDtype {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -199,6 +212,14 @@ pub struct KvCacheConfig {
     /// all layers use the uniform `num_kv_heads`/`head_dim` (backward
     /// compatible — homogeneous models need no change).
     pub layer_dims: Vec<(usize, usize)>,
+    /// Per-layer physical retention. Empty means [`KvLayerRetention::Full`]
+    /// for every layer. A sliding layer uses a bounded ring instead of
+    /// allocating `num_blocks` copies of its K/V storage.
+    pub layer_retention: Vec<KvLayerRetention>,
+    /// Largest prefill chunk that can be resident while a sliding layer reads
+    /// its preceding window. This is charged once per sliding ring, not per
+    /// logical sequence block.
+    pub prefill_chunk_tokens: usize,
     /// `--high-speed-swap` HBM-shrink knob (Phase 6.1). When `Some(N)`,
     /// each sequence is capped at `N` HBM-resident blocks; older blocks
     /// are evicted to disk via `HighSpeedSwap` and read back on demand.
@@ -210,6 +231,29 @@ pub struct KvCacheConfig {
 }
 
 impl KvCacheConfig {
+    /// Resolve the physical retention policy for one layer.
+    pub fn retention_for_layer(&self, layer_idx: usize) -> KvLayerRetention {
+        self.layer_retention
+            .get(layer_idx)
+            .copied()
+            .unwrap_or(KvLayerRetention::Full)
+    }
+
+    /// Number of physical blocks required by one layer for a logical pool of
+    /// `full_blocks` blocks. The ring holds the preceding window plus the
+    /// largest in-flight prefill chunk; one extra cache block prevents an exact
+    /// boundary from aliasing the oldest still-visible block.
+    pub fn physical_blocks_for_layer(&self, layer_idx: usize, full_blocks: usize) -> usize {
+        match self.retention_for_layer(layer_idx) {
+            KvLayerRetention::Full => full_blocks,
+            KvLayerRetention::Sliding { window_tokens } => window_tokens
+                .saturating_add(self.prefill_chunk_tokens)
+                .div_ceil(self.block_size)
+                .saturating_add(1)
+                .min(full_blocks),
+        }
+    }
+
     /// Resolve the effective dtype for a given attention layer index.
     pub fn dtype_for_layer(&self, layer_idx: usize) -> KvCacheDtype {
         if layer_idx < self.layer_dtypes.len() {
@@ -426,6 +470,10 @@ struct LayerPool {
     v_block_stride: usize,
     /// Effective dtype for this layer.
     dtype: KvCacheDtype,
+    /// Physical blocks allocated for this layer. Sliding layers use fewer
+    /// blocks than the shared logical allocator.
+    physical_blocks: usize,
+    retention: KvLayerRetention,
 }
 
 /// Paged KV cache across all attention layers.
@@ -440,6 +488,7 @@ pub struct PagedKvCache {
 }
 
 mod paged_impl;
+mod paged_retention;
 #[cfg(test)]
 mod tests;
 
