@@ -173,6 +173,63 @@ pub fn q4k_grouped_gemm(
         .launch(stream)
 }
 
+/// Fused n=1 DECODE MoE GEMV (two occupancy-friendly launches): gate+up+silu
+/// (staging s_act into `gate_silu` = the arena expert_gate_out), then Q4_K/Q6_K
+/// down. Output tiled across grid.y for high block count (the single-block-per-
+/// slot fusion starved GB10's SMs). Replaces permute+quant+grouped-GEMM at decode.
+/// CUDA-graph-legal: no alloc/sync, device-side sorted ids only.
+#[allow(clippy::too_many_arguments)]
+pub fn moe_q4k_decode_fused(
+    gpu: &dyn GpuBackend,
+    gate_up_k: KernelHandle, // atlas_moe_q4k_decode_gate_up
+    down_k: KernelHandle,    // atlas_moe_q4k_decode_down
+    expert_input: DevicePtr,
+    gate_base: DevicePtr,
+    up_base: DevicePtr,
+    down_base: DevicePtr,
+    sorted_token_ids: DevicePtr,
+    sorted_expert_ids: DevicePtr,
+    gate_silu: DevicePtr,    // [total_expanded, inter] BF16 scratch (expert_gate_out)
+    expert_down_out: DevicePtr,
+    h: u32,
+    inter: u32,
+    total_expanded: u32,
+    down_is_q6k: bool,
+    stream: u64,
+) -> Result<()> {
+    const DEC_BLOCK: u32 = 256;
+    const DEC_WARPS: u32 = DEC_BLOCK / 32; // 8 output channels per block
+    // Kernel 1: gate+up+silu → gate_silu. grid.y tiles inter across blocks.
+    KernelLaunch::new(gpu, gate_up_k)
+        .grid([total_expanded, div_ceil(inter, DEC_WARPS), 1])
+        .block([DEC_BLOCK, 1, 1])
+        .shared_mem(h * 4)
+        .arg_ptr(expert_input)
+        .arg_ptr(gate_base)
+        .arg_ptr(up_base)
+        .arg_ptr(sorted_token_ids)
+        .arg_ptr(sorted_expert_ids)
+        .arg_ptr(gate_silu)
+        .arg_u32(h)
+        .arg_u32(inter)
+        .arg_u32(total_expanded)
+        .launch(stream)?;
+    // Kernel 2: down. grid.y tiles h across blocks.
+    KernelLaunch::new(gpu, down_k)
+        .grid([total_expanded, div_ceil(h, DEC_WARPS), 1])
+        .block([DEC_BLOCK, 1, 1])
+        .shared_mem(inter * 4)
+        .arg_ptr(gate_silu)
+        .arg_ptr(down_base)
+        .arg_ptr(sorted_expert_ids)
+        .arg_ptr(expert_down_out)
+        .arg_u32(h)
+        .arg_u32(inter)
+        .arg_u32(total_expanded)
+        .arg_u32(if down_is_q6k { 1 } else { 0 })
+        .launch(stream)
+}
+
 /// FUSED device-side GROUPED gate+up MoE MMQ: ONE launch computes BOTH the gate
 /// and up projections per CTA (shared empty-expert early-return + ids setup, then
 /// the verified `mul_mat_q_process_tile` twice). Halves the scheduled-CTA count

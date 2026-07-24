@@ -403,6 +403,9 @@ pub struct MoeLayer {
     /// Fused gate+up grouped Q4_K MoE MMQ (one launch/CTA -> both projections).
     pub(crate) q4k_grouped_gate_up_nc_k: KernelHandle,
     pub(crate) q4k_grouped_gate_up_wc_k: KernelHandle,
+    /// Fused n=1 decode MoE GEMV (gather+dequant, output-tiled): gate+up+silu, down.
+    pub(crate) q4k_decode_gate_up_k: KernelHandle,
+    pub(crate) q4k_decode_down_k: KernelHandle,
     /// D4-layout q8_1 activation quantizer (Q6_K MMQ input).
     pub(crate) q4k_quant_act_d4_k: KernelHandle,
     // Phase 2.7 Tier C — Frankenstein dispatch flag.

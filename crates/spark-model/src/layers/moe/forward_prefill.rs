@@ -375,6 +375,7 @@ impl MoeLayer {
                 expert_input,
                 expert_offsets,
                 sorted_token_ids,
+                sorted_expert_ids,
                 n,
                 h,
                 inter,

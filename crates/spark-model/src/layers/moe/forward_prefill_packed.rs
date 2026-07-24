@@ -24,9 +24,10 @@ impl MoeLayer {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn run_routed_grouped_gemm_packed(
         &self,
-        expert_input: DevicePtr,     // [n, h] BF16 (normed MoE input)
-        expert_offsets: DevicePtr,   // [ne+1] i32, device — sorted cumulative counts
-        sorted_token_ids: DevicePtr, // [n*top_k] i32, device
+        expert_input: DevicePtr,      // [n, h] BF16 (normed MoE input)
+        expert_offsets: DevicePtr,    // [ne+1] i32, device — sorted cumulative counts
+        sorted_token_ids: DevicePtr,  // [n*top_k] i32, device
+        sorted_expert_ids: DevicePtr, // [n*top_k] i32, device — expert per sorted slot
         n: u32,
         h: u32,
         inter: u32,
@@ -39,6 +40,46 @@ impl MoeLayer {
             anyhow::anyhow!("run_routed_grouped_gemm_packed: layer has no packed_experts")
         })?;
         let total_expanded = n * top_k;
+
+        // Fused n=1 DECODE path: at small te (decode, n≈1) the grouped MMQ wastes
+        // ~2000 CTAs (127/128 of each 128-row tensor-core tile idle). Two
+        // output-tiled GEMV kernels that gather+dequant directly (no permute, no
+        // q8_1 quantize, no tensor-core-tile waste) are ~18% faster (14→~16.5
+        // tok/s) and stay CUDA-graph-legal. Host-known `n` (decode is always n=1
+        // per graph capture) keeps the captured graph on ONE arm. Default-on;
+        // opt out with ATLAS_PACKED_DECODE_FUSED=0.
+        const DECODE_FUSED_MAX_SLOTS: u32 = 32; // ~n<=2 at top_k=10
+        if total_expanded <= DECODE_FUSED_MAX_SLOTS
+            && self.q4k_decode_gate_up_k.0 != 0
+            && self.q4k_decode_down_k.0 != 0
+            && std::env::var("ATLAS_PACKED_DECODE_FUSED").as_deref() != Ok("0")
+        {
+            let down_is_q6k = matches!(packed[0].down, crate::weight_map::QuantWeight::PackedQ6(_));
+            let down_base = match &packed[0].down {
+                crate::weight_map::QuantWeight::PackedQ4(w4) => w4.weight,
+                crate::weight_map::QuantWeight::PackedQ6(w6) => w6.weight,
+                other => anyhow::bail!("packed MoE down_proj: unexpected variant {other:?}"),
+            };
+            ops::moe_q4k_decode_fused(
+                ctx.gpu,
+                self.q4k_decode_gate_up_k,
+                self.q4k_decode_down_k,
+                expert_input,
+                packed[0].gate.weight,
+                packed[0].up.weight,
+                down_base,
+                sorted_token_ids,
+                sorted_expert_ids,
+                ctx.buffers.expert_gate_out(), // s_act staging
+                ctx.buffers.expert_down_out(),
+                h,
+                inter,
+                total_expanded,
+                down_is_q6k,
+                stream,
+            )?;
+            return Ok(());
+        }
 
         // All scratch is persistent arena — NO per-call alloc/free, so the whole
         // arm is CUDA-graph-capture-legal (decode). `permuted` aliases
