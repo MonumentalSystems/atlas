@@ -175,8 +175,37 @@ impl TransformerModel {
         // Graph decision, computed BEFORE padded_n so eager can drop pad lanes.
         let ms_profile = std::env::var("ATLAS_MS_PROFILE").ok().as_deref() == Some("1");
         let lora_eager = self.lora.is_some() && crate::lora::lora_eager_env();
+        // Grouped-routed decode MoE (n >= MIN) does a host D2H sync of the CUTLASS
+        // expert_offsets — illegal under CUDA graph capture (CUDA_ERROR_STREAM_
+        // CAPTURE_UNSUPPORTED, 900). So when the grouped path will fire this step,
+        // run it EAGER (skip capture). Low-C steps (n < MIN) keep multi-seq graphs.
+        // The eager penalty is negligible at the C>=MIN batch sizes where grouped
+        // amortizes (measured C4 +34%, C8 +75% over the per-token+graphs path).
+        // (env reads mirror ffn.rs grouped_routed_decode_enabled()/_min(); kept
+        // inline to avoid opening the private multi_seq::ffn module path.)
+        // NOTE: check the PADDED lane count, not real `n`. The graphed path runs
+        // `padded_n ∈ {2,4,8}` lanes (see below), so at real n=3 the MoE runs
+        // 4 lanes → grouped would fire → its host D2H crashes mid-capture. Gate
+        // on padded_n so any step that could take the grouped path stays eager.
+        let grouped_decode_fires = {
+            use std::sync::OnceLock;
+            static ON: OnceLock<bool> = OnceLock::new();
+            static MIN: OnceLock<usize> = OnceLock::new();
+            let on = *ON.get_or_init(|| {
+                std::env::var("ATLAS_MOE_GROUPED_ROUTED_DECODE").as_deref() == Ok("1")
+            });
+            let min = *MIN.get_or_init(|| {
+                std::env::var("ATLAS_MOE_GROUPED_ROUTED_DECODE_MIN")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(2)
+            });
+            let padded = [2usize, 4, 8].iter().copied().find(|&s| s >= n).unwrap_or(n);
+            on && padded >= min
+        };
         let use_graphs = !ms_profile
             && !lora_eager
+            && !grouped_decode_fires
             && std::env::var("ATLAS_DECODE_GRAPHS_MULTISEQ")
                 .ok()
                 .as_deref()
