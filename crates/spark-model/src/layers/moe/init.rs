@@ -163,6 +163,19 @@ impl MoeLayer {
                 "moe_w4a16",
                 "moe_w4a16_fused_gate_up_t_k64_fp4",
             ),
+            // SMALL-M FP4 decode GEMV pair (ATLAS_MOE_FP4_DECODE_SMALLM).
+            // try_kernel: only targets whose moe_w4a16 module ships them
+            // (currently laguna-s-2.1) resolve non-zero.
+            moe_fused_gate_up_fp4_smallm: super::super::try_kernel(
+                gpu,
+                "moe_w4a16",
+                "moe_w4a16_fused_gate_up_fp4_smallm",
+            ),
+            moe_down_fp4_smallm: super::super::try_kernel(
+                gpu,
+                "moe_w4a16",
+                "moe_w4a16_down_fp4_smallm",
+            ),
             moe_fp8_grouped_gemm_t: gpu.kernel("moe_w4a16", "moe_fp8_grouped_gemm_ptrtable_t")?,
             // THE routed-expert FP8 prefill kernel: grid-compaction (persistent
             // 96-CTA grid over a compacted work-list). Handle may be 0 on older
@@ -349,6 +362,23 @@ impl MoeLayer {
             down_fp4: std::env::var("ATLAS_HOLO_MOE_DOWN_FP4")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false),
+            // Small-M FP4 decode GEMV arm: 0 = off (default). When enabled the
+            // grouped FP4 dispatch swaps the M_TILE=64 K64 kernels for the
+            // slot-major GEMV pair whenever total_expanded <= this threshold.
+            // Default 96 covers padded decode n<=8 at top_k=10 (80 slots) while
+            // leaving all real prefills on the tensor-core K64/CUTLASS path.
+            fp4_decode_smallm_max: if std::env::var("ATLAS_MOE_FP4_DECODE_SMALLM")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false)
+            {
+                std::env::var("ATLAS_MOE_FP4_DECODE_SMALLM_MAX")
+                    .ok()
+                    .and_then(|v| v.parse::<u32>().ok())
+                    .filter(|&m| m > 0)
+                    .unwrap_or(96)
+            } else {
+                0
+            },
             shared_gate_t: None,
             shared_up_t: None,
             shared_down_t: None,

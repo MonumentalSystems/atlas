@@ -336,6 +336,100 @@ pub fn moe_w4a16_fused_gate_up_k64_n128(
         .launch(stream)
 }
 
+/// SMALL-M FP4 decode GEMV — fused gate+up (`moe_w4a16_fused_gate_up_fp4_smallm`,
+/// `ATLAS_MOE_FP4_DECODE_SMALLM=1`). Slot-major output-tiled GEMV over the shared
+/// `[K/2,N]` `_t` tables: one block per (sorted slot, 32 output columns), 8 warps
+/// split K, in-kernel binary search of device `expert_offsets` for the slot's
+/// expert. Replaces the M_TILE=64 K64 MMA kernel at decode-M (1-2 rows/expert)
+/// where 16-64x of the tile is padding. Same argument list/output layout as the
+/// K64 kernel; CUDA-graph-capture-legal (grid dims host-known `n*top_k`, no
+/// D2H/sync/alloc).
+///
+/// Grid: (ceil(n_out/32), total_expanded, 1)  Block: (256, 1, 1)
+/// Dynamic smem: `k*4 + (k/16)*4` bytes (quantized A row + group scales).
+#[allow(clippy::too_many_arguments)]
+pub fn moe_w4a16_fp4_smallm_gate_up(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    a: DevicePtr,
+    gate_packed_ptrs: DevicePtr,
+    gate_scale_ptrs: DevicePtr,
+    gate_scale2_vals: DevicePtr,
+    up_packed_ptrs: DevicePtr,
+    up_scale_ptrs: DevicePtr,
+    up_scale2_vals: DevicePtr,
+    c_gate: DevicePtr,
+    c_up: DevicePtr,
+    expert_offsets: DevicePtr,
+    sorted_token_ids: DevicePtr,
+    num_experts: u32,
+    n_out: u32,
+    k: u32,
+    total_expanded: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(n_out, 32), total_expanded, 1])
+        .block([256, 1, 1])
+        .shared_mem(k * 4 + (k / 16) * 4)
+        .arg_ptr(a)
+        .arg_ptr(gate_packed_ptrs)
+        .arg_ptr(gate_scale_ptrs)
+        .arg_ptr(gate_scale2_vals)
+        .arg_ptr(up_packed_ptrs)
+        .arg_ptr(up_scale_ptrs)
+        .arg_ptr(up_scale2_vals)
+        .arg_ptr(c_gate)
+        .arg_ptr(c_up)
+        .arg_ptr(expert_offsets)
+        .arg_ptr(sorted_token_ids)
+        .arg_u32(num_experts)
+        .arg_u32(n_out)
+        .arg_u32(k)
+        .launch(stream)
+}
+
+/// SMALL-M FP4 decode GEMV — down projection (`moe_w4a16_down_fp4_smallm`).
+/// Single-matrix sibling of [`moe_w4a16_fp4_smallm_gate_up`]; A is the post-SiLU
+/// sorted intermediate and `sorted_token_ids` is null (identity row gather),
+/// exactly like the K64 down kernel it replaces at small M.
+///
+/// Grid: (ceil(n_out/32), total_expanded, 1)  Block: (256, 1, 1)
+/// Dynamic smem: `k*4 + (k/16)*4` bytes.
+#[allow(clippy::too_many_arguments)]
+pub fn moe_w4a16_fp4_smallm_down(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    a: DevicePtr,
+    b_packed_ptrs: DevicePtr,
+    b_scale_ptrs: DevicePtr,
+    scale2_vals: DevicePtr,
+    c: DevicePtr,
+    expert_offsets: DevicePtr,
+    sorted_token_ids: DevicePtr,
+    num_experts: u32,
+    n_out: u32,
+    k: u32,
+    total_expanded: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(n_out, 32), total_expanded, 1])
+        .block([256, 1, 1])
+        .shared_mem(k * 4 + (k / 16) * 4)
+        .arg_ptr(a)
+        .arg_ptr(b_packed_ptrs)
+        .arg_ptr(b_scale_ptrs)
+        .arg_ptr(scale2_vals)
+        .arg_ptr(c)
+        .arg_ptr(expert_offsets)
+        .arg_ptr(sorted_token_ids)
+        .arg_u32(num_experts)
+        .arg_u32(n_out)
+        .arg_u32(k)
+        .launch(stream)
+}
+
 /// Gather token rows into expert-sorted order: `permuted[i] = hidden[sorted_token_ids[i]]`.
 /// `permuted` is `[total_expanded, hidden]`. One block per output row, threads
 /// stride over `hidden`. Used by the FP4 grouped gate_up path (the CUTLASS

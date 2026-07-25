@@ -38,6 +38,26 @@ pub(crate) fn grouped_cutlass_device_offsets_enabled() -> bool {
     })
 }
 
+/// Lower bound (inclusive) on `total_expanded` for the small-M FP4 decode GEMV
+/// to fire. The slot-major W4A16 GEMV only BEATS the CUTLASS/K64 tensor-core
+/// path once concurrency is high enough to amortize its per-slot bf16-A
+/// staging: measured on Laguna-S-2.1 (GB10), smallm is +7.9 tok/s at
+/// total_expanded=80 (padded n=8) but −5.8 at 40 (padded n=4). Decode graphs
+/// pad n to {2,4,8} so total_expanded is discrete (20/40/80 at top_k=10); a
+/// default of 64 cleanly selects the n=8 tier only and leaves n<=4 on CUTLASS.
+/// Tunable via `ATLAS_MOE_FP4_DECODE_SMALLM_MIN`; 0 = fire at any M (old
+/// behavior).
+pub(crate) fn fp4_decode_smallm_min() -> u32 {
+    use std::sync::OnceLock;
+    static MIN: OnceLock<u32> = OnceLock::new();
+    *MIN.get_or_init(|| {
+        std::env::var("ATLAS_MOE_FP4_DECODE_SMALLM_MIN")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(64)
+    })
+}
+
 impl MoeLayer {
     /// Routed-expert grouped-GEMM path: upper-bound grid sizing → grouped
     /// gate+up GEMM → SiLU+mul → grouped down GEMM.
@@ -145,7 +165,50 @@ impl MoeLayer {
         // Host expert_offsets from the CUTLASS gate_up, reused by down to skip
         // a second D2H + host-blocking synchronize.
         let mut cutlass_eoff: Option<Vec<i32>> = None;
+        // ── SMALL-M FP4 decode GEMV arm (ATLAS_MOE_FP4_DECODE_SMALLM=1) ──
+        // At decode-M (1-2 rows/expert) every M_TILE=64 grouped kernel — CUTLASS
+        // and FP4-K64 alike — pays a full 64-row tile per 1-2 real rows. The
+        // slot-major GEMV pair reads the SAME shared `_t` tables + scale2 and
+        // writes the SAME sorted C_gate/C_up/down layout, so silu/LoRA-fold/
+        // unpermute are unchanged; it intercepts BEFORE the CUTLASS branch so the
+        // canonical serve config (GROUPED_CUTLASS=1) also gets the small-M win.
+        // Graph-capture-legal (device offsets binary-searched in-kernel, grid =
+        // host-known n*top_k). Prefill (total_expanded > threshold) is untouched.
+        let smallm_m = self.fp4_decode_smallm_max;
+        let smallm_nvfp4 =
+            self.experts_scale_kind == crate::weight_map::WeightQuantFormat::Nvfp4;
+        let smallm_gate_up = smallm_m > 0
+            && total_expanded <= smallm_m
+            && total_expanded as u32 >= fp4_decode_smallm_min()
+            && smallm_nvfp4
+            && self.moe_fused_gate_up_fp4_smallm.0 != 0
+            && self.gate_ptrs_t.is_some()
+            && self.up_ptrs_t.is_some();
         if max_m_tiles > 0 {
+            if smallm_gate_up {
+                let gp = self.gate_ptrs_t.as_ref().expect("smallm_gate_up checked");
+                let up = self.up_ptrs_t.as_ref().expect("smallm_gate_up checked");
+                ops::moe_w4a16_fp4_smallm_gate_up(
+                    ctx.gpu,
+                    self.moe_fused_gate_up_fp4_smallm,
+                    expert_input,
+                    gp.packed_ptrs,
+                    gp.scale_ptrs,
+                    gp.scale2_vals,
+                    up.packed_ptrs,
+                    up.scale_ptrs,
+                    up.scale2_vals,
+                    expert_gate_out,
+                    expert_up_out,
+                    expert_offsets,
+                    sorted_token_ids,
+                    num_experts,
+                    inter,
+                    h,
+                    total_expanded,
+                    stream,
+                )?;
+            } else
             // CUTLASS grouped NVFP4 gate_up reads the ORIGINAL [N,K/2] tables
             // (CUTLASS B is ColumnMajor = K-contiguous), NOT the Atlas
             // transposed ones, so it must be reachable when gate_ptrs_t is
@@ -404,7 +467,34 @@ impl MoeLayer {
             // Compounds with the FP4 gate_up path to run the whole FFN at FP4.
             // CUTLASS grouped down reads the ORIGINAL [N,K/2] table, so like
             // gate_up it must be reachable without down_ptrs_t.
-            if grouped_cutlass_gate_up_enabled()
+            // Small-M FP4 GEMV down (see the gate_up arm above): intercepts both
+            // the CUTLASS and K64 down kernels at decode-M. Same sorted layout +
+            // null sorted_token_ids (identity row gather), unpermute unchanged.
+            let smallm_down = smallm_m > 0
+                && total_expanded <= smallm_m
+                && total_expanded as u32 >= fp4_decode_smallm_min()
+                && smallm_nvfp4
+                && self.moe_down_fp4_smallm.0 != 0
+                && self.down_ptrs_t.is_some();
+            if smallm_down {
+                let dp = self.down_ptrs_t.as_ref().expect("smallm_down checked");
+                ops::moe_w4a16_fp4_smallm_down(
+                    ctx.gpu,
+                    self.moe_down_fp4_smallm,
+                    expert_gate_out,
+                    dp.packed_ptrs,
+                    dp.scale_ptrs,
+                    dp.scale2_vals,
+                    expert_down_out,
+                    expert_offsets,
+                    DevicePtr(0),
+                    num_experts,
+                    h,
+                    inter,
+                    total_expanded,
+                    stream,
+                )?;
+            } else if grouped_cutlass_gate_up_enabled()
                 && self.down_sfb_cutlass.is_some()
                 && std::env::var("ATLAS_HOLO_MOE_GROUPED_DOWN").ok().as_deref() == Some("1")
             {

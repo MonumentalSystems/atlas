@@ -2272,3 +2272,263 @@ extern "C" __global__ void moe_w4a16_down_t_k64_fp4(
         if (r1v && c1 < N) C[r1*N+c1] = __float2bfloat16(acc[nt][3] * scale2);
     }
 }
+
+// ═══════════════════════════════════════════════════════════════════
+// SMALL-M FP4 DECODE GEMV arm (ATLAS_MOE_FP4_DECODE_SMALLM=1).
+//
+// At decode the grouped batch has M ≈ 1-2 real rows per touched expert
+// (C=4: 40 slots over ~37 distinct experts), so the M_TILE=64 K64 MMA
+// kernels above spend a full 64-row tile's compute (A cp.async + 64-row
+// e2m1 quant + 4-warp MMA sweep + transpose + double-buffer syncs) per
+// 1-2 real rows — 16-64x waste. This is the exact failure mode the GGUF
+// Q4_K decode arm fixed (kernels/gb10/common/moe_q4k_decode_fused.cu):
+// slot-major output-tiled GEMV, direct gather+dequant, no tile padding.
+//
+// Structure (mirrors the q4k decode-fused win, adapted to the [K/2,N]
+// K-major `_t` tables):
+//   grid = (ceil(N/32), total_expanded); block = 256 = 8 warps.
+//   Each block owns ONE sorted slot x 32 output columns. The 8 warps
+//   split K (contiguous 16-elem scale groups, ascending), each lane owns
+//   one output column, so every warp's weight-byte read is 32 consecutive
+//   bytes of a [K/2,N] row — fully coalesced. Cross-warp reduce via smem.
+//   Slot -> expert is an in-kernel binary search of the device
+//   expert_offsets (no new host buffers; graph-capture-legal by
+//   construction: no D2H/sync/alloc, grid dims host-known n*top_k).
+//
+// NUMERICS (W4A16): the A row is kept at FULL bf16 precision — NOT
+// quantized to e2m1. Only B is 4-bit: nibbles decode through the E2M1 LUT
+// + per-16 ue4m3 group scale + per-expert scale2. acc = sum(a_bf16 *
+// b_dequant), f32-accumulated in ascending-k order. This is HIGHER
+// precision than the K64 MMA kernel (which runs W4A8, A cast to e4m3),
+// and far higher than the earlier W4A4 variant of this kernel, which
+// quantized A to e2m1 and — because that error compounds across
+// concurrent tokens — was coherent at C1 but garbled by C8 (measured).
+// vs the proven grouped path the only divergence is f32 accumulation
+// order, so output is coherent at all concurrencies. Weight bytes per
+// slot = the full expert row set, so slots sharing an expert re-read it
+// (~1.1x duplication at decode M) — vastly cheaper than the 64-row tile
+// padding it replaces. Gated to its winning window (total_expanded in
+// [ATLAS_MOE_FP4_DECODE_SMALLM_MIN=64, _MAX=96]) since the bf16-A staging
+// only amortizes at high concurrency (n=8: +7.9 tok/s; n=4: -5.8).
+// ═══════════════════════════════════════════════════════════════════
+
+#define SMALLM_NT 32                 // output columns per block (= warp width)
+#define SMALLM_BLOCK 256
+#define SMALLM_WARPS (SMALLM_BLOCK / 32)
+
+// Find e such that expert_offsets[e] <= slot < expert_offsets[e+1].
+// Offsets are a non-decreasing prefix sum partitioning [0, total_expanded).
+__device__ __forceinline__ int smallm_find_expert(const int* __restrict__ expert_offsets,
+                                                  int slot, int num_experts) {
+    int lo = 0, hi = num_experts - 1;
+    while (lo < hi) {
+        int mid = (lo + hi) >> 1;
+        if (expert_offsets[mid + 1] <= slot) lo = mid + 1;
+        else hi = mid;
+    }
+    return lo;
+}
+
+// Stage one 16-element group of the A row into shared memory at FULL bf16
+// precision (W4A16), NOT quantized to e2m1 (W4A4).
+//
+// The original path quantized A to e2m1 (max_abs/6 + hardware e2m1 rounding,
+// storing dequant e2m1 values + a ue4m3 scale), mirroring the opt-in FP4-
+// activation kernel `..._t_k64_fp4`. That W4A4 activation precision is the
+// quality-risky path that is off-by-default everywhere else, and it compounds
+// error across concurrent tokens — coherent at C1, garbles by C8 (measured).
+// The proven default Laguna decode kernels (`..._t_k64`) keep activations at
+// >=FP8. At this scalar-GEMV small-M shape there is no tensor-core gain from
+// 4-bit A, so we keep A at full bf16 and let B's per-group dequant carry the
+// only scale: s_sfa=1, and the downstream `pg * (sfa * f_g)` reduces to the
+// exact W4A16 sum `sum(a_raw * s_lut[b]) * f_g`. Also cheaper (no per-group
+// max-reduce + e2m1 cvt), so the small-M decode speedup is retained.
+__device__ __forceinline__ void smallm_quant_group(const __nv_bfloat16* __restrict__ a_row,
+                                                   unsigned int g,
+                                                   const float* __restrict__ s_lut,
+                                                   float* __restrict__ s_qa,
+                                                   float* __restrict__ s_sfa) {
+    (void)s_lut;
+    #pragma unroll
+    for (int i = 0; i < 16; i++)
+        s_qa[g * GROUP_SIZE + i] = __bfloat162float(a_row[g * GROUP_SIZE + i]);
+    s_sfa[g] = 1.0f;  // A carries no separate scale in W4A16
+}
+
+// ── Fused gate+up small-M GEMV ──
+// Same argument list as moe_w4a16_fused_gate_up_t_k64_fp4 (drop-in kernel
+// swap at small M; silu/LoRA-fold/unpermute downstream unchanged).
+// Grid: (ceil(N/32), total_expanded). Block 256.
+// Dynamic smem: K*4 (s_qa) + (K/16)*4 (s_sfa) bytes.
+extern "C" __global__ void moe_w4a16_fused_gate_up_fp4_smallm(
+    const __nv_bfloat16* __restrict__ A,
+    const unsigned long long* __restrict__ gate_packed_ptrs,
+    const unsigned long long* __restrict__ gate_scale_ptrs,
+    const float* __restrict__ gate_scale2_vals,
+    const unsigned long long* __restrict__ up_packed_ptrs,
+    const unsigned long long* __restrict__ up_scale_ptrs,
+    const float* __restrict__ up_scale2_vals,
+    __nv_bfloat16* __restrict__ C_gate,
+    __nv_bfloat16* __restrict__ C_up,
+    const int* __restrict__ expert_offsets,
+    const int* __restrict__ sorted_token_ids,
+    unsigned int num_experts,
+    unsigned int N,
+    unsigned int K
+) {
+    const int slot = (int)blockIdx.y;
+    const unsigned int cta_n = blockIdx.x * SMALLM_NT;
+    const int e = smallm_find_expert(expert_offsets, slot, (int)num_experts);
+    const unsigned char* Bg = (const unsigned char*)gate_packed_ptrs[e];
+    const unsigned char* Sg = (const unsigned char*)gate_scale_ptrs[e];
+    const unsigned char* Bu = (const unsigned char*)up_packed_ptrs[e];
+    const unsigned char* Su = (const unsigned char*)up_scale_ptrs[e];
+    if (Bg == 0 || Bu == 0) return;  // mirrors the grouped kernels (no write)
+    const float sc2_g = gate_scale2_vals[e];
+    const float sc2_u = up_scale2_vals[e];
+    const int tok = sorted_token_ids ? sorted_token_ids[slot] : slot;
+
+    extern __shared__ float s_dyn[];
+    float* s_qa = s_dyn;                       // [K] dequant e2m1(A), unscaled
+    float* s_sfa = s_dyn + K;                  // [K/16] decoded ue4m3 A scales
+    __shared__ float s_lut[16];
+    __shared__ float s_red_g[SMALLM_WARPS][SMALLM_NT];
+    __shared__ float s_red_u[SMALLM_WARPS][SMALLM_NT];
+
+    if (threadIdx.x < 16) s_lut[threadIdx.x] = E2M1_LUT_MOE[threadIdx.x];
+    __syncthreads();
+
+    const unsigned int num_groups = K / GROUP_SIZE;
+    const __nv_bfloat16* a_row = A + (unsigned long long)tok * K;
+    for (unsigned int g = threadIdx.x; g < num_groups; g += SMALLM_BLOCK)
+        smallm_quant_group(a_row, g, s_lut, s_qa, s_sfa);
+    __syncthreads();
+
+    const unsigned int warp = threadIdx.x >> 5;
+    const unsigned int lane = threadIdx.x & 31;
+    const unsigned int gn = cta_n + lane;
+    const bool nv = gn < N;
+    const unsigned int gpw = (num_groups + SMALLM_WARPS - 1) / SMALLM_WARPS;
+    const unsigned int g_beg = warp * gpw;
+    const unsigned int g_end = min(g_beg + gpw, num_groups);
+    float acc_g = 0.0f, acc_u = 0.0f;
+    if (nv) {
+        #pragma unroll 2
+        for (unsigned int g = g_beg; g < g_end; ++g) {
+            __nv_fp8_e4m3 f_g, f_u;
+            *(unsigned char*)&f_g = Sg[(unsigned long long)g * N + gn];
+            *(unsigned char*)&f_u = Su[(unsigned long long)g * N + gn];
+            const float sfa = s_sfa[g];
+            const float* aq = &s_qa[g * GROUP_SIZE];
+            const unsigned long long brow = (unsigned long long)g * 8 * N + gn;
+            float pg = 0.0f, pu = 0.0f;
+            #pragma unroll
+            for (int kp = 0; kp < 8; kp++) {
+                unsigned char bg = Bg[brow + (unsigned long long)kp * N];
+                unsigned char bu = Bu[brow + (unsigned long long)kp * N];
+                float a0 = aq[2 * kp], a1 = aq[2 * kp + 1];
+                pg += a0 * s_lut[bg & 0xF] + a1 * s_lut[bg >> 4];
+                pu += a0 * s_lut[bu & 0xF] + a1 * s_lut[bu >> 4];
+            }
+            // Per-16-group e2m1xe2m1 partials are exact in f32; scale like the
+            // block-scaled MMA (sfa * sfb per group), accumulate in k-order.
+            acc_g += pg * (sfa * (float)f_g);
+            acc_u += pu * (sfa * (float)f_u);
+        }
+    }
+    s_red_g[warp][lane] = acc_g;
+    s_red_u[warp][lane] = acc_u;
+    __syncthreads();
+    if (threadIdx.x < SMALLM_NT) {
+        float tg = 0.0f, tu = 0.0f;
+        #pragma unroll
+        for (int w = 0; w < SMALLM_WARPS; w++) {  // ascending w = ascending k
+            tg += s_red_g[w][threadIdx.x];
+            tu += s_red_u[w][threadIdx.x];
+        }
+        unsigned int n_out = cta_n + threadIdx.x;
+        if (n_out < N) {
+            C_gate[(unsigned long long)slot * N + n_out] = __float2bfloat16(tg * sc2_g);
+            C_up[(unsigned long long)slot * N + n_out]   = __float2bfloat16(tu * sc2_u);
+        }
+    }
+}
+
+// ── Down small-M GEMV ──
+// Same argument list as moe_w4a16_down_t_k64_fp4. A = post-SiLU sorted
+// intermediate [total_expanded, K=inter]; sorted_token_ids is null on this
+// path so the row gather is the identity (row = slot), like the K64 kernel.
+// Grid: (ceil(N/32), total_expanded). Block 256.
+// Dynamic smem: K*4 + (K/16)*4 bytes.
+extern "C" __global__ void moe_w4a16_down_fp4_smallm(
+    const __nv_bfloat16* __restrict__ A,
+    const unsigned long long* __restrict__ B_packed_ptrs,
+    const unsigned long long* __restrict__ B_scale_ptrs,
+    const float* __restrict__ scale2_vals,
+    __nv_bfloat16* __restrict__ C,
+    const int* __restrict__ expert_offsets,
+    const int* __restrict__ sorted_token_ids,
+    unsigned int num_experts,
+    unsigned int N,
+    unsigned int K
+) {
+    const int slot = (int)blockIdx.y;
+    const unsigned int cta_n = blockIdx.x * SMALLM_NT;
+    const int e = smallm_find_expert(expert_offsets, slot, (int)num_experts);
+    const unsigned char* B_expert = (const unsigned char*)B_packed_ptrs[e];
+    const unsigned char* S_expert = (const unsigned char*)B_scale_ptrs[e];
+    if (B_expert == 0) return;
+    const float scale2 = scale2_vals[e];
+    const int tok = sorted_token_ids ? sorted_token_ids[slot] : slot;
+
+    extern __shared__ float s_dyn[];
+    float* s_qa = s_dyn;
+    float* s_sfa = s_dyn + K;
+    __shared__ float s_lut[16];
+    __shared__ float s_red[SMALLM_WARPS][SMALLM_NT];
+
+    if (threadIdx.x < 16) s_lut[threadIdx.x] = E2M1_LUT_MOE[threadIdx.x];
+    __syncthreads();
+
+    const unsigned int num_groups = K / GROUP_SIZE;
+    const __nv_bfloat16* a_row = A + (unsigned long long)tok * K;
+    for (unsigned int g = threadIdx.x; g < num_groups; g += SMALLM_BLOCK)
+        smallm_quant_group(a_row, g, s_lut, s_qa, s_sfa);
+    __syncthreads();
+
+    const unsigned int warp = threadIdx.x >> 5;
+    const unsigned int lane = threadIdx.x & 31;
+    const unsigned int gn = cta_n + lane;
+    const bool nv = gn < N;
+    const unsigned int gpw = (num_groups + SMALLM_WARPS - 1) / SMALLM_WARPS;
+    const unsigned int g_beg = warp * gpw;
+    const unsigned int g_end = min(g_beg + gpw, num_groups);
+    float acc = 0.0f;
+    if (nv) {
+        #pragma unroll 2
+        for (unsigned int g = g_beg; g < g_end; ++g) {
+            __nv_fp8_e4m3 f_s;
+            *(unsigned char*)&f_s = S_expert[(unsigned long long)g * N + gn];
+            const float sfa = s_sfa[g];
+            const float* aq = &s_qa[g * GROUP_SIZE];
+            const unsigned long long brow = (unsigned long long)g * 8 * N + gn;
+            float p = 0.0f;
+            #pragma unroll
+            for (int kp = 0; kp < 8; kp++) {
+                unsigned char b = B_expert[brow + (unsigned long long)kp * N];
+                p += aq[2 * kp] * s_lut[b & 0xF] + aq[2 * kp + 1] * s_lut[b >> 4];
+            }
+            acc += p * (sfa * (float)f_s);
+        }
+    }
+    s_red[warp][lane] = acc;
+    __syncthreads();
+    if (threadIdx.x < SMALLM_NT) {
+        float t = 0.0f;
+        #pragma unroll
+        for (int w = 0; w < SMALLM_WARPS; w++) t += s_red[w][threadIdx.x];
+        unsigned int n_out = cta_n + threadIdx.x;
+        if (n_out < N)
+            C[(unsigned long long)slot * N + n_out] = __float2bfloat16(t * scale2);
+    }
+}

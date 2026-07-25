@@ -235,7 +235,17 @@ impl TransformerModel {
                 let down_fp4 = flag("ATLAS_HOLO_MOE_DOWN_FP4");
                 let grouped_cutlass = flag("ATLAS_HOLO_MOE_GROUPED_CUTLASS");
                 let dev_offsets = flag("ATLAS_MOE_CUTLASS_DEVICE_OFFSETS");
-                (gateup_fp4 && down_fp4 && !grouped_cutlass)
+                // Small-M FP4 decode GEMV arm (ATLAS_MOE_FP4_DECODE_SMALLM=1)
+                // intercepts BEFORE the CUTLASS/FP4-K64 grouped arms for
+                // total_expanded <= _MAX. At decode, padded_n <= 8 → total_expanded
+                // = padded_n*top_k <= 80 <= the default MAX 96, so it handles EVERY
+                // grouped decode step. It is device-offset (grid = (ceil(N/32),
+                // m_total), device binary-search on expert_offsets, NO host D2H/
+                // sync/alloc) → CUDA-graph-capture-LEGAL. So when it's on, keep
+                // capture regardless of which grouped arm would otherwise fire.
+                let smallm = flag("ATLAS_MOE_FP4_DECODE_SMALLM");
+                smallm
+                    || (gateup_fp4 && down_fp4 && !grouped_cutlass)
                     || (grouped_cutlass && dev_offsets)
             })
         };

@@ -288,6 +288,20 @@ pub struct MoeLayer {
     /// handle != 0, `gateup_fp4` is set, and the shared `gate_ptrs_t`/`up_ptrs_t`
     /// tables are present (FAST_MOE=full).
     moe_fused_gate_up_t_k64_fp4: KernelHandle,
+    /// SMALL-M FP4 decode GEMV pair (`ATLAS_MOE_FP4_DECODE_SMALLM=1`): slot-major
+    /// output-tiled GEMV kernels over the same shared `[K/2,N]` `_t` tables +
+    /// per-expert `scale2`, replacing the M_TILE=64 K64 MMA kernels when
+    /// `total_expanded <= fp4_decode_smallm_max` (decode: 1-2 rows/expert makes
+    /// the 64-row tile 16-64x padding). `try_kernel` — 0 on images lacking them;
+    /// dispatch requires handle != 0 + NVFP4 routed experts + the `_t` tables.
+    moe_fused_gate_up_fp4_smallm: KernelHandle,
+    moe_down_fp4_smallm: KernelHandle,
+    /// Small-M threshold for the FP4 decode GEMV arm. 0 = arm disabled (the
+    /// default). Set from `ATLAS_MOE_FP4_DECODE_SMALLM=1` (+ optional
+    /// `ATLAS_MOE_FP4_DECODE_SMALLM_MAX`, default 96 — covers padded decode
+    /// n<=8 at top_k=10 = 80 slots). Resolved once at construction so the
+    /// captured-graph dispatch branch is stable per batch size.
+    fp4_decode_smallm_max: u32,
     moe_fp8_grouped_gemm_t: KernelHandle,
     w4a16_gemm_t: KernelHandle,
     bf16_to_fp8_k: KernelHandle,
