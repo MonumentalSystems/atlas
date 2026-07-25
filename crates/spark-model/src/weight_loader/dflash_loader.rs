@@ -27,7 +27,7 @@
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
-use spark_runtime::gpu::GpuBackend;
+use spark_runtime::gpu::{DevicePtr, GpuBackend};
 use spark_runtime::weights::WeightStore;
 
 use crate::weight_map::{DenseWeight, dense};
@@ -129,6 +129,15 @@ pub struct DflashWeights {
 
     pub layers: Vec<DflashLayerWeights>,
 
+    /// Laguna-DFlash per-captured-state RMSNorm weights (`aux_hidden_norms.{i}`,
+    /// one `[target_hidden]` vector per captured target layer). Applied to each
+    /// captured hidden state BEFORE the `fc` concat+projection. Empty for
+    /// Qwen-format drafters (single `hidden_norm` only).
+    pub aux_hidden_norms: Vec<DenseWeight>,
+    /// True when the drafter ships a per-head attention gate (`g_proj`) — the
+    /// Laguna-DFlash format. False for Qwen-format drafters.
+    pub gated: bool,
+
     /// Present iff the drafter has a draft-id → target-id mapping (i.e.
     /// `draft_vocab_size != target_vocab_size`). Absent for
     /// Qwen3.6-35B-A3B-DFlash (both vocabs = 248320).
@@ -146,6 +155,9 @@ pub struct DflashLayerWeights {
     pub o_proj: DenseWeight,
     pub q_norm: DenseWeight,
     pub k_norm: DenseWeight,
+    /// Laguna-DFlash per-head attention gate (`g_proj`, `[num_q_heads, H]`).
+    /// `weight == DevicePtr::NULL` for Qwen-format drafters (no gate).
+    pub g_proj: DenseWeight,
     pub gate_proj: DenseWeight,
     pub up_proj: DenseWeight,
     pub down_proj: DenseWeight,
@@ -232,26 +244,85 @@ pub fn load_dflash_weights(
         .context("DFlash drafter: load norm.weight")?;
 
     let layer_count = drafter_config.num_hidden_layers;
+    // Laguna-DFlash ships a FUSED `qkv_proj` [Q*Hd + 2*Kv*Hd, H] + per-head gate
+    // `g_proj`; Qwen-DFlash ships separate q/k/v and no gate. Auto-detect from
+    // the store (mirrors `store_has_dflash_weights`'s `fc.weight` probe).
+    let fused_qkv =
+        drafter_store.contains(&format!("{prefix}layers.0.self_attn.qkv_proj.weight"));
+    let gated = drafter_store.contains(&format!("{prefix}layers.0.self_attn.g_proj.weight"));
+    let hd = drafter_config.head_dim;
+    let h = drafter_config.hidden_size;
+    let q_dim = drafter_config.num_attention_heads * hd;
+    let kv_dim = drafter_config.num_key_value_heads * hd;
+    const ELT: usize = 2; // BF16 bytes/element
     let mut layers = Vec::with_capacity(layer_count);
     for i in 0..layer_count {
         let lp = format!("{prefix}layers.{i}");
+        // QKV: fused → out-major row-range offset VIEWS into the one tensor (no
+        // copy; every downstream GEMM takes explicit n/k, and `from_weights.rs`'s
+        // fused-kv `copy_d2d` follows the ptr transparently). Or separate keys.
+        let (q_proj, k_proj, v_proj) = if fused_qkv {
+            let qkv = drafter_store
+                .get(&format!("{lp}.self_attn.qkv_proj.weight"))?
+                .ptr;
+            (
+                DenseWeight { weight: qkv },
+                DenseWeight {
+                    weight: qkv.offset(q_dim * h * ELT),
+                },
+                DenseWeight {
+                    weight: qkv.offset((q_dim + kv_dim) * h * ELT),
+                },
+            )
+        } else {
+            (
+                dense(drafter_store, &format!("{lp}.self_attn.q_proj.weight"))?,
+                dense(drafter_store, &format!("{lp}.self_attn.k_proj.weight"))?,
+                dense(drafter_store, &format!("{lp}.self_attn.v_proj.weight"))?,
+            )
+        };
+        let g_proj = if gated {
+            dense(drafter_store, &format!("{lp}.self_attn.g_proj.weight"))?
+        } else {
+            DenseWeight {
+                weight: DevicePtr::NULL,
+            }
+        };
         let layer = DflashLayerWeights {
             input_layernorm: dense(drafter_store, &format!("{lp}.input_layernorm.weight"))?,
             post_attention_layernorm: dense(
                 drafter_store,
                 &format!("{lp}.post_attention_layernorm.weight"),
             )?,
-            q_proj: dense(drafter_store, &format!("{lp}.self_attn.q_proj.weight"))?,
-            k_proj: dense(drafter_store, &format!("{lp}.self_attn.k_proj.weight"))?,
-            v_proj: dense(drafter_store, &format!("{lp}.self_attn.v_proj.weight"))?,
+            q_proj,
+            k_proj,
+            v_proj,
             o_proj: dense(drafter_store, &format!("{lp}.self_attn.o_proj.weight"))?,
             q_norm: dense(drafter_store, &format!("{lp}.self_attn.q_norm.weight"))?,
             k_norm: dense(drafter_store, &format!("{lp}.self_attn.k_norm.weight"))?,
+            g_proj,
             gate_proj: dense(drafter_store, &format!("{lp}.mlp.gate_proj.weight"))?,
             up_proj: dense(drafter_store, &format!("{lp}.mlp.up_proj.weight"))?,
             down_proj: dense(drafter_store, &format!("{lp}.mlp.down_proj.weight"))?,
         };
         layers.push(layer);
+    }
+
+    // Laguna-DFlash per-captured-state RMSNorms (`aux_hidden_norms.{i}`), one per
+    // captured target layer. Applied to each captured hidden state before `fc`.
+    let n_captures = drafter_config
+        .dflash_config
+        .as_ref()
+        .map(|c| c.target_layer_ids.len())
+        .unwrap_or(0);
+    let mut aux_hidden_norms = Vec::new();
+    if drafter_store.contains(&format!("{prefix}aux_hidden_norms.0.weight")) {
+        for i in 0..n_captures {
+            aux_hidden_norms.push(dense(
+                drafter_store,
+                &format!("{prefix}aux_hidden_norms.{i}.weight"),
+            )?);
+        }
     }
 
     // `d2t` (draft-id → target-id) is absent from Qwen3.6-DFlash because
@@ -291,6 +362,8 @@ pub fn load_dflash_weights(
         hidden_norm,
         norm,
         layers,
+        aux_hidden_norms,
+        gated,
         draft_id_to_target_id,
     }))
 }
