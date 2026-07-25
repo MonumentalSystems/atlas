@@ -20,7 +20,10 @@ mod grouped;
 mod pack;
 
 pub use gemm::{bf16_gemm_act_weight_t, nvfp4_gemm_bf16_act_weight_t};
-pub use grouped::{nvfp4_grouped_down, nvfp4_grouped_gate_up, nvfp4_grouped_gate_up_fused};
+pub use grouped::{
+    nvfp4_grouped_down, nvfp4_grouped_down_dev, nvfp4_grouped_gate_up,
+    nvfp4_grouped_gate_up_fused, nvfp4_grouped_gate_up_fused_dev,
+};
 pub use pack::{pack_bf16_weight_to_nvfp4_t, pack_weight_sfb, transpose_nvfp4_packed_kton};
 
 #[cfg(all(test, atlas_cutlass))]
@@ -105,6 +108,43 @@ unsafe extern "C" {
         c_bf16: *mut c_void,
         expert_offsets_host: *const i32,
         num_experts: i32,
+        n: i32,
+        k: i32,
+        workspace: *mut c_void,
+        workspace_size: usize,
+        stream: *mut c_void,
+    ) -> i32;
+    // Device-offset (graph-capture-safe) twins: every array param is a DEVICE
+    // pointer; m_total = total expanded rows (host-known, no D2H).
+    pub(crate) fn atlas_cutlass_nvfp4_grouped_gate_up_dev(
+        a_bf16: *const c_void,
+        sorted_token_ids: *const i32,
+        gate_packed_ptrs_dev: *const u64,
+        gate_sfb_ptrs_dev: *const u64,
+        gate_scale2_dev: *const f32,
+        up_packed_ptrs_dev: *const u64,
+        up_sfb_ptrs_dev: *const u64,
+        up_scale2_dev: *const f32,
+        c_gate_bf16: *mut c_void,
+        c_up_bf16: *mut c_void,
+        expert_offsets_dev: *const i32,
+        num_experts: i32,
+        m_total: i32,
+        n: i32,
+        k: i32,
+        workspace: *mut c_void,
+        workspace_size: usize,
+        stream: *mut c_void,
+    ) -> i32;
+    pub(crate) fn atlas_cutlass_nvfp4_grouped_down_dev(
+        a_bf16: *const c_void,
+        packed_ptrs_dev: *const u64,
+        sfb_ptrs_dev: *const u64,
+        scale2_dev: *const f32,
+        c_bf16: *mut c_void,
+        expert_offsets_dev: *const i32,
+        num_experts: i32,
+        m_total: i32,
         n: i32,
         k: i32,
         workspace: *mut c_void,

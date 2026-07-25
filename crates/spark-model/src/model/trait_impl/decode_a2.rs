@@ -203,9 +203,48 @@ impl TransformerModel {
             let padded = [2usize, 4, 8].iter().copied().find(|&s| s >= n).unwrap_or(n);
             on && padded >= min
         };
+        // NOT every grouped variant is graph-illegal. Three arms exist:
+        //   • CUTLASS grouped, host-driven (ATLAS_HOLO_MOE_GROUPED_CUTLASS=1
+        //     alone): host D2H of expert_offsets → error 900 under capture →
+        //     MUST stay eager.
+        //   • CUTLASS grouped, DEVICE-OFFSET (grouped_cutlass +
+        //     ATLAS_MOE_CUTLASS_DEVICE_OFFSETS=1): same GEMM kernel, but the
+        //     per-group problem sizes/pointer arrays are built ON-DEVICE from
+        //     expert_offsets and the launch grid is the fixed sm_count
+        //     persistent grid (host_problem_shapes=nullptr) — no D2H, no host
+        //     sync, no alloc → CUDA-graph-capture-LEGAL, keep capture.
+        //   • native-FP4 K64 (ATLAS_HOLO_MOE_GATEUP_FP4=1 && _DOWN_FP4=1, and
+        //     NOT grouped_cutlass): grid.z=num_experts, expert_offsets read
+        //     ON-DEVICE, empty-expert early-return, NO host D2H/sync — so it is
+        //     CUDA-graph-capture-LEGAL and can (should) run UNDER graphs.
+        // Only force eager for the host-driven CUTLASS arm; the device-offset
+        // CUTLASS arm and the FP4-K64 arm keep capture.
+        // (env reads mirror moe/init.rs gateup_fp4/down_fp4 and
+        // forward_prefill_routed.rs grouped_cutlass_gate_up_enabled()/
+        // grouped_cutlass_device_offsets_enabled().)
+        let grouped_is_graph_safe = {
+            use std::sync::OnceLock;
+            static SAFE: OnceLock<bool> = OnceLock::new();
+            *SAFE.get_or_init(|| {
+                let flag = |k: &str| {
+                    std::env::var(k)
+                        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                        .unwrap_or(false)
+                };
+                let gateup_fp4 = flag("ATLAS_HOLO_MOE_GATEUP_FP4");
+                let down_fp4 = flag("ATLAS_HOLO_MOE_DOWN_FP4");
+                let grouped_cutlass = flag("ATLAS_HOLO_MOE_GROUPED_CUTLASS");
+                let dev_offsets = flag("ATLAS_MOE_CUTLASS_DEVICE_OFFSETS");
+                (gateup_fp4 && down_fp4 && !grouped_cutlass)
+                    || (grouped_cutlass && dev_offsets)
+            })
+        };
+        // Force eager ONLY when the grouped step that will fire is the
+        // host-D2H (CUTLASS) one. The device-offset FP4-K64 arm stays captured.
+        let grouped_forces_eager = grouped_decode_fires && !grouped_is_graph_safe;
         let use_graphs = !ms_profile
             && !lora_eager
-            && !grouped_decode_fires
+            && !grouped_forces_eager
             && std::env::var("ATLAS_DECODE_GRAPHS_MULTISEQ")
                 .ok()
                 .as_deref()

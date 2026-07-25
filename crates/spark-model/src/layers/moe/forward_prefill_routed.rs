@@ -20,6 +20,24 @@ fn grouped_cutlass_gate_up_enabled() -> bool {
         == Some("1")
 }
 
+/// Whether the CUTLASS grouped path builds its per-group problem sizes ON
+/// DEVICE (`ATLAS_MOE_CUTLASS_DEVICE_OFFSETS=1`). Same GEMM kernel, but no
+/// host D2H of `expert_offsets` and a fixed `sm_count` launch grid
+/// (`host_problem_shapes = nullptr`) — CUDA-graph-capture-legal, so multi-seq
+/// decode keeps its graphs while the grouped CUTLASS MoE fires (see the
+/// `grouped_is_graph_safe` gate in `decode_a2.rs`). Off by default: the
+/// shipped host-driven (eager-under-decode) path is unchanged.
+pub(crate) fn grouped_cutlass_device_offsets_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("ATLAS_MOE_CUTLASS_DEVICE_OFFSETS")
+            .ok()
+            .as_deref()
+            == Some("1")
+    })
+}
+
 impl MoeLayer {
     /// Routed-expert grouped-GEMM path: upper-bound grid sizing → grouped
     /// gate+up GEMM → SiLU+mul → grouped down GEMM.
@@ -148,24 +166,51 @@ impl MoeLayer {
                 // expert_input + sorted_token_ids directly, no separate permute pass.
                 // Writes C_gate/C_up in the sorted layout so silu+down+unpermute are
                 // unchanged.
-                cutlass_eoff = Some(ops::moe_grouped_gate_up_cutlass(
-                    ctx.gpu,
-                    expert_input,
-                    sorted_token_ids,
-                    self.gate_ptrs.packed_ptrs,
-                    self.gate_sfb_cutlass.expect("gate sfb checked above"),
-                    self.gate_ptrs.scale2_vals,
-                    self.up_ptrs.packed_ptrs,
-                    self.up_sfb_cutlass.expect("up sfb checked above"),
-                    self.up_ptrs.scale2_vals,
-                    expert_gate_out,
-                    expert_up_out,
-                    expert_offsets,
-                    num_experts as usize,
-                    inter,
-                    h,
-                    stream,
-                )?);
+                if grouped_cutlass_device_offsets_enabled() {
+                    // DEVICE-OFFSET variant (ATLAS_MOE_CUTLASS_DEVICE_OFFSETS=1):
+                    // same grouped GEMM, but per-group problem sizes/pointers are
+                    // built on-device from `expert_offsets` and the launch grid is
+                    // the fixed sm_count persistent grid — no D2H + no host sync,
+                    // so this arm is CUDA-graph-capture-legal (decode graphs stay
+                    // captured; see decode_a2.rs grouped_is_graph_safe).
+                    ops::moe_grouped_gate_up_cutlass_dev(
+                        expert_input,
+                        sorted_token_ids,
+                        self.gate_ptrs.packed_ptrs,
+                        self.gate_sfb_cutlass.expect("gate sfb checked above"),
+                        self.gate_ptrs.scale2_vals,
+                        self.up_ptrs.packed_ptrs,
+                        self.up_sfb_cutlass.expect("up sfb checked above"),
+                        self.up_ptrs.scale2_vals,
+                        expert_gate_out,
+                        expert_up_out,
+                        expert_offsets,
+                        num_experts as usize,
+                        total_expanded,
+                        inter,
+                        h,
+                        stream,
+                    )?;
+                } else {
+                    cutlass_eoff = Some(ops::moe_grouped_gate_up_cutlass(
+                        ctx.gpu,
+                        expert_input,
+                        sorted_token_ids,
+                        self.gate_ptrs.packed_ptrs,
+                        self.gate_sfb_cutlass.expect("gate sfb checked above"),
+                        self.gate_ptrs.scale2_vals,
+                        self.up_ptrs.packed_ptrs,
+                        self.up_sfb_cutlass.expect("up sfb checked above"),
+                        self.up_ptrs.scale2_vals,
+                        expert_gate_out,
+                        expert_up_out,
+                        expert_offsets,
+                        num_experts as usize,
+                        inter,
+                        h,
+                        stream,
+                    )?);
+                }
             } else if let (Some(gp), Some(up)) = (&self.gate_ptrs_t, &self.up_ptrs_t) {
                 if self.experts_scale_kind == crate::weight_map::WeightQuantFormat::Mxfp4E8m0 {
                     // ── ARM-2 Phase-K: native-MXFP4 (E8M0) fused gate_up ──
@@ -369,20 +414,40 @@ impl MoeLayer {
                 // gate_up wrote it sorted), so NO gather. Weights = decode down_ptrs
                 // packed [N=hidden,K/2] + load-built swizzled SFB + real scale2. Writes
                 // expert_down_out in the sorted layout (unpermute downstream unchanged).
-                ops::moe_grouped_down_cutlass(
-                    ctx.gpu,
-                    cutlass_eoff.as_deref(),
-                    expert_gate_out,
-                    self.down_ptrs.packed_ptrs,
-                    self.down_sfb_cutlass.expect("down sfb checked above"),
-                    self.down_ptrs.scale2_vals,
-                    expert_down_out,
-                    expert_offsets,
-                    num_experts as usize,
-                    h,
-                    inter,
-                    stream,
-                )?;
+                if grouped_cutlass_device_offsets_enabled() {
+                    // DEVICE-OFFSET variant — see the gate_up branch above. No
+                    // host `expert_offsets` exist in this mode (nothing was
+                    // copied down), so the down projection re-reads the device
+                    // prefix sum in its own prep kernel.
+                    ops::moe_grouped_down_cutlass_dev(
+                        expert_gate_out,
+                        self.down_ptrs.packed_ptrs,
+                        self.down_sfb_cutlass.expect("down sfb checked above"),
+                        self.down_ptrs.scale2_vals,
+                        expert_down_out,
+                        expert_offsets,
+                        num_experts as usize,
+                        total_expanded,
+                        h,
+                        inter,
+                        stream,
+                    )?;
+                } else {
+                    ops::moe_grouped_down_cutlass(
+                        ctx.gpu,
+                        cutlass_eoff.as_deref(),
+                        expert_gate_out,
+                        self.down_ptrs.packed_ptrs,
+                        self.down_sfb_cutlass.expect("down sfb checked above"),
+                        self.down_ptrs.scale2_vals,
+                        expert_down_out,
+                        expert_offsets,
+                        num_experts as usize,
+                        h,
+                        inter,
+                        stream,
+                    )?;
+                }
             } else if let Some(dp) = &self.down_ptrs_t {
                 if self.experts_scale_kind == crate::weight_map::WeightQuantFormat::Mxfp4E8m0 {
                     // ── ARM-2 Phase-K: native-MXFP4 (E8M0) grouped down ──

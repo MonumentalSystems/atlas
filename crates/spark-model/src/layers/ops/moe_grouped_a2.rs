@@ -221,6 +221,86 @@ pub fn moe_grouped_gate_up_cutlass(
     Ok(eoff)
 }
 
+/// DEVICE-OFFSET twin of [`moe_grouped_gate_up_cutlass`]
+/// (`ATLAS_MOE_CUTLASS_DEVICE_OFFSETS=1`): passes the device-resident
+/// per-expert pointer/scale tables and the device `expert_offsets` STRAIGHT
+/// through to the CUTLASS entry, which builds every per-group argument
+/// on-device and launches with `host_problem_shapes = nullptr` (fixed
+/// `sm_count` grid). No D2H, no synchronize, no host allocation — legal under
+/// CUDA graph capture, so multi-seq decode can keep its graphs while the
+/// grouped CUTLASS MoE fires. `m_total` is the expanded row count
+/// (`num_tokens * top_k`), which the caller already knows host-side.
+#[allow(clippy::too_many_arguments)]
+pub fn moe_grouped_gate_up_cutlass_dev(
+    a: DevicePtr,
+    sorted_token_ids: DevicePtr,
+    gate_packed: DevicePtr,
+    gate_sfb: DevicePtr,
+    gate_scale2: DevicePtr,
+    up_packed: DevicePtr,
+    up_sfb: DevicePtr,
+    up_scale2: DevicePtr,
+    c_gate: DevicePtr,
+    c_up: DevicePtr,
+    expert_offsets: DevicePtr,
+    num_experts: usize,
+    m_total: u32,
+    inter: u32,
+    hidden: u32,
+    stream: u64,
+) -> Result<()> {
+    spark_runtime::cutlass::nvfp4_grouped_gate_up_fused_dev(
+        a.0,
+        sorted_token_ids.0,
+        gate_packed.0,
+        gate_sfb.0,
+        gate_scale2.0,
+        up_packed.0,
+        up_sfb.0,
+        up_scale2.0,
+        c_gate.0,
+        c_up.0,
+        expert_offsets.0,
+        num_experts,
+        m_total,
+        inter,
+        hidden,
+        stream,
+    )
+}
+
+/// DEVICE-OFFSET twin of [`moe_grouped_down_cutlass`] — same graph-capture-safe
+/// contract as [`moe_grouped_gate_up_cutlass_dev`]. `a` is the post-SiLU
+/// intermediate (expert-contiguous, identity gather).
+#[allow(clippy::too_many_arguments)]
+pub fn moe_grouped_down_cutlass_dev(
+    a: DevicePtr,
+    packed: DevicePtr,
+    sfb: DevicePtr,
+    scale2: DevicePtr,
+    c: DevicePtr,
+    expert_offsets: DevicePtr,
+    num_experts: usize,
+    m_total: u32,
+    hidden: u32,
+    inter: u32,
+    stream: u64,
+) -> Result<()> {
+    spark_runtime::cutlass::nvfp4_grouped_down_dev(
+        a.0,
+        packed.0,
+        sfb.0,
+        scale2.0,
+        c.0,
+        expert_offsets.0,
+        num_experts,
+        m_total,
+        hidden,
+        inter,
+        stream,
+    )
+}
+
 /// Single-launch CUTLASS grouped NVFP4 DOWN projection. `a` is the post-SiLU
 /// intermediate `[total_expanded, inter]` (already expert-contiguous — no gather).
 /// `packed`/`sfb` are device `[num_experts]` u64 pointer arrays into the

@@ -57,6 +57,45 @@ pub fn nvfp4_grouped_gate_up_fused(
     unreachable!("cutlass::nvfp4_grouped_gate_up_fused is cuda-only (not built for metal)")
 }
 
+#[allow(clippy::too_many_arguments)]
+pub fn nvfp4_grouped_gate_up_fused_dev(
+    _a: u64,
+    _sorted_token_ids: u64,
+    _gate_packed_ptrs_dev: u64,
+    _gate_sfb_ptrs_dev: u64,
+    _gate_scale2_dev: u64,
+    _up_packed_ptrs_dev: u64,
+    _up_sfb_ptrs_dev: u64,
+    _up_scale2_dev: u64,
+    _c_gate: u64,
+    _c_up: u64,
+    _expert_offsets_dev: u64,
+    _num_experts: usize,
+    _m_total: u32,
+    _n: u32,
+    _k: u32,
+    _stream: u64,
+) -> Result<()> {
+    unreachable!("cutlass::nvfp4_grouped_gate_up_fused_dev is cuda-only (not built for metal)")
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn nvfp4_grouped_down_dev(
+    _a: u64,
+    _packed_ptrs_dev: u64,
+    _sfb_ptrs_dev: u64,
+    _scale2_dev: u64,
+    _c: u64,
+    _expert_offsets_dev: u64,
+    _num_experts: usize,
+    _m_total: u32,
+    _n: u32,
+    _k: u32,
+    _stream: u64,
+) -> Result<()> {
+    unreachable!("cutlass::nvfp4_grouped_down_dev is cuda-only (not built for metal)")
+}
+
 pub fn nvfp4_grouped_down(
     _a: u64,
     _packed_ptrs: &[u64],

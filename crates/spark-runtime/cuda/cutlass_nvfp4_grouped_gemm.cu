@@ -658,6 +658,496 @@ extern "C" int atlas_cutlass_nvfp4_grouped_gate_up_fused(
 }
 
 // ════════════════════════════════════════════════════════════════════════════
+// DEVICE-OFFSET grouped path (ATLAS_MOE_CUTLASS_DEVICE_OFFSETS=1) —
+// CUDA-graph-capture-safe variant of the host-driven entries above.
+//
+// The host-driven path D2H-copies `expert_offsets` + synchronizes to build the
+// per-group problem_sizes/pointer arrays on the host — illegal under CUDA graph
+// capture (CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED, 900), which forces the whole
+// multi-seq decode step eager whenever the grouped MoE fires.
+//
+// This variant keeps the SAME Sm120 grouped GEMM kernel but drives it entirely
+// from the device:
+//   • num_groups = num_experts (ALL experts, empty groups get M_k = 0 — the
+//     GroupScheduler's warp-speculative group walk skips 0-tile groups; see
+//     sm90_tile_scheduler_group.hpp get_work_idx_m_and_n).
+//   • per-group {M_k,N,K} problem shapes + A/SFA/C pointer + stride + SF-layout
+//     arrays are written by build_group_args_dev, a single-block kernel that
+//     reads the device `expert_offsets` (M_k = off[k+1]-off[k]).
+//   • B / SFB / alpha arrays: the device-resident per-expert u64 pointer tables
+//     (`*_ptrs.packed_ptrs`, `*_sfb_cutlass`) are passed through DIRECTLY —
+//     group index == expert index, so no snapshot/copy at all. alpha_ptr_array
+//     entries (&scale2[e]) are written by the same prep kernel.
+//   • host_problem_shapes = nullptr ⇒ the tile scheduler launches a FIXED
+//     hw_info.sm_count persistent grid (sm90_tile_scheduler_group.hpp:221-222)
+//     — hardware-constant, hence capture-legal.
+//   • gemm.initialize()/get_workspace_size()/can_implement() are host-pure for
+//     the grouped kernel (mainloop/epilogue to_underlying_arguments build the
+//     template TMA descriptors from TileShape, not host shapes; all
+//     initialize_workspace hooks are no-ops) — verified against the vendored
+//     CUTLASS 4.6.0 headers. The launch itself is a plain `<<<>>>`.
+// NO cudaMemcpy(D2H or pageable-H2D of transients), NO synchronize, NO
+// allocation anywhere on this path — everything is carved from the caller's
+// fixed workspace at host-arithmetic offsets (m_total is host-known: n*top_k).
+// ════════════════════════════════════════════════════════════════════════════
+#if defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED) || defined(CUTLASS_ARCH_MMA_SM121_SUPPORTED)
+
+static int cached_sm_count_() {
+  static int c = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(0);
+  return c;
+}
+
+// Exact SFA staging bytes for an [m, k] group (1-byte SF elements). Shared
+// host/device formula; the host carve bound additionally relies on this being
+// linear in ceil(m/128), which the public entries verify per (n,k) (cheap,
+// host-pure) before trusting it.
+static inline size_t sfa_bytes_host_(int m, int n, int k) {
+  auto lsa = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFA(cute::make_shape(m, n, k, 1));
+  return (size_t)cute::size(cute::filter_zeros(lsa));
+}
+
+// Single-block prep: read device expert_offsets, prefix-sum the per-group SFA
+// staging sizes, and write EVERY per-group argument array the grouped GEMM
+// needs. Replaces the host loop + 9 cudaMemcpyAsync uploads of the host-driven
+// path. Pointer arrays are written as u64 (bit-identical to the void* arrays
+// CUTLASS reads). Grid: (1,1,1) Block: (256,1,1).
+__global__ void build_group_args_dev(
+    const int* __restrict__ expert_offsets,  // [G+1] device prefix sum
+    int G,
+    int n,
+    int k,
+    const unsigned char* packed_a_base,      // packed-A staging region
+    unsigned char* sfa_base,                 // SFA staging region
+    ProblemShape* __restrict__ shapes,       // [G] {m_e, n, k}
+    unsigned long long* __restrict__ ptr_a,  // [G] group packed-A ptr
+    unsigned long long* __restrict__ ptr_sfa,  // [G] group SFA ptr
+    LayoutSFA* __restrict__ l_sfa,           // [G]
+    StrideA* __restrict__ ds_a,              // [G] (M-independent, replicated)
+    StrideB* __restrict__ ds_b,              // [G]
+    StrideC* __restrict__ ds_c,              // [G]
+    StrideD* __restrict__ ds_d,              // [G]
+    LayoutSFB* __restrict__ l_sfb,           // [G] (M-independent, replicated)
+    const float* scale2_0,                   // device [G] (projection 0)
+    unsigned long long* __restrict__ alpha0,  // [G] &scale2_0[e]
+    const float* scale2_1,                   // nullable (projection 1)
+    unsigned long long* __restrict__ alpha1,  // nullable
+    unsigned long long c0_base,              // projection-0 output base
+    unsigned long long* __restrict__ ptr_c0,  // [G]
+    unsigned long long c1_base,              // nullable pair
+    unsigned long long* __restrict__ ptr_c1) {
+  __shared__ unsigned long long sfa_cum[1025];  // G <= 1024 (checked host-side)
+  const int tid = threadIdx.x;
+  for (int e = tid; e < G; e += blockDim.x) {
+    const int m_e = expert_offsets[e + 1] - expert_offsets[e];
+    unsigned long long bytes = 0;
+    if (m_e > 0) {
+      auto lsa =
+          Sm1xxBlkScaledConfig::tile_atom_to_shape_SFA(cute::make_shape(m_e, n, k, 1));
+      bytes = (unsigned long long)cute::size(cute::filter_zeros(lsa));
+    }
+    sfa_cum[e + 1] = bytes;
+  }
+  __syncthreads();
+  if (tid == 0) {
+    sfa_cum[0] = 0;
+    for (int e = 0; e < G; ++e) {
+      sfa_cum[e + 1] += sfa_cum[e];
+    }
+  }
+  __syncthreads();
+  for (int e = tid; e < G; e += blockDim.x) {
+    const int off = expert_offsets[e];
+    const int m_e = expert_offsets[e + 1] - off;
+    const int m_l = m_e > 0 ? m_e : 1;  // placeholder for never-read layouts
+    shapes[e] = ProblemShape{m_e, n, k};
+    ptr_a[e] =
+        (unsigned long long)(packed_a_base + (unsigned long long)off * (k / 2));
+    ptr_sfa[e] = (unsigned long long)(sfa_base + sfa_cum[e]);
+    l_sfa[e] =
+        Sm1xxBlkScaledConfig::tile_atom_to_shape_SFA(cute::make_shape(m_l, n, k, 1));
+    ds_a[e] = cutlass::make_cute_packed_stride(StrideA{}, {m_l, k, 1});
+    ds_b[e] = cutlass::make_cute_packed_stride(StrideB{}, {n, k, 1});
+    ds_c[e] = cutlass::make_cute_packed_stride(StrideC{}, {m_l, n, 1});
+    ds_d[e] = cutlass::make_cute_packed_stride(StrideD{}, {m_l, n, 1});
+    l_sfb[e] =
+        Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(cute::make_shape(m_l, n, k, 1));
+    alpha0[e] = (unsigned long long)(scale2_0 + e);
+    if (alpha1 != nullptr) {
+      alpha1[e] = (unsigned long long)(scale2_1 + e);
+    }
+    const unsigned long long c_off = (unsigned long long)off * n * 2ull;
+    ptr_c0[e] = c0_base + c_off;
+    if (ptr_c1 != nullptr) {
+      ptr_c1[e] = c1_base + c_off;
+    }
+  }
+}
+
+// A-pack for the device-offset path. Identical quantization math to
+// pack_act_group/pack_act_grouped_batched, but indexed by GLOBAL sorted row
+// (grid.x = m_total, host-known — no data-dependent grid): each row finds its
+// expert via binary search over the device expert_offsets, writes its packed-A
+// row at the globally contiguous row offset (group A ptr = base + off_e*(k/2),
+// so local row lrow lands at base + row*(k/2)) and its SFA byte through the
+// per-group SFA pointer written by build_group_args_dev.
+__global__ void pack_act_dev_offsets(
+    const __nv_bfloat16* __restrict__ act_global,  // TOKEN-MAJOR base [*, k]
+    const int* __restrict__ sorted_token_ids,      // null => identity
+    const int* __restrict__ expert_offsets,        // [G+1] device
+    int G,
+    unsigned char* __restrict__ packed_base,
+    const unsigned long long* __restrict__ sfa_ptrs,  // [G] from prep
+    int k) {
+  const int row = blockIdx.x;  // grid.x == m_total exactly
+  int group = blockIdx.y * blockDim.x + threadIdx.x;
+  const int groups = k / 16;
+  if (group >= groups) {
+    return;
+  }
+  // Last e with expert_offsets[e] <= row (duplicates from empty experts
+  // resolve to the owning non-empty group: off[e] <= row < off[e+1]).
+  int lo = 0;
+  int hi = G;
+  while (hi - lo > 1) {
+    const int mid = (lo + hi) >> 1;
+    if (expert_offsets[mid] <= row) {
+      lo = mid;
+    } else {
+      hi = mid;
+    }
+  }
+  const int e = lo;
+  const int lrow = row - expert_offsets[e];
+  const int m_e = expert_offsets[e + 1] - expert_offsets[e];
+  // SFA layout is N-independent — same (m_e, 1, k) form as the batched packer.
+  auto layout_sfa =
+      Sm1xxBlkScaledConfig::tile_atom_to_shape_SFA(cute::make_shape(m_e, 1, k, 1));
+  unsigned char* scales = reinterpret_cast<unsigned char*>(sfa_ptrs[e]);
+  const int tok = sorted_token_ids ? sorted_token_ids[row] : row;
+  const __nv_bfloat16* arow = act_global + (unsigned long long)tok * k;
+  const int base = group * 16;
+  float max_abs = 0.0f;
+#pragma unroll
+  for (int i = 0; i < 16; ++i) {
+    float v = __bfloat162float(arow[base + i]);
+    max_abs = fmaxf(max_abs, fabsf(v));
+  }
+  float scale = max_abs > 0.0f ? max_abs / 6.0f : 1.0f;
+  cutlass::float_ue4m3_t sf(scale);
+  scales[layout_sfa(lrow, base, 0)] = *reinterpret_cast<unsigned char*>(&sf);
+  float dec = static_cast<float>(sf);
+  float inv = dec > 0.0f ? 1.0f / dec : 0.0f;
+#pragma unroll
+  for (int i = 0; i < 16; i += 2) {
+    float v0 = __bfloat162float(arow[base + i]) * inv;
+    float v1 = __bfloat162float(arow[base + i + 1]) * inv;
+    packed_base[(unsigned long long)row * (k / 2) + base / 2 + i / 2] =
+        static_cast<unsigned char>(float_to_e2m1_g(v0) | (float_to_e2m1_g(v1) << 4));
+  }
+}
+
+// One grouped GEMM with fully device-resident per-group arguments and
+// host_problem_shapes = nullptr (fixed sm_count grid — capture-legal). All
+// host work here is pure arithmetic + the launch.
+static int launch_projection_dev(
+    int G,
+    ProblemShape* d_shapes,
+    const unsigned long long* d_a,
+    StrideA* ds_a,
+    const unsigned long long* d_sfa,
+    LayoutSFA* dl_sfa,
+    const unsigned long long* b_ptrs_dev,   // device per-expert table, as-is
+    const unsigned long long* sfb_ptrs_dev,  // device per-expert table, as-is
+    StrideB* ds_b,
+    LayoutSFB* dl_sfb,
+    const unsigned long long* d_alpha_ptr,
+    const unsigned long long* d_c,
+    StrideC* ds_c,
+    StrideD* ds_d,
+    unsigned char* ws,
+    size_t cursor,
+    size_t workspace_size,
+    size_t* cursor_out,
+    cudaStream_t stream,
+    int tag) {
+  cutlass::KernelHardwareInfo hw{};
+  hw.device_id = 0;
+  hw.sm_count = cached_sm_count_();
+
+  typename Gemm::GemmKernel::CollectiveMainloop::Arguments mainloop_args{
+      reinterpret_cast<const ElementA::DataType**>(
+          const_cast<unsigned long long*>(d_a)),
+      ds_a,
+      reinterpret_cast<const ElementB::DataType**>(
+          const_cast<unsigned long long*>(b_ptrs_dev)),
+      ds_b,
+      reinterpret_cast<const ElementSF**>(const_cast<unsigned long long*>(d_sfa)),
+      dl_sfa,
+      reinterpret_cast<const ElementSF**>(
+          const_cast<unsigned long long*>(sfb_ptrs_dev)),
+      dl_sfb};
+
+  typename Gemm::GemmKernel::CollectiveEpilogue::Arguments epi_args{};
+  epi_args.thread.alpha = 1.0f;
+  epi_args.thread.beta = 0.0f;
+  epi_args.thread.alpha_ptr_array =
+      reinterpret_cast<const float**>(const_cast<unsigned long long*>(d_alpha_ptr));
+  epi_args.ptr_C =
+      reinterpret_cast<const ElementC**>(const_cast<unsigned long long*>(d_c));
+  epi_args.dC = ds_c;
+  epi_args.ptr_D =
+      reinterpret_cast<ElementD**>(const_cast<unsigned long long*>(d_c));
+  epi_args.dD = ds_d;
+
+  typename Gemm::Arguments args{
+      cutlass::gemm::GemmUniversalMode::kGrouped,
+      // host_problem_shapes = nullptr ⇒ scheduler grid = hw_info.sm_count
+      // (fixed) and every per-group decision moves on-device.
+      {G, d_shapes, nullptr},
+      mainloop_args,
+      epi_args,
+      hw};
+
+  Gemm gemm;
+  size_t need = Gemm::get_workspace_size(args);
+  if (cursor + need > workspace_size) {
+    return -2;
+  }
+  if (gemm.can_implement(args) != cutlass::Status::kSuccess) {
+    return tag + (-50);
+  }
+  cutlass::Status st = gemm.initialize(args, ws + cursor, stream);
+  if (st != cutlass::Status::kSuccess) {
+    return tag + static_cast<int>(st);
+  }
+  st = gemm.run(stream);
+  if (cursor_out != nullptr) {
+    *cursor_out = align_up_(cursor + need, 256);
+  }
+  return st == cutlass::Status::kSuccess ? 0 : tag + static_cast<int>(st);
+}
+
+// Per-call workspace carve for the device-offset path. All sizes are pure host
+// arithmetic over (m_total, n, k, G) — m_total is n_lanes*top_k, known without
+// touching the device. Returns 0 on success.
+struct DevCarve {
+  unsigned char* packed_a = nullptr;
+  unsigned char* sfa = nullptr;
+  ProblemShape* shapes = nullptr;
+  unsigned long long* ptr_a = nullptr;
+  unsigned long long* ptr_sfa = nullptr;
+  LayoutSFA* l_sfa = nullptr;
+  StrideA* ds_a = nullptr;
+  StrideB* ds_b = nullptr;
+  StrideC* ds_c = nullptr;
+  StrideD* ds_d = nullptr;
+  LayoutSFB* l_sfb = nullptr;
+  unsigned long long* alpha0 = nullptr;
+  unsigned long long* alpha1 = nullptr;
+  unsigned long long* ptr_c0 = nullptr;
+  unsigned long long* ptr_c1 = nullptr;
+  size_t cursor = 0;  // first free byte after the arrays
+};
+
+static int carve_dev_(unsigned char* ws,
+                      size_t ws_size,
+                      int G,
+                      int m_total,
+                      int n,
+                      int k,
+                      bool dual,
+                      DevCarve& d) {
+  // Guard the carve's linear-in-ceil(m/128) SFA model (host-pure, cheap).
+  const size_t atom = sfa_bytes_host_(128, n, k);
+  if (sfa_bytes_host_(1, n, k) != atom || sfa_bytes_host_(129, n, k) != 2 * atom ||
+      sfa_bytes_host_(257, n, k) != 3 * atom) {
+    return -7;
+  }
+  size_t cur = 0;
+  auto take = [&](size_t bytes) -> unsigned char* {
+    unsigned char* p = ws + cur;
+    cur = align_up_(cur + bytes, 256);
+    return p;
+  };
+  d.packed_a = take((size_t)m_total * (k / 2));
+  // Upper bound: sum_e ceil(m_e/128) <= ceil(m_total/128) + #nonempty, and
+  // #nonempty <= min(G, m_total). The prep kernel packs groups exactly (no
+  // per-group alignment padding; atom sizes are already 256B multiples).
+  const size_t nonempty_max = (size_t)(G < m_total ? G : m_total);
+  d.sfa = take(((size_t)(m_total + 127) / 128 + nonempty_max) * atom);
+  d.shapes = (ProblemShape*)take((size_t)G * sizeof(ProblemShape));
+  d.ptr_a = (unsigned long long*)take((size_t)G * 8);
+  d.ptr_sfa = (unsigned long long*)take((size_t)G * 8);
+  d.l_sfa = (LayoutSFA*)take((size_t)G * sizeof(LayoutSFA));
+  d.ds_a = (StrideA*)take((size_t)G * sizeof(StrideA));
+  d.ds_b = (StrideB*)take((size_t)G * sizeof(StrideB));
+  d.ds_c = (StrideC*)take((size_t)G * sizeof(StrideC));
+  d.ds_d = (StrideD*)take((size_t)G * sizeof(StrideD));
+  d.l_sfb = (LayoutSFB*)take((size_t)G * sizeof(LayoutSFB));
+  d.alpha0 = (unsigned long long*)take((size_t)G * 8);
+  d.alpha1 = dual ? (unsigned long long*)take((size_t)G * 8) : nullptr;
+  d.ptr_c0 = (unsigned long long*)take((size_t)G * 8);
+  d.ptr_c1 = dual ? (unsigned long long*)take((size_t)G * 8) : nullptr;
+  d.cursor = cur;
+  return cur <= ws_size ? 0 : -2;
+}
+#endif  // arch guard
+
+// ════════════════════════════════════════════════════════════════════════════
+// PUBLIC ENTRY — DEVICE-OFFSET grouped gate_up (graph-capture-safe twin of
+// atlas_cutlass_nvfp4_grouped_gate_up_fused). ALL array parameters are DEVICE
+// pointers: *_ptrs_dev / *_sfb_ptrs_dev / *_scale2_dev are the per-expert
+// tables as they already live on the GPU; expert_offsets is the device i32
+// [num_experts+1] prefix sum from moe_sort_by_expert. m_total = total expanded
+// rows (n_tokens * top_k), host-known. No D2H, no sync, no alloc.
+// ════════════════════════════════════════════════════════════════════════════
+extern "C" int atlas_cutlass_nvfp4_grouped_gate_up_dev(
+    const void* A_bf16,
+    const int* sorted_token_ids,
+    const unsigned long long* gate_packed_ptrs_dev,
+    const unsigned long long* gate_sfb_ptrs_dev,
+    const float* gate_scale2_dev,
+    const unsigned long long* up_packed_ptrs_dev,
+    const unsigned long long* up_sfb_ptrs_dev,
+    const float* up_scale2_dev,
+    void* C_gate_bf16,
+    void* C_up_bf16,
+    const int* expert_offsets_dev,
+    int num_experts,
+    int m_total,
+    int n,
+    int k,
+    void* workspace,
+    size_t workspace_size,
+    cudaStream_t stream) {
+#if defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED) || defined(CUTLASS_ARCH_MMA_SM121_SUPPORTED)
+  // k%32: per-row packed-A bytes (k/2) stay 16B-aligned for per-group TMA
+  // bases; n%8: per-group C offsets (off*n*2B) stay 16B-aligned.
+  if (n <= 0 || k <= 0 || (k % 32) != 0 || (n % 8) != 0 || num_experts <= 0 ||
+      num_experts > 1024) {
+    return -1;
+  }
+  if (m_total <= 0) {
+    return 0;
+  }
+  unsigned char* ws = static_cast<unsigned char*>(workspace);
+  DevCarve d;
+  int rc = carve_dev_(ws, workspace_size, num_experts, m_total, n, k, true, d);
+  if (rc) {
+    return rc;
+  }
+  build_group_args_dev<<<1, 256, 0, stream>>>(
+      expert_offsets_dev, num_experts, n, k, d.packed_a, d.sfa, d.shapes, d.ptr_a,
+      d.ptr_sfa, d.l_sfa, d.ds_a, d.ds_b, d.ds_c, d.ds_d, d.l_sfb, gate_scale2_dev,
+      d.alpha0, up_scale2_dev, d.alpha1, (unsigned long long)C_gate_bf16, d.ptr_c0,
+      (unsigned long long)C_up_bf16, d.ptr_c1);
+  dim3 blk(256);
+  dim3 grd(m_total, (k / 16 + blk.x - 1) / blk.x);
+  pack_act_dev_offsets<<<grd, blk, 0, stream>>>(
+      static_cast<const __nv_bfloat16*>(A_bf16), sorted_token_ids,
+      expert_offsets_dev, num_experts, d.packed_a, d.ptr_sfa, k);
+  size_t cur = d.cursor;
+  rc = launch_projection_dev(num_experts, d.shapes, d.ptr_a, d.ds_a, d.ptr_sfa,
+                             d.l_sfa, gate_packed_ptrs_dev, gate_sfb_ptrs_dev,
+                             d.ds_b, d.l_sfb, d.alpha0, d.ptr_c0, d.ds_c, d.ds_d,
+                             ws, cur, workspace_size, &cur, stream, 400000);
+  if (rc) {
+    return rc;
+  }
+  return launch_projection_dev(num_experts, d.shapes, d.ptr_a, d.ds_a, d.ptr_sfa,
+                               d.l_sfa, up_packed_ptrs_dev, up_sfb_ptrs_dev,
+                               d.ds_b, d.l_sfb, d.alpha1, d.ptr_c1, d.ds_c,
+                               d.ds_d, ws, cur, workspace_size, nullptr, stream,
+                               500000);
+#else
+  (void)A_bf16;
+  (void)sorted_token_ids;
+  (void)gate_packed_ptrs_dev;
+  (void)gate_sfb_ptrs_dev;
+  (void)gate_scale2_dev;
+  (void)up_packed_ptrs_dev;
+  (void)up_sfb_ptrs_dev;
+  (void)up_scale2_dev;
+  (void)C_gate_bf16;
+  (void)C_up_bf16;
+  (void)expert_offsets_dev;
+  (void)num_experts;
+  (void)m_total;
+  (void)n;
+  (void)k;
+  (void)workspace;
+  (void)workspace_size;
+  (void)stream;
+  return -120;
+#endif
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// PUBLIC ENTRY — DEVICE-OFFSET grouped DOWN (graph-capture-safe twin of
+// atlas_cutlass_nvfp4_grouped_down). A = post-SiLU [m_total, K=inter], already
+// expert-contiguous (identity gather). All arrays are DEVICE pointers.
+// ════════════════════════════════════════════════════════════════════════════
+extern "C" int atlas_cutlass_nvfp4_grouped_down_dev(
+    const void* A_bf16,
+    const unsigned long long* packed_ptrs_dev,
+    const unsigned long long* sfb_ptrs_dev,
+    const float* scale2_dev,
+    void* C_bf16,
+    const int* expert_offsets_dev,
+    int num_experts,
+    int m_total,
+    int n,
+    int k,
+    void* workspace,
+    size_t workspace_size,
+    cudaStream_t stream) {
+#if defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED) || defined(CUTLASS_ARCH_MMA_SM121_SUPPORTED)
+  if (n <= 0 || k <= 0 || (k % 32) != 0 || (n % 8) != 0 || num_experts <= 0 ||
+      num_experts > 1024) {
+    return -1;
+  }
+  if (m_total <= 0) {
+    return 0;
+  }
+  unsigned char* ws = static_cast<unsigned char*>(workspace);
+  DevCarve d;
+  int rc = carve_dev_(ws, workspace_size, num_experts, m_total, n, k, false, d);
+  if (rc) {
+    return rc;
+  }
+  build_group_args_dev<<<1, 256, 0, stream>>>(
+      expert_offsets_dev, num_experts, n, k, d.packed_a, d.sfa, d.shapes, d.ptr_a,
+      d.ptr_sfa, d.l_sfa, d.ds_a, d.ds_b, d.ds_c, d.ds_d, d.l_sfb, scale2_dev,
+      d.alpha0, nullptr, nullptr, (unsigned long long)C_bf16, d.ptr_c0, 0ull,
+      nullptr);
+  dim3 blk(256);
+  dim3 grd(m_total, (k / 16 + blk.x - 1) / blk.x);
+  pack_act_dev_offsets<<<grd, blk, 0, stream>>>(
+      static_cast<const __nv_bfloat16*>(A_bf16), nullptr, expert_offsets_dev,
+      num_experts, d.packed_a, d.ptr_sfa, k);
+  return launch_projection_dev(num_experts, d.shapes, d.ptr_a, d.ds_a, d.ptr_sfa,
+                               d.l_sfa, packed_ptrs_dev, sfb_ptrs_dev, d.ds_b,
+                               d.l_sfb, d.alpha0, d.ptr_c0, d.ds_c, d.ds_d, ws,
+                               d.cursor, workspace_size, nullptr, stream, 600000);
+#else
+  (void)A_bf16;
+  (void)packed_ptrs_dev;
+  (void)sfb_ptrs_dev;
+  (void)scale2_dev;
+  (void)C_bf16;
+  (void)expert_offsets_dev;
+  (void)num_experts;
+  (void)m_total;
+  (void)n;
+  (void)k;
+  (void)workspace;
+  (void)workspace_size;
+  (void)stream;
+  return -120;
+#endif
+}
+
+// ════════════════════════════════════════════════════════════════════════════
 // PUBLIC ENTRY — grouped DOWN. A = post-SiLU intermediate [M_total, K=inter],
 // ALREADY expert-contiguous (sorted_token_ids=null). B = down_proj [N=hidden,K/2].
 // ════════════════════════════════════════════════════════════════════════════

@@ -181,6 +181,149 @@ pub fn nvfp4_grouped_gate_up_fused(
     }
 }
 
+/// DEVICE-OFFSET twin of [`nvfp4_grouped_gate_up_fused`] — CUDA-graph-capture-
+/// safe (`ATLAS_MOE_CUTLASS_DEVICE_OFFSETS=1`). Every array argument is a
+/// DEVICE pointer: `*_packed_ptrs`/`*_sfb_ptrs` are the per-expert u64 pointer
+/// tables as they live on the GPU, `*_scale2` the device f32 `[num_experts]`
+/// arrays, `expert_offsets` the device i32 `[num_experts+1]` prefix sum.
+/// `m_total` is the total expanded row count (`num_tokens * top_k`), which the
+/// caller knows without any D2H. The C entry builds all per-group problem
+/// shapes/pointers on-device and launches the grouped GEMM with
+/// `host_problem_shapes = nullptr` (fixed `sm_count` grid) — no D2H, no
+/// synchronize, no allocation, so it is legal under CUDA graph capture.
+#[allow(clippy::too_many_arguments)]
+pub fn nvfp4_grouped_gate_up_fused_dev(
+    a: u64,
+    sorted_token_ids: u64,
+    gate_packed_ptrs_dev: u64,
+    gate_sfb_ptrs_dev: u64,
+    gate_scale2_dev: u64,
+    up_packed_ptrs_dev: u64,
+    up_sfb_ptrs_dev: u64,
+    up_scale2_dev: u64,
+    c_gate: u64,
+    c_up: u64,
+    expert_offsets_dev: u64,
+    num_experts: usize,
+    m_total: u32,
+    n: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
+    #[cfg(atlas_cutlass)]
+    {
+        let ctx = ctx()?;
+        let status = unsafe {
+            atlas_cutlass_nvfp4_grouped_gate_up_dev(
+                a as *const c_void,
+                sorted_token_ids as *const i32,
+                gate_packed_ptrs_dev as *const u64,
+                gate_sfb_ptrs_dev as *const u64,
+                gate_scale2_dev as *const f32,
+                up_packed_ptrs_dev as *const u64,
+                up_sfb_ptrs_dev as *const u64,
+                up_scale2_dev as *const f32,
+                c_gate as *mut c_void,
+                c_up as *mut c_void,
+                expert_offsets_dev as *const i32,
+                num_experts as i32,
+                m_total as i32,
+                n as i32,
+                k as i32,
+                ctx.workspace as *mut c_void,
+                ctx.ws_size,
+                stream as *mut c_void,
+            )
+        };
+        if status != 0 {
+            bail!("CUTLASS nvfp4 grouped(dev-offsets) gate_up failed: status {status}");
+        }
+        Ok(())
+    }
+    #[cfg(not(atlas_cutlass))]
+    {
+        let _ = (
+            a,
+            sorted_token_ids,
+            gate_packed_ptrs_dev,
+            gate_sfb_ptrs_dev,
+            gate_scale2_dev,
+            up_packed_ptrs_dev,
+            up_sfb_ptrs_dev,
+            up_scale2_dev,
+            c_gate,
+            c_up,
+            expert_offsets_dev,
+            num_experts,
+            m_total,
+            n,
+            k,
+            stream,
+        );
+        bail!("CUTLASS support was not built; set CUTLASS_HOME when building")
+    }
+}
+
+/// DEVICE-OFFSET twin of [`nvfp4_grouped_down`] — CUDA-graph-capture-safe.
+/// Same device-pointer contract as [`nvfp4_grouped_gate_up_fused_dev`].
+#[allow(clippy::too_many_arguments)]
+pub fn nvfp4_grouped_down_dev(
+    a: u64,
+    packed_ptrs_dev: u64,
+    sfb_ptrs_dev: u64,
+    scale2_dev: u64,
+    c: u64,
+    expert_offsets_dev: u64,
+    num_experts: usize,
+    m_total: u32,
+    n: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
+    #[cfg(atlas_cutlass)]
+    {
+        let ctx = ctx()?;
+        let status = unsafe {
+            atlas_cutlass_nvfp4_grouped_down_dev(
+                a as *const c_void,
+                packed_ptrs_dev as *const u64,
+                sfb_ptrs_dev as *const u64,
+                scale2_dev as *const f32,
+                c as *mut c_void,
+                expert_offsets_dev as *const i32,
+                num_experts as i32,
+                m_total as i32,
+                n as i32,
+                k as i32,
+                ctx.workspace as *mut c_void,
+                ctx.ws_size,
+                stream as *mut c_void,
+            )
+        };
+        if status != 0 {
+            bail!("CUTLASS nvfp4 grouped(dev-offsets) down failed: status {status}");
+        }
+        Ok(())
+    }
+    #[cfg(not(atlas_cutlass))]
+    {
+        let _ = (
+            a,
+            packed_ptrs_dev,
+            sfb_ptrs_dev,
+            scale2_dev,
+            c,
+            expert_offsets_dev,
+            num_experts,
+            m_total,
+            n,
+            k,
+            stream,
+        );
+        bail!("CUTLASS support was not built; set CUTLASS_HOME when building")
+    }
+}
+
 /// Single-launch grouped NVFP4 DOWN projection (`atlas_cutlass_nvfp4_grouped_down`).
 /// `a` is the post-SiLU bf16 intermediate `[M_total, K=inter]`, ALREADY
 /// expert-contiguous (no gather). `packed_ptrs`/`sfb_ptrs` are device-pointer
