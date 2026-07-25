@@ -384,6 +384,29 @@ pub fn emit_token(a: &mut ActiveSeq, tok: u32, logprobs: Option<crate::api::Toke
         return;
     }
     if a.eos_tokens.contains(&tok) && suppress_eos {
+        // BUDGET DESYNC FIX (twin of process_decode_logits): the up-front
+        // `consume_generation_budget()` above already ran for THIS token, but a
+        // suppressed EOS is DISCARDED (never pushed to `output_tokens`).
+        // `remaining` counts only emitted tokens, so refund the spurious
+        // decrement — otherwise every suppressed EOS shortens the response by one
+        // token (early finish_reason="length") and, when the budget hits 0 on
+        // such a step, the `remaining == 0` finish check below is skipped so the
+        // sequence rides an extra step and trips consume_generation_budget() at 0.
+        a.remaining = a.remaining.saturating_add(1);
+        // Backstop (paired with the refund): the length/ceiling stops live below
+        // this early return, so a pathological all-suppressed-EOS stream would
+        // never terminate after the refund. `seq.seq_len` advances one KV
+        // position per step, so enforce the served `max_seq_len` ceiling here.
+        // No-op when `max_seq_len` is unset (0) or not yet reached.
+        if seqlen_force_stop(a.seq.seq_len, max_seq_len_ceiling()) {
+            tracing::info!(
+                seq_len = a.seq.seq_len,
+                max_seq_len = max_seq_len_ceiling(),
+                output_tokens = a.output_tokens.len(),
+                "emit_token: max_seq_len ceiling reached on suppressed-EOS step; force-stop (finish=length)"
+            );
+            a.finished = true;
+        }
         // EOS suppressed: grammar not terminated, legacy tool call not yet seen,
         // or min_tokens not reached. Don't stop — let the model continue generating.
         return;

@@ -615,6 +615,26 @@ pub fn process_decode_logits(
             crate::scheduler::emit_step::update_tool_param_state(a, tok);
             a.finished = true;
         } else if a.eos_tokens.contains(&tok) && suppress_eos {
+            // BUDGET DESYNC FIX (concurrent mixed-length early-stop): the
+            // up-front budget decrement (`handle_content_token` / the
+            // `inside_thinking` `consume_generation_budget()` above) already ran
+            // for THIS token, but a suppressed EOS is DISCARDED — it is never
+            // pushed to `output_tokens`. `remaining` is initialized to
+            // `max_tokens - 1` and must count only EMITTED tokens, so a decrement
+            // for a discarded token desyncs `remaining` below
+            // `max_tokens - output_tokens.len()`. Each suppressed EOS then
+            // silently shortens the response by one token — the length stop fires
+            // at `max_tokens - (suppressed EOS count)` (e.g. 180→107, 240→234).
+            // It is concurrency-specific because batched decode
+            // (`decode_batch_compute_main`) is numerically distinct from the n==1
+            // single-seq `decode()` graph path, so the greedy argmax occasionally
+            // flips to an EOS token mid-generation under C>=2 that C=1 never
+            // samples; and it is the source of the "generation budget decremented
+            // at 0" WARN, because when the budget hits 0 on a suppressed-EOS step
+            // the `remaining == 0` finish check (emit branch only) is skipped, so
+            // the sequence rides one extra step and trips
+            // `consume_generation_budget()` at 0. Refund the spurious decrement.
+            a.remaining = a.remaining.saturating_add(1);
             // EOS suppressed: grammar not terminated or legacy tool call not yet seen.
             // Don't stop, don't stream the EOS — the model must keep generating.
             // Don't add to output_tokens (EOS is discarded).
@@ -676,6 +696,22 @@ pub fn process_decode_logits(
                 by_min_tokens = min_tokens_suppresses,
                 "EOS suppressed; model forced to continue"
             );
+            // Backstop (paired with the refund above): every stop condition
+            // otherwise lives only in the emit branch below, so a pathological
+            // model that samples a suppressed EOS on EVERY step would, after the
+            // refund, never decrement `remaining` and never reach the emit-branch
+            // checks. `seq.seq_len` still advances one KV position per step
+            // (decode_a2.rs), so enforce the served `max_seq_len` ceiling here
+            // too. No-op when `max_seq_len` is unset (0) or not yet reached.
+            if !a.finished && seqlen_force_stop(a.seq.seq_len, max_seq_len_ceiling()) {
+                tracing::info!(
+                    seq_len = a.seq.seq_len,
+                    max_seq_len = max_seq_len_ceiling(),
+                    output_tokens = a.output_tokens.len(),
+                    "process_decode_logits: max_seq_len ceiling reached on suppressed-EOS step; force-stop (finish=length)"
+                );
+                a.finished = true;
+            }
         } else {
             a.output_tokens.push(tok);
             // SM1 (2026-05-26): drive the tool-body / parameter-body
