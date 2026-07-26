@@ -66,8 +66,7 @@ impl ChatTokenizer {
                 super::jinja_helpers::load_override_template(model_type, repo_root)
             {
                 override_tmpl
-            } else if let Some(config_tmpl) =
-                super::jinja_helpers::load_config_template(model_dir)?
+            } else if let Some(config_tmpl) = super::jinja_helpers::load_config_template(model_dir)?
             {
                 config_tmpl
             } else {
@@ -192,6 +191,7 @@ impl ChatTokenizer {
         tools: Option<&[serde_json::Value]>,
         enable_thinking: bool,
         disable_tool_steering: bool,
+        preserve_thinking: bool,
     ) -> Result<Vec<u32>> {
         let tmpl = self
             .jinja_env
@@ -240,6 +240,7 @@ impl ChatTokenizer {
             tools => tools_val.unwrap_or(minijinja::Value::UNDEFINED),
             add_generation_prompt => !continue_final,
             enable_thinking => enable_thinking,
+            preserve_thinking => preserve_thinking,
             reasoning_effort => reasoning_effort,
             disable_tool_steering => disable_tool_steering,
             add_vision_id => false,
@@ -283,6 +284,7 @@ impl ChatTokenizer {
         tools: Option<&[serde_json::Value]>,
         enable_thinking: bool,
         disable_tool_steering: bool,
+        preserve_thinking: bool,
     ) -> Result<Vec<u32>> {
         if let Some(ref env) = self.openai_jinja_env {
             let tmpl = env
@@ -304,6 +306,7 @@ impl ChatTokenizer {
                 tools => tools_val.unwrap_or(minijinja::Value::UNDEFINED),
                 add_generation_prompt => true,
                 enable_thinking => enable_thinking,
+                preserve_thinking => preserve_thinking,
                 reasoning_effort => reasoning_effort,
                 disable_tool_steering => disable_tool_steering,
                 add_vision_id => false,
@@ -313,7 +316,13 @@ impl ChatTokenizer {
                 .map_err(|e| anyhow::anyhow!("Failed to render OpenAI Jinja template: {e}"))?;
             self.encode(&rendered)
         } else {
-            self.apply_chat_template_jinja(messages, tools, enable_thinking, disable_tool_steering)
+            self.apply_chat_template_jinja(
+                messages,
+                tools,
+                enable_thinking,
+                disable_tool_steering,
+                preserve_thinking,
+            )
         }
     }
 
@@ -335,7 +344,7 @@ impl ChatTokenizer {
             })
             .collect();
 
-        self.apply_chat_template_jinja(&json_messages, None, enable_thinking, false)
+        self.apply_chat_template_jinja(&json_messages, None, enable_thinking, false, false)
     }
 
     pub fn eos_token_id(&self) -> u32 {

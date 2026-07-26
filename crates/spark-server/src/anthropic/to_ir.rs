@@ -205,6 +205,8 @@ impl From<MessagesRequest> for ir::ChatRequest {
         };
 
         ir::ChatRequest {
+            // Anthropic wire has no `chat_template_kwargs` passthrough.
+            preserve_thinking: false,
             model: req.model,
             messages,
             tools: req

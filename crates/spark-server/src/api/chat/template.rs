@@ -34,6 +34,7 @@ pub(super) fn render_template(
     enable_thinking: bool,
     thinking_budget: Option<u32>,
     tools_active: bool,
+    preserve_thinking: bool,
 ) -> Result<TemplateOut, Response> {
     // Use closed thinking when client doesn't explicitly enable it.
     let template_thinking = enable_thinking;
@@ -71,6 +72,7 @@ pub(super) fn render_template(
                 &json_messages,
                 jinja_tools.as_deref(),
                 template_thinking,
+                preserve_thinking,
                 state.behavior.disable_tool_steering,
             )
             .map(|t| t.len())
@@ -89,6 +91,7 @@ pub(super) fn render_template(
         jinja_tools.as_deref(),
         template_thinking,
         state.behavior.disable_tool_steering,
+        preserve_thinking,
     ) {
         Ok(t) => t,
         Err(e) => {

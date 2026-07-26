@@ -180,6 +180,7 @@ pub async fn tokenize(
             None,
             false,
             state.behavior.disable_tool_steering,
+            false,
         ) {
             Ok(t) => t,
             Err(e) => {

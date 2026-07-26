@@ -292,6 +292,15 @@ pub struct ReasoningConfig {
 pub struct ChatTemplateKwargs {
     pub enable_thinking: Option<bool>,
     pub thinking_budget: Option<u32>,
+    /// vLLM-style passthrough consumed by the CHAT TEMPLATE only: keep prior
+    /// assistant turns' `reasoning_content` in the rendered history instead of
+    /// stripping it. Poolside recommends preserving thinking between tool calls
+    /// for agentic coding, and Laguna-S-2.1's template gates on
+    /// `enable_thinking or preserve_thinking`. Purely a rendering flag — it does
+    /// NOT touch the thinking state machine (budget, watchdogs, reasoning
+    /// parsing), so it is threaded as a plain bool rather than through
+    /// `ThinkingDirective`. Absent => false (template self-defaults the same).
+    pub preserve_thinking: Option<bool>,
 }
 
 /// Default thinking budget when thinking is enabled but no explicit budget set.

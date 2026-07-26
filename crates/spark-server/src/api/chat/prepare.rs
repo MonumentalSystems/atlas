@@ -109,6 +109,7 @@ pub(crate) fn prepare_chat_prompt(
         enable_thinking,
         thinking_budget,
         tools_active,
+        req.preserve_thinking,
     )?;
 
     Ok(PreparedChat {

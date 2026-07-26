@@ -39,6 +39,9 @@ pub struct ChatRequest {
     /// Client thinking intent (edge-resolved). Server/model defaults
     /// fold in later (`api/chat/thinking.rs`).
     pub thinking: ThinkingDirective,
+    /// Render-only: keep prior turns' reasoning in the templated history
+    /// (`preserve_thinking` in the chat template). See ChatTemplateKwargs.
+    pub preserve_thinking: bool,
     /// Per-request token-loop detector override.
     pub repetition_detection: Option<crate::api::inference_types::RepetitionDetectionParams>,
     /// M2 per-request LoRA routing: optional resident adapter NAME for

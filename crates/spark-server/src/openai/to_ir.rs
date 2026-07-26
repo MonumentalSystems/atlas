@@ -93,7 +93,13 @@ impl From<ChatCompletionRequest> for ir::ChatRequest {
                 })
             }
         };
+        let preserve_thinking = req
+            .chat_template_kwargs
+            .as_ref()
+            .and_then(|k| k.preserve_thinking)
+            .unwrap_or(false);
         ir::ChatRequest {
+            preserve_thinking,
             model: req.model,
             messages: req.messages.iter().map(Into::into).collect(),
             tools: req.tools.unwrap_or_default(),
