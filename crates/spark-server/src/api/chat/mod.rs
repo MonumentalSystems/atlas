@@ -284,7 +284,9 @@ pub(crate) async fn chat_completions_inner(
     // context full" (vLLM parity) when the client omits max_tokens, instead of
     // the old fixed 4096. `prompt_len < max_seq_len` is guaranteed above, so the
     // remaining budget is ≥ 1.
-    let max_tokens = max_tokens.min(state.max_seq_len.saturating_sub(prompt_len)).max(1);
+    let max_tokens = max_tokens
+        .min(state.max_seq_len.saturating_sub(prompt_len))
+        .max(1);
     tracing::debug!(
         prompt_len,
         max_seq_len = state.max_seq_len,
