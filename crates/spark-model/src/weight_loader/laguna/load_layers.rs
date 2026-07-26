@@ -106,6 +106,9 @@ pub(super) fn load_layers(
             yarn_inv_freq,
             sliding_inv_freq,
             i,
+            absmax_k,
+            quantize_k,
+            stream,
         )?;
         layers.push(Box::new(layer));
     }
@@ -228,15 +231,37 @@ fn load_moe_ffn(
     };
 
     let shared = format!("{mlp}.shared_expert");
-    let shared_gate = dense_auto(store, &format!("{shared}.gate_proj.weight"), gpu)?;
-    let shared_up = dense_auto(store, &format!("{shared}.up_proj.weight"), gpu)?;
-    let shared_down = dense_auto(store, &format!("{shared}.down_proj.weight"), gpu)?;
     let si = config.shared_expert_intermediate_size;
     let h = config.hidden_size;
+    // Shared-expert precision differs across Laguna variants: S-2.1 ships it
+    // BF16 (in the quant ignore list) and keeps BF16 authoritative; XS-2.1 ships
+    // it NVFP4-packed (`.weight_packed`, NOT ignored) like the routed experts.
+    // Detect and load accordingly — mirrors the routed `expert_proj` above.
+    let shared_packed = store.contains(&format!("{shared}.gate_proj.weight_packed"));
+    let shared_proj = |proj: &str, n: usize, k: usize| -> Result<QuantizedWeight> {
+        if shared_packed {
+            quantized_v2(store, proj, gpu)
+        } else {
+            let bf16 = dense_auto(store, &format!("{proj}.weight"), gpu)?;
+            quantize_to_nvfp4(&bf16, n, k, gpu, absmax_k, quantize_k, stream)
+        }
+    };
     let shared_expert = ExpertWeight {
-        gate_proj: quantize_to_nvfp4(&shared_gate, si, h, gpu, absmax_k, quantize_k, stream)?,
-        up_proj: quantize_to_nvfp4(&shared_up, si, h, gpu, absmax_k, quantize_k, stream)?,
-        down_proj: quantize_to_nvfp4(&shared_down, h, si, gpu, absmax_k, quantize_k, stream)?,
+        gate_proj: shared_proj(&format!("{shared}.gate_proj"), si, h)?,
+        up_proj: shared_proj(&format!("{shared}.up_proj"), si, h)?,
+        down_proj: shared_proj(&format!("{shared}.down_proj"), h, si)?,
+    };
+    // BF16 variant (S-2.1): also keep the raw BF16 tensors to set authoritative
+    // (the NVFP4 copies above are placeholders overwritten before blending).
+    // NVFP4-packed variant (XS-2.1): the NVFP4 shared_expert IS authoritative.
+    let bf16_shared = if shared_packed {
+        None
+    } else {
+        Some((
+            dense_auto(store, &format!("{shared}.gate_proj.weight"), gpu)?,
+            dense_auto(store, &format!("{shared}.up_proj.weight"), gpu)?,
+            dense_auto(store, &format!("{shared}.down_proj.weight"), gpu)?,
+        ))
     };
     let weights = MoeWeights {
         gate,
@@ -250,11 +275,15 @@ fn load_moe_ffn(
         correction_bias: Some(correction_bias),
     };
     let mut layer = MoeLayer::new(weights, config.num_experts, None, gpu, config)?;
-    // The checkpoint explicitly excludes the shared expert from NVFP4
-    // compression. Keep its BF16 weights authoritative for both prefill and
-    // decode; the quantized copies above are placeholders for fused routed
-    // kernels and their shared contribution is overwritten before blending.
-    layer.set_bf16_shared_expert(shared_gate, shared_up, shared_down)?;
+    // S-2.1 excludes the shared expert from NVFP4 compression: keep its BF16
+    // weights authoritative for both prefill and decode; the quantized copies
+    // above are placeholders for fused routed kernels and their shared
+    // contribution is overwritten before blending. XS-2.1 ships the shared
+    // expert NVFP4-packed → no BF16 override, so the NVFP4 `weights.shared_expert`
+    // (same machinery as the routed NVFP4 experts) is the authoritative path.
+    if let Some((sg, su, sd)) = bf16_shared {
+        layer.set_bf16_shared_expert(sg, su, sd)?;
+    }
     // Keep-packed GGUF experts: the routed experts are raw Q4_K/Q6_K blocks and
     // carry NO NVFP4 scale tables, so the NVFP4-specific transpose and CUTLASS
     // SFB swizzle below (which read the null NVFP4 expert scales) must be
@@ -293,6 +322,9 @@ fn load_attention(
     yarn_inv_freq: DevicePtr,
     sliding_inv_freq: DevicePtr,
     i: usize,
+    absmax_k: spark_runtime::gpu::KernelHandle,
+    quantize_k: spark_runtime::gpu::KernelHandle,
+    stream: u64,
 ) -> Result<Qwen3AttentionLayer> {
     let p = format!("{lp}.self_attn");
     let heads = config.num_attention_heads_per_layer[i];
@@ -321,6 +353,36 @@ fn load_attention(
     let v_proj = dense_auto(store, &format!("{p}.v_proj.weight"), gpu)?;
     let o_proj = dense_auto(store, &format!("{p}.o_proj.weight"), gpu)?;
     let (k_scale, v_scale) = load_kv_scales(store, gpu, &p)?;
+
+    // Lever A (ATLAS_LAGUNA_ATTN_NVFP4=1): the NVFP4 checkpoint keeps attention
+    // BF16 (excluded from compression), which is ~33% of the decode weight-byte
+    // traffic and the entire concurrency gap to GGUF (roofline: CUTLASS MoE is
+    // already at the DRAM floor). Quantizing q/k/v/o to NVFP4 at load halves
+    // those bytes → projected C4 43.6→~57.6 (beats vLLM 51 + GGUF 56). The
+    // decode/prefill NVFP4 attention GEMV kernels already exist (fire on
+    // as_nvfp4().is_some()). Opt-in; quality is uncalibrated static min-max so
+    // gate behind the coherence check. Default OFF = BF16 attention unchanged.
+    let attn_nvfp4 = std::env::var("ATLAS_LAGUNA_ATTN_NVFP4")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let kv_width = config.num_key_value_heads * config.head_dim;
+    // Quantize q/k/v to NVFP4 (multi-seq ms_qkv_batch2/3/n read them batched-ONCE).
+    // o_proj is kept BF16: MEASURED, o-NVFP4's w4a16_gemv_batch4/batch8 arms are
+    // SLOWER than the BF16 dense_gemv_batchm at C=4/8 (full qkvo-NVFP4 tanked C4
+    // 45.9→33.1, C8 55.2→49), so o stays on its batched BF16 read-once path.
+    // Net win: single-stream C1 19.3→~30 (+55%, beats vLLM/GGUF) + C2/C4 gains;
+    // a faster batched-NVFP4 o (and levers B/C: shared-expert/lm_head) is the
+    // follow-up for concurrency parity with GGUF. o_proj is [N=hidden, K=q_width].
+    let (q_nvfp4, k_nvfp4, v_nvfp4) = if attn_nvfp4 {
+        (
+            Some(quantize_to_nvfp4(&q_proj, q_width, config.hidden_size, gpu, absmax_k, quantize_k, stream)?),
+            Some(quantize_to_nvfp4(&k_proj, kv_width, config.hidden_size, gpu, absmax_k, quantize_k, stream)?),
+            Some(quantize_to_nvfp4(&v_proj, kv_width, config.hidden_size, gpu, absmax_k, quantize_k, stream)?),
+        )
+    } else {
+        (None, None, None)
+    };
+
     let attn = AttentionWeights {
         q_proj,
         k_proj,
@@ -339,15 +401,20 @@ fn load_attention(
         post_attn_norm,
         ffn,
         i,
-        None,
-        None,
-        None,
+        q_nvfp4,
+        k_nvfp4,
+        v_nvfp4,
         gpu,
         kv_dtype,
         config.fp8_kv_calibration_tokens,
         config,
     )?;
     layer.set_dimension_overrides(config.head_dim, heads, config.num_key_value_heads);
+    // Lever A off (default): BF16 o_proj keeps the batched read-once
+    // dense_gemv_batchm arm at n=2..8 — unchanged default path. Lever A on:
+    // o_proj was installed as NVFP4 in `attn` above; o_dense_bf16 must stay
+    // o_proj is always BF16 (batched read-once at n=2..8) — o-NVFP4 measured
+    // slower at concurrency, so lever A quantizes only q/k/v.
     layer.set_o_dense_bf16(o_proj);
     layer.set_head_gate_weight(
         dense_auto(store, &format!("{p}.g_proj.weight"), gpu)?,

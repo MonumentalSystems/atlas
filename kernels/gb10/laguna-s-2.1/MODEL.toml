@@ -124,5 +124,14 @@ max_inter_tool_prose = 2048
 model_type = "laguna"
 hidden_size = 3072
 
+# Laguna-XS-2.1 (poolside/Laguna-XS-2.1-NVFP4): same architecture, scaled down
+# (hidden 2048, 40 layers, top_k 8, moe_intermediate 512). head_dim=128 is
+# identical, so the -DHDIM=128 PTX in this target is reused as-is; the loader is
+# fully config-driven. Only this (model_type, hidden_size) match is needed for
+# the kernel target to accept it.
+[[model_types]]
+model_type = "laguna"
+hidden_size = 2048
+
 [kernel]
 moe_gate_shmem_bytes = 6144
