@@ -518,12 +518,17 @@ pub(crate) async fn serve(mut args: cli::ServeArgs) -> Result<()> {
     // The --enable-thinking flag controls OPEN-ENDED vs CLOSED thinking.
     let caps = config.capabilities();
     let supports_thinking = caps.supports_thinking;
+    // Laguna-XS (hidden 2048) ships its own authoritative chat_template.jinja
+    // (v8), distinct from the shared `laguna` override authored for S — prefer
+    // the bundled one for XS (override stays as a compile-failure fallback).
+    let prefer_bundled_template = config.model_type == "laguna" && config.hidden_size == 2048;
     let tokenizer = ChatTokenizer::from_model_dir(
         &model_dir,
         eos_tokens[0],
         supports_thinking,
         &config.model_type,
         Some(std::path::Path::new(".")), // repo root for override templates
+        prefer_bundled_template,
     )?;
 
     // (AM1 attractor-mask registration removed 2026-06-03 — see
@@ -887,6 +892,14 @@ pub(crate) async fn serve(mut args: cli::ServeArgs) -> Result<()> {
             }
             if let Some(cli_disable) = args.disable_tool_grammar {
                 b.disable_tool_grammar = cli_disable;
+            }
+            // Laguna-XS (hidden 2048) defaults thinking OFF; Laguna-S (hidden
+            // 3072) keeps it ON per poolside's agentic-coding recommendation.
+            // The two variants share one kernel target + MODEL.toml [behavior],
+            // so split the model-default here. Clients can still opt back into
+            // thinking per request (this only changes the model-default rung).
+            if config.model_type == "laguna" && config.hidden_size == 2048 {
+                b.thinking_default = false;
             }
             b
         },

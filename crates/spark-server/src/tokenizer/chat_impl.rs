@@ -21,6 +21,7 @@ impl ChatTokenizer {
         supports_thinking: bool,
         model_type: &str,
         repo_root: Option<&Path>,
+        prefer_bundled: bool,
     ) -> Result<Self> {
         let tokenizer_path = model_dir.join("tokenizer.json");
         let mut tokenizer = Tokenizer::from_file(&tokenizer_path)
@@ -29,21 +30,53 @@ impl ChatTokenizer {
             .with_truncation(None)
             .map_err(|e| anyhow::anyhow!("Failed to disable tokenizer truncation: {e}"))?;
 
-        // Priority 1: Override template from jinja-templates/{model_type}.jinja
-        // Priority 2: Template from tokenizer_config.json (shipped with model weights)
-        // Priority 3: Default ChatML fallback
-        let chat_template = if let Some(override_tmpl) =
-            super::jinja_helpers::load_override_template(model_type, repo_root)
-        {
-            override_tmpl
-        } else if let Some(config_tmpl) = super::jinja_helpers::load_config_template(model_dir)? {
-            config_tmpl
+        // Template resolution. Default order:
+        //   Priority 1: curated override jinja-templates/{model_type}.jinja
+        //   Priority 2: the model's bundled template (tokenizer_config.json
+        //               chat_template, or a standalone chat_template.jinja)
+        //   Priority 3: default ChatML fallback
+        //
+        // When `prefer_bundled` is set (Laguna-XS: its shipped chat_template.jinja
+        // is its own authoritative v8 template, distinct from the shared `laguna`
+        // override authored for the S variant), try the bundled template FIRST and
+        // fall back to the curated override only if the bundled is absent or fails
+        // to compile — so a bundled-template regression can never hard-break serving.
+        let bundled_first = if prefer_bundled {
+            super::jinja_helpers::load_config_template(model_dir)?
         } else {
-            tracing::warn!("No chat template found — using default ChatML");
-            super::jinja_helpers::default_chatml_template(supports_thinking)
+            None
         };
-
-        let jinja_env = super::jinja_helpers::build_jinja_env(&chat_template)?;
+        let (chat_template, jinja_env) = 'resolve: {
+            if let Some(bundled_tmpl) = bundled_first {
+                match super::jinja_helpers::build_jinja_env(&bundled_tmpl) {
+                    Ok(env) => {
+                        tracing::info!(
+                            "Using model's bundled chat template ({} chars)",
+                            bundled_tmpl.len()
+                        );
+                        break 'resolve (bundled_tmpl, env);
+                    }
+                    Err(e) => tracing::warn!(
+                        "Bundled chat template failed to compile ({e:#}); \
+                         falling back to override/config/ChatML"
+                    ),
+                }
+            }
+            let tmpl = if let Some(override_tmpl) =
+                super::jinja_helpers::load_override_template(model_type, repo_root)
+            {
+                override_tmpl
+            } else if let Some(config_tmpl) =
+                super::jinja_helpers::load_config_template(model_dir)?
+            {
+                config_tmpl
+            } else {
+                tracing::warn!("No chat template found — using default ChatML");
+                super::jinja_helpers::default_chatml_template(supports_thinking)
+            };
+            let env = super::jinja_helpers::build_jinja_env(&tmpl)?;
+            (tmpl, env)
+        };
 
         // Load OpenAI-variant template if it exists (jinja-templates/openai/{model_type}.jinja).
         // This variant gates historical <think> wrappers on enable_thinking, preventing

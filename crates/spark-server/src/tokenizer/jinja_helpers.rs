@@ -438,6 +438,22 @@ pub(super) fn convert_python_jinja_to_minijinja(template: &str) -> String {
     t = t.replace("tojson(ensure_ascii=False)", "tojson");
     t = t.replace("tojson(ensure_ascii=True)", "tojson");
 
+    // HF training-only `{% generation %}…{% endgeneration %}` markers wrap the
+    // assistant span so `apply_chat_template(..., return_assistant_tokens_mask=True)`
+    // can report which tokens the model produced. They carry no render semantics,
+    // and minijinja has no `generation` tag (it hard-errors on it). Strip the tags
+    // — every whitespace-control spelling — while KEEPING the inner content, so a
+    // model's own bundled template (e.g. Laguna-XS's v8) compiles as-is. The four
+    // spellings are pairwise-disjoint substrings, so replace order is immaterial.
+    t = t.replace("{%- generation -%}", "");
+    t = t.replace("{%- generation %}", "");
+    t = t.replace("{% generation -%}", "");
+    t = t.replace("{% generation %}", "");
+    t = t.replace("{%- endgeneration -%}", "");
+    t = t.replace("{%- endgeneration %}", "");
+    t = t.replace("{% endgeneration -%}", "");
+    t = t.replace("{% endgeneration %}", "");
+
     // messages[1:] — minijinja 2.x supports slice syntax natively
 
     t

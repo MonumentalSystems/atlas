@@ -555,3 +555,48 @@ fn tojson_filter_default_compact_hf_ref_opt_in() {
         "ATLAS_USE_HF_REF_JSON_DUMPS=1 must restore Python json.dumps byte parity\ngot:\n{got_hf}\n"
     );
 }
+
+/// HF `{% generation %}…{% endgeneration %}` training-mask markers must be
+/// stripped (tags removed, inner content kept) so a model's own bundled
+/// template — e.g. Laguna-XS's v8, which wraps the assistant span in them —
+/// compiles under minijinja (which has no `generation` tag) and still renders
+/// the assistant turn. Covers all whitespace-control spellings.
+#[test]
+fn generation_markers_are_stripped_content_kept() {
+    let raw = concat!(
+        "{%- for message in messages -%}",
+        "{%- if message.role == 'assistant' -%}",
+        "{%- generation -%}<assistant>{{- message.content -}}</assistant>{%- endgeneration -%}",
+        "{%- endif -%}",
+        "{%- endfor -%}",
+    );
+    let converted = super::jinja_helpers::convert_python_jinja_to_minijinja(raw);
+    assert!(
+        !converted.contains("generation"),
+        "generation/endgeneration tags must be gone: {converted}"
+    );
+    // The stripped template must compile (no `generation` tag error) AND still
+    // emit the assistant content the markers wrapped.
+    let env =
+        super::jinja_helpers::build_jinja_env(&converted).expect("stripped template compiles");
+    let messages = vec![json!({"role": "assistant", "content": "hello"})];
+    let rendered = env
+        .get_template("chat")
+        .unwrap()
+        .render(minijinja::context! { messages => minijinja::Value::from_serialize(&messages) })
+        .expect("stripped template renders");
+    assert_eq!(rendered, "<assistant>hello</assistant>");
+
+    // Whitespace-control variants are all covered.
+    for spelling in [
+        "{% generation %}X{% endgeneration %}",
+        "{%- generation %}X{% endgeneration -%}",
+        "{% generation -%}X{%- endgeneration %}",
+    ] {
+        let out = super::jinja_helpers::convert_python_jinja_to_minijinja(spelling);
+        assert!(
+            !out.contains("generation"),
+            "spelling not stripped: {spelling} -> {out}"
+        );
+    }
+}
