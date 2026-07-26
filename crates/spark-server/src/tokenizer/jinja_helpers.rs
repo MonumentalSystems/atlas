@@ -320,6 +320,69 @@ pub(super) fn load_openai_template(model_type: &str, repo_root: Option<&Path>) -
     None
 }
 
+/// Extract the first single- or double-quoted string in `s`, if any.
+fn first_quoted(s: &str) -> Option<String> {
+    let start = s.find(['\'', '"'])?;
+    let quote = s.as_bytes()[start] as char;
+    let rest = &s[start + 1..];
+    let end = rest.find(quote)?;
+    Some(rest[..end].to_string())
+}
+
+/// Inline `{% include 'file' %}` directives by substituting the referenced
+/// file's contents read from `model_dir`. Atlas's minijinja environment
+/// registers a single `"chat"` template with no file loader, so an unresolved
+/// `include` is a hard compile error. Poolside's Laguna-S ships its
+/// tokenizer_config.json `chat_template` as exactly `{% include
+/// 'chat_template.jinja' %}` (a pointer to the standalone v8 file); inlining it
+/// lets S use its own bundled template instead of the curated override.
+///
+/// Handles single/double quotes and whitespace-control markers (`{%- … -%}`).
+/// One level only (the inlined content is not re-scanned) — sufficient for the
+/// pointer-file case, and any residual/nested include simply surfaces as a
+/// compile error → template resolution falls back to the override. An include
+/// whose target is missing/unreadable is left verbatim (same fallback path).
+fn resolve_jinja_includes(template: &str, model_dir: &Path) -> String {
+    let mut result = String::with_capacity(template.len());
+    let mut cursor = 0usize;
+    while cursor < template.len() {
+        let Some(rel_open) = template[cursor..].find("{%") else {
+            result.push_str(&template[cursor..]);
+            break;
+        };
+        let open = cursor + rel_open;
+        let Some(rel_close) = template[open..].find("%}") else {
+            result.push_str(&template[cursor..]);
+            break;
+        };
+        let close = open + rel_close + 2;
+        // Tag body without `{%`/`%}` and optional whitespace-control dashes.
+        let body = template[open + 2..close - 2]
+            .trim()
+            .trim_start_matches('-')
+            .trim_end_matches('-')
+            .trim();
+        if body.starts_with("include") {
+            if let Some(fname) = first_quoted(body) {
+                // Only allow a bare filename in the model dir (no path escapes).
+                if !fname.contains('/') && !fname.contains("..") {
+                    if let Ok(contents) = std::fs::read_to_string(model_dir.join(&fname)) {
+                        result.push_str(&template[cursor..open]);
+                        result.push_str(&contents);
+                        tracing::info!("Inlined Jinja include '{fname}' ({} chars)", contents.len());
+                        cursor = close;
+                        continue;
+                    }
+                }
+            }
+        }
+        // Not a resolvable include — emit the tag verbatim and continue.
+        result.push_str(&template[cursor..close]);
+        cursor = close;
+    }
+    result
+}
+
 /// Load template from tokenizer_config.json in the model directory.
 pub(super) fn load_config_template(model_dir: &Path) -> Result<Option<String>> {
     let config_path = model_dir.join("tokenizer_config.json");
@@ -332,7 +395,10 @@ pub(super) fn load_config_template(model_dir: &Path) -> Result<Option<String>> {
         serde_json::from_str(&config_json).context("Failed to parse tokenizer_config.json")?;
     match config.get("chat_template").and_then(|v| v.as_str()) {
         Some(t) => {
-            let converted = convert_python_jinja_to_minijinja(t);
+            // Resolve `{% include 'chat_template.jinja' %}` pointers (Laguna-S)
+            // before conversion — minijinja's env has no file loader.
+            let inlined = resolve_jinja_includes(t, model_dir);
+            let converted = convert_python_jinja_to_minijinja(&inlined);
             tracing::info!(
                 "Loaded Jinja chat template from tokenizer_config.json ({} chars)",
                 converted.len()

@@ -518,10 +518,12 @@ pub(crate) async fn serve(mut args: cli::ServeArgs) -> Result<()> {
     // The --enable-thinking flag controls OPEN-ENDED vs CLOSED thinking.
     let caps = config.capabilities();
     let supports_thinking = caps.supports_thinking;
-    // Laguna-XS (hidden 2048) ships its own authoritative chat_template.jinja
-    // (v8), distinct from the shared `laguna` override authored for S — prefer
-    // the bundled one for XS (override stays as a compile-failure fallback).
-    let prefer_bundled_template = config.model_type == "laguna" && config.hidden_size == 2048;
+    // Laguna variants ship their own authoritative chat_template.jinja (v8) —
+    // prefer the model's bundled template over the curated `laguna` override so
+    // it auto-tracks poolside's updates. S embeds it as a `{% include %}`
+    // pointer (resolved in load_config_template); XS ships it standalone. The
+    // curated override stays as a compile-failure fallback for both.
+    let prefer_bundled_template = config.model_type == "laguna";
     let tokenizer = ChatTokenizer::from_model_dir(
         &model_dir,
         eos_tokens[0],

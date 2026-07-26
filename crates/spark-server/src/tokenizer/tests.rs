@@ -600,3 +600,43 @@ fn generation_markers_are_stripped_content_kept() {
         );
     }
 }
+
+/// Laguna-S embeds its chat_template as `{% include 'chat_template.jinja' %}`
+/// in tokenizer_config.json (a pointer to the standalone v8 file). Atlas's
+/// minijinja env has no file loader, so load_config_template must inline the
+/// referenced file (and the converter must strip its {% generation %} blocks)
+/// for the bundled template to compile + render.
+#[test]
+fn config_template_include_is_inlined_and_generation_stripped() {
+    let dir = std::env::temp_dir().join("atlas_laguna_include_test");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("chat_template.jinja"),
+        "{%- for m in messages -%}{%- if m.role=='assistant' -%}\
+         {%- generation -%}<assistant>{{- m.content -}}</assistant>{%- endgeneration -%}\
+         {%- endif -%}{%- endfor -%}",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("tokenizer_config.json"),
+        r#"{"chat_template": "{% include 'chat_template.jinja' %}"}"#,
+    )
+    .unwrap();
+
+    let tmpl = super::jinja_helpers::load_config_template(&dir)
+        .expect("load_config_template ok")
+        .expect("some template");
+    assert!(!tmpl.contains("include"), "include must be inlined: {tmpl}");
+    assert!(!tmpl.contains("generation"), "generation stripped: {tmpl}");
+
+    let env = super::jinja_helpers::build_jinja_env(&tmpl).expect("inlined template compiles");
+    let messages = vec![json!({"role": "assistant", "content": "hi"})];
+    let out = env
+        .get_template("chat")
+        .unwrap()
+        .render(minijinja::context! { messages => minijinja::Value::from_serialize(&messages) })
+        .expect("inlined template renders");
+    assert_eq!(out, "<assistant>hi</assistant>");
+    let _ = std::fs::remove_dir_all(&dir);
+}
