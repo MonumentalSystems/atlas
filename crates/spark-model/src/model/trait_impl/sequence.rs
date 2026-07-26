@@ -439,4 +439,18 @@ impl TransformerModel {
     pub(super) fn num_free_blocks_dispatch(&self) -> usize {
         self.kv_cache.lock().num_free_blocks()
     }
+
+    pub(super) fn reclaim_prefix_blocks_dispatch(&self, num_blocks: usize) -> usize {
+        if num_blocks == 0 || !self.prefix_cache.is_active() {
+            return 0;
+        }
+        let evicted = self.prefix_cache.evict(num_blocks);
+        if evicted.is_empty() {
+            return 0;
+        }
+        let mut kv = self.kv_cache.lock();
+        let before = kv.num_free_blocks();
+        super::super::block_mgmt::apply_evicted_blocks(evicted, &mut kv);
+        kv.num_free_blocks().saturating_sub(before)
+    }
 }
