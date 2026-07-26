@@ -473,7 +473,8 @@ mod tests {
 
         // These should not panic
         let new_acq = cache.insert(&tokens, &block_table, &disk_block_ids, 4, 0, 0);
-        assert!(new_acq.is_empty());
+        assert!(new_acq.disk_block_ids.is_empty());
+        assert!(new_acq.blocks.is_empty());
         cache.release(&tokens, 4, 0);
 
         let evicted = cache.evict(10);
