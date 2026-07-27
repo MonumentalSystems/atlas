@@ -21,7 +21,7 @@ Usage:
   python3 conc_harness.py --levels 4 --repeats 3 --include-csharp
   python3 conc_harness.py --levels 8 --python-only
 """
-import argparse, json, os, re, shutil, statistics as st, subprocess, sys, tempfile, time
+import argparse, json, os, re, shutil, statistics as st, subprocess, sys, tempfile, threading, time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -153,6 +153,25 @@ def run_agent(prompt, workdir, timeout, model, max_repeat=0):
     events, last_sig, repeats, killed = [], None, 0, ""
     p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                          text=True, cwd=str(workdir), env=env)
+    # Hard wall-clock watchdog. The in-loop `time.time() - t0 > timeout` check
+    # below is NOT sufficient on its own: `for line in p.stdout` blocks in
+    # readline, so that check only runs when the child actually emits something.
+    # An agent that hangs SILENTLY (observed: opencode alive 15+ min, zero
+    # requests reaching the server, no child processes) never yields a line, so
+    # the loop parks forever and stalls the whole sweep. A timer thread kills
+    # the child on schedule no matter what it is or isn't printing.
+    timed_out = threading.Event()
+
+    def _fire():
+        timed_out.set()
+        try:
+            p.kill()
+        except Exception:
+            pass
+
+    watchdog = threading.Timer(timeout, _fire)
+    watchdog.daemon = True
+    watchdog.start()
     try:
         for line in p.stdout:
             line = line.strip()
@@ -175,10 +194,13 @@ def run_agent(prompt, workdir, timeout, model, max_repeat=0):
                 p.kill()
                 break
     finally:
+        watchdog.cancel()
         try:
             p.wait(timeout=15)
         except Exception:
             p.kill()
+    if timed_out.is_set() and not killed:
+        killed = "timeout"
     wall = time.time() - t0
     if killed:
         return (124 if killed == "timeout" else 125), events, wall, killed
