@@ -1,24 +1,24 @@
 [model]
-name = "laguna-s-2.1"
-hf_id = "poolside/Laguna-S-2.1-NVFP4"
+name = "laguna-xs-2.1"
+hf_id = "poolside/Laguna-XS-2.1-NVFP4"
 model_type = "laguna"
 architecture = "Hybrid Full/Sliding Attention + Dense/MoE"
-parameters = "117.6B-A8.5B"
+parameters = "XS (hidden 2048, 40 layers, top_k 8)"
 
-layers_total = 48
-layers_sliding_attention = 36
-layers_full_attention = 12
+layers_total = 40
+layers_sliding_attention = 30
+layers_full_attention = 10
 layer_pattern = "1 full attention followed by 3 sliding attention"
 
-hidden_dim = 3072
+hidden_dim = 2048
 head_dim = 128
-q_heads = 72
+q_heads = 48
 kv_heads = 8
-intermediate_size = 12288
+intermediate_size = 8192
 moe_experts = 256
-moe_topk = 10
-moe_intermediate = 1024
-shared_expert_intermediate = 1024
+moe_topk = 8
+moe_intermediate = 512
+shared_expert_intermediate = 512
 moe_scoring_func = "sigmoid"
 moe_routing_bias = true
 
@@ -110,9 +110,13 @@ max_thinking_budget = 8192
 # 90%-of-max_tokens secondary clamp (a budget vLLM does not have) truncated
 # thinking on those turns. False = reasoning bounded only by max_thinking_budget.
 cap_thinking_at_max_tokens = false
-# Poolside recommends thinking for agentic coding and preserving it between
-# tool calls. Clients can still opt out per request with enable_thinking=false.
-thinking_default = true
+# XS defaults thinking OFF. S (hidden 3072) keeps it ON per poolside's agentic-
+# coding recommendation, but on XS the reasoning block leaked into responses, so
+# the smaller variant ships thinking-off. This used to be a hardcoded
+# `model_type == "laguna" && hidden_size == 2048` gate in serve.rs, needed only
+# because both variants shared ONE MODEL.toml; with a target of its own XS just
+# states its default. Clients can still opt in per request.
+thinking_default = false
 default_kv_dtype = "fp8"
 tool_call_parser = "poolside_v1"
 # The model card recommends 0.7 / 0.95 for quality and reliability, while the
@@ -128,14 +132,9 @@ disable_cwd_hint_injection = true
 # while still catching a genuine run-on loop.
 max_inter_tool_prose = 2048
 
-# This target is Laguna-S only. Laguna-XS (hidden 2048) has its own target at
-# kernels/gb10/laguna-xs-2.1 — it previously matched HERE, which forced the two
-# variants to share one [behavior]/[sampling] block and made `thinking_default`
-# unrepresentable for both at once (patched by a hardcoded hidden_size gate in
-# serve.rs, now deleted).
 [[model_types]]
 model_type = "laguna"
-hidden_size = 3072
+hidden_size = 2048
 
 [kernel]
 moe_gate_shmem_bytes = 6144

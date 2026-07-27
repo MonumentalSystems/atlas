@@ -895,14 +895,7 @@ pub(crate) async fn serve(mut args: cli::ServeArgs) -> Result<()> {
             if let Some(cli_disable) = args.disable_tool_grammar {
                 b.disable_tool_grammar = cli_disable;
             }
-            // Laguna-XS (hidden 2048) defaults thinking OFF; Laguna-S (hidden
-            // 3072) keeps it ON per poolside's agentic-coding recommendation.
-            // The two variants share one kernel target + MODEL.toml [behavior],
-            // so split the model-default here. Clients can still opt back into
-            // thinking per request (this only changes the model-default rung).
-            if config.model_type == "laguna" && config.hidden_size == 2048 {
-                b.thinking_default = false;
-            }
+
             b
         },
         disable_thinking: args.disable_thinking,
