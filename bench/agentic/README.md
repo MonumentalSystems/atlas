@@ -101,3 +101,28 @@ Measured on Laguna-S (GB10, NVFP4): **floor 203.7 ms, 3234 tok/s**, i.e. 24% of 
   isolating thinking as the dominant cost.
 - **Watch the loop detector count, not just pass rate.** Degeneration scales with
   concurrency and shows up as repeat-kills before it shows up as failures.
+
+## Cross-model concurrency (2026-07-27, one GB10, thinking OFF on all three)
+
+| model | agg tok/s C=1 / 4 / 8 | pass C=1 / 4 / 8 | loop-kills | makespan C=8 |
+|---|---|---|---|---|
+| Holo 3.1 35B-A3B-NVFP4 | 42.8 / 53.2 / **53.5** | 0/1, 3/4, **4/8** | 1 / 2 / 4 | 194 s |
+| Laguna-XS-2.1 | 21.1 / 45.4 / 59.3 | 1/1, 4/4, 8/8 | 0 / 0 / 4 | 133 s |
+| Laguna-S-2.1 | 11.0 / 25.1 / 46.0 | 1/1, 3/4, 8/8 | 0 / 0 / 1 | 210 s |
+
+Holo is the fastest per stream (decode median 44.6 tok/s at C=1 vs 38.6 / 13.2)
+and the worst at scaling: aggregate moves 53.2 → 53.5 from C=4 to C=8 (+0.6%)
+while XS gains +31% and S +83%. It saturates at C≈4.
+
+Two traps in reading that table:
+
+- **Holo's lower C=8 makespan is an artifact.** Killed tasks exit early, so
+  finishing 4/8 in 194 s is not better than finishing 8/8 in 210 s. Read pass
+  rate before makespan.
+- **`loop: () x6` — six identical tool calls with EMPTY arguments — now appears
+  on all three models**, including Holo at C=1 with thinking off and tuned
+  sampling. Three checkpoints, one signature, so suspect the Atlas tool-call
+  path over a model quirk. Undiagnosed.
+
+KV counters were clean (`decref=0 evict_unowned=0 exhaustions=0 preempts=0`) in
+every run, on all three models.

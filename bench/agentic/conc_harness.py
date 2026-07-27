@@ -21,12 +21,13 @@ Usage:
   python3 conc_harness.py --levels 4 --repeats 3 --include-csharp
   python3 conc_harness.py --levels 8 --python-only
 """
-import os, argparse, json, os, re, shutil, statistics as st, subprocess, sys, tempfile, time
+import argparse, json, os, re, shutil, statistics as st, subprocess, sys, tempfile, time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 OC = os.environ.get("OPENCODE_BIN") or shutil.which("opencode") or "opencode"
 CONTAINER = os.environ.get("ATLAS_CONTAINER", "laguna-s")
+PROVIDER = os.environ.get("OPENCODE_PROVIDER", "atlas")
 
 # ── Task pool ────────────────────────────────────────────────────────────────
 # (name, kind, prompt, verify_argv). Kept deliberately similar in size/shape so
@@ -140,7 +141,11 @@ def run_agent(prompt, workdir, timeout, model, max_repeat=0):
     each a 30-token generation against an 8.4K-token prompt. That is pure waste
     that also distorts every concurrency number in the run.
     """
-    m = model if "/" in model else f"atlas/{model}"
+    # Provider-qualify unless already qualified. A bare `"/" in model` test is
+    # WRONG: HF-style ids contain a slash themselves (Hcompany/Holo-3.1-...),
+    # so that heuristic passed them through unprefixed and opencode exited in
+    # ~1s with every task failing before the agent ever started.
+    m = model if model.startswith(f"{PROVIDER}/") else f"{PROVIDER}/{model}"
     cmd = [OC, "run", "--auto", "--format", "json", "--dir", str(workdir), "-m", m, prompt]
     env = dict(os.environ, DOTNET_CLI_TELEMETRY_OPTOUT="1", DOTNET_NOLOGO="1",
                ATLAS_HARNESS_PORT="3001")
