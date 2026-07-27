@@ -248,6 +248,23 @@ def kv_counters():
 TOKS = re.compile(r"Done: (\d+) tokens .*?([\d.]+) tok/s")
 
 
+def require_container():
+    """Fail loudly when CONTAINER names something that isn't running.
+
+    Throughput is scraped from the server's own log, so a wrong container name
+    yields zero matches — which renders as a clean `0.0 tok/s` table rather than
+    an error. That looks exactly like a real measurement and silently wasted a
+    full sweep. Check once, up front, and say which name to set.
+    """
+    out = subprocess.run(["docker", "ps", "--format", "{{.Names}}"],
+                         capture_output=True, text=True)
+    names = (out.stdout or "").split()
+    if CONTAINER not in names:
+        sys.exit(f"ATLAS_CONTAINER={CONTAINER!r} is not a running container "
+                 f"(running: {', '.join(names) or 'none'}). Throughput is read from "
+                 f"its log, so the sweep would report 0.0 tok/s. Set ATLAS_CONTAINER.")
+
+
 def decode_stats(since_s):
     """Per-stream decode rates the server reported during the batch window."""
     out = subprocess.run(["docker", "logs", "--since", f"{int(since_s)+2}s", CONTAINER],
@@ -306,6 +323,7 @@ def main():
     ap.add_argument("--keep", action="store_true")
     ap.add_argument("--json", default="")
     args = ap.parse_args()
+    require_container()
 
     if args.csharp_only:
         pool = CS_TASKS
