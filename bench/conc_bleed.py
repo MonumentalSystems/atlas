@@ -15,6 +15,8 @@ Each concurrent worker owns a UNIQUE canary token and a UNIQUE topic, and its
 prompt asks for its own canary back. Verdicts per response:
 
   OK       answer contains ITS OWN canary and number
+  TYPO     canary MISSPELLED but number correct — a model spelling artefact on an
+           invented token, explicitly NOT corruption (see `_near`)
   PARTIAL  own canary, wrong number
   WRONG    no canary / wrong value        -> model weakness OR corruption
   BLEED    contains ANOTHER worker's canary or topic
@@ -33,6 +35,11 @@ USAGE
   THINK_BUDGET=2048  per-request thinking budget, Anthropic-style
                      {"thinking":{"budget_tokens":N}}; implies THINK=1
   MAXTOK=200         max_tokens per request
+  TOOLS=1            attach a tool schema and scan tool-call arguments too
+  STREAM=1           use the SSE streaming endpoint — a DIFFERENT code path from
+                     blocking, and the one agentic clients actually use
+  PREFIX_WORDS=6000  shared-prefix length; MUST exceed the Marconi checkpoint
+                     interval (4096 tokens) or the SSM snapshot path is never hit
 
 Run it BOTH ways. Thinking ON and OFF exercise different code paths, and
 thinking materially changes the result: with thinking ON and a small
@@ -58,6 +65,21 @@ ROUNDS = int(sys.argv[3]) if len(sys.argv) > 3 else 3
 PORT = os.environ.get("PORT", "8888")
 URL = f"http://localhost:{PORT}/v1/chat/completions"
 MAXTOK = int(os.environ.get("MAXTOK", "200"))
+# Words of SHARED prefix prepended to every worker. This is the whole point:
+# agentic clients send a long COMMON system prompt and differ only in the tail,
+# so every request collides in the radix at the shared depth. A harness with
+# short, mutually-distinct prompts never populates the cache and cannot see
+# prefix-cache contamination at all. ~2000 words is ~2600 tokens, ~160 blocks
+# at block_size 16. PREFIX_WORDS=0 reverts to the (weaker) no-sharing shape.
+#
+# MUST EXCEED THE MARCONI CHECKPOINT INTERVAL. Atlas writes an intermediate SSM
+# checkpoint every 256 blocks (4096 tokens at block_size 16). A shared prefix
+# SHORTER than that produces "Prefix cache hit: N tokens but no SSM snapshot —
+# recomputing all KV": the KV radix hits but NO snapshot exists at or below the
+# matched depth, so the SSM snapshot path is never exercised. Measured: a 2000-word
+# prefix (3376 tok / 211 blocks) hit KV only. 6000 words is ~7800 tokens / ~490
+# blocks, which straddles the interval and produces a reusable snapshot.
+PREFIX_WORDS = int(os.environ.get("PREFIX_WORDS", "6000"))
 BUDGET = os.environ.get("THINK_BUDGET")
 THINK = os.environ.get("THINK") == "1" or BUDGET is not None
 
@@ -77,6 +99,62 @@ ALL_CANARIES = [w[0] for w in WORKERS]
 ALL_TOPICS = [w[1].split()[0] for w in WORKERS]
 
 
+# TOOLS=1 attaches a tool schema and asks the model to call it. Agentic clients
+# always send tools, and the tool path has its own parsing/grammar/steering code
+# that plain chat never touches — a bleed that only manifests there would be
+# invisible without this.
+TOOLS = os.environ.get("TOOLS") == "1"
+# STREAM=1 uses the SSE streaming endpoint. This is NOT cosmetic: Atlas's
+# streaming and blocking paths are separate code with documented divergences
+# (a known case cut generation at 141 tokens streaming vs 248 blocking), and
+# agentic clients like opencode ALWAYS stream. A bleed that only manifests on
+# the streaming path is invisible to a blocking-only harness.
+STREAM = os.environ.get("STREAM") == "1"
+TOOL_SCHEMA = [{
+    "type": "function",
+    "function": {
+        "name": "record_site_entry",
+        "description": "Record the project codename and entry count for a site log.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "codename": {"type": "string", "description": "The project codename"},
+                "entries": {"type": "integer", "description": "Number of log entries"},
+            },
+            "required": ["codename", "entries"],
+        },
+    },
+}]
+
+
+def _ask_stream(body, req_headers):
+    """Accumulate SSE deltas, including tool-call argument fragments."""
+    body["stream"] = True
+    req = urllib.request.Request(
+        URL, data=json.dumps(body).encode(), headers=req_headers
+    )
+    text = ""
+    with urllib.request.urlopen(req, timeout=900) as r:
+        for raw in r:
+            line = raw.decode("utf-8", "replace").strip()
+            if not line.startswith("data:"):
+                continue
+            payload = line[5:].strip()
+            if payload == "[DONE]":
+                break
+            try:
+                ev = json.loads(payload)
+            except Exception:
+                continue
+            for ch in ev.get("choices") or []:
+                d = ch.get("delta") or {}
+                text += d.get("content") or ""
+                for tc in (d.get("tool_calls") or []):
+                    fn = tc.get("function") or {}
+                    text += " " + str(fn.get("name", "")) + " " + str(fn.get("arguments", ""))
+    return text
+
+
 def ask(prompt):
     body = {
         "model": MODEL,
@@ -85,24 +163,48 @@ def ask(prompt):
         "temperature": 0.0,
         "chat_template_kwargs": {"enable_thinking": THINK},
     }
+    if TOOLS:
+        body["tools"] = TOOL_SCHEMA
+        body["tool_choice"] = "auto"
     if BUDGET:
         body["thinking"] = {"budget_tokens": int(BUDGET)}
-    req = urllib.request.Request(
-        URL, data=json.dumps(body).encode(), headers={"Content-Type": "application/json"}
-    )
+    headers = {"Content-Type": "application/json"}
     try:
+        if STREAM:
+            return _ask_stream(body, headers)
+        req = urllib.request.Request(URL, data=json.dumps(body).encode(), headers=headers)
         with urllib.request.urlopen(req, timeout=900) as r:
             d = json.loads(r.read())
-        return d["choices"][0]["message"].get("content") or ""
+        msg = d["choices"][0]["message"]
+        text = msg.get("content") or ""
+        # Tool-call arguments carry the answer when TOOLS=1 — scan them too, or
+        # every tool-calling response scores WRONG and real bleed inside the
+        # arguments would be missed entirely.
+        for tc in (msg.get("tool_calls") or []):
+            fn = tc.get("function") or {}
+            text += " " + str(fn.get("name", "")) + " " + str(fn.get("arguments", ""))
+        return text
     except Exception as e:
         return f"__ERR__ {type(e).__name__}"
 
 
-def make_prompt(canary, topic, num, pad):
-    # `pad` FIRST so each worker's prompt is long enough to exercise chunking
-    # and the prefix cache, while sharing no prefix with the other workers.
+# Built ONCE and reused verbatim by every worker and every round, so round 2+
+# are genuine warm cache hits at the shared depth — the condition under which
+# cross-request bleed was actually observed in production.
+_rng = __import__("random").Random(20260728)
+_VOCAB = ("ledger harbour quarry lantern trellis cistern meadow gantry pallet "
+          "furrow beacon cobble thicket parapet spindle mortar wicker bramble "
+          "conduit rafter").split()
+SHARED_PREFIX = " ".join(_rng.choice(_VOCAB) for _ in range(PREFIX_WORDS))
+
+
+def make_prompt(canary, topic, num, _pad=None):
+    # SHARED prefix first (identical for all workers), then the per-worker
+    # unique section. Requests therefore match each other deep into the radix
+    # and differ only in the tail that carries the canary.
+    head = f"Reference log:\n{SHARED_PREFIX}\n\n" if PREFIX_WORDS else ""
     return (
-        f"{pad}\n\n"
+        f"{head}"
         f"Project codename is {canary}. The project concerns {topic}. "
         f"The site log records exactly {num} entries.\n\n"
         f"Question: What is the project codename, and how many entries does "
@@ -110,9 +212,25 @@ def make_prompt(canary, topic, num, pad):
     )
 
 
+def _near(a, b, tol=2):
+    """True if some token in `b` is within `tol` edits of `a` (same length only).
+
+    Models misspell INVENTED tokens: Holo returned "VORRAL" for "VORPAL" with the
+    number correct. Scoring that WRONG produced a false concurrency signal that
+    cost real debugging time — the substance was right every time. A near-miss on
+    the canary with the correct number is a spelling artefact, NOT corruption.
+    """
+    for w in b.replace(",", " ").replace(".", " ").split():
+        if len(w) == len(a) and sum(x != y for x, y in zip(w, a)) <= tol:
+            return True
+    return False
+
+
 def classify(idx, out):
     mine, num = WORKERS[idx][0], WORKERS[idx][2]
     up = out.upper()
+    # Foreign canary/topic first — that is the finding this harness exists for,
+    # and it outranks everything else.
     others = [c for j, c in enumerate(ALL_CANARIES) if j != idx and c in up]
     otop = [t for j, t in enumerate(ALL_TOPICS) if j != idx and t.upper() in up]
     if others or otop:
@@ -121,27 +239,32 @@ def classify(idx, out):
         return "OK", ""
     if mine in up:
         return "PARTIAL", "canary ok, number wrong"
+    if num in out and _near(mine, up):
+        return "TYPO", "canary misspelled, number correct — not corruption"
     return "WRONG", ""
 
 
 def run_round(rnd):
-    pad = " ".join(f"note{rnd}-{k}" for k in range(40))
-    prompts = [make_prompt(c, t, n, pad) for (c, t, n) in WORKERS[:CONC]]
+    # IDENTICAL prompts every round on purpose: round 1 populates the cache,
+    # rounds 2+ are warm. Varying them per round (an earlier version did) means
+    # zero cache hits and the harness proves nothing about the cache.
+    prompts = [make_prompt(c, t, n) for (c, t, n) in WORKERS[:CONC]]
     with concurrent.futures.ThreadPoolExecutor(max_workers=CONC) as ex:
         outs = list(ex.map(ask, prompts))
     return [(classify(i, o), o) for i, o in enumerate(outs)]
 
 
-mode = f"thinking={'ON' if THINK else 'OFF'}"
+mode = (f"thinking={'ON' if THINK else 'OFF'} tools={'ON' if TOOLS else 'OFF'} "
+        f"api={'STREAM' if STREAM else 'blocking'}")
 if BUDGET:
     mode += f" budget={BUDGET}"
-print(f"model={MODEL} port={PORT} concurrency={CONC} rounds={ROUNDS} {mode} max_tokens={MAXTOK}")
+print(f"model={MODEL} port={PORT} concurrency={CONC} rounds={ROUNDS} {mode} "
+      f"max_tokens={MAXTOK} shared_prefix_words={PREFIX_WORDS}")
 
 print("=== SOLO reference (sequential — establishes the baseline) ===")
-pad0 = " ".join(f"note0-{k}" for k in range(40))
 solo_ok = 0
 for i, (c, t, n) in enumerate(WORKERS[:CONC]):
-    v, _ = classify(i, ask(make_prompt(c, t, n, pad0)))
+    v, _ = classify(i, ask(make_prompt(c, t, n)))
     solo_ok += v == "OK"
     print(f"  {c:<8} {v}")
 print(f"  solo OK: {solo_ok}/{CONC}")
@@ -151,6 +274,10 @@ if solo_ok < CONC:
 
 tally = collections.Counter()
 bleeds = []
+# Keep the actual text of non-OK responses. A verdict alone cannot distinguish
+# "model produced no answer" from "model produced ANOTHER request's answer
+# rephrased" — the latter is bleed the canary match may miss.
+wrongs = []
 print("\n=== CONCURRENT passes ===")
 for r in range(1, ROUNDS + 1):
     line = []
@@ -159,11 +286,17 @@ for r in range(1, ROUNDS + 1):
         line.append(f"{WORKERS[i][0][:4]}:{v[0]}")
         if v == "BLEED":
             bleeds.append((WORKERS[i][0], why, out[:150]))
+        elif v not in ("OK", "TYPO"):
+            wrongs.append((r, WORKERS[i][0], v, out[:220]))
     print(f"  round {r}: " + " ".join(line))
 
 print(f"\n=== TOTALS over {ROUNDS * CONC} concurrent requests ===")
 for k, v in tally.most_common():
     print(f"  {k:<8} {v}")
+if wrongs:
+    print(f"\n--- {len(wrongs)} non-OK responses (inspect for disguised bleed) ---")
+    for r, name, v, txt in wrongs[:8]:
+        print(f"  round {r} [{name}] {v}: {txt!r}")
 if bleeds:
     print(f"\n*** {len(bleeds)} CROSS-REQUEST BLEED EVENTS ***")
     for name, why, txt in bleeds[:6]:
