@@ -149,8 +149,15 @@ fn run_gemm(gpu: &dyn GpuBackend, stream: u64, which: &str, m: u32, n: u32, k: u
     let kb = (k as usize).div_ceil(FP8_BLOCK);
     const S: f32 = 0.00088065;
 
-    let a_host: Vec<u8> = (0..(m as usize) * (k as usize))
-        .flat_map(|_| bf16_bytes(1.0))
+    // A varies by ROW and the block scale varies by N-BLOCK, so the expected
+    // value depends on BOTH m and n. With all-ones inputs every output element
+    // is identical and a transposed / wrong-stride result is indistinguishable
+    // from a correct one — which is exactly the failure mode being hunted.
+    let a_row = |mi: usize| -> f32 { ((mi % 7) + 1) as f32 };
+    let s_blk = |nbi: usize| -> f32 { S * (1 + (nbi % 5)) as f32 };
+
+    let a_host: Vec<u8> = (0..(m as usize))
+        .flat_map(|mi| (0..(k as usize)).flat_map(move |_| bf16_bytes(a_row(mi))))
         .collect();
     let a = gpu.alloc(a_host.len())?;
     gpu.copy_h2d(&a_host, a)?;
@@ -160,8 +167,10 @@ fn run_gemm(gpu: &dyn GpuBackend, stream: u64, which: &str, m: u32, n: u32, k: u
     gpu.copy_h2d(&b_host, b)?;
 
     let mut s_host = Vec::with_capacity(nb * kb * 4);
-    for _ in 0..(nb * kb) {
-        s_host.extend_from_slice(&S.to_le_bytes());
+    for nbi in 0..nb {
+        for _ in 0..kb {
+            s_host.extend_from_slice(&s_blk(nbi).to_le_bytes());
+        }
     }
     let s = gpu.alloc(s_host.len())?;
     gpu.copy_h2d(&s_host, s)?;
@@ -187,27 +196,44 @@ fn run_gemm(gpu: &dyn GpuBackend, stream: u64, which: &str, m: u32, n: u32, k: u
 
     let mut c_host = vec![0u8; (m as usize) * (n as usize) * 2];
     gpu.copy_d2h(c, &mut c_host)?;
-    let want = S * k as f32;
+    // Row-major [M, N]: C[m,n] = A_row(m) * s_blk(n/128) * K
+    let want_at = |mi: usize, ni: usize| -> f32 { a_row(mi) * s_blk(ni / FP8_BLOCK) * k as f32 };
     let mut worst = 0.0f32;
     let mut bad = 0usize;
-    for idx in 0..(m as usize) * (n as usize) {
-        let got = bf16_to_f32(c_host[idx * 2], c_host[idx * 2 + 1]);
-        let rel = ((got - want) / want).abs();
-        if rel > worst {
-            worst = rel;
-        }
-        if rel > 0.02 {
-            bad += 1;
+    let mut first_bad: Option<(usize, usize, f32, f32)> = None;
+    for mi in 0..(m as usize) {
+        for ni in 0..(n as usize) {
+            let idx = mi * (n as usize) + ni;
+            let got = bf16_to_f32(c_host[idx * 2], c_host[idx * 2 + 1]);
+            let want = want_at(mi, ni);
+            let rel = ((got - want) / want).abs();
+            if rel > worst {
+                worst = rel;
+            }
+            if rel > 0.02 {
+                bad += 1;
+                if first_bad.is_none() {
+                    first_bad = Some((mi, ni, got, want));
+                }
+            }
         }
     }
     println!("  {which}: M={m} N={n} K={k}");
     println!(
-        "    [0,0] got={:.6} want={want:.6}  worst rel={:.5}  bad={bad}/{}",
+        "    [0,0] got={:.4} want={:.4} | [1,0] got={:.4} want={:.4} | [0,{}] got={:.4} want={:.4}",
         bf16_to_f32(c_host[0], c_host[1]),
-        worst,
-        (m as usize) * (n as usize)
+        want_at(0, 0),
+        bf16_to_f32(c_host[(n as usize) * 2], c_host[(n as usize) * 2 + 1]),
+        want_at(1, 0),
+        FP8_BLOCK,
+        bf16_to_f32(c_host[FP8_BLOCK * 2], c_host[FP8_BLOCK * 2 + 1]),
+        want_at(0, FP8_BLOCK),
     );
-    println!("    {}", if bad == 0 { "PASS" } else { "FAIL" });
+    if let Some((mi, ni, got, want)) = first_bad {
+        println!("    FAIL first bad [{mi},{ni}] got={got:.4} want={want:.4}  bad={bad}/{}", (m as usize) * (n as usize));
+    } else {
+        println!("    PASS (worst rel {worst:.5})");
+    }
     Ok(())
 }
 

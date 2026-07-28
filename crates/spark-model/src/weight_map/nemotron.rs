@@ -272,7 +272,14 @@ pub(crate) fn load_nemotron_moe(
     } else {
         None
     };
-    let shared_up = if shared_up_has_s2 {
+    // Under native FP8 nothing reads the NVFP4 copy, so do not spend the load
+    // time or the ~2.9 GB building it. Every consumer is gated on
+    // `shared_up_fp8`/`shared_down_fp8` — including the LatentMoE decode path,
+    // which is the live one on Puzzle (`hybrid_mamba2_latent_moe_...`) and was
+    // the site that faulted with CUDA 700 when it was missed.
+    let shared_up = if shared_up_fp8.is_some() {
+        QuantizedWeight::null()
+    } else if shared_up_has_s2 {
         quantized(store, &shared_up_prefix, gpu)?
     } else {
         // FP8 or BF16 — dequant to scratch, then quantize to NVFP4
@@ -317,7 +324,9 @@ pub(crate) fn load_nemotron_moe(
     } else {
         None
     };
-    let shared_down = if shared_down_has_s2 {
+    let shared_down = if shared_down_fp8.is_some() {
+        QuantizedWeight::null()
+    } else if shared_down_has_s2 {
         quantized(store, &shared_down_prefix, gpu)?
     } else {
         let bf16 = if shared_down_has_s {

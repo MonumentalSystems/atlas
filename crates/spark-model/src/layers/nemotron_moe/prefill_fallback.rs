@@ -103,12 +103,12 @@ impl NemotronMoeLayer {
                     .weights
                     .shared_down_fp8
                     .as_ref()
-                    .filter(|_| self.w8a16_gemv_k.0 != 0 && self.relu_squared_inplace_k.0 != 0);
+                    .filter(|_| self.w8a16_gemv_k.0 != 0 && self.moe_relu2_elementwise_k.0 != 0);
                 if let Some(fp8w) = native_down {
                     // Same substitution as decode: relu^2 in place, then the
                     // checkpoint's own FP8 bytes through `w8a16_gemv`, and let the
                     // fused NVFP4 launch below drop its shared slot.
-                    KernelLaunch::new(ctx.gpu, self.relu_squared_inplace_k)
+                    KernelLaunch::new(ctx.gpu, self.moe_relu2_elementwise_k)
                         .grid([div_ceil(p.shared_inter, 256), 1, 1])
                         .block([256, 1, 1])
                         .arg_ptr(token_shared_up)
@@ -224,12 +224,12 @@ impl NemotronMoeLayer {
                     .weights
                     .shared_down_fp8
                     .as_ref()
-                    .filter(|_| self.w8a16_gemv_k.0 != 0 && self.relu_squared_inplace_k.0 != 0);
+                    .filter(|_| self.w8a16_gemv_k.0 != 0 && self.moe_relu2_elementwise_k.0 != 0);
                 if let Some(fp8w) = native_down {
                     // Same substitution as decode: relu^2 in place, then the
                     // checkpoint's own FP8 bytes through `w8a16_gemv`, and let the
                     // fused NVFP4 launch below drop its shared slot.
-                    KernelLaunch::new(ctx.gpu, self.relu_squared_inplace_k)
+                    KernelLaunch::new(ctx.gpu, self.moe_relu2_elementwise_k)
                         .grid([div_ceil(p.shared_inter, 256), 1, 1])
                         .block([256, 1, 1])
                         .arg_ptr(token_shared_up)

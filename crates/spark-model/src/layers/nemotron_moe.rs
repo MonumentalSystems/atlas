@@ -48,9 +48,6 @@ pub struct NemotronMoeLayer {
     /// Native-FP8 decode GEMV for the shared-expert up_proj (see
     /// `NemotronMoeWeights::shared_up_fp8`). 0 when unavailable.
     w8a16_gemv_k: KernelHandle,
-    /// Elementwise relu^2, used to build the shared expert's activation when the
-    /// native-FP8 shared_down path replaces the fused NVFP4 kernel. 0 when absent.
-    relu_squared_inplace_k: KernelHandle,
     /// Native-FP8 prefill GEMM for the shared expert. 0 when unavailable.
     w8a16_gemm_k: KernelHandle,
     w8a16_gemm_pipelined_k: KernelHandle,
@@ -137,7 +134,6 @@ impl NemotronMoeLayer {
             moe_expert_gemv_k: gpu.kernel("moe_expert_gemv", "moe_expert_gemv")?,
             w4a16_gemv_k: gpu.kernel("w4a16_gemv", "w4a16_gemv")?,
             w8a16_gemv_k: super::try_kernel(gpu, "w8a16_gemv", "w8a16_gemv"),
-            relu_squared_inplace_k: super::try_kernel(gpu, "relu_squared", "relu_squared_inplace"),
             w8a16_gemm_k: super::try_kernel(gpu, "w8a16_gemm", "w8a16_gemm"),
             w8a16_gemm_pipelined_k: super::try_kernel(gpu, "w8a16_gemm_pipelined", "w8a16_gemm_pipelined"),
             relu2_down_shared_k: gpu.kernel("moe_relu2_fused", "moe_expert_relu2_down_shared")?,
