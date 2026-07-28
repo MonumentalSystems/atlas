@@ -41,6 +41,14 @@ pub struct NemotronMamba2Layer {
     // Consumed by `fp8_gemm_t`, which has NO dequant phase at all.
     in_proj_pd_fp8: Option<DevicePtr>,
     out_proj_pd_fp8: Option<DevicePtr>,
+    // NATIVE BF16 projections. A mixed-precision checkpoint can leave some
+    // Mamba layers unquantized (Nano-30B: 6 of 23 in_proj/out_proj are BF16
+    // while 17 are NVFP4). Requantizing those to NVFP4 under ONE global scale
+    // is what the FP8 arm above already documents as destroying context
+    // retrieval; keeping them BF16 avoids inventing a quantization the
+    // checkpoint never asked for.
+    in_proj_bf16: Option<DenseWeight>,
+    out_proj_bf16: Option<DenseWeight>,
     // Kernel handles — decode
     rms_norm_residual_k: KernelHandle,
     w4a16_gemv_k: KernelHandle,
@@ -58,6 +66,9 @@ pub struct NemotronMamba2Layer {
     w4a16_gemm_t_m128_k: KernelHandle,
     fp8_gemm_t_k: KernelHandle,
     fp8_fp8_gemm_t_k: KernelHandle,
+    // Native-BF16 projection kernels (paired with in_proj_bf16/out_proj_bf16).
+    dense_gemm_bf16_k: KernelHandle,
+    dense_gemv_bf16_k: KernelHandle,
     bf16_to_fp8_k: KernelHandle,
     w4a4_gemm_k: KernelHandle,
     quantize_nvfp4_k: KernelHandle,
@@ -109,6 +120,8 @@ impl NemotronMamba2Layer {
             out_proj_t: None,
             in_proj_pd_fp8: None,
             out_proj_pd_fp8: None,
+            in_proj_bf16: None,
+            out_proj_bf16: None,
             rms_norm_residual_k: gpu.kernel("norm", "rms_norm_residual")?,
             w4a16_gemv_k: gpu.kernel("w4a16_gemv", "w4a16_gemv")?,
             w8a16_gemv_k: super::try_kernel(gpu, "w8a16_gemv", "w8a16_gemv"),
@@ -127,6 +140,8 @@ impl NemotronMamba2Layer {
             w4a16_gemm_t_m128_k: super::try_kernel(gpu, "w4a16", "w4a16_gemm_t_m128"),
             fp8_gemm_t_k: super::try_kernel(gpu, "w4a16", "fp8_gemm_t_m128_mfast"),
             fp8_fp8_gemm_t_k: super::try_kernel(gpu, "w4a16", "fp8_fp8_gemm_t_m128_mfast"),
+            dense_gemm_bf16_k: super::try_kernel(gpu, "gemm", "dense_gemm_bf16_pipelined"),
+            dense_gemv_bf16_k: super::try_kernel(gpu, "gemv", "dense_gemv_bf16"),
             bf16_to_fp8_k: super::try_kernel(gpu, "w4a16", "bf16_to_fp8"),
             w4a4_gemm_k: super::try_kernel(gpu, "w4a4", "w4a4_gemm_mfast"),
             quantize_nvfp4_k: super::try_kernel(gpu, "quantize_nvfp4", "quantize_bf16_to_nvfp4"),
@@ -228,6 +243,23 @@ impl NemotronMamba2Layer {
     /// Measured on Puzzle: ablating just that dequant ALU cut a 1k prefill from
     /// 557 ms to 424 ms. Converting the weights once at load time removes it
     /// entirely and lets prefill use `fp8_gemm_t`, which has no dequant phase.
+    /// Install the checkpoint's own BF16 projections, bypassing the NVFP4
+    /// requant entirely. Only valid when BOTH projections are BF16 in the
+    /// checkpoint and the dense kernels resolved; the caller checks that.
+    pub fn set_bf16_weights(&mut self, in_proj: DenseWeight, out_proj: DenseWeight) {
+        self.in_proj_bf16 = Some(in_proj);
+        self.out_proj_bf16 = Some(out_proj);
+    }
+
+    /// Whether this layer can run natively BF16 (weights installed AND both
+    /// dense kernels present).
+    pub fn bf16_native_ready(&self) -> bool {
+        self.in_proj_bf16.is_some()
+            && self.out_proj_bf16.is_some()
+            && self.dense_gemm_bf16_k.0 != 0
+            && self.dense_gemv_bf16_k.0 != 0
+    }
+
     pub fn set_fp8_prefill_weights(&mut self, in_proj: DevicePtr, out_proj: DevicePtr) {
         self.in_proj_pd_fp8 = Some(in_proj);
         self.out_proj_pd_fp8 = Some(out_proj);

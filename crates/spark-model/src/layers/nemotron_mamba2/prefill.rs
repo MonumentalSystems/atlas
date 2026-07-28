@@ -98,7 +98,23 @@ impl NemotronMamba2Layer {
         // this arm: in the `decode` bisect mode the FP8 weights are installed
         // for `w8a16_gemv` while the NVFP4 copies below are still built, and
         // prefill must keep using those.
-        if let Some(ref fp8w) = self.in_proj_fp8.as_ref().filter(|_| self.native_fp8_prefill) {
+        // NATIVE BF16 first. When installed, the checkpoint's projections were
+        // never quantized, so `ssm.in_proj` is a NULL `QuantizedWeight` and every
+        // arm below would dereference it — this must take precedence.
+        if let Some(ref w) = self.in_proj_bf16 {
+            ops::dense_gemm_bf16_pipelined(
+                ctx.gpu,
+                self.dense_gemm_bf16_k,
+                normed,
+                w,
+                proj,
+                n,
+                self.in_proj_size as u32,
+                h as u32,
+                stream,
+            )?;
+        } else if let Some(ref fp8w) = self.in_proj_fp8.as_ref().filter(|_| self.native_fp8_prefill)
+        {
             if self.w8a16_gemm_pipelined_k.0 != 0 {
                 ops::w8a16_gemm_pipelined(
                     ctx.gpu,
@@ -437,7 +453,19 @@ impl NemotronMamba2Layer {
         // ── 6. out_proj GEMM: [N, d_inner] × [d_inner, h] → [N, h] ──
         let out = ctx.buffers.ssm_qkvz();
         // Native FP8 first — mirrors the in_proj dispatch (see step 2).
-        if let Some(ref fp8w) = self
+        if let Some(ref w) = self.out_proj_bf16 {
+            ops::dense_gemm_bf16_pipelined(
+                ctx.gpu,
+                self.dense_gemm_bf16_k,
+                gated_out,
+                w,
+                out,
+                n,
+                h as u32,
+                self.d_inner as u32,
+                stream,
+            )?;
+        } else if let Some(ref fp8w) = self
             .out_proj_fp8
             .as_ref()
             .filter(|_| self.native_fp8_prefill)

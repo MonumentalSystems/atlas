@@ -105,6 +105,24 @@ impl NemotronHWeightLoader {
             && out_is_fp8
             && gemv_k.0 != 0
             && (gemm_pipe_k.0 != 0 || gemm_k.0 != 0);
+        // NATIVE BF16 — the same argument as native FP8, for the other mixed-
+        // precision case. A ModelOpt checkpoint may leave some Mamba layers
+        // unquantized: Nemotron Nano-30B ships 6 of 23 in_proj/out_proj as plain
+        // BF16 alongside 17 NVFP4 ones. The legacy arm below then DEQUANTIZES
+        // nothing and simply quantizes BF16 -> NVFP4 under ONE global scale, i.e.
+        // it invents a quantization the checkpoint never asked for and destroys
+        // exactly what the FP8 comment above documents: retrieval of a token from
+        // context. Keeping the checkpoint's own BF16 costs ~2x the bytes of those
+        // few layers and no accuracy.
+        // `ATLAS_NEMOTRON_NATIVE_BF16_SSM=0` restores the legacy requant (A/B).
+        let out_is_bf16 = !store.contains(&format!("{p}.out_proj.weight_scale"));
+        let dgemm_k = crate::layers::try_kernel(gpu, "gemm", "dense_gemm_bf16_pipelined");
+        let dgemv_k = crate::layers::try_kernel(gpu, "gemv", "dense_gemv_bf16");
+        let native_bf16 = std::env::var("ATLAS_NEMOTRON_NATIVE_BF16_SSM").as_deref() != Ok("0")
+            && quant_kind == NemotronSsmQuant::Bf16
+            && out_is_bf16
+            && dgemm_k.0 != 0
+            && dgemv_k.0 != 0;
         if native_fp8_enabled && quant_kind == NemotronSsmQuant::Fp8 && !native_fp8 {
             static NATIVE_FALLBACK_WARN: std::sync::Once = std::sync::Once::new();
             NATIVE_FALLBACK_WARN.call_once(|| {
@@ -123,7 +141,8 @@ impl NemotronHWeightLoader {
         // usual and prefill keeps using them.
         let native_prefill = native_fp8 && native_prefill_wanted;
         tracing::info!(
-            "L{i} SSM quant={quant_kind:?} native_fp8={native_fp8} native_prefill={native_prefill} \
+            "L{i} SSM quant={quant_kind:?} native_fp8={native_fp8} native_bf16={native_bf16} \
+             native_prefill={native_prefill} \
              in_proj_size={} d_inner={} h={h}",
             config.mamba2_in_proj_size(),
             config.mamba2_d_inner(),
@@ -204,7 +223,7 @@ impl NemotronHWeightLoader {
         // weight copy below read `ssm.in_proj`/`ssm.out_proj`, which
         // `load_nemotron_ssm` returns as `QuantizedWeight::null()` on the FP8
         // arm, so they must be materialized here or prefill derefs NULL.
-        if !native_prefill && quant_kind != NemotronSsmQuant::Nvfp4 {
+        if !native_prefill && !native_bf16 && quant_kind != NemotronSsmQuant::Nvfp4 {
             let in_proj_dense = if quant_kind == NemotronSsmQuant::Fp8 {
                 dequant_fp8_to_bf16_into(store, &format!("{p}.in_proj"), gpu, scratch)?
             } else {
@@ -263,8 +282,15 @@ impl NemotronHWeightLoader {
         // would `copy_d2h` from NULL and `predequant_to_fp8` would launch on a
         // NULL B. Native prefill goes through w8a16_gemm instead, so neither
         // copy is built (and ~6.4 GB of derived weights is not allocated).
-        let fp8_prefill = !native_prefill && std::env::var("ATLAS_NO_SSM_FP8_PREFILL").is_err();
+        // `native_bf16` joins `native_prefill` here for the same reason: both
+        // leave `ssm.in_proj`/`ssm.out_proj` as NULL `QuantizedWeight`s, and both
+        // derived copies read them (`transpose_for_gemm` copy_d2h's from NULL,
+        // `predequant_to_fp8` launches on a NULL B).
+        let fp8_prefill = !native_prefill
+            && !native_bf16
+            && std::env::var("ATLAS_NO_SSM_FP8_PREFILL").is_err();
         let prefill_t = !native_prefill
+            && !native_bf16
             && !fp8_prefill
             && std::env::var("ATLAS_NO_SSM_PREFILL_T").is_err();
         let proj_t = if prefill_t {
@@ -294,7 +320,22 @@ impl NemotronHWeightLoader {
         } else {
             None
         };
+        let bf16w = if native_bf16 {
+            Some((
+                dense(store, &format!("{p}.in_proj.weight"))?,
+                dense(store, &format!("{p}.out_proj.weight"))?,
+            ))
+        } else {
+            None
+        };
         let mut layer = NemotronMamba2Layer::new(norm, ssm, config, gpu, i)?;
+        if let Some((in_w, out_w)) = bf16w {
+            layer.set_bf16_weights(in_w, out_w);
+            ensure!(
+                layer.bf16_native_ready(),
+                "L{i} SSM: native BF16 selected but the dense kernels are missing"
+            );
+        }
         if let Some((in_fp8, out_fp8)) = native {
             layer.set_fp8_weights(Some(in_fp8), Some(out_fp8), native_prefill)?;
         }
