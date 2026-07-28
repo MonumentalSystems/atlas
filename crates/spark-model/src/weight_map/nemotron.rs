@@ -68,6 +68,12 @@ pub struct NemotronMoeWeights {
     pub shared_up_fp8: Option<Fp8Weight>,
     /// Shared expert down_proj: [hidden_size, shared_inter] NVFP4.
     pub shared_down: QuantizedWeight,
+    /// Shared expert down_proj kept as NATIVE FP8, same rationale as
+    /// `shared_up_fp8`. Consumed by relu_squared_inplace + `w8a16_gemv` instead
+    /// of the fused `moe_expert_relu2_down_shared` kernel, which only speaks
+    /// NVFP4 — the fused launch simply drops its shared slot (grid.y = top_k)
+    /// when this is present.
+    pub shared_down_fp8: Option<Fp8Weight>,
     /// LatentMoE: fc1 [moe_latent_size, hidden_size] BF16 (dequant from FP8 at load).
     /// Present only for Super 120B (moe_latent_size > 0).
     pub fc1_latent_proj: Option<DenseWeight>,
@@ -293,6 +299,24 @@ pub(crate) fn load_nemotron_moe(
     let shared_down_prefix = format!("{p}.shared_experts.down_proj");
     let shared_down_has_s2 = store.contains(&format!("{shared_down_prefix}.weight_scale_2"));
     let shared_down_has_s = store.contains(&format!("{shared_down_prefix}.weight_scale"));
+    let shared_down_fp8 = if want_native_fp8 && !shared_down_has_s2 && shared_down_has_s {
+        match load_fp8_block_scaled_as_fp8weight(store, &shared_down_prefix, gpu) {
+            Ok(mut w) => {
+                // Own the bytes (the helper aliases the WeightStore pointer).
+                let bytes = (w.n as usize) * (w.k as usize);
+                let owned = gpu.alloc(bytes)?;
+                gpu.copy_d2d(w.weight, owned, bytes)?;
+                w.weight = owned;
+                Some(w)
+            }
+            Err(e) => {
+                tracing::warn!("shared_down native FP8 unavailable ({e}) — using NVFP4 requant");
+                None
+            }
+        }
+    } else {
+        None
+    };
     let shared_down = if shared_down_has_s2 {
         quantized(store, &shared_down_prefix, gpu)?
     } else {
@@ -415,6 +439,7 @@ pub(crate) fn load_nemotron_moe(
         experts,
         shared_up,
         shared_up_fp8,
+        shared_down_fp8,
         shared_down,
         fc1_latent_proj,
         fc2_latent_proj,

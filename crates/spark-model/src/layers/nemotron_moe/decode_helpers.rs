@@ -174,8 +174,44 @@ impl NemotronMoeLayer {
         let shared_down_out = ctx.buffers.ssm_deinterleaved();
         let smem = (shared_inter.max(inter) as usize) * 4;
 
+        // Native-FP8 shared down_proj. The fused kernel below only speaks NVFP4
+        // (E2M1 LUT, per-group u8 scale, one f32 scale_2), so rather than teach
+        // it FP8 we compute the shared expert separately out of the checkpoint's
+        // own bytes — relu^2 in place, then the already-proven `w8a16_gemv` —
+        // and drop the fused launch's shared slot. `is_shared` there is
+        // `expert_slot == top_k`, so a grid.y of `top_k` never selects it.
+        let native_shared_down = self
+            .weights
+            .shared_down_fp8
+            .as_ref()
+            .filter(|_| self.w8a16_gemv_k.0 != 0 && self.relu_squared_inplace_k.0 != 0);
+        if let Some(fp8w) = native_shared_down {
+            KernelLaunch::new(ctx.gpu, self.relu_squared_inplace_k)
+                .grid([div_ceil(shared_inter, 256), 1, 1])
+                .block([256, 1, 1])
+                .arg_ptr(shared_up_out)
+                .arg_u32(shared_inter)
+                .launch(stream)?;
+            ops::w8a16_gemv(
+                ctx.gpu,
+                self.w8a16_gemv_k,
+                shared_up_out,
+                fp8w.weight,
+                fp8w.row_scale,
+                shared_down_out,
+                h,
+                shared_inter,
+                stream,
+            )?;
+        }
+        let fused_slots = if native_shared_down.is_some() {
+            top_k
+        } else {
+            top_k + 1
+        };
+
         KernelLaunch::new(ctx.gpu, self.relu2_down_shared_k)
-            .grid([div_ceil(h, 8), top_k + 1, 1])
+            .grid([div_ceil(h, 8), fused_slots, 1])
             .block([128, 1, 1])
             .shared_mem(smem as u32)
             .arg_ptr(expert_up_out)
