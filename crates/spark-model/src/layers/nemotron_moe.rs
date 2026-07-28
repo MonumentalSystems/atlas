@@ -51,6 +51,9 @@ pub struct NemotronMoeLayer {
     /// Elementwise relu^2, used to build the shared expert's activation when the
     /// native-FP8 shared_down path replaces the fused NVFP4 kernel. 0 when absent.
     relu_squared_inplace_k: KernelHandle,
+    /// Native-FP8 prefill GEMM for the shared expert. 0 when unavailable.
+    w8a16_gemm_k: KernelHandle,
+    w8a16_gemm_pipelined_k: KernelHandle,
     relu2_down_shared_k: KernelHandle,
     weighted_sum_scale_k: KernelHandle,
     residual_add_k: KernelHandle,
@@ -135,6 +138,8 @@ impl NemotronMoeLayer {
             w4a16_gemv_k: gpu.kernel("w4a16_gemv", "w4a16_gemv")?,
             w8a16_gemv_k: super::try_kernel(gpu, "w8a16_gemv", "w8a16_gemv"),
             relu_squared_inplace_k: super::try_kernel(gpu, "relu_squared", "relu_squared_inplace"),
+            w8a16_gemm_k: super::try_kernel(gpu, "w8a16_gemm", "w8a16_gemm"),
+            w8a16_gemm_pipelined_k: super::try_kernel(gpu, "w8a16_gemm_pipelined", "w8a16_gemm_pipelined"),
             relu2_down_shared_k: gpu.kernel("moe_relu2_fused", "moe_expert_relu2_down_shared")?,
             weighted_sum_scale_k: gpu.kernel("relu2", "moe_weighted_sum_scale")?,
             residual_add_k: gpu.kernel("residual_add", "bf16_residual_add")?,
@@ -300,7 +305,15 @@ impl TransformerLayer for NemotronMoeLayer {
         // Native FP4 tensor cores: shared_up consumed in its ORIGINAL NVFP4 form
         // (no FP8 or transposed copies), activations quantized to NVFP4 in one
         // pass. Same gates as the SSM W4A4 path; ATLAS_NO_SHARED_W4A4=1 disables.
-        let w4a4 = n >= 512
+        // Native FP8 wins over w4a4. w4a4 quantizes the ACTIVATIONS to 4 bits as
+        // well as the weights, and it is the default for every prompt >= 512
+        // tokens — i.e. every real request — so leaving it ahead of the native
+        // arm would have kept the worst-precision path on exactly the traffic
+        // that matters while the native weights sat unused.
+        let native_shared_up = self.weights.shared_up_fp8.is_some()
+            && (self.w8a16_gemm_pipelined_k.0 != 0 || self.w8a16_gemm_k.0 != 0);
+        let w4a4 = !native_shared_up
+            && n >= 512
             && self.w4a4_gemm_k.0 != 0
             && self.quantize_nvfp4_k.0 != 0
             && ctx.buffers.fp8_act_bytes() >= (shared_inter as usize).max(h) * (n as usize)
@@ -324,6 +337,36 @@ impl TransformerLayer for NemotronMoeLayer {
                 a4,
                 a4_sf,
                 &self.weights.shared_up,
+                shared_up_out_base,
+                n,
+                shared_inter,
+                h as u32,
+                stream,
+            )?;
+        } else if let Some(fp8w) = self
+            .weights
+            .shared_up_fp8
+            .as_ref()
+            .filter(|_| self.w8a16_gemm_pipelined_k.0 != 0 || self.w8a16_gemm_k.0 != 0)
+        {
+            // Native FP8 from the checkpoint — no NVFP4 requant, no derived copy.
+            // `w4a4` is suppressed above when this is available (see there).
+            let (kern, pipelined) = if self.w8a16_gemm_pipelined_k.0 != 0 {
+                (self.w8a16_gemm_pipelined_k, true)
+            } else {
+                (self.w8a16_gemm_k, false)
+            };
+            let f = if pipelined {
+                ops::w8a16_gemm_pipelined
+            } else {
+                ops::w8a16_gemm
+            };
+            f(
+                ctx.gpu,
+                kern,
+                normed,
+                fp8w.weight,
+                fp8w.row_scale,
                 shared_up_out_base,
                 n,
                 shared_inter,
