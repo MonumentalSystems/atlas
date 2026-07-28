@@ -36,6 +36,7 @@ USAGE
                      {"thinking":{"budget_tokens":N}}; implies THINK=1
   MAXTOK=200         max_tokens per request
   TOOLS=1            attach a tool schema and scan tool-call arguments too
+  EXACT=1            deterministic-answer mode; the SENSITIVE bleed detector
   STREAM=1           use the SSE streaming endpoint — a DIFFERENT code path from
                      blocking, and the one agentic clients actually use
   PREFIX_WORDS=6000  shared-prefix length; MUST exceed the Marconi checkpoint
@@ -110,6 +111,19 @@ TOOLS = os.environ.get("TOOLS") == "1"
 # agentic clients like opencode ALWAYS stream. A bleed that only manifests on
 # the streaming path is invisible to a blocking-only harness.
 STREAM = os.environ.get("STREAM") == "1"
+# EXACT=1 is the SENSITIVE detector. It asks for a deterministic one-token-ish
+# answer ("<CANARY><NUM>", nothing else) and compares EXACTLY. The prose mode
+# cannot see fragment-level bleed because every worker's sentence opens with the
+# same words; exact mode makes ANY deviation visible.
+#
+# MEASURED on Holo 3.1 (streaming, 8 workers, identical prompts, temp 0):
+#   sequential : 0/24 deviations
+#   concurrent : deviations EVERY trial, e.g. ZANTHOR -> "ZANTHORGY" where "GY"
+#                is the opening of GYRE's canary; VORPAL -> "VORZPAL"
+#                (a "Z" from ZANTHOR injected MID-TOKEN)
+# Sequential-clean + concurrent-dirty on identical inputs is cross-request
+# contamination, not model variance.
+EXACT = os.environ.get("EXACT") == "1"
 TOOL_SCHEMA = [{
     "type": "function",
     "function": {
@@ -203,13 +217,17 @@ def make_prompt(canary, topic, num, _pad=None):
     # unique section. Requests therefore match each other deep into the radix
     # and differ only in the tail that carries the canary.
     head = f"Reference log:\n{SHARED_PREFIX}\n\n" if PREFIX_WORDS else ""
-    return (
-        f"{head}"
-        f"Project codename is {canary}. The project concerns {topic}. "
-        f"The site log records exactly {num} entries.\n\n"
-        f"Question: What is the project codename, and how many entries does "
-        f"the site log record? Answer in one short sentence."
-    )
+    body = (f"{head}"
+            f"Project codename is {canary}. The project concerns {topic}. "
+            f"The site log records exactly {num} entries.\n\n")
+    if EXACT:
+        # Deterministic target so ANY deviation is signal. Critically the reply
+        # STARTS with the canary, so a foreign fragment cannot hide behind the
+        # identical prose opening every worker would otherwise produce.
+        return body + ("Question: Reply with EXACTLY the codename followed by the "
+                       "number, nothing else. Start your reply with the codename.")
+    return body + ("Question: What is the project codename, and how many entries "
+                   "does the site log record? Answer in one short sentence.")
 
 
 def _near(a, b, tol=2):
@@ -229,6 +247,19 @@ def _near(a, b, tol=2):
 def classify(idx, out):
     mine, num = WORKERS[idx][0], WORKERS[idx][2]
     up = out.upper()
+    if EXACT:
+        clean = "".join(ch for ch in up if ch.isalnum())
+        if clean == f"{mine}{num}":
+            return "OK", ""
+        # Any deviation is corruption. Name the foreign canary when a fragment of
+        # one is present — fragments as short as 2 chars have been observed.
+        for j, c in enumerate(ALL_CANARIES):
+            if j == idx:
+                continue
+            for k in range(len(c), 1, -1):
+                if c[:k] in clean.replace(mine, "").replace(num, ""):
+                    return "BLEED", f"fragment {c[:k]!r} of {c}"
+        return "WRONG", f"expected {mine}{num}"
     # Foreign canary/topic first — that is the finding this harness exists for,
     # and it outranks everything else.
     others = [c for j, c in enumerate(ALL_CANARIES) if j != idx and c in up]
@@ -255,7 +286,7 @@ def run_round(rnd):
 
 
 mode = (f"thinking={'ON' if THINK else 'OFF'} tools={'ON' if TOOLS else 'OFF'} "
-        f"api={'STREAM' if STREAM else 'blocking'}")
+        f"api={'STREAM' if STREAM else 'blocking'} exact={'ON' if EXACT else 'OFF'}")
 if BUDGET:
     mode += f" budget={BUDGET}"
 print(f"model={MODEL} port={PORT} concurrency={CONC} rounds={ROUNDS} {mode} "
