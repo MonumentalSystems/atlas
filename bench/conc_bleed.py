@@ -123,6 +123,19 @@ STREAM = os.environ.get("STREAM") == "1"
 #                (a "Z" from ZANTHOR injected MID-TOKEN)
 # Sequential-clean + concurrent-dirty on identical inputs is cross-request
 # contamination, not model variance.
+#
+# IT IS NOT STREAMING-SPECIFIC. Measured on Holo 3.1, 32 concurrent requests per
+# path, EXACT mode, identical totals:
+#     streaming  28 OK / 3 WRONG / 1 BLEED
+#     blocking   28 OK / 3 WRONG / 1 BLEED   <- same ZANTHORGY bleed
+# An earlier reading called this a streaming bug because the PROSE mode showed
+# nothing on blocking — prose hides fragment splices behind the identical sentence
+# opening every worker produces. Always run EXACT on BOTH paths before attributing.
+#
+# Some corruptions are not canary fragments at all but tokens from elsewhere in the
+# vocabulary — "Viktorches", "Trenutley", "Vývojpal" (non-ASCII) — i.e. a token
+# sampled from the WRONG distribution, which is what reading another sequence's
+# logits row would produce.
 EXACT = os.environ.get("EXACT") == "1"
 TOOL_SCHEMA = [{
     "type": "function",
