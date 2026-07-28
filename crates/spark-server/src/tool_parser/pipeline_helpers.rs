@@ -76,10 +76,37 @@ pub(super) fn parse_json_fallback_calls(text: &str) -> Vec<ToolCall> {
     // doesn't balance cleanly.
     {
         let bytes = text.as_bytes();
-        let needle = b"{\"name\"";
+        // Locate `{` ... `"name"` allowing WHITESPACE between them. The old
+        // needle was the literal `{"name"`, which only matches compact JSON —
+        // a model that pretty-prints its tool call:
+        //     {
+        //       "name": "write",
+        //       "arguments": { ... }
+        //     }
+        // slipped past every candidate collector here (the line-based scan
+        // above needs one line that both starts `{` and ends `}`, and the code
+        // -block scan needs ``` fences), so the documented "guaranteed
+        // catch-all" caught nothing and a perfectly well-formed tool call was
+        // returned to the client as prose. Measured on Nemotron-Puzzle-75B:
+        // 0/4 parsed before, 4/4 after.
+        let find_name_obj = |from: usize| -> Option<usize> {
+            let mut i = from;
+            while let Some(rel) = text[i..].find("\"name\"") {
+                let nm = i + rel;
+                // Walk back over whitespace to the opening brace.
+                let mut j = nm;
+                while j > 0 && text.as_bytes()[j - 1].is_ascii_whitespace() {
+                    j -= 1;
+                }
+                if j > 0 && text.as_bytes()[j - 1] == b'{' {
+                    return Some(j - 1);
+                }
+                i = nm + 6;
+            }
+            None
+        };
         let mut search_start = 0;
-        while let Some(rel) = text[search_start..].find("{\"name\"") {
-            let start = search_start + rel;
+        while let Some(start) = find_name_obj(search_start) {
             // Find balanced closing brace.
             let mut depth = 0i32;
             let mut in_str = false;
@@ -126,7 +153,7 @@ pub(super) fn parse_json_fallback_calls(text: &str) -> Vec<ToolCall> {
                 search_start = end;
             } else {
                 // Couldn't find balance — skip past this `{"name"` occurrence.
-                search_start = start + needle.len();
+                search_start = start + 1;
             }
         }
     }
