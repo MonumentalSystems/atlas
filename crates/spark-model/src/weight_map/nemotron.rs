@@ -242,7 +242,8 @@ pub(crate) fn load_nemotron_moe(
     // `shared_down` is NOT converted here: it is consumed inside the fused
     // `relu2_down_shared` kernel, which takes NVFP4 (packed + scale + scale_2)
     // arguments, so making it native needs CUDA work rather than a loader change.
-    let native_fp8_mode = std::env::var("ATLAS_NEMOTRON_NATIVE_FP8_SSM").unwrap_or_default();
+    let native_fp8_mode = std::env::var("ATLAS_NEMOTRON_NATIVE_FP8_SSM")
+        .unwrap_or_else(|_| "1".to_string());
     let want_native_fp8 = matches!(native_fp8_mode.as_str(), "1" | "both" | "decode");
     let shared_up_fp8 = if want_native_fp8 && !shared_up_has_s2 && shared_up_has_s {
         match load_fp8_block_scaled_as_fp8weight(store, &shared_up_prefix, gpu) {

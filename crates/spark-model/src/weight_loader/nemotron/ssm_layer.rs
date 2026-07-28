@@ -58,39 +58,35 @@ impl NemotronHWeightLoader {
         // real block-scale buffer. `ATLAS_NEMOTRON_NATIVE_FP8_SSM=0` restores
         // the legacy path exactly (same-binary A/B).
         //
-        // DEFAULT OFF — this path is a MEASURED REGRESSION, not yet a fix.
-        // Enabled on Puzzle-75B (2026-07-27, `native_fp8=true` confirmed in the
-        // load log) it made output strictly worse than the double-quant it
-        // replaces: "Alice is 30. Bob is 25. Who is older?" went from a correct
-        // "Alice" to inventing a Carol/Charlie never present in the prompt;
-        // "my dog is named Rufus" degenerated into a `The user says: "My".`
-        // repeat loop; a 3-item colour question returned empty. Arithmetic
-        // (17*23=391) still passed, so the model loads and runs — the numerics
-        // of this path are wrong somewhere between the scale materialisation and
-        // the w8a16 dispatch, not the wiring.
+        // DEFAULT ON. The requant is what broke this model, and the effect is
+        // specific: language modelling was never damaged, but retrieval of a
+        // proper noun from context was. Measured on a 977-token story
+        // ("My dog is named Rufus ... mention his name often"):
+        //   legacy requant  — calls the dog "Rover" / "Rex"; the given name
+        //                     appears ZERO times
+        //   native decode   — Rufus x3 / x8, with occasional "Rex"/"Buddy" slips
+        //   native BOTH     — Rufus x6 / x5 / x2 / x2 over four trials, and
+        //                     ZERO substitutions
+        // Short direct questions ("what is my dog called?") passed either way,
+        // which is why this hid for so long: only sustained generation exposes it.
         //
-        // Kept, default-off, because the wiring is the valuable part and was
-        // non-obvious: `set_fp8_weights` (layers/nemotron_mamba2.rs) and the
-        // decode `w8a16_gemv` preference (trait_impl.rs) were already written
-        // and had ZERO callers — a finished, dead path. All three w8a16 kernels
-        // are already compiled into the Puzzle target; no CUDA authoring is
-        // needed to revive it. Suspects for the bad numerics, in order: the
-        // scalar-`weight_scale` broadcast into a [ceil(N/128), ceil(K/128)]
-        // block matrix, and the k_blocks floor-vs-ceil disagreement between
-        // w8a16_gemv.cu:129 `(K+127)/128` and w8a16_gemm{,_pipelined}.cu
-        // `K/128` (benign at K=4096/8192, but it shows the two kernels do not
-        // share one scale-layout contract).
+        // Safe to default on: the branch requires `quant_kind == Fp8`, and the
+        // only other Nemotron checkpoint served here
+        // (NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4) has no FP8 config group at all,
+        // so the gate cannot fire on it. `=0` restores the legacy path exactly
+        // for a same-binary A/B, and every failure to load native FP8 falls back
+        // to the legacy arm with a warning rather than aborting.
         //
-        // THREE modes, so decode and prefill can be bisected independently (the
-        // native path changed BOTH at once — `w8a16_gemv` for decode and
-        // `w8a16_gemm[_pipelined]` for prefill — so a single on/off gate cannot
-        // say which one corrupts):
-        //   unset / "0"  — legacy FP8→BF16→NVFP4 everywhere (baseline)
-        //   "decode"     — native FP8 weights installed AND used by decode, but
-        //                  the legacy NVFP4 requant + prefill weight copies are
-        //                  still built and prefill keeps using them
-        //   "1" / "both" — native FP8 for decode and prefill (no NVFP4 copies)
-        let mode = std::env::var("ATLAS_NEMOTRON_NATIVE_FP8_SSM").unwrap_or_default();
+        // THREE modes, kept because they bisect decode from prefill — the native
+        // path changes BOTH (`w8a16_gemv` for decode, `w8a16_gemm[_pipelined]`
+        // for prefill), so a single on/off gate cannot say which one moved a
+        // result:
+        //   "0"            — legacy FP8→BF16→NVFP4 everywhere (baseline)
+        //   "decode"       — native decode; legacy NVFP4 requant + prefill
+        //                    copies still built, prefill keeps using them
+        //   unset/"1"/"both" — native FP8 for decode and prefill (no NVFP4 copies)
+        let mode = std::env::var("ATLAS_NEMOTRON_NATIVE_FP8_SSM")
+            .unwrap_or_else(|_| "1".to_string());
         let native_fp8_enabled = matches!(mode.as_str(), "1" | "both" | "decode");
         // Decode-only mode keeps the legacy NVFP4 weights resident for prefill.
         let native_prefill_wanted = matches!(mode.as_str(), "1" | "both");
@@ -167,7 +163,7 @@ impl NemotronHWeightLoader {
                 // is the one link it cannot check.
                 let mut head = [0u8; 16];
                 gpu.copy_d2h(in_fp8.weight, &mut head)?;
-                tracing::info!(
+                tracing::debug!(
                     "L0 in_proj FP8 head: {}",
                     head.iter()
                         .map(|b| format!("{b:02x}"))
