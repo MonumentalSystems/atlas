@@ -130,17 +130,71 @@ mod scrub_think_tests {
 /// the content).
 pub(crate) fn strip_orphan_tool_markup(text: &str) -> String {
     const OPENERS: [&str; 2] = ["<tool_call>", "<function="];
-    let cut = OPENERS
-        .iter()
-        .filter_map(|op| text.find(op))
-        .min()
-        .unwrap_or(text.len());
-    text[..cut].trim_end().to_string()
+    let find_opener = |s: &str| -> Option<(usize, usize)> {
+        OPENERS
+            .iter()
+            .filter_map(|op| s.find(op).map(|i| (i, op.len())))
+            .min_by_key(|&(i, _)| i)
+    };
+    let Some((cut, oplen)) = find_opener(text) else {
+        return text.trim_end().to_string();
+    };
+    let head = text[..cut].trim_end();
+    if !head.is_empty() {
+        // Normal case: answer first, orphan tool block after it. Keep the answer.
+        return head.to_string();
+    }
+    // LEADING MARKER. Cutting at index 0 returns "" and DISCARDS THE WHOLE
+    // RESPONSE — the caller then hands the client an empty `content` with
+    // `finish_reason=stop` and a non-zero `completion_tokens`, i.e. silent data
+    // loss that looks like the model produced nothing.
+    //
+    // MEASURED on Laguna-S, 8 concurrent requests over a shared prefix (a full
+    // prefix-cache hit, which is what an agentic client's system prompt produces
+    // on every turn): ~12% of responses came back empty. `logprobs:true` showed
+    // the emitted tokens were
+    //   ['<tool_call>', 'The', ' project', ' cod', 'ename', ' is', ' Z', 'AN', ...]
+    // i.e. a spurious `<tool_call>` at position 0 followed by a COMPLETE and
+    // CORRECT answer. The request supplied NO tools, so the tool parser never ran
+    // and this function was the only thing touching the text.
+    //
+    // When the marker leads, the answer is what FOLLOWS it. Drop the marker and
+    // keep the remainder (still trimming any genuine trailing tool block from it).
+    // Returning slightly odd text always beats returning nothing.
+    let rest = text[cut + oplen..].trim_start();
+    match find_opener(rest) {
+        Some((next, _)) => rest[..next].trim_end().to_string(),
+        None => rest.trim_end().to_string(),
+    }
 }
 
 #[cfg(test)]
 mod orphan_tool_tests {
     use super::strip_orphan_tool_markup;
+
+    #[test]
+    fn leading_marker_keeps_the_answer_instead_of_returning_nothing() {
+        // Regression: a spurious `<tool_call>` as TOKEN 0 used to cut at index 0
+        // and discard a complete, correct answer, handing the client an empty
+        // `content` with finish_reason=stop. Measured at ~12% of concurrent
+        // requests on a full prefix-cache hit.
+        let leaked = "<tool_call>The project codename is ZANTHOR, and the site log \
+records exactly 7 entries.";
+        let out = strip_orphan_tool_markup(leaked);
+        assert!(out.starts_with("The project codename is ZANTHOR"), "got {out:?}");
+        assert!(!out.contains("<tool_call>"), "marker survived: {out:?}");
+    }
+
+    #[test]
+    fn leading_marker_still_cuts_a_genuine_trailing_block() {
+        let s = "<tool_call>Answer here.<function=do_thing({})";
+        assert_eq!(strip_orphan_tool_markup(s), "Answer here.");
+    }
+
+    #[test]
+    fn marker_only_input_is_still_empty() {
+        assert_eq!(strip_orphan_tool_markup("<tool_call>"), "");
+    }
 
     #[test]
     fn cuts_the_live_leak() {
