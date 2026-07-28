@@ -28,6 +28,12 @@ pub struct NemotronMamba2Layer {
     // FP8 native weights (skip double-quantization FP8→BF16→NVFP4)
     in_proj_fp8: Option<Fp8Weight>,
     out_proj_fp8: Option<Fp8Weight>,
+    // Whether PREFILL may use the native FP8 weights above. False in the
+    // `ATLAS_NEMOTRON_NATIVE_FP8_SSM=decode` bisect mode, where the native
+    // weights are installed for decode only and the legacy NVFP4 copies are
+    // still built and used by prefill. Prefill must key off this flag, not off
+    // `in_proj_fp8.is_some()`.
+    native_fp8_prefill: bool,
     // Transposed NVFP4 weights for fast prefill GEMM (FP8 MMA, N128, cp.async)
     in_proj_t: Option<QuantizedWeight>,
     out_proj_t: Option<QuantizedWeight>,
@@ -45,6 +51,9 @@ pub struct NemotronMamba2Layer {
     residual_add_k: KernelHandle,
     // Kernel handles — prefill (GEMM + batched kernels)
     w4a16_gemm_k: KernelHandle,
+    // Native FP8 block-scaled prefill GEMM (paired with in_proj_fp8/out_proj_fp8).
+    w8a16_gemm_k: KernelHandle,
+    w8a16_gemm_pipelined_k: KernelHandle,
     w4a16_gemm_t_k: KernelHandle,
     w4a16_gemm_t_m128_k: KernelHandle,
     fp8_gemm_t_k: KernelHandle,
@@ -95,6 +104,7 @@ impl NemotronMamba2Layer {
             ssm,
             in_proj_fp8: None,
             out_proj_fp8: None,
+            native_fp8_prefill: false,
             in_proj_t: None,
             out_proj_t: None,
             in_proj_pd_fp8: None,
@@ -107,6 +117,12 @@ impl NemotronMamba2Layer {
             gated_rms_norm_k: gpu.kernel("norm", "gated_rms_norm")?,
             residual_add_k: gpu.kernel("residual_add", "bf16_residual_add")?,
             w4a16_gemm_k: gpu.kernel("w4a16", "w4a16_gemm")?,
+            w8a16_gemm_k: super::try_kernel(gpu, "w8a16_gemm", "w8a16_gemm"),
+            w8a16_gemm_pipelined_k: super::try_kernel(
+                gpu,
+                "w8a16_gemm_pipelined",
+                "w8a16_gemm_pipelined",
+            ),
             w4a16_gemm_t_k: super::try_kernel(gpu, "w4a16", "w4a16_gemm_t"),
             w4a16_gemm_t_m128_k: super::try_kernel(gpu, "w4a16", "w4a16_gemm_t_m128"),
             fp8_gemm_t_k: super::try_kernel(gpu, "w4a16", "fp8_gemm_t_m128_mfast"),
@@ -139,10 +155,52 @@ impl NemotronMamba2Layer {
     }
 
     /// Set native FP8 weights to skip double-quantization (FP8→BF16→NVFP4).
-    /// When set, decode uses w8a16_gemv (FP8 LUT kernel) instead of w4a16_gemv.
-    pub fn set_fp8_weights(&mut self, in_proj: Option<Fp8Weight>, out_proj: Option<Fp8Weight>) {
+    /// When set, decode uses w8a16_gemv and prefill uses w8a16_gemm[_pipelined]
+    /// instead of the NVFP4/W4A4 arms.
+    ///
+    /// Inputs MUST be tagged `WeightQuantFormat::Fp8BlockScaled`: every w8a16
+    /// kernel indexes `block_scale[n/128 * k_blocks + k/128]`, so a per-row `[N]`
+    /// scale — or the checkpoint's raw 4-byte scalar `weight_scale` — reads far
+    /// past the end of its allocation (illegal address, not wrong numbers). The
+    /// kernel-handle checks are the same contract: once the FP8 weights are
+    /// installed the NVFP4 fallbacks are NULL, so a missing kernel must fail
+    /// here at load, not deref NULL on the first token.
+    ///
+    /// `prefill` selects whether the prefill GEMMs may use these weights. When
+    /// false (`ATLAS_NEMOTRON_NATIVE_FP8_SSM=decode`) only `w8a16_gemv` reads
+    /// them and prefill stays on the legacy NVFP4 / pre-dequantized copies,
+    /// which the loader still builds in that mode.
+    pub fn set_fp8_weights(
+        &mut self,
+        in_proj: Option<Fp8Weight>,
+        out_proj: Option<Fp8Weight>,
+        prefill: bool,
+    ) -> Result<()> {
+        use crate::weight_map::WeightQuantFormat;
+        if let Some(ref w) = in_proj {
+            w.scale_format.expect(
+                WeightQuantFormat::Fp8BlockScaled,
+                "nemotron mamba2 in_proj (w8a16 expects [ceil(N/128),ceil(K/128)] FP32 block scales)",
+            );
+        }
+        if let Some(ref w) = out_proj {
+            w.scale_format.expect(
+                WeightQuantFormat::Fp8BlockScaled,
+                "nemotron mamba2 out_proj (w8a16 expects [ceil(N/128),ceil(K/128)] FP32 block scales)",
+            );
+        }
+        anyhow::ensure!(
+            self.w8a16_gemv_k.0 != 0,
+            "native FP8 SSM requires the w8a16_gemv kernel (decode)"
+        );
+        anyhow::ensure!(
+            !prefill || self.w8a16_gemm_pipelined_k.0 != 0 || self.w8a16_gemm_k.0 != 0,
+            "native FP8 SSM requires w8a16_gemm[_pipelined] (prefill)"
+        );
         self.in_proj_fp8 = in_proj;
         self.out_proj_fp8 = out_proj;
+        self.native_fp8_prefill = prefill;
+        Ok(())
     }
 
     /// Access SSM weights (needed by weight loader for transpose).

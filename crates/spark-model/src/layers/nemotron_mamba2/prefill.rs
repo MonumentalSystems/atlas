@@ -76,7 +76,51 @@ impl NemotronMamba2Layer {
             && self.quantize_nvfp4_k.0 != 0
             && ctx.buffers.fp8_act_bytes() >= (n as usize) * self.d_inner.max(h)
             && std::env::var("ATLAS_NO_SSM_W4A4").is_err();
-        if w4a4 {
+        // Native FP8 first: when the checkpoint's own block-scaled FP8 weights are
+        // installed, `self.ssm.in_proj` is NULL (no NVFP4 copy was ever built), so
+        // every arm below would fault. This also keeps prefill on the checkpoint's
+        // per-128×128-block scales instead of the single global NVFP4 scale the
+        // legacy load derived across all 73.9M elements.
+        //
+        // `native_fp8_prefill` (not merely the presence of the weights) selects
+        // this arm: in the `decode` bisect mode the FP8 weights are installed
+        // for `w8a16_gemv` while the NVFP4 copies below are still built, and
+        // prefill must keep using those.
+        if let Some(ref fp8w) = self.in_proj_fp8.as_ref().filter(|_| self.native_fp8_prefill) {
+            if self.w8a16_gemm_pipelined_k.0 != 0 {
+                ops::w8a16_gemm_pipelined(
+                    ctx.gpu,
+                    self.w8a16_gemm_pipelined_k,
+                    normed,
+                    fp8w.weight,
+                    fp8w.row_scale,
+                    proj,
+                    n,
+                    self.in_proj_size as u32,
+                    h as u32,
+                    stream,
+                )
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "ssm prefill: in_proj w8a16_gemm_pipelined failed (M={n}, N={}): {e}",
+                        self.in_proj_size
+                    )
+                })?;
+            } else {
+                ops::w8a16_gemm(
+                    ctx.gpu,
+                    self.w8a16_gemm_k,
+                    normed,
+                    fp8w.weight,
+                    fp8w.row_scale,
+                    proj,
+                    n,
+                    self.in_proj_size as u32,
+                    h as u32,
+                    stream,
+                )?;
+            }
+        } else if w4a4 {
             let a4 = ctx.buffers.fp8_act();
             let a4_sf = a4.offset((n as usize) * h / 2);
             ops::quantize_bf16_to_nvfp4(
@@ -365,7 +409,45 @@ impl NemotronMamba2Layer {
 
         // ── 6. out_proj GEMM: [N, d_inner] × [d_inner, h] → [N, h] ──
         let out = ctx.buffers.ssm_qkvz();
-        if w4a4 {
+        // Native FP8 first — mirrors the in_proj dispatch (see step 2).
+        if let Some(ref fp8w) = self
+            .out_proj_fp8
+            .as_ref()
+            .filter(|_| self.native_fp8_prefill)
+        {
+            if self.w8a16_gemm_pipelined_k.0 != 0 {
+                ops::w8a16_gemm_pipelined(
+                    ctx.gpu,
+                    self.w8a16_gemm_pipelined_k,
+                    gated_out,
+                    fp8w.weight,
+                    fp8w.row_scale,
+                    out,
+                    n,
+                    h as u32,
+                    self.d_inner as u32,
+                    stream,
+                )
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "ssm prefill: out_proj w8a16_gemm_pipelined failed (M={n}, N={h}): {e}"
+                    )
+                })?;
+            } else {
+                ops::w8a16_gemm(
+                    ctx.gpu,
+                    self.w8a16_gemm_k,
+                    gated_out,
+                    fp8w.weight,
+                    fp8w.row_scale,
+                    out,
+                    n,
+                    h as u32,
+                    self.d_inner as u32,
+                    stream,
+                )?;
+            }
+        } else if w4a4 {
             let a4 = ctx.buffers.fp8_act();
             let a4_sf = a4.offset((n as usize) * self.d_inner / 2);
             ops::quantize_bf16_to_nvfp4(
