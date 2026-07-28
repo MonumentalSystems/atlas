@@ -54,7 +54,24 @@ impl SsmSnapshotIndex {
             // path previously had NO is_tail gate, so a sessionless lookup
             // could restore another session's tail — the exact cross-request
             // corruption the session-gate exists to prevent).
-            if entry.is_tail && (session_hash == 0 || entry.session_hash != session_hash) {
+            // TAIL snapshots hold state for MORE tokens than `token_count` — they
+            // bleed past the prefix into the previous request's GENERATED output.
+            // The session gate below is not sufficient protection, because
+            // `compute_session_hash` hashes only the first 1024 tokens: every
+            // client with a long shared system prompt (opencode's is ~17k) gets
+            // ONE session_hash for every conversation, so a tail from request A
+            // is restorable by unrelated request B, which then continues A's
+            // answer. Measured on Puzzle-75B: asking for three sentences about
+            // teamwork returned request A's CSS, 5/6 runs.
+            //
+            // Default OFF therefore. `ATLAS_SSM_TAIL_REUSE=1` restores the old
+            // behaviour (only safe when session_hash truly identifies a
+            // conversation, i.e. short/unique system prompts).
+            if entry.is_tail
+                && (std::env::var("ATLAS_SSM_TAIL_REUSE").is_err()
+                    || session_hash == 0
+                    || entry.session_hash != session_hash)
+            {
                 continue;
             }
             if hash_token_prefix(tokens, entry.token_count, adapter_id) != entry.prefix_hash {

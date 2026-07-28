@@ -197,7 +197,14 @@ impl SsmSnapshotIndex {
             }
             // TAIL snapshots bleed past the exact prefix — byte-safe ONLY for the
             // same non-zero session. Cross-request reuse corrupts SSM state.
-            if entry.is_tail && (session_hash == 0 || entry.session_hash != session_hash) {
+            // See snapshot_tier.rs: session_hash covers only the first 1024
+            // tokens, so it cannot distinguish conversations that share a long
+            // system prompt. Tail reuse is opt-in via ATLAS_SSM_TAIL_REUSE=1.
+            if entry.is_tail
+                && (std::env::var("ATLAS_SSM_TAIL_REUSE").is_err()
+                    || session_hash == 0
+                    || entry.session_hash != session_hash)
+            {
                 continue;
             }
             let h = hash_token_prefix(tokens, entry.token_count, adapter_id);
