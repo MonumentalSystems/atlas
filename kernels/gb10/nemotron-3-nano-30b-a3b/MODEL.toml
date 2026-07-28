@@ -58,6 +58,15 @@ dry_multiplier = 0.0      # 2026-06-06: 0.5->0.0; no vendor DRY. Re-gate; if loo
 # <tool_call>-inside-<think> attractor that previously motivated
 # disabling. If Nemotron-H Nano's Think-Satisfy reappears in practice,
 # re-disable per-model here; see project_qwen36_thinking_fix.md.
+# This checkpoint's generation_config.json carries temperature=1.0 AND top_p=1.0
+# — the HF evaluation default, not a serving recipe. WITHOUT this opt-in, core
+# sampling falls through to those values and every preset above (0.6 thinking /
+# 0.7 non-thinking / 0.6 tools, top_p 0.95, top_k 20) is SILENTLY IGNORED, so any
+# client that does not send its own sampling params — opencode does not — decodes
+# completely unfiltered. Same fix and same reasoning as the Puzzle-75B sibling,
+# where it took tool-call pass rate 4/8 -> 7/8 on Holo. Explicit per-request
+# values from the client always win.
+use_sampling_presets_for_core = true
 thinking_in_tools = true
 # Bumped 256 → 1024 in pass-17: fib prompt's reasoning trace needs room to
 # complete (before bump, model hit budget mid-step and force-end-thinking
