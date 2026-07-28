@@ -295,7 +295,13 @@ def classify(idx, out):
         for j, c in enumerate(ALL_CANARIES):
             if j == idx:
                 continue
-            for k in range(len(c), 1, -1):
+            # >=3 chars. A 2-char fragment is NOT evidence: models garble invented
+            # tokens, and a common digram (e.g. "GY") landing inside a mangled
+            # canary looks identical to a real splice. Measured: at a 2-char
+            # threshold nearly every "bleed" was "GY", which is exactly what a
+            # coincidence distribution looks like; at 3 chars only genuine
+            # multi-token splices survive ("VORGYR", "ZANGYR").
+            for k in range(len(c), 2, -1):
                 if c[:k] in clean.replace(mine, "").replace(num, ""):
                     return "BLEED", f"fragment {c[:k]!r} of {c}"
         return "WRONG", f"expected {mine}{num}"
