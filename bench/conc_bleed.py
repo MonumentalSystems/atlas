@@ -50,6 +50,32 @@ content, which scores WRONG and would MASK real bleed. Measured on Holo 3.1:
 That is why thinking defaults to OFF here — a harness that cannot establish a
 clean solo baseline cannot detect anything.
 
+THE TRIGGER IS A SHARED PREFIX
+------------------------------
+Back-to-back on ONE Laguna-XS container, same detector, only prompt shape differs:
+
+    DISTINCT prompts (PREFIX_WORDS=0)  ->  32/32 CLEAN
+    SHARED 6000-word prefix            ->  4 BLEED, e.g. VORPAL -> "VORGYR 19"
+                                           (VORPAL's "VOR" + GYRE's "GYR")
+
+This RECONCILES this harness with bench/agentic/conc_harness.py rather than either
+being wrong. That harness passes 7/8 at C=8 with clean KV health — and its own
+source says it uses DISTINCT prompts deliberately, "otherwise the prefix cache
+would dedupe". It therefore cannot trigger this. It is not a weak test; it tests
+a different shape.
+
+The shared-prefix shape is the PRODUCTION one: every agentic client sends a long
+common system prompt and differs only in the tail. So "the agentic harness passes"
+is a statement about distinct-prompt traffic ONLY, and says nothing about
+shared-prefix concurrency — which is what real clients do.
+
+Sequential is clean at BOTH shapes, so it needs concurrency AND sharing together.
+
+COUNT BLEED, NOT WRONG
+----------------------
+EXACT mode scores a correct-but-prose answer ("The project codename is MIMSY...
+MIMSY 31") as WRONG. Use BLEED events for the corruption rate: 4/32 = 12.5%.
+
 INTERPRETING RESULTS
 --------------------
   solo OK == N and concurrent all OK      -> clean
