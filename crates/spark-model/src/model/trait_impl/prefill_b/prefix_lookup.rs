@@ -184,9 +184,19 @@ impl TransformerModel {
                 // from 2/10 distinct completions to 5/10 — the bypass made
                 // determinism WORSE, which is what exposed the ordering bug.
                 // Skipping the restore too is what the flag always meant.
+                // DEFAULT ON. The exact-full-prompt shortcut is UNSOUND BY
+                // CONSTRUCTION, not merely buggy: computing the last token needs
+                // SSM state@(N-1), the snapshot holds state@N, and the recurrence
+                // is not invertible, so state@(N-1) cannot be recovered. The path
+                // therefore re-runs token N-1 from state@N (a deliberate
+                // "double-advance"), patches the SSM state back afterwards — and
+                // leaves the KV it wrote for position N-1 CORRUPTED, in a block
+                // SHARED with the prefix cache. `ctx.gdn_exact_replay`'s own doc
+                // in layer.rs describes this same poisoning for the GDN path.
+                // `ATLAS_MARCONI_EXACT=1` re-enables it for A/B.
                 let bypass_exact = snap_tok == matched
                     && matched == total
-                    && std::env::var("ATLAS_NO_MARCONI_EXACT").as_deref() == Ok("1");
+                    && std::env::var("ATLAS_MARCONI_EXACT").as_deref() != Ok("1");
                 if snap_tok > 0
                     && matched <= total
                     && !exact_without_hidden
@@ -281,7 +291,7 @@ impl TransformerModel {
             if skip
                 && prefix_match.ssm_snapshot_tokens == matched
                 && matched == total
-                && std::env::var("ATLAS_NO_MARCONI_EXACT").as_deref() == Ok("1")
+                && std::env::var("ATLAS_MARCONI_EXACT").as_deref() != Ok("1")
             {
                 skip = false;
                 seq.marconi_exact_snap = None;
