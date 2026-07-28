@@ -362,6 +362,11 @@ impl SsmSnapshotPool {
     /// tag: a freed slot carries no restorable state, so leaving the tag
     /// would make [`Self::session_has_history`] report phantom history.
     pub(super) fn free(&self, snap_slot: usize) {
+        // Slot lifecycle, paired with the CAPTURE/RESTORE lines in the
+        // radix snapshot index. A RESTORE naming a slot that was FREEd and
+        // then re-CAPTUREd under a different prefix hash is a use-after-free:
+        // the index entry outlived the HBM state it points at.
+        tracing::debug!(target: "ssm_snap", "FREE slot={snap_slot}");
         self.slot_has_hidden.lock().remove(&snap_slot);
         self.session_tags.lock().remove(&snap_slot);
         self.free_slots.lock().push(snap_slot);

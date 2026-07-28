@@ -13,6 +13,11 @@ impl SsmSnapshotIndex {
         session_hash: u64,
         token_count: usize,
     ) -> Option<usize> {
+        tracing::debug!(
+            target: "ssm_snap",
+            "CAPTURE plain slot={snapshot_id} depth={token_count} sess={session_hash:#x} \
+             phash={prefix_hash:#x}"
+        );
         for entry in &mut self.entries {
             if entry.prefix_hash == prefix_hash {
                 let old = entry.snapshot_id;
@@ -57,6 +62,14 @@ impl SsmSnapshotIndex {
         session_hash: u64,
         token_count: usize,
     ) -> Vec<usize> {
+        // Capture provenance — pairs with the "RESTORE" line in `lookup_tiered`.
+        // Correlating slot ids across the two proves whether a restore read the
+        // state that was actually written for its verified prefix hash.
+        tracing::debug!(
+            target: "ssm_snap",
+            "CAPTURE tail slot={snapshot_id} depth={token_count} sess={session_hash:#x} \
+             phash={prefix_hash:#x}"
+        );
         let mut displaced = Vec::new();
         if session_hash != 0 {
             let mut i = 0;
@@ -108,6 +121,11 @@ impl SsmSnapshotIndex {
         session_hash: u64,
         token_count: usize,
     ) -> Option<usize> {
+        tracing::debug!(
+            target: "ssm_snap",
+            "CAPTURE sibling slot={snapshot_id} depth={token_count} sess={session_hash:#x} \
+             phash={prefix_hash:#x}"
+        );
         for entry in &mut self.entries {
             if entry.prefix_hash == prefix_hash {
                 let old = entry.snapshot_id;

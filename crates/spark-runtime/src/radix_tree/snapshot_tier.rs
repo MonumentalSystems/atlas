@@ -95,6 +95,24 @@ impl SsmSnapshotIndex {
             } else {
                 SnapLoc::Hbm(e.snapshot_id)
             };
+            // Provenance of every SSM restore. `prefix_hash` was verified above
+            // against the CALLER's tokens at `depth`, so a contaminated answer
+            // that shows `hash_ok=1` here proves the corruption is NOT a
+            // prefix-collision / session-gate failure but a slot-lifecycle or
+            // replay-depth defect. `replay` is the span the caller must still
+            // recompute; a nonzero value that the caller skips is corruption.
+            tracing::debug!(
+                target: "ssm_snap",
+                "RESTORE depth={depth} matched={matched_tokens} replay={} is_tail={} is_sib={} \
+                 entry_sess={:#x} req_sess={:#x} slot={} tiered={tiered} phash={:#x} hash_ok=1",
+                matched_tokens.saturating_sub(depth),
+                e.is_tail,
+                e.is_tail_sibling,
+                e.session_hash,
+                session_hash,
+                e.snapshot_id,
+                e.prefix_hash,
+            );
             self.stats.hits += 1;
             self.stats.anchor_depth_sum += depth as u64;
             self.stats.recompute_tokens_on_hit += matched_tokens.saturating_sub(depth) as u64;
