@@ -186,6 +186,43 @@ pub(super) fn handle_done(
         response_tokens_per_second: tps,
     };
 
+    // Finalize salvage: the STREAMING detector only recognises the parser's
+    // native markup, so a model that answers with a bare JSON object emits zero
+    // tool-call deltas and the JSON is handed to the client as prose. The
+    // blocking path already recovers this via `tool_parser::parse_tool_calls`
+    // (see chat_blocking.rs) — streaming had a `salvaged_tool_call` flag for it
+    // but nothing ever set it, so opencode-style clients got no tool call at all
+    // and every agentic task failed on a missing file.
+    //
+    // Run the same parser over the accumulated text when tools were active and
+    // nothing was detected, and emit the recovered calls as deltas.
+    if state.detector.as_ref().is_some_and(|d| !d.has_tool_calls()) && !state.tool_loop_capped {
+        // `accumulated_content` is reset as the stream progresses (it tracks the
+        // un-forwarded tail), so it is empty here. `refusal_scan_buf` mirrors the
+        // whole post-sanitizer content stream — the exact text the client saw.
+        let (_content, recovered) = crate::tool_parser::parse_tool_calls(&state.refusal_scan_buf);
+        for (i, tc) in recovered.iter().enumerate() {
+            tracing::info!(
+                "stream salvage: recovered bare tool call {}({})",
+                tc.function.name,
+                tc.function.arguments.chars().take(80).collect::<String>()
+            );
+            deltas.push(StreamDelta::ToolCallStart {
+                index: i,
+                id: tc.id.clone(),
+                name: tc.function.name.clone(),
+            });
+            deltas.push(StreamDelta::ToolCallArgs {
+                index: i,
+                fragment: tc.function.arguments.clone(),
+                token_ids: Vec::new(),
+            });
+        }
+        if !recovered.is_empty() {
+            state.salvaged_tool_call = true;
+        }
+    }
+
     let fr = if state.tool_loop_capped {
         // A tool-call loop guard (Bug-2 name-run cap, F11 within-dedup,
         // F5 cross-flush dedup, or F44 perm-fail) forcibly ended the
