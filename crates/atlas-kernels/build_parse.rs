@@ -158,6 +158,7 @@ pub(super) struct ParsedBehavior {
     pub disable_tool_grammar: bool,
     pub rollback_resteer: bool,
     pub rom_head: String,
+    pub default_system_prompt: String,
     pub tool_retry: bool,
 }
 
@@ -190,6 +191,7 @@ impl Default for ParsedBehavior {
             disable_tool_grammar: false,
             rollback_resteer: true,
             rom_head: String::new(),
+            default_system_prompt: String::new(),
             tool_retry: true,
         }
     }
@@ -328,6 +330,11 @@ pub(super) fn parse_behavior(model_dir: &std::path::Path) -> ParsedBehavior {
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
+    let default_system_prompt = b
+        .and_then(|v| v.get("default_system_prompt"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
     let tool_retry = b
         .and_then(|v| v.get("tool_retry"))
         .and_then(|v| v.as_bool())
@@ -359,6 +366,7 @@ pub(super) fn parse_behavior(model_dir: &std::path::Path) -> ParsedBehavior {
         disable_tool_grammar,
         rollback_resteer,
         rom_head,
+        default_system_prompt,
         tool_retry,
     }
 }

@@ -257,6 +257,19 @@ pub struct ModelBehavior {
     /// itself is intentionally NOT implemented (no per-model trained head
     /// is available); only the optional hook is wired.
     pub rom_head: &'static str,
+    /// System prompt injected when the request supplies NO system message.
+    /// Empty = inject nothing (the default for every model).
+    ///
+    /// Exists for checkpoints whose own chat template emits an EMPTY system
+    /// turn in that case. Measured on Nemotron Nano-30B, whose template
+    /// renders `<|im_start|>system\n<|im_end|>`: that empty turn alone makes
+    /// the model misread its prompt — "My dog is named Rufus. What is my dog
+    /// called?" -> "Your dog's name is Rex." Supplying ANY system text, or
+    /// removing the block entirely, restores the correct answer, and the
+    /// identical prompt through /v1/completions with no template is correct,
+    /// so this is a template pathology and not a numerics or quantization
+    /// defect (all of Nano's weights are consumed in their checkpoint dtype).
+    pub default_system_prompt: &'static str,
     /// Tier 5c (2026-05-26): one-shot tool-call re-roll on hard
     /// validation failure. When `true`, `validate_tool_calls` errors on
     /// the chat path fire a single retry inference with the same
@@ -323,6 +336,7 @@ impl Default for ModelBehavior {
             disable_tool_grammar: false,
             rollback_resteer: true,
             rom_head: "",
+            default_system_prompt: "",
             tool_retry: true,
         }
     }

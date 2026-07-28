@@ -88,6 +88,28 @@ pub(crate) fn prepare_chat_prompt(
         state.behavior.disable_cwd_hint_injection,
     )?;
 
+    // Inject MODEL.toml's `default_system_prompt` when the request carries no
+    // system message. Empty for every model except those whose own chat
+    // template renders an EMPTY system turn in that case — which is not
+    // harmless: on Nemotron Nano-30B the empty turn alone makes the model
+    // misread its prompt (see the field docs on `default_system_prompt`).
+    // A client-supplied system message always wins; this only fills a gap.
+    let messages = if !state.behavior.default_system_prompt.is_empty()
+        && !req
+            .messages
+            .iter()
+            .any(|m| matches!(m.role, crate::ir::message::Role::System))
+    {
+        let mut m = messages;
+        m.insert(
+            0,
+            msg_entry::MsgEntry::system(state.behavior.default_system_prompt),
+        );
+        m
+    } else {
+        messages
+    };
+
     // ── Phase 1.5 + 2: thinking directive + resolution (pre-template) ─
     // The client's per-request directive (resolved at the API edge) wins;
     // when the client is silent the server-level

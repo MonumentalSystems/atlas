@@ -42,6 +42,20 @@ pub(crate) struct MsgEntry {
     pub(super) reasoning_content: Option<String>,
 }
 
+impl MsgEntry {
+    /// A plain system turn, used to fill in MODEL.toml's
+    /// `default_system_prompt` when the request carries none.
+    pub(crate) fn system(content: &str) -> Self {
+        Self {
+            role: "system".to_string(),
+            content: content.to_string(),
+            tool_calls: None,
+            image_count: 0,
+            reasoning_content: None,
+        }
+    }
+}
+
 /// Outputs of [`build_msg_entries`]. Bundled as a struct because
 /// the caller threads each field through five later phases.
 pub(super) struct BuildOut {

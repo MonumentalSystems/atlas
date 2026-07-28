@@ -70,4 +70,31 @@ max_thinking_budget = 2048
 # matching NVIDIA's shipped `nano_v3` parser) strips the block and returns
 # clean `content`. A tagless thinking-on output (cut off mid-think) is
 # treated as reasoning, never leaked into `content`.
-thinking_default = true
+# Thinking OFF by default. Measured 2026-07-28 with the empty-system-block fix
+# already in place, so this is NOT that bug resurfacing: thinking ON leaks
+# training-corpus text into the answer ("My dog is named Rufus. What is my dog
+# called?" -> "The name you gave is **NAME_1**") and returns EMPTY content on
+# other prompts, exactly the pathology documented on the Puzzle-75B sibling.
+# Thinking OFF answers the same prompts correctly. Clients can still opt in
+# per request with chat_template_kwargs.enable_thinking.
+thinking_default = false
+# `max_thinking_budget` is the SOLE thinking cap — drop Atlas's second,
+# 90%-of-max_tokens clamp, which vLLM has no equivalent of and which
+# force-closes `</think>` mid-reasoning. Same fix as the Puzzle/Laguna
+# siblings.
+cap_thinking_at_max_tokens = false
+
+# This checkpoint's own chat template renders an EMPTY system turn when the
+# request carries no system message: `<|im_start|>system\n<|im_end|>`. That
+# empty turn ALONE degrades the model. Measured 2026-07-28, temperature 0,
+# identical user text, only the system block differing:
+#   empty system block   -> "My dog is named Rufus. What is my dog called?"
+#                           answers "Your dog's name is Rex."
+#   any system text      -> "Rufus"  (correct)
+#   no system block      -> "Rufus"  (correct)
+# The same user text through /v1/completions with no template at all is also
+# correct ("My dog is named Rufus. My dog is called" -> "Rufus"), so this is a
+# TEMPLATE pathology, not numerics: every weight in this checkpoint is consumed
+# in its own dtype (BF16 attention, 12 BF16 + 34 NVFP4 SSM projections, NVFP4
+# MoE) with no requantization anywhere.
+default_system_prompt = "You are a helpful assistant."
