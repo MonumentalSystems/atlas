@@ -172,9 +172,25 @@ impl TransformerModel {
                 let exact_without_hidden = snap_tok == matched
                     && matched == total
                     && !self.ssm_snapshots.has_hidden(snap_id);
+                // `ATLAS_NO_MARCONI_EXACT=1` must be decided HERE, not after the
+                // restore below. It used to be checked ~80 lines further down,
+                // where it set `skip = false` to force a full recompute — but by
+                // then `restore()` had ALREADY overwritten the SSM pool with the
+                // snapshot state. The "full recompute" then ran the prefill on top
+                // of a restored (non-zero) starting state instead of a clean one,
+                // so the flag did the opposite of what it documents.
+                //
+                // MEASURED: with the check in its old position, warm requests went
+                // from 2/10 distinct completions to 5/10 — the bypass made
+                // determinism WORSE, which is what exposed the ordering bug.
+                // Skipping the restore too is what the flag always meant.
+                let bypass_exact = snap_tok == matched
+                    && matched == total
+                    && std::env::var("ATLAS_NO_MARCONI_EXACT").as_deref() == Ok("1");
                 if snap_tok > 0
                     && matched <= total
                     && !exact_without_hidden
+                    && !bypass_exact
                     && self
                         .ssm_snapshots
                         .session_matches(snap_id, seq.session_hash)
