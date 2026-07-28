@@ -206,7 +206,19 @@ impl TransformerModel {
         // capture-safe (pool weights / arena scratch / f32 scale are all
         // load-time-fixed). Folded in as one more suppressor.
         let lora_eager = self.lora.is_some() && crate::lora::lora_eager_env();
-        let use_graphs = (self.comm.is_none() || ep_graphs || gdn_graphs)
+        // `ATLAS_NO_DECODE_GRAPHS=1` — run decode eagerly. Capture faults are
+        // STICKY: a fault inside `cuStreamBeginCapture`/`EndCapture` leaves the
+        // context poisoned, so every later request 500s until the process is
+        // restarted. Measured on Nemotron-Puzzle-75B: a tool-heavy request
+        // (12 tools, 2944 prompt tokens) faults with CUDA 716 MISALIGNED_ADDRESS
+        // during capture, after which a 6-tool request that succeeds on a fresh
+        // server 500s forever. That is what hangs agent clients — the server
+        // never recovers and the client waits on a request that will never
+        // complete. Decode graphs were separately measured as a no-op on this
+        // hardware (decode is compute-bound), so this is a cheap escape hatch.
+        let no_decode_graphs = std::env::var("ATLAS_NO_DECODE_GRAPHS").as_deref() == Ok("1");
+        let use_graphs = !no_decode_graphs
+            && (self.comm.is_none() || ep_graphs || gdn_graphs)
             && !self.profile
             && !self
                 .suppress_graphs
