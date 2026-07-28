@@ -247,8 +247,7 @@ pub fn load_dflash_weights(
     // Laguna-DFlash ships a FUSED `qkv_proj` [Q*Hd + 2*Kv*Hd, H] + per-head gate
     // `g_proj`; Qwen-DFlash ships separate q/k/v and no gate. Auto-detect from
     // the store (mirrors `store_has_dflash_weights`'s `fc.weight` probe).
-    let fused_qkv =
-        drafter_store.contains(&format!("{prefix}layers.0.self_attn.qkv_proj.weight"));
+    let fused_qkv = drafter_store.contains(&format!("{prefix}layers.0.self_attn.qkv_proj.weight"));
     let gated = drafter_store.contains(&format!("{prefix}layers.0.self_attn.g_proj.weight"));
     let hd = drafter_config.head_dim;
     let h = drafter_config.hidden_size;

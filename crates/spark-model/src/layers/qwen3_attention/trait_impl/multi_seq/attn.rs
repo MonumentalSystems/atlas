@@ -394,12 +394,17 @@ impl Qwen3AttentionLayer {
                 stream,
             )?;
         } else if !self.attn.o_proj.is_null() {
-            // WIDE-VERIFY BATCHED O-PROJ (DFlash γ=16, n>3). One GEMM reads
-            // the o_proj weight ONCE for all n rows instead of the per-row
-            // GEMV loop below. attn_out is contiguous [n, q_dim]; o_out is
-            // contiguous [n, h]; both already laid out for a single M=n GEMM
-            // (no scatter). Uses the pipelined m128_v2 kernel when the
-            // transposed weight is present (base M64 GEMM is the slow path).
+            // WIDE BATCHED NVFP4 O-PROJ (n>3): DFlash wide verify (γ=16) and
+            // multi-seq NVFP4-attention decode at n=4..8 (Laguna lever A,
+            // padded_n ∈ {4,8}). One GEMM/GEMV reads the o_proj weight ONCE
+            // for all n rows instead of the per-row GEMV loop below.
+            // attn_out is contiguous [n, q_dim]; o_out is contiguous [n, h];
+            // both already laid out for a single M=n launch (no scatter).
+            // n<=8 rides w4a16_gemv_batch4/batch8 (bit-identical per row to
+            // w4a16_gemv, weight streamed once); larger n takes the tile
+            // GEMMs. Graph-capture-safe: every branch is a single plain
+            // kernel launch into preallocated buffers (no alloc/sync/D2H),
+            // keyed off the graph-stable padded n like batch2/batch3.
             self.wide_verify_gemm(
                 c,
                 attn_out,

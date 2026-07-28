@@ -440,21 +440,61 @@ impl MoeLayer {
             // images without them stay at handle 0 (arm gated on packed_experts).
             q4k_mmq_nc_k: super::super::try_kernel(gpu, "q4k_mmq", "atlas_q4k_mmq128_nc"),
             q4k_mmq_wc_k: super::super::try_kernel(gpu, "q4k_mmq", "atlas_q4k_mmq128_wc"),
-            q4k_quant_act_k: super::super::try_kernel(gpu, "q4k_mmq", "atlas_q8_1_quantize_ds4_bf16"),
+            q4k_quant_act_k: super::super::try_kernel(
+                gpu,
+                "q4k_mmq",
+                "atlas_q8_1_quantize_ds4_bf16",
+            ),
             q6k_dequant_k: super::super::try_kernel(
                 gpu,
                 "dequant_gguf_bf16",
                 "dequant_q6_k_to_bf16",
             ),
-            q4k_grouped_nc_k: super::super::try_kernel(gpu, "q4k_mmq", "atlas_q4k_mmq128_grouped_nc"),
-            q4k_grouped_wc_k: super::super::try_kernel(gpu, "q4k_mmq", "atlas_q4k_mmq128_grouped_wc"),
-            q6k_grouped_nc_k: super::super::try_kernel(gpu, "q4k_mmq", "atlas_q6k_mmq128_grouped_nc"),
-            q6k_grouped_wc_k: super::super::try_kernel(gpu, "q4k_mmq", "atlas_q6k_mmq128_grouped_wc"),
-            q4k_grouped_gate_up_nc_k: super::super::try_kernel(gpu, "q4k_mmq", "atlas_q4k_mmq128_grouped_gate_up_nc"),
-            q4k_grouped_gate_up_wc_k: super::super::try_kernel(gpu, "q4k_mmq", "atlas_q4k_mmq128_grouped_gate_up_wc"),
-            q4k_decode_gate_up_k: super::super::try_kernel(gpu, "moe_q4k_decode_fused", "atlas_moe_q4k_decode_gate_up"),
-            q4k_decode_down_k: super::super::try_kernel(gpu, "moe_q4k_decode_fused", "atlas_moe_q4k_decode_down"),
-            q4k_quant_act_d4_k: super::super::try_kernel(gpu, "q4k_mmq", "atlas_q8_1_quantize_d4_bf16"),
+            q4k_grouped_nc_k: super::super::try_kernel(
+                gpu,
+                "q4k_mmq",
+                "atlas_q4k_mmq128_grouped_nc",
+            ),
+            q4k_grouped_wc_k: super::super::try_kernel(
+                gpu,
+                "q4k_mmq",
+                "atlas_q4k_mmq128_grouped_wc",
+            ),
+            q6k_grouped_nc_k: super::super::try_kernel(
+                gpu,
+                "q4k_mmq",
+                "atlas_q6k_mmq128_grouped_nc",
+            ),
+            q6k_grouped_wc_k: super::super::try_kernel(
+                gpu,
+                "q4k_mmq",
+                "atlas_q6k_mmq128_grouped_wc",
+            ),
+            q4k_grouped_gate_up_nc_k: super::super::try_kernel(
+                gpu,
+                "q4k_mmq",
+                "atlas_q4k_mmq128_grouped_gate_up_nc",
+            ),
+            q4k_grouped_gate_up_wc_k: super::super::try_kernel(
+                gpu,
+                "q4k_mmq",
+                "atlas_q4k_mmq128_grouped_gate_up_wc",
+            ),
+            q4k_decode_gate_up_k: super::super::try_kernel(
+                gpu,
+                "moe_q4k_decode_fused",
+                "atlas_moe_q4k_decode_gate_up",
+            ),
+            q4k_decode_down_k: super::super::try_kernel(
+                gpu,
+                "moe_q4k_decode_fused",
+                "atlas_moe_q4k_decode_down",
+            ),
+            q4k_quant_act_d4_k: super::super::try_kernel(
+                gpu,
+                "q4k_mmq",
+                "atlas_q8_1_quantize_d4_bf16",
+            ),
             // Phase 2.7 Tier C — set by loader after construction (qwen35.rs).
             is_dflash_capture_layer: false,
             lora: None,

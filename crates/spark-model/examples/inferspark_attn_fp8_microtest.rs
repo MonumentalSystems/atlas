@@ -27,7 +27,7 @@ use spark_runtime::cuda_backend::AtlasCudaBackend;
 use spark_runtime::gpu::{DevicePtr, GpuBackend};
 use spark_runtime::kernel_args::{KernelLaunch, div_ceil};
 
-const HDIM: usize = 256; // compile-fixed in the kernel
+const HDIM: usize = 128; // compile-fixed in the kernel (Laguna: -DHDIM=128)
 const COSINE_GATE: f64 = 0.99;
 
 struct Rng(u64);

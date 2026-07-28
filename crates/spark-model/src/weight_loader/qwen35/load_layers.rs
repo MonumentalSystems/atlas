@@ -988,8 +988,21 @@ fn parse_layer_ranges(spec: &str) -> Vec<(usize, usize)> {
 }
 
 fn is_holo_modelopt_mixed_precision(config: &ModelConfig) -> bool {
-    config.model_type == "holo3_1_moe"
-        && config.quantization_config.as_ref().is_some_and(|qc| {
-            qc.quant_method == "modelopt" && qc.quant_algo.eq_ignore_ascii_case("MIXED_PRECISION")
-        })
+    // Gate on the QUANT signal, not a single model_type string. holo3_1_moe and
+    // qwen3_5_moe are the SAME arch (the label differs by checkpoint vendor —
+    // e.g. Hcompany Holo-3.1-35B ships "holo3_1_moe", nvidia Qwen3.6-35B ships
+    // "qwen3_5_moe"), and this fn is only reached from the qwen35 loader, so the
+    // model_type is already one of the family. The real discriminator is a
+    // ModelOpt MIXED_PRECISION checkpoint (FP8 attn/SSM + NVFP4 MoE) — without
+    // this, native-FP8 attn/SSM never engages on the nvidia Qwen3.6 checkpoint
+    // and its FP8 attention gets re-quanted (double-quant quality loss).
+    // NOTE: intentionally NOT gated on config.model_type. Same arch, but the
+    // label varies by vendor + Atlas normalization (holo3_1_moe / qwen3_5_moe /
+    // qwen3_6_moe / qwen3_vl_moe), so a model_type allowlist silently misses new
+    // checkpoints (it did for nvidia Qwen3.6-35B -> its FP8 attn/SSM got
+    // re-quanted). Gate on the quant signal only; this fn is reached only from
+    // the qwen35 (GDN-hybrid MoE) loader. See holo-flag-naming-misnomer.
+    config.quantization_config.as_ref().is_some_and(|qc| {
+        qc.quant_method == "modelopt" && qc.quant_algo.eq_ignore_ascii_case("MIXED_PRECISION")
+    })
 }

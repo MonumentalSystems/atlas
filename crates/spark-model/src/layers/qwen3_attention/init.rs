@@ -261,6 +261,11 @@ impl Qwen3AttentionLayer {
                 "fused_k_norm_rope_cache",
                 "fused_k_norm_rope_mrope_cache_write_bf16",
             ),
+            fused_qk_norm_rope_write_nvfp4_k: super::super::try_kernel(
+                gpu,
+                "fused_k_norm_rope_cache",
+                "fused_qk_norm_rope_write_nvfp4",
+            ),
             reshape_and_cache_flash_v_only_k: super::super::try_kernel(
                 gpu,
                 "reshape_and_cache",

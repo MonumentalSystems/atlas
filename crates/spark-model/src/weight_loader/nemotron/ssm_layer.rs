@@ -161,6 +161,20 @@ impl NemotronHWeightLoader {
                 gpu.copy_d2d(w.weight, owned, bytes)?;
                 w.weight = owned;
             }
+            if i == 0 {
+                // Prove the bytes the kernel will read ARE the checkpoint's. The
+                // numeric test covers the kernel with synthetic weights, so this
+                // is the one link it cannot check.
+                let mut head = [0u8; 16];
+                gpu.copy_d2h(in_fp8.weight, &mut head)?;
+                tracing::info!(
+                    "L0 in_proj FP8 head: {}",
+                    head.iter()
+                        .map(|b| format!("{b:02x}"))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                );
+            }
             // Shape + alignment contract. `w8a16_gemv.cu` computes K16 = K/16 with
             // no tail and issues 16-byte uint4 loads of `B + n*K`, so a K that is
             // not a multiple of 16 reads garbage silently — fail loudly at load

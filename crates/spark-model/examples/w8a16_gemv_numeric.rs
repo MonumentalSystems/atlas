@@ -142,6 +142,75 @@ fn run(gpu: &dyn GpuBackend, stream: u64, n: u32, k: u32, vary: bool) -> Result<
     Ok(())
 }
 
+/// Same construction, for the PREFILL GEMMs. `C[m,n]` must equal `K*S` for every
+/// (m, n) since A is all ones and every weight is 1.0.
+fn run_gemm(gpu: &dyn GpuBackend, stream: u64, which: &str, m: u32, n: u32, k: u32) -> Result<()> {
+    let nb = (n as usize).div_ceil(FP8_BLOCK);
+    let kb = (k as usize).div_ceil(FP8_BLOCK);
+    const S: f32 = 0.00088065;
+
+    let a_host: Vec<u8> = (0..(m as usize) * (k as usize))
+        .flat_map(|_| bf16_bytes(1.0))
+        .collect();
+    let a = gpu.alloc(a_host.len())?;
+    gpu.copy_h2d(&a_host, a)?;
+
+    let b_host = vec![0x38u8; (n as usize) * (k as usize)];
+    let b = gpu.alloc(b_host.len())?;
+    gpu.copy_h2d(&b_host, b)?;
+
+    let mut s_host = Vec::with_capacity(nb * kb * 4);
+    for _ in 0..(nb * kb) {
+        s_host.extend_from_slice(&S.to_le_bytes());
+    }
+    let s = gpu.alloc(s_host.len())?;
+    gpu.copy_h2d(&s_host, s)?;
+
+    let c = gpu.alloc((m as usize) * (n as usize) * 2)?;
+    let kern = gpu.kernel(which, which)?;
+    let launch = KernelLaunch::new(gpu, kern);
+    let launch = if which == "w8a16_gemm_pipelined" {
+        launch.grid([n.div_ceil(32), m.div_ceil(128), 1]).block([256, 1, 1])
+    } else {
+        launch.grid([n.div_ceil(64), m.div_ceil(64), 1]).block([128, 1, 1])
+    };
+    launch
+        .arg_ptr(a)
+        .arg_ptr(b)
+        .arg_ptr(s)
+        .arg_ptr(c)
+        .arg_u32(m)
+        .arg_u32(n)
+        .arg_u32(k)
+        .launch(stream)?;
+    gpu.synchronize(stream)?;
+
+    let mut c_host = vec![0u8; (m as usize) * (n as usize) * 2];
+    gpu.copy_d2h(c, &mut c_host)?;
+    let want = S * k as f32;
+    let mut worst = 0.0f32;
+    let mut bad = 0usize;
+    for idx in 0..(m as usize) * (n as usize) {
+        let got = bf16_to_f32(c_host[idx * 2], c_host[idx * 2 + 1]);
+        let rel = ((got - want) / want).abs();
+        if rel > worst {
+            worst = rel;
+        }
+        if rel > 0.02 {
+            bad += 1;
+        }
+    }
+    println!("  {which}: M={m} N={n} K={k}");
+    println!(
+        "    [0,0] got={:.6} want={want:.6}  worst rel={:.5}  bad={bad}/{}",
+        bf16_to_f32(c_host[0], c_host[1]),
+        worst,
+        (m as usize) * (n as usize)
+    );
+    println!("    {}", if bad == 0 { "PASS" } else { "FAIL" });
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let n: u32 = args.get(1).map(|s| s.parse()).transpose()?.unwrap_or(18048);
@@ -151,8 +220,11 @@ fn main() -> Result<()> {
     }
     let gpu = AtlasCudaBackend::new(0, &atlas_kernels::ptx_modules())?;
     let stream = gpu.default_stream();
-    println!("w8a16_gemv numeric check");
+    println!("w8a16_gemv numeric check (DECODE)");
     run(&gpu, stream, n, k, false)?;
     run(&gpu, stream, n, k, true)?;
+    println!("w8a16 GEMM numeric check (PREFILL), M=256");
+    run_gemm(&gpu, stream, "w8a16_gemm_pipelined", 256, n, k)?;
+    run_gemm(&gpu, stream, "w8a16_gemm", 256, n, k)?;
     Ok(())
 }

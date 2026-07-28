@@ -193,6 +193,13 @@ pub struct Qwen3AttentionLayer {
     /// MRoPE-interleaved variant of the above. Same precision regime.
     /// Dispatched when `mrope_interleaved` is true.
     pub(super) fused_k_norm_rope_mrope_cache_write_bf16_k: KernelHandle,
+    /// DECODE attention-tail fusion: q_norm + k_norm + RoPE + NVFP4 K/V
+    /// cache-write in one launch (replaces 4 tiny per-head kernels/layer).
+    /// Bit-parity with the legacy decode chain (BF16-rounded RMSNorm before
+    /// RoPE). Engaged only for gated per-head-norm + NVFP4-KV + standard-RoPE
+    /// + head_dim==128 models (Laguna-S), behind `ATLAS_FUSE_ATTN_TAIL`
+    /// (default on). KernelHandle(0) when the kernel is absent.
+    pub(super) fused_qk_norm_rope_write_nvfp4_k: KernelHandle,
     /// V-only paged cache write. Used alongside the fused K-path so the
     /// K side of the cache stays single-rounded.
     pub(super) reshape_and_cache_flash_v_only_k: KernelHandle,

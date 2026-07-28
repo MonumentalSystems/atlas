@@ -22,7 +22,11 @@ use crate::weight_map::{
 fn packed_q4_from_store(store: &WeightStore, prefix: &str) -> Result<PackedQ4Weight> {
     let t = store.get(&format!("{prefix}.weight"))?;
     ensure!(t.is_packed_q4k(), "{prefix}.weight is not keep-packed Q4_K");
-    ensure!(t.shape.len() == 2, "{prefix}.weight is not 2D ({:?})", t.shape);
+    ensure!(
+        t.shape.len() == 2,
+        "{prefix}.weight is not 2D ({:?})",
+        t.shape
+    );
     Ok(PackedQ4Weight {
         weight: t.ptr,
         n: t.shape[0] as u32,
@@ -34,7 +38,11 @@ fn packed_q4_from_store(store: &WeightStore, prefix: &str) -> Result<PackedQ4Wei
 fn packed_q6_from_store(store: &WeightStore, prefix: &str) -> Result<PackedQ6Weight> {
     let t = store.get(&format!("{prefix}.weight"))?;
     ensure!(t.is_packed_q6k(), "{prefix}.weight is not keep-packed Q6_K");
-    ensure!(t.shape.len() == 2, "{prefix}.weight is not 2D ({:?})", t.shape);
+    ensure!(
+        t.shape.len() == 2,
+        "{prefix}.weight is not 2D ({:?})",
+        t.shape
+    );
     Ok(PackedQ6Weight {
         weight: t.ptr,
         n: t.shape[0] as u32,
@@ -170,10 +178,87 @@ fn load_moe_ffn(
     // trailing bytes hit an unmapped page). Widen BF16→F32 into a correctly-sized
     // device buffer. Safetensors already delivers F32 on-device, so keep `dense`.
     let correction_bias = if experts_keep_packed {
-        dense_bias_to_device(store, &format!("{mlp}.experts.e_score_correction_bias"), gpu)?
+        dense_bias_to_device(
+            store,
+            &format!("{mlp}.experts.e_score_correction_bias"),
+            gpu,
+        )?
     } else {
         dense(store, &format!("{mlp}.experts.e_score_correction_bias"))?
     };
+
+    // ── Native full-BF16 MoE ──
+    // A BF16 checkpoint (poolside/Laguna-XS-2.1 base) ships routed + shared
+    // experts as plain BF16 `.weight` (no `.weight_packed`, no packed Q4K). The
+    // NVFP4 `expert_proj` else-branch below would quantize them to NVFP4 at load
+    // (Atlas min-max, no imatrix) — LOWER fidelity than the pre-calibrated NVFP4
+    // checkpoint (factual recall degrades). Instead keep them BF16 and compute
+    // via `moe_bf16_grouped_gemm` (the same stack qwen35 uses for FP8→BF16): load
+    // DenseWeight arrays + `set_bf16_experts` (which installs the BF16 routed +
+    // shared pointer tables and flips the forward onto the BF16 path).
+    //
+    // EXPERIMENTAL / opt-in (`ATLAS_LAGUNA_NATIVE_BF16=1`): the path LOADS + runs
+    // + generates coherently, but a correctness bug remains — factual recall
+    // degrades vs the NVFP4 checkpoint even though the BF16 base and the NVFP4
+    // checkpoint are the SAME model (attention/embed/norms verified bit-identical;
+    // only the experts are NVFP4-quantized in the checkpoint). The kernel +
+    // set_bf16_experts are proven by qwen35, so the fault is in this laguna
+    // BF16-MoE integration (suspects: down-proj transpose scratch, the routed-BF16
+    // + shared-BF16 combo, or the BF16 decode path). Until fixed, the NVFP4
+    // checkpoint is the recommended artifact; default is the (also-lossy)
+    // quantize-at-load so a BF16 checkpoint at least serves without this bug.
+    let experts_are_bf16 = !experts_keep_packed
+        && store.contains(&format!("{mlp}.experts.0.gate_proj.weight"))
+        && !store.contains(&format!("{mlp}.experts.0.gate_proj.weight_packed"));
+    if experts_are_bf16 && std::env::var("ATLAS_LAGUNA_NATIVE_BF16").ok().as_deref() == Some("1") {
+        let load_experts = |proj: &str| -> Result<Vec<DenseWeight>> {
+            (0..config.num_experts)
+                .map(|e| {
+                    if !config.is_local_expert(e) {
+                        return Ok(DenseWeight {
+                            weight: DevicePtr::NULL,
+                        });
+                    }
+                    dense_auto(store, &format!("{mlp}.experts.{e}.{proj}.weight"), gpu)
+                })
+                .collect()
+        };
+        let gate_bf16 = load_experts("gate_proj")?;
+        let up_bf16 = load_experts("up_proj")?;
+        let down_bf16 = load_experts("down_proj")?;
+        let sh = format!("{mlp}.shared_expert");
+        let sh_g = dense_auto(store, &format!("{sh}.gate_proj.weight"), gpu)?;
+        let sh_u = dense_auto(store, &format!("{sh}.up_proj.weight"), gpu)?;
+        let sh_d = dense_auto(store, &format!("{sh}.down_proj.weight"), gpu)?;
+        let weights = MoeWeights {
+            gate,
+            shared_expert: ExpertWeight::null(),
+            shared_expert_gate: DenseWeight {
+                weight: DevicePtr::NULL,
+            },
+            experts: (0..config.num_experts)
+                .map(|_| ExpertWeight::null())
+                .collect(),
+            packed_experts: None,
+            router_pre_norm: None,
+            correction_bias: Some(correction_bias),
+        };
+        let mut layer = MoeLayer::new(weights, config.num_experts, None, gpu, config)?;
+        layer.set_bf16_experts(
+            &gate_bf16,
+            &up_bf16,
+            &down_bf16,
+            sh_g.weight,
+            sh_u.weight,
+            sh_d.weight,
+            gpu,
+        )?;
+        tracing::info!(
+            "Laguna MoE: NATIVE BF16 ({} routed + 1 shared experts kept BF16, no quant-at-load)",
+            config.num_experts
+        );
+        return Ok(FfnComponent::Moe(layer));
+    }
 
     let (experts, packed_experts) = if experts_keep_packed {
         let mut packed = Vec::with_capacity(config.num_experts);
@@ -200,7 +285,9 @@ fn load_moe_ffn(
                 down,
             });
         }
-        let null_experts = (0..config.num_experts).map(|_| ExpertWeight::null()).collect();
+        let null_experts = (0..config.num_experts)
+            .map(|_| ExpertWeight::null())
+            .collect();
         (null_experts, Some(packed))
     } else {
         // Existing NVFP4/safetensors path: pre-packed NVFP4 (`.weight_packed`)
@@ -375,9 +462,33 @@ fn load_attention(
     // follow-up for concurrency parity with GGUF. o_proj is [N=hidden, K=q_width].
     let (q_nvfp4, k_nvfp4, v_nvfp4) = if attn_nvfp4 {
         (
-            Some(quantize_to_nvfp4(&q_proj, q_width, config.hidden_size, gpu, absmax_k, quantize_k, stream)?),
-            Some(quantize_to_nvfp4(&k_proj, kv_width, config.hidden_size, gpu, absmax_k, quantize_k, stream)?),
-            Some(quantize_to_nvfp4(&v_proj, kv_width, config.hidden_size, gpu, absmax_k, quantize_k, stream)?),
+            Some(quantize_to_nvfp4(
+                &q_proj,
+                q_width,
+                config.hidden_size,
+                gpu,
+                absmax_k,
+                quantize_k,
+                stream,
+            )?),
+            Some(quantize_to_nvfp4(
+                &k_proj,
+                kv_width,
+                config.hidden_size,
+                gpu,
+                absmax_k,
+                quantize_k,
+                stream,
+            )?),
+            Some(quantize_to_nvfp4(
+                &v_proj,
+                kv_width,
+                config.hidden_size,
+                gpu,
+                absmax_k,
+                quantize_k,
+                stream,
+            )?),
         )
     } else {
         (None, None, None)

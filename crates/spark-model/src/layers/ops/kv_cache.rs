@@ -203,6 +203,67 @@ pub fn fused_k_norm_rope_cache_write_bf16_mrope(
         .launch(stream)
 }
 
+/// DECODE-path attention-tail fusion: q_norm + k_norm + RoPE + NVFP4 K/V
+/// cache-write in ONE launch (replaces 4 tiny per-head kernels).
+///
+/// Bit-parity target is the legacy decode 4-kernel chain
+/// (`ops::rms_norm` ×2 → `ops::rope` → `ops::reshape_and_cache_nvfp4`),
+/// reproduced by round-tripping the RMSNorm result through BF16 before RoPE
+/// (the legacy path stores that intermediate in BF16). Q is normed+roped in
+/// place (stays BF16); K is normed+roped then NVFP4-quantized; V is quantized
+/// straight from `v_in` (no norm/RoPE). Single-token decode only —
+/// `positions[0]`/`slot_mapping[0]` are read and the grid indexes heads.
+///
+/// Grid: (nq + nkv, 1, 1)   Block: (head_dim, 1, 1)
+/// Fully CUDA-graph-capture safe (device positions/slot, no host sync/alloc).
+#[allow(clippy::too_many_arguments)]
+pub fn fused_qk_norm_rope_write_nvfp4(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    q: DevicePtr,
+    k_in: DevicePtr,
+    v_in: DevicePtr,
+    q_norm_weight: DevicePtr,
+    k_norm_weight: DevicePtr,
+    positions: DevicePtr,
+    k_cache: DevicePtr,
+    v_cache: DevicePtr,
+    slot_mapping: DevicePtr,
+    num_q_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    rotary_dim: u32,
+    block_size: u32,
+    rms_eps: f32,
+    theta: f32,
+    block_stride_bytes: u64,
+    data_section_bytes: u64,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([num_q_heads + num_kv_heads, 1, 1])
+        .block([head_dim, 1, 1])
+        .arg_ptr(q)
+        .arg_ptr(k_in)
+        .arg_ptr(v_in)
+        .arg_ptr(q_norm_weight)
+        .arg_ptr(k_norm_weight)
+        .arg_ptr(positions)
+        .arg_ptr(k_cache)
+        .arg_ptr(v_cache)
+        .arg_ptr(slot_mapping)
+        .arg_u32(num_q_heads)
+        .arg_u32(num_kv_heads)
+        .arg_u32(head_dim)
+        .arg_u32(rotary_dim)
+        .arg_u32(block_size)
+        .arg_f32(rms_eps)
+        .arg_f32(theta)
+        .arg_u64(block_stride_bytes)
+        .arg_u64(data_section_bytes)
+        .launch(stream)
+}
+
 /// FP8-output sibling of [`fused_k_norm_rope_cache_write_bf16`]. Same
 /// semantics; one fewer BF16 round before the saturating FP8 cast.
 #[allow(clippy::too_many_arguments)]

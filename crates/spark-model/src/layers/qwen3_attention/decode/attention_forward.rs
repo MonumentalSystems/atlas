@@ -16,6 +16,21 @@ use super::super::Qwen3AttentionLayer;
 use crate::layer::ForwardContext;
 use crate::layers::ops;
 
+/// Kill-switch for the decode attention-tail fusion
+/// (`fused_qk_norm_rope_write_nvfp4`). Default ON; set
+/// `ATLAS_FUSE_ATTN_TAIL=0` to fall back to the legacy 4-kernel chain
+/// (q_norm → k_norm → RoPE → reshape_and_cache_nvfp4) for A/B validation.
+/// Read once (host-side, at first decode) so it is CUDA-graph-capture safe.
+fn fuse_attn_tail_enabled() -> bool {
+    use std::sync::OnceLock;
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| {
+        std::env::var("ATLAS_FUSE_ATTN_TAIL")
+            .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+            .unwrap_or(true)
+    })
+}
+
 impl Qwen3AttentionLayer {
     pub(in super::super) fn attention_forward(
         &self,
@@ -366,177 +381,234 @@ impl Qwen3AttentionLayer {
         // Applied BEFORE RoPE (MiniMaxM2Attention.forward reference).
         // This codepath never runs for Mistral/DeepSeek-style MLA
         // models — they early-return in the MLA branch above.
-        if let Some(ref q_norm_full) = self.attn.q_norm_full {
-            ops::rms_norm(
-                ctx.gpu,
-                self.rms_norm_w_k,
-                q_out,
-                q_norm_full,
-                q_out,
-                1,
-                nq * hd,
-                eps,
-                stream,
-            )?;
-        } else if !self.attn.q_norm.weight.is_null() {
-            ops::rms_norm(
-                ctx.gpu,
-                self.rms_norm_w_k,
-                q_out,
-                &self.attn.q_norm,
-                q_out,
-                nq,
-                hd,
-                eps,
-                stream,
-            )?;
-        }
-        if let Some(ref k_norm_full) = self.attn.k_norm_full {
-            ops::rms_norm(
-                ctx.gpu,
-                self.rms_norm_w_k,
-                k_out,
-                k_norm_full,
-                k_out,
-                1,
-                nkv * hd,
-                eps,
-                stream,
-            )?;
-        } else if !self.attn.k_norm.weight.is_null() {
-            ops::rms_norm(
-                ctx.gpu,
-                self.rms_norm_w_k,
-                k_out,
-                &self.attn.k_norm,
-                k_out,
-                nkv,
-                hd,
-                eps,
-                stream,
-            )?;
-        }
+        // ── Fused attention-tail fast path (Laguna-S decode) ──
+        // One kernel replaces the q_norm → k_norm → RoPE →
+        // reshape_and_cache_nvfp4 chain below (4 launches → 1, i.e. 3 fewer
+        // launches/layer). Bit-parity target is that legacy chain: the RMSNorm
+        // result is BF16-rounded before RoPE (matching `ops::rms_norm`'s store),
+        // K is normed+roped then NVFP4-quantized, V is quantized straight from
+        // the raw projection. The gate reproduces the EXACT structural shape
+        // this kernel implements — every other model (MLA, MiniMax full-norm,
+        // Gemma v_norm/proportional-RoPE, mRoPE, YaRN, non-NVFP4 KV, HSS,
+        // head_dim≠128) falls through to the unchanged chain.
+        let fuse_attn_tail = fuse_attn_tail_enabled()
+            && self.fused_qk_norm_rope_write_nvfp4_k.0 != 0
+            && self.mla.is_none()
+            && matches!(self.kv_dtype, KvCacheDtype::Nvfp4)
+            && hd == 128
+            && !self.attn.q_norm.weight.is_null()
+            && !self.attn.k_norm.weight.is_null()
+            && self.attn.q_norm_full.is_none()
+            && self.attn.k_norm_full.is_none()
+            && self.v_norm_weight.is_none()
+            && self.yarn_inv_freq.is_null()
+            && !self.rope_proportional
+            && !self.mrope_interleaved
+            && !self.high_speed_swap_engaged(kv_cache);
 
-        // Gemma-4 v_norm (applied at EVERY layer, not just K=V). HF
-        // `Gemma4TextAttention.forward()` modeling_gemma4.py:1220 applies
-        // `value_states = self.v_norm(value_states)` with
-        // `Gemma4RMSNorm(with_scale=False)` = pure `x * rms` regardless of
-        // K=V mode. For full-attention K=V layers, v_out holds raw K (V
-        // GEMV against aliased K weights). For sliding layers, v_out holds
-        // V projection output. Either way, normalize in place. V does NOT
-        // receive RoPE. Ones (not zeros) because Gemma-4's rms_norm uses
-        // the absolute formula `out = x * rms * weight`.
-        if let Some(v_norm_w) = self.v_norm_weight.as_ref() {
-            ops::rms_norm(
-                ctx.gpu,
-                self.rms_norm_w_k,
-                v_out,
-                v_norm_w,
-                v_out,
-                nkv,
-                hd,
-                eps,
-                stream,
-            )?;
-        }
-
-        if self.mla.is_some() {
-            // MLA: RoPE already applied inside the MLA block (to rope portions only).
-            // Skip the shared RoPE to avoid double-rotation.
-        } else if !self.yarn_inv_freq.is_null() {
-            ops::rope_yarn_scaled(
-                ctx.gpu,
-                self.rope_yarn_scaled_k,
-                q_out,
-                k_out,
-                meta.positions,
-                1,
-                nq,
-                nkv,
-                hd,
-                self.rotary_dim_override
-                    .unwrap_or(ctx.config.rotary_dim() as u32),
-                self.yarn_inv_freq,
-                self.yarn_attention_factor,
-                stream,
-            )?;
-        } else if self.rope_proportional && self.rope_proportional_k.0 != 0 {
-            // Gemma-4 full-attention: proportional RoPE with rotation pairs
-            // (i, i + head_dim/2) for i < rope_angles. rotary_dim_override
-            // here holds `rope_angles` (64 for 31B full attn).
-            let rope_angles = self
+        if fuse_attn_tail {
+            let rotary_dim = self
                 .rotary_dim_override
                 .unwrap_or(ctx.config.rotary_dim() as u32);
-            ops::rope_proportional(
+            let theta = self
+                .rope_theta_override
+                .unwrap_or(ctx.config.rope_theta as f32);
+            ops::fused_qk_norm_rope_write_nvfp4(
                 ctx.gpu,
-                self.rope_proportional_k,
+                self.fused_qk_norm_rope_write_nvfp4_k,
                 q_out,
                 k_out,
+                v_out,
+                self.attn.q_norm.weight,
+                self.attn.k_norm.weight,
                 meta.positions,
-                1,
+                kv_cache.k_pool_ptr(self.attn_layer_idx),
+                kv_cache.v_pool_ptr(self.attn_layer_idx),
+                meta.slot,
                 nq,
                 nkv,
                 hd,
-                rope_angles,
-                self.rope_theta_override
-                    .unwrap_or(ctx.config.rope_theta as f32),
-                stream,
-            )?;
-        } else if self.mrope_interleaved && self.rope_mrope_interleaved_k.0 != 0 {
-            ops::rope_mrope_interleaved(
-                ctx.gpu,
-                self.rope_mrope_interleaved_k,
-                q_out,
-                k_out,
-                meta.positions,
-                meta.positions_h,
-                meta.positions_w,
-                1,
-                nq,
-                nkv,
-                hd,
-                self.rotary_dim_override
-                    .unwrap_or(ctx.config.rotary_dim() as u32),
-                self.rope_theta_override
-                    .unwrap_or(ctx.config.rope_theta as f32),
+                rotary_dim,
+                bs as u32,
+                eps,
+                theta,
+                kv_cache.block_stride_bytes_for_layer(self.attn_layer_idx) as u64,
+                kv_cache.nvfp4_data_bytes() as u64,
                 stream,
             )?;
         } else {
-            ops::rope(
+            if let Some(ref q_norm_full) = self.attn.q_norm_full {
+                ops::rms_norm(
+                    ctx.gpu,
+                    self.rms_norm_w_k,
+                    q_out,
+                    q_norm_full,
+                    q_out,
+                    1,
+                    nq * hd,
+                    eps,
+                    stream,
+                )?;
+            } else if !self.attn.q_norm.weight.is_null() {
+                ops::rms_norm(
+                    ctx.gpu,
+                    self.rms_norm_w_k,
+                    q_out,
+                    &self.attn.q_norm,
+                    q_out,
+                    nq,
+                    hd,
+                    eps,
+                    stream,
+                )?;
+            }
+            if let Some(ref k_norm_full) = self.attn.k_norm_full {
+                ops::rms_norm(
+                    ctx.gpu,
+                    self.rms_norm_w_k,
+                    k_out,
+                    k_norm_full,
+                    k_out,
+                    1,
+                    nkv * hd,
+                    eps,
+                    stream,
+                )?;
+            } else if !self.attn.k_norm.weight.is_null() {
+                ops::rms_norm(
+                    ctx.gpu,
+                    self.rms_norm_w_k,
+                    k_out,
+                    &self.attn.k_norm,
+                    k_out,
+                    nkv,
+                    hd,
+                    eps,
+                    stream,
+                )?;
+            }
+
+            // Gemma-4 v_norm (applied at EVERY layer, not just K=V). HF
+            // `Gemma4TextAttention.forward()` modeling_gemma4.py:1220 applies
+            // `value_states = self.v_norm(value_states)` with
+            // `Gemma4RMSNorm(with_scale=False)` = pure `x * rms` regardless of
+            // K=V mode. For full-attention K=V layers, v_out holds raw K (V
+            // GEMV against aliased K weights). For sliding layers, v_out holds
+            // V projection output. Either way, normalize in place. V does NOT
+            // receive RoPE. Ones (not zeros) because Gemma-4's rms_norm uses
+            // the absolute formula `out = x * rms * weight`.
+            if let Some(v_norm_w) = self.v_norm_weight.as_ref() {
+                ops::rms_norm(
+                    ctx.gpu,
+                    self.rms_norm_w_k,
+                    v_out,
+                    v_norm_w,
+                    v_out,
+                    nkv,
+                    hd,
+                    eps,
+                    stream,
+                )?;
+            }
+
+            if self.mla.is_some() {
+                // MLA: RoPE already applied inside the MLA block (to rope portions only).
+                // Skip the shared RoPE to avoid double-rotation.
+            } else if !self.yarn_inv_freq.is_null() {
+                ops::rope_yarn_scaled(
+                    ctx.gpu,
+                    self.rope_yarn_scaled_k,
+                    q_out,
+                    k_out,
+                    meta.positions,
+                    1,
+                    nq,
+                    nkv,
+                    hd,
+                    self.rotary_dim_override
+                        .unwrap_or(ctx.config.rotary_dim() as u32),
+                    self.yarn_inv_freq,
+                    self.yarn_attention_factor,
+                    stream,
+                )?;
+            } else if self.rope_proportional && self.rope_proportional_k.0 != 0 {
+                // Gemma-4 full-attention: proportional RoPE with rotation pairs
+                // (i, i + head_dim/2) for i < rope_angles. rotary_dim_override
+                // here holds `rope_angles` (64 for 31B full attn).
+                let rope_angles = self
+                    .rotary_dim_override
+                    .unwrap_or(ctx.config.rotary_dim() as u32);
+                ops::rope_proportional(
+                    ctx.gpu,
+                    self.rope_proportional_k,
+                    q_out,
+                    k_out,
+                    meta.positions,
+                    1,
+                    nq,
+                    nkv,
+                    hd,
+                    rope_angles,
+                    self.rope_theta_override
+                        .unwrap_or(ctx.config.rope_theta as f32),
+                    stream,
+                )?;
+            } else if self.mrope_interleaved && self.rope_mrope_interleaved_k.0 != 0 {
+                ops::rope_mrope_interleaved(
+                    ctx.gpu,
+                    self.rope_mrope_interleaved_k,
+                    q_out,
+                    k_out,
+                    meta.positions,
+                    meta.positions_h,
+                    meta.positions_w,
+                    1,
+                    nq,
+                    nkv,
+                    hd,
+                    self.rotary_dim_override
+                        .unwrap_or(ctx.config.rotary_dim() as u32),
+                    self.rope_theta_override
+                        .unwrap_or(ctx.config.rope_theta as f32),
+                    stream,
+                )?;
+            } else {
+                ops::rope(
+                    ctx.gpu,
+                    self.rope_k,
+                    q_out,
+                    k_out,
+                    meta.positions,
+                    1,
+                    nq,
+                    nkv,
+                    hd,
+                    self.rotary_dim_override
+                        .unwrap_or(ctx.config.rotary_dim() as u32),
+                    self.rope_theta_override
+                        .unwrap_or(ctx.config.rope_theta as f32),
+                    stream,
+                )?;
+            }
+
+            // K/V are contiguous (separate dense_gemm outputs), stride = nkv * hd
+            let kv_stride = nkv * hd;
+            self.write_kv_cache(
                 ctx.gpu,
-                self.rope_k,
-                q_out,
                 k_out,
-                meta.positions,
+                v_out,
+                kv_cache,
+                meta.slot,
                 1,
-                nq,
                 nkv,
                 hd,
-                self.rotary_dim_override
-                    .unwrap_or(ctx.config.rotary_dim() as u32),
-                self.rope_theta_override
-                    .unwrap_or(ctx.config.rope_theta as f32),
+                bs as u32,
+                kv_stride,
+                kv_stride,
                 stream,
+                ctx.graph_capture,
             )?;
-        }
-
-        // K/V are contiguous (separate dense_gemm outputs), stride = nkv * hd
-        let kv_stride = nkv * hd;
-        self.write_kv_cache(
-            ctx.gpu,
-            k_out,
-            v_out,
-            kv_cache,
-            meta.slot,
-            1,
-            nkv,
-            hd,
-            bs as u32,
-            kv_stride,
-            kv_stride,
-            stream,
-            ctx.graph_capture,
-        )?;
+        } // end !fuse_attn_tail legacy chain
 
         // Turbo KV cache: apply WHT to Q before paged decode.
         // KV cache stores WHT(K) and WHT(V). By Parseval's theorem,

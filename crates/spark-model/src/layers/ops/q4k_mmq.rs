@@ -135,14 +135,14 @@ pub fn q4k_grouped_gemm(
     gpu: &dyn GpuBackend,
     kernel_nc: KernelHandle,
     kernel_wc: KernelHandle,
-    weight_base: DevicePtr,     // expert 0 packed blocks (contiguous stack)
-    a_q8: DevicePtr,            // sorted q8_1 activations [total_expanded, k]
-    expert_offsets: DevicePtr,  // [ne+1] i32 device (sorted cumulative counts)
-    dst_bf16: DevicePtr,        // sorted output [total_expanded, n_out]
-    n_out: u32,                 // output features per expert (nrows_x)
-    k: u32,                     // input features (ncols_x, %256==0)
+    weight_base: DevicePtr,    // expert 0 packed blocks (contiguous stack)
+    a_q8: DevicePtr,           // sorted q8_1 activations [total_expanded, k]
+    expert_offsets: DevicePtr, // [ne+1] i32 device (sorted cumulative counts)
+    dst_bf16: DevicePtr,       // sorted output [total_expanded, n_out]
+    n_out: u32,                // output features per expert (nrows_x)
+    k: u32,                    // input features (ncols_x, %256==0)
     num_experts: u32,
-    total_expanded: u32,        // sorted-buffer row count (worst-case M bound)
+    total_expanded: u32, // sorted-buffer row count (worst-case M bound)
     stream: u64,
 ) -> Result<()> {
     // nc assumes n_out % 128 == 0 (true for Laguna inter=1024 / hidden=3072);
@@ -189,7 +189,7 @@ pub fn moe_q4k_decode_fused(
     down_base: DevicePtr,
     sorted_token_ids: DevicePtr,
     sorted_expert_ids: DevicePtr,
-    gate_silu: DevicePtr,    // [total_expanded, inter] BF16 scratch (expert_gate_out)
+    gate_silu: DevicePtr, // [total_expanded, inter] BF16 scratch (expert_gate_out)
     expert_down_out: DevicePtr,
     h: u32,
     inter: u32,

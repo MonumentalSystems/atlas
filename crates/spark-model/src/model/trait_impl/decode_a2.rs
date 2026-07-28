@@ -200,7 +200,11 @@ impl TransformerModel {
                     .and_then(|v| v.parse().ok())
                     .unwrap_or(2)
             });
-            let padded = [2usize, 4, 8].iter().copied().find(|&s| s >= n).unwrap_or(n);
+            let padded = [2usize, 4, 8]
+                .iter()
+                .copied()
+                .find(|&s| s >= n)
+                .unwrap_or(n);
             on && padded >= min
         };
         // NOT every grouped variant is graph-illegal. Three arms exist:

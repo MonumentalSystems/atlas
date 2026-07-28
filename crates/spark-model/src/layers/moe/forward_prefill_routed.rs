@@ -175,8 +175,7 @@ impl MoeLayer {
         // Graph-capture-legal (device offsets binary-searched in-kernel, grid =
         // host-known n*top_k). Prefill (total_expanded > threshold) is untouched.
         let smallm_m = self.fp4_decode_smallm_max;
-        let smallm_nvfp4 =
-            self.experts_scale_kind == crate::weight_map::WeightQuantFormat::Nvfp4;
+        let smallm_nvfp4 = self.experts_scale_kind == crate::weight_map::WeightQuantFormat::Nvfp4;
         let smallm_gate_up = smallm_m > 0
             && total_expanded <= smallm_m
             && total_expanded as u32 >= fp4_decode_smallm_min()
