@@ -76,6 +76,18 @@ impl NemotronMamba2Layer {
             && self.quantize_nvfp4_k.0 != 0
             && ctx.buffers.fp8_act_bytes() >= (n as usize) * self.d_inner.max(h)
             && std::env::var("ATLAS_NO_SSM_W4A4").is_err();
+        // The predequant-FP8 arms below launch `fp8_fp8_gemm_t_m128_mfast` (when
+        // `fp8_a`) or else `fp8_gemm_t_m128_mfast`. Both resolve through
+        // `try_kernel`, which yields a NULL handle instead of failing, and a
+        // per-model `w4a16_gemm.cu` override need not define them — Nano-30B's
+        // exports `fp8_gemm_t`, NOT `fp8_gemm_t_m128_mfast`. Those arms used to be
+        // entered on weight presence ALONE, unlike every sibling arm here, so on
+        // such a checkpoint prefill launched a null handle and died with
+        // CUDA_ERROR_INVALID_HANDLE (400) at layer 0 — the whole model unusable,
+        // no fallback. `fp8_a` already proves its own two kernels resolved, so only
+        // the non-`fp8_a` kernel needs checking. Falling through reaches the
+        // transposed-NVFP4 and plain `w4a16_gemm` arms, which are always present.
+        let pd_fp8_ok = fp8_a || self.fp8_gemm_t_k.0 != 0;
         // Native FP8 first: when the checkpoint's own block-scaled FP8 weights are
         // installed, `self.ssm.in_proj` is NULL (no NVFP4 copy was ever built), so
         // every arm below would fault. This also keeps prefill on the checkpoint's
@@ -145,7 +157,7 @@ impl NemotronMamba2Layer {
                 h as u32,
                 stream,
             )?;
-        } else if let Some(w_fp8) = self.in_proj_pd_fp8 {
+        } else if let Some(w_fp8) = self.in_proj_pd_fp8.filter(|_| pd_fp8_ok) {
             // Weights already FP8: no per-K-step dequant, no M-block redundancy.
             if fp8_a {
                 let a8 = ctx.buffers.fp8_act();
@@ -264,6 +276,15 @@ impl NemotronMamba2Layer {
             && self.head_dim.is_multiple_of(ops::SSD_PT as usize)
             && self.state_size.is_multiple_of(8)
             && (self.state_size / 8).is_multiple_of(4)
+            // The scan's dynamic shared memory grows with `state_size` and can
+            // exceed what a block may opt into (sm_121: 101376 B). Over the limit
+            // `cuFuncSetAttribute` fails with CUDA_ERROR_INVALID_VALUE, which
+            // ABORTS the layer rather than degrading — Nemotron Nano-30B
+            // (state_size=128 -> 115968 B) could not serve a single token, while
+            // Puzzle-75B (state_size=96 -> 91392 B) was unaffected, which is why
+            // this went unnoticed. Treat the fit as a precondition of the fast
+            // path; failing it falls through to the sequential scan below.
+            && ops::ssd_scan_fits(self.state_size as u32)
             && std::env::var("ATLAS_NO_SSD").is_err();
 
         if ssd_ok {
@@ -332,7 +353,13 @@ impl NemotronMamba2Layer {
                 self.d_inner as u32,
                 stream,
             )?;
-        } else if self.mamba2_ssm_prefill_persistent_k.0 != 0 {
+        } else if self.mamba2_ssm_prefill_persistent_k.0 != 0
+            // Same-binary A/B against the plain sequential scan below. The
+            // persistent kernel keeps H in shared memory and is only reachable
+            // when the SSD fast path is unavailable — a path no shipped model
+            // took until Nemotron Nano-30B (state_size=128) fell out of SSD.
+            && std::env::var("ATLAS_NO_SSM_PERSISTENT").is_err()
+        {
             ops::mamba2_ssm_prefill_persistent(
                 ctx.gpu,
                 self.mamba2_ssm_prefill_persistent_k,
@@ -472,7 +499,7 @@ impl NemotronMamba2Layer {
                 self.d_inner as u32,
                 stream,
             )?;
-        } else if let Some(w_fp8) = self.out_proj_pd_fp8 {
+        } else if let Some(w_fp8) = self.out_proj_pd_fp8.filter(|_| pd_fp8_ok) {
             if fp8_a {
                 let a8 = ctx.buffers.fp8_act();
                 ops::bf16_to_fp8(
