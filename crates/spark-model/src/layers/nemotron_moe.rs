@@ -45,6 +45,9 @@ pub struct NemotronMoeLayer {
     topk_sigmoid_k: KernelHandle,
     moe_expert_gemv_k: KernelHandle,
     w4a16_gemv_k: KernelHandle,
+    /// Native-FP8 decode GEMV for the shared-expert up_proj (see
+    /// `NemotronMoeWeights::shared_up_fp8`). 0 when unavailable.
+    w8a16_gemv_k: KernelHandle,
     relu2_down_shared_k: KernelHandle,
     weighted_sum_scale_k: KernelHandle,
     residual_add_k: KernelHandle,
@@ -127,6 +130,7 @@ impl NemotronMoeLayer {
             topk_sigmoid_k: gpu.kernel("moe_topk_sig", "moe_topk_sigmoid")?,
             moe_expert_gemv_k: gpu.kernel("moe_expert_gemv", "moe_expert_gemv")?,
             w4a16_gemv_k: gpu.kernel("w4a16_gemv", "w4a16_gemv")?,
+            w8a16_gemv_k: super::try_kernel(gpu, "w8a16_gemv", "w8a16_gemv"),
             relu2_down_shared_k: gpu.kernel("moe_relu2_fused", "moe_expert_relu2_down_shared")?,
             weighted_sum_scale_k: gpu.kernel("relu2", "moe_weighted_sum_scale")?,
             residual_add_k: gpu.kernel("residual_add", "bf16_residual_add")?,

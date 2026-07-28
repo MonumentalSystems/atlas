@@ -139,18 +139,33 @@ impl NemotronMoeLayer {
             stream,
         )?;
 
-        // Shared expert UP
+        // Shared expert UP. Prefer the checkpoint's own FP8 bytes when the loader
+        // kept them (ModelOpt MIXED_PRECISION) instead of the FP8→BF16→NVFP4
+        // requant — the requant is what degrades proper-noun retrieval on Puzzle.
         let shared_up_out = ctx.buffers.ssm_qkvz();
-        ops::w4a16_gemv(
-            ctx.gpu,
-            self.w4a16_gemv_k,
-            normed,
-            &self.weights.shared_up,
-            shared_up_out,
-            shared_inter,
-            h,
-            stream,
-        )?;
+        match self.weights.shared_up_fp8.as_ref().filter(|_| self.w8a16_gemv_k.0 != 0) {
+            Some(fp8w) => ops::w8a16_gemv(
+                ctx.gpu,
+                self.w8a16_gemv_k,
+                normed,
+                fp8w.weight,
+                fp8w.row_scale,
+                shared_up_out,
+                shared_inter,
+                h,
+                stream,
+            )?,
+            None => ops::w4a16_gemv(
+                ctx.gpu,
+                self.w4a16_gemv_k,
+                normed,
+                &self.weights.shared_up,
+                shared_up_out,
+                shared_inter,
+                h,
+                stream,
+            )?,
+        }
 
         // Fused relu²+down for all experts (routed + shared in one launch)
         let expert_down_out = ctx.buffers.expert_down_out();

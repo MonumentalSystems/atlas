@@ -69,4 +69,13 @@ default_kv_dtype = "bf16"
 # per request; explicit request values always win.
 use_sampling_presets_for_core = true
 max_thinking_budget = 2048
+# `max_thinking_budget` is the SOLE thinking cap — drop Atlas's second,
+# 90%-of-max_tokens clamp, which vLLM has no equivalent of. Measured here: a
+# request with max_tokens=30 logged "Thinking enabled, budget=Some(27)", and
+# when that budget is hit Atlas force-closes `</think>`, leaving the model with
+# no natural continuation. The result is the degeneration this model was
+# reported for — prompt content elided ("My dog is named ...?") and
+# `The user asks: "The user asks: ...` repeat loops. Same fix, same reasoning as
+# the Laguna siblings (see laguna-xs-2.1 MODEL.toml).
+cap_thinking_at_max_tokens = false
 thinking_default = true

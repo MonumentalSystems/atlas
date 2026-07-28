@@ -261,6 +261,14 @@ impl ChatTokenizer {
             tracing::info!("continue_final_message: stripped trailing EOT for prefill A/B");
         }
 
+        // `ATLAS_DUMP_PROMPT=1` logs the WHOLE rendered prompt, not just the tail.
+        // The tail is enough to confirm a template ran, but not to answer "are we
+        // rendering the model's own template faithfully?" — which is the question
+        // whenever a model ignores its template's tool-call format and free-generates
+        // some other shape. Diff this against a standalone jinja2 render.
+        if std::env::var("ATLAS_DUMP_PROMPT").as_deref() == Ok("1") {
+            tracing::info!("Jinja FULL ({} chars):\n{}", rendered.len(), rendered);
+        }
         // Debug: log the tail of the rendered template for the first few requests.
         // Use floor_char_boundary to avoid panicking on multi-byte UTF-8 (e.g. Swedish å ä ö).
         if rendered.len() < 2000 {
