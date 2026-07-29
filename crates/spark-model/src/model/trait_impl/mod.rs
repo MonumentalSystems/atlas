@@ -150,7 +150,17 @@ impl Model for TransformerModel {
         streams: &mut [PrefillSlice<'_>],
         stream: u64,
     ) -> Result<Vec<DevicePtr>> {
-        self.prefill_batch_chunk_dispatch(streams, stream)
+        self.prefill_batch_chunk_dispatch(streams, stream, 0)
+    }
+    /// Mixed-step variant: shift the finishing streams' logits rows clear of
+    /// the decode lanes. See the trait docs for the aliasing this prevents.
+    fn prefill_batch_chunk_rows(
+        &self,
+        streams: &mut [PrefillSlice<'_>],
+        stream: u64,
+        row_base: usize,
+    ) -> Result<Vec<DevicePtr>> {
+        self.prefill_batch_chunk_dispatch(streams, stream, row_base)
     }
     fn vocab_size(&self) -> usize {
         self.vocab_size_dispatch()
