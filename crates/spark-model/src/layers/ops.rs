@@ -13,6 +13,8 @@
 
 #[path = "ops/activations.rs"]
 mod activations;
+#[path = "ops/b12x_flashinfer.rs"]
+pub mod b12x_flashinfer;
 #[path = "ops/dispatch_helpers.rs"]
 mod dispatch_helpers;
 #[path = "ops/dispatch_proj.rs"]

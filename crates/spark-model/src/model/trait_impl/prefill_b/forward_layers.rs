@@ -14,6 +14,16 @@ use super::super::super::types::TransformerModel;
 use crate::layer::{AttnMetadataDev, ForwardContext};
 use crate::traits::SequenceState;
 
+// One-shot cudaProfiler range around a whole prefill for a clean nsys capture
+// (`ATLAS_NSYS_CAPTURE=1` + nsys `--capture-range=cudaProfilerApi`). cudart is
+// linked into the final `spark` binary.
+unsafe extern "C" {
+    fn cudaProfilerStart() -> i32;
+    fn cudaProfilerStop() -> i32;
+    fn cudaDeviceSynchronize() -> i32;
+}
+static NSYS_CAPTURE_DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 impl TransformerModel {
     pub(super) fn prefill_b_forward_layers(
         &self,
@@ -157,6 +167,16 @@ impl TransformerModel {
         let t_loop = host_timing.then(std::time::Instant::now);
         let mut t_in_prefill = std::time::Duration::ZERO;
         let mut t_dflash = std::time::Duration::ZERO;
+        // One-shot: begin the nsys capture range around the WHOLE prefill layer
+        // loop. No prof_step syncs run inside (host_timing off), so the trace
+        // shows natural cross-kernel overlap. Skips the small fp8-KV calibration
+        // prefill via the >=512-token gate; fires on the first real prefill only.
+        let nsys_capture = std::env::var("ATLAS_NSYS_CAPTURE").is_ok()
+            && proc_count >= 512
+            && !NSYS_CAPTURE_DONE.swap(true, std::sync::atomic::Ordering::Relaxed);
+        if nsys_capture {
+            unsafe { cudaProfilerStart() };
+        }
         for (i, layer) in self.layers.iter().enumerate() {
             let t_pf = host_timing.then(std::time::Instant::now);
             let lt0 = if profile_now {
@@ -289,6 +309,15 @@ impl TransformerModel {
                     &vals[..2.min(vals.len())]
                 );
             }
+        }
+        if nsys_capture {
+            // Drain the whole prefill into the capture, then close the range so
+            // nsys writes the report for exactly this one prefill.
+            unsafe {
+                cudaDeviceSynchronize();
+                cudaProfilerStop();
+            }
+            tracing::info!("ATLAS_NSYS_CAPTURE: closed cudaProfiler range for prefill (proc_count={proc_count})");
         }
         if let Some(t) = t_loop {
             let wall = t.elapsed();

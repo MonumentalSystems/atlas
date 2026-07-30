@@ -396,6 +396,10 @@ pub struct MoeLayer {
     // path. Used to test whether the kernel choice is the dominant cause
     // of low DFlash drafter acceptance on FP4/FP8 targets.
     pub is_dflash_capture_layer: bool,
+    /// b12x fused-MoE repacked weights (`ATLAS_LAGUNA_MOE_B12X`). `None` = not
+    /// built / ineligible (grouped-CUTLASS path runs). Only `Some` when every
+    /// expert is resident (no EP shard, no null experts) and the shim lib loaded.
+    pub(crate) b12x: Option<b12x_weights::B12xMoeWeights>,
 }
 
 impl MoeLayer {
@@ -426,6 +430,8 @@ impl MoeLayer {
 }
 
 // ── Sub-files (split for ≤500 LoC) ────────────────────────────────────────
+mod b12x_scales;
+mod b12x_weights;
 mod dump;
 mod forward;
 mod forward_atomic_c4;
@@ -435,6 +441,7 @@ mod forward_k2;
 mod forward_k3;
 mod forward_phase;
 mod forward_prefill;
+mod forward_prefill_b12x;
 mod forward_prefill_bf16;
 mod forward_prefill_fp8;
 mod forward_prefill_phase;
@@ -448,4 +455,5 @@ mod init;
 mod mod_tests;
 mod ptr_table_build;
 mod union_stats;
+pub(crate) use b12x_weights::B12xMoeWeights;
 pub(crate) use ptr_table_build::*;
