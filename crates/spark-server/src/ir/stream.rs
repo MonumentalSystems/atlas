@@ -39,6 +39,10 @@ pub enum StreamDelta {
         reason: super::response::FinishReason,
         usage: super::response::Usage,
         token_ids: Vec<u32>,
+        /// Opt-in per-request power/energy metadata (pre-serialized). Set by
+        /// the OpenAI streaming path when the request opted in; `None`
+        /// otherwise. Other surfaces destructure with `..` and ignore it.
+        power: Option<serde_json::Value>,
     },
     /// Stream-level error payload, sent verbatim as SSE data.
     Error { message: String },

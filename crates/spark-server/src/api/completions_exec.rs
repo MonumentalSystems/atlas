@@ -48,6 +48,12 @@ pub(super) struct CompletionParams {
     pub length_penalty: f32,
     /// NLLB beam search: early stopping.
     pub early_stopping: bool,
+    /// Opt-in power window (span + generated-token baseline). `Some` only when
+    /// the request opted in; consumed by the blocking path to stamp the
+    /// response's `power` field. Streaming just drops it (in-flight balances).
+    #[cfg(feature = "power_attribution")]
+    pub power_ctx:
+        Option<(std::sync::Arc<crate::power::PowerHandle>, atlas_power::PowerSpan, u64)>,
 }
 
 /// Run every (prompt × n) choice sequentially and assemble the response.
@@ -222,10 +228,11 @@ pub(super) async fn run_blocking(
         response_tokens_per_second: last_tps,
     };
 
-    Json(CompletionResponse::from_choices(
-        &state.model_name,
-        choices,
-        usage,
-    ))
-    .into_response()
+    #[cfg_attr(not(feature = "power_attribution"), allow(unused_mut))]
+    let mut resp = CompletionResponse::from_choices(&state.model_name, choices, usage);
+    #[cfg(feature = "power_attribution")]
+    if let Some((handle, span, start_tokens)) = p.power_ctx {
+        crate::power::attach_completion_power(&mut resp, &handle, span, start_tokens);
+    }
+    Json(resp).into_response()
 }

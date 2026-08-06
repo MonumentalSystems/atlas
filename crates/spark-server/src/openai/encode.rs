@@ -40,6 +40,10 @@ pub(crate) fn encode_chat_response(
         response_tokens_per_second: ir.usage.response_tokens_per_second,
     };
 
+    // Opt-in power metadata carried through the IR (populated by the public
+    // chat handler). Moved out before `ir.choices` is consumed below.
+    let power = ir.power;
+
     let choices: Vec<ChatChoice> = ir
         .choices
         .into_iter()
@@ -90,6 +94,7 @@ pub(crate) fn encode_chat_response(
         system_fingerprint: Some("fp_atlas".to_string()),
         choices,
         usage,
+        power,
         service_tier: echo.service_tier.clone(),
         metadata: echo.metadata.clone(),
     };

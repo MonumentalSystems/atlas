@@ -153,6 +153,12 @@ pub struct AppState {
         String,
         (std::path::PathBuf, atlas_core::config::PeftAdapterConfig),
     >,
+    /// Opt-in native power attribution. `Some` only when the
+    /// `power_attribution` feature is on, `ATLAS_POWER_ATTRIBUTION` is set,
+    /// and this node's GB10 `spbm` source reports `Measured`. `None`
+    /// everywhere else → power metadata is omitted, never fabricated.
+    #[cfg(feature = "power_attribution")]
+    pub power: Option<std::sync::Arc<crate::power::PowerHandle>>,
 }
 
 use crate::main_modules::promotion::PromoteReject;

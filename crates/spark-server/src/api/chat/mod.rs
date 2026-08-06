@@ -73,6 +73,7 @@ use super::compact::openai_error_response;
 pub async fn chat_completions(
     State(state): State<Arc<AppState>>,
     req_ctx: Option<axum::extract::Extension<crate::rate_limiter::RequestContext>>,
+    #[cfg(feature = "power_attribution")] headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
     // Parse the body ourselves (instead of using axum's `Json`
@@ -105,7 +106,29 @@ pub async fn chat_completions(
     // Wire → IR at the edge: echo-only fields peel off beside the
     // envelope; everything downstream reads only the IR.
     let echo = ResponseEcho::from(&req);
-    match chat_completions_inner(state.clone(), req_ctx, req.into(), dump_seq).await {
+
+    // Opt-in power window: begin BEFORE the work (so it spans prefill +
+    // decode) only when the feature is on, enabled on this node, and the
+    // request asked for it via `X-Atlas-Power: 1`. Absent → no work beyond
+    // the sampler's background thread.
+    #[cfg(feature = "power_attribution")]
+    let power_span = state
+        .power
+        .as_ref()
+        .filter(|_| crate::power::header_requests_power(&headers))
+        .map(|h| {
+            let (span, start_tokens) = h.begin();
+            (h.clone(), span, start_tokens)
+        });
+
+    let outcome = chat_completions_inner(state.clone(), req_ctx, req.into(), dump_seq).await;
+
+    // Finish the window and stash the report into the (blocking) IR before
+    // it is encoded; streaming/error outcomes just drop the span.
+    #[cfg(feature = "power_attribution")]
+    let outcome = crate::power::attach_power(outcome, power_span);
+
+    match outcome {
         ChatOutcome::Blocking(ir) => {
             crate::openai::encode_chat_response(&state, *ir, &echo, dump_seq)
         }

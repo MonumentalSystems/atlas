@@ -14,6 +14,12 @@ pub struct ChatCompletionResponse {
     pub system_fingerprint: Option<String>,
     pub choices: Vec<ChatChoice>,
     pub usage: Usage,
+    /// Opt-in per-request power/energy metadata (Atlas extension). Present
+    /// only when the `power_attribution` feature is enabled and the request
+    /// sent `X-Atlas-Power: 1`; omitted otherwise (never zero-filled). The
+    /// object carries `estimated: true` unconditionally.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub power: Option<serde_json::Value>,
     /// Echo of the request's `service_tier` (OpenAI-compatible).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub service_tier: Option<String>,
@@ -145,6 +151,7 @@ impl ChatCompletionResponse {
                 logprobs: None,
             }],
             usage,
+            power: None,
             service_tier: None,
             metadata: None,
         }
@@ -176,6 +183,7 @@ impl ChatCompletionResponse {
                 logprobs: None,
             }],
             usage,
+            power: None,
             service_tier: None,
             metadata: None,
         }

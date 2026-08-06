@@ -83,6 +83,7 @@ fn delta_to_payloads(d: &StreamDelta, model: &str, id: &str, include_usage: bool
             reason,
             usage,
             token_ids,
+            power,
         } => {
             let wire_usage = wire_usage(usage);
             if include_usage {
@@ -90,9 +91,13 @@ fn delta_to_payloads(d: &StreamDelta, model: &str, id: &str, include_usage: bool
                 // the usage-only chunk (`choices: []`) precedes the
                 // final `finish_reason` chunk (usage omitted). Residual
                 // token ids ride the final chunk, keeping
-                // Σ token_ids == completion_tokens.
+                // Σ token_ids == completion_tokens. Power rides the
+                // usage-only chunk (its natural sibling).
                 vec![
-                    chunk_json(ChatCompletionChunk::usage_only_chunk(model, id, wire_usage)),
+                    chunk_json(
+                        ChatCompletionChunk::usage_only_chunk(model, id, wire_usage)
+                            .with_power(power.clone()),
+                    ),
                     chunk_json(
                         ChatCompletionChunk::final_chunk_no_usage(model, id, reason.as_wire())
                             .with_token_ids(token_ids.clone()),
@@ -101,7 +106,8 @@ fn delta_to_payloads(d: &StreamDelta, model: &str, id: &str, include_usage: bool
             } else {
                 vec![chunk_json(
                     ChatCompletionChunk::done_chunk(model, id, reason.as_wire(), wire_usage)
-                        .with_token_ids(token_ids.clone()),
+                        .with_token_ids(token_ids.clone())
+                        .with_power(power.clone()),
                 )]
             }
         }
@@ -290,6 +296,7 @@ mod tests {
             reason: FinishReason::Stop,
             usage,
             token_ids: vec![7],
+            power: None,
         };
 
         // include_usage=true: usage-only chunk (`choices:[]`) FIRST,

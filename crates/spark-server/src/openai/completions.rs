@@ -174,6 +174,11 @@ pub struct CompletionResponse {
     /// Matches chat completions ("fp_atlas"); some SDKs read it for
     /// seed/determinism bookkeeping.
     pub system_fingerprint: String,
+    /// Opt-in per-request power/energy metadata (Atlas extension). Present
+    /// only when the `power_attribution` feature is enabled and the request
+    /// sent `X-Atlas-Power: 1`; omitted otherwise (never zero-filled).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub power: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -210,6 +215,7 @@ impl CompletionResponse {
             choices,
             usage,
             system_fingerprint: "fp_atlas".to_string(),
+            power: None,
         }
     }
 }
@@ -224,6 +230,10 @@ pub struct CompletionChunk {
     pub choices: Vec<CompletionChunkChoice>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub usage: Option<Usage>,
+    /// Opt-in per-request power/energy metadata (Atlas extension). Set only on
+    /// the terminal usage-bearing chunk when the request opted in.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub power: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -253,6 +263,7 @@ impl CompletionChunk {
                 logprobs: None,
             }],
             usage: None,
+            power: None,
         }
     }
 
@@ -276,6 +287,7 @@ impl CompletionChunk {
                 logprobs,
             }],
             usage: None,
+            power: None,
         }
     }
 
@@ -294,6 +306,7 @@ impl CompletionChunk {
                 logprobs: None,
             }],
             usage: None,
+            power: None,
         }
     }
 
@@ -307,6 +320,7 @@ impl CompletionChunk {
             model: model.to_string(),
             choices: Vec::new(),
             usage: Some(usage),
+            power: None,
         }
     }
 
@@ -324,7 +338,15 @@ impl CompletionChunk {
                 logprobs: None,
             }],
             usage: Some(usage),
+            power: None,
         }
+    }
+
+    /// Attach opt-in power metadata to the terminal usage-bearing chunk.
+    /// No-op when `power` is `None`, keeping the wire byte-identical.
+    pub fn with_power(mut self, power: Option<serde_json::Value>) -> Self {
+        self.power = power;
+        self
     }
 }
 

@@ -23,6 +23,11 @@ pub struct ChatCompletionChunk {
     pub choices: Vec<ChunkChoice>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub usage: Option<Usage>,
+    /// Opt-in per-request power/energy metadata (Atlas extension). Set only on
+    /// the terminal usage-bearing chunk when the request opted in; omitted
+    /// otherwise. Carries `estimated: true` unconditionally.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub power: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -88,6 +93,7 @@ impl ChatCompletionChunk {
                 token_ids: Vec::new(),
             }],
             usage: None,
+            power: None,
         }
     }
 
@@ -114,6 +120,7 @@ impl ChatCompletionChunk {
                 token_ids: Vec::new(),
             }],
             usage: None,
+            power: None,
         }
     }
 
@@ -139,6 +146,7 @@ impl ChatCompletionChunk {
                 token_ids: Vec::new(),
             }],
             usage: None,
+            power: None,
         }
     }
 
@@ -179,6 +187,7 @@ impl ChatCompletionChunk {
                 token_ids: Vec::new(),
             }],
             usage: None,
+            power: None,
         }
     }
 
@@ -215,6 +224,7 @@ impl ChatCompletionChunk {
                 token_ids: Vec::new(),
             }],
             usage: None,
+            power: None,
         }
     }
 
@@ -240,6 +250,7 @@ impl ChatCompletionChunk {
                 token_ids: Vec::new(),
             }],
             usage: Some(usage),
+            power: None,
         }
     }
 
@@ -256,6 +267,7 @@ impl ChatCompletionChunk {
             system_fingerprint: Some("fp_atlas".to_string()),
             choices: Vec::new(),
             usage: Some(usage),
+            power: None,
         }
     }
 
@@ -286,6 +298,7 @@ impl ChatCompletionChunk {
                 token_ids: Vec::new(),
             }],
             usage: None,
+            power: None,
         }
     }
 
@@ -313,6 +326,7 @@ impl ChatCompletionChunk {
                 token_ids: Vec::new(),
             }],
             usage: None,
+            power: None,
         }
     }
 
@@ -327,6 +341,14 @@ impl ChatCompletionChunk {
         {
             choice.token_ids = ids;
         }
+        self
+    }
+
+    /// Attach opt-in power metadata to this chunk (the terminal usage chunk).
+    /// No-op when `power` is `None`, keeping the wire format byte-identical
+    /// for requests that did not opt in.
+    pub(crate) fn with_power(mut self, power: Option<serde_json::Value>) -> Self {
+        self.power = power;
         self
     }
 }
