@@ -199,6 +199,13 @@ target_layer_ids = [1, 16, 31, 46, 61]
 # complete list for this target with each dispatch site, and exits non-zero
 # while anything is unexplained.
 
+[expected_absent.fused_k_norm_rope_cache]
+fused_qk_norm_rope_write_nvfp4 = """
+NVFP4-KV fused write twin; qwen3_attention::init probes it for the nvfp4
+KV dtype only. This model's recipes serve bf16/fp8 KV, whose fused write
+kernels resolve from common. Harvested 2026-08-09 on the integrated tree
+(the probe arrived with the Laguna-era attention work)."""
+
 [expected_absent.w4a4]
 w4a4_gemm_mfast = """
 This model's w4a4_gemm.cu defines only w4a4_gemm; the mfast variant exists solely
