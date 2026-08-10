@@ -64,6 +64,31 @@ typos  # crate-ci/typos — install once, `cargo install typos-cli`
 A real build + test cycle requires a CUDA-capable host; see
 [CONTRIBUTING.md](CONTRIBUTING.md).
 
+### Host build: single-GPU (skip NCCL)
+
+`spark-server` and `spark-comm` default to the `nccl` feature (multi-GPU EP/TP
+collectives), which links `libnccl`. On a host without `libnccl.so` (e.g. a
+single-GB10 dev box where NCCL lives only inside unrelated Python venvs), the
+default build fails at link with `cannot find -lnccl`. Build single-GPU with the
+sanctioned flags (the same ones the AMD/SCALE single-GPU path uses):
+
+```bash
+# pick ONE model target — the default is qwen3-next-80b-a3b, a mismatch for Holo
+ATLAS_TARGET_MODEL=holo-3.1-35b-a3b \
+  cargo build --release -p spark-server --bin spark \
+  --no-default-features --features cuda
+```
+
+Or install `libnccl-dev` and build with the full default features. Note the CUDA
+`-devel` base image does **not** bundle NCCL, so any build target that links
+`spark-server`/`spark-comm` with default features needs `libnccl-dev` present —
+the `Dockerfile.builder` apt line must include it, not just the runtime
+`libnccl2`.
+
+**Always `set -o pipefail`**: `cargo build ... | tail` reports *tail's* exit
+code, so a failed build reads as success and you silently run a stale
+`target/release/spark`.
+
 ## Adding a new model
 
 High-level walkthrough — the patterns to follow are already in-tree.

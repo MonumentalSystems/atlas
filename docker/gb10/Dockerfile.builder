@@ -37,8 +37,14 @@ ARG CUTLASS_DSL_VER
 RUN apt-get update -qq && \
     apt-get install -y -qq --no-install-recommends \
       curl ca-certificates build-essential pkg-config git cmake libclang-dev \
-      python3 python3-pip && \
+      python3 python3-pip \
+      libnccl-dev && \
     rm -rf /var/lib/apt/lists/*
+# libnccl-dev: spark-server / spark-comm default to the `nccl` feature, which
+# links libnccl at BUILD time (`#[link(name = "nccl")]`). The CUDA -devel base
+# image does NOT bundle NCCL, so without this the `cargo build -p spark-server`
+# below fails at link with `cannot find -lnccl`. The runtime stage's libnccl2
+# is the shared lib for RUNNING, not the dev package for LINKING.
 
 # Rust (stable — overrides rust-toolchain.toml's 1.85 pin; libloading 0.9 needs >=1.88).
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
