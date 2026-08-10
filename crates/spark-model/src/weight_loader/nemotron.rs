@@ -324,7 +324,15 @@ impl ModelWeightLoader for NemotronHWeightLoader {
                     let vt = v_nv
                         .as_ref()
                         .and_then(|w| w.transpose_for_gemm(gpu, kv_dim, h).ok());
-                    let ot = attn.o_proj.transpose_for_gemm(gpu, h, q_dim).ok();
+                    // Keep-BF16 attention leaves o_proj as QuantizedWeight::null();
+                    // transpose_for_gemm would copy_d2h from NULL — the error is
+                    // swallowed by .ok() but the context is poisoned → CUDA 700 at
+                    // the next module load. Found by #443's gate-by-gate bisect.
+                    let ot = if attn.o_proj.weight.is_null() {
+                        None
+                    } else {
+                        attn.o_proj.transpose_for_gemm(gpu, h, q_dim).ok()
+                    };
 
                     let mut attn_layer = Qwen3AttentionLayer::new_ungated(
                         norm,
