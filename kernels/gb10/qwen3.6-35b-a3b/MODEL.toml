@@ -387,3 +387,18 @@ the resolved half-register gate is set, and that gate is off by default
 gated_delta_rule_decode_f32_strided_norm_smem = """
 SMEM-staged twin; gated behind ATLAS_GDN_SMEM_STAGE (presence, off by
 default) AND the half-register gate. Not a live path as shipped."""
+
+# Harvested 2026-08-09 on the integrated tree (see moe_w4a16 additions above).
+
+[expected_absent.fused_k_norm_rope_cache]
+fused_qk_norm_rope_write_nvfp4 = """
+NVFP4-KV fused write twin; qwen3_attention::init probes it for the nvfp4
+KV dtype only. This model's recipes serve bf16/fp8 KV, whose fused write
+kernels resolve from common."""
+
+[expected_absent.q2_0_mmq]
+atlas_q2_0_mmq128_nc = """
+Ternary keep-packed MMQ (Bonsai GGUF Tier-2). DenseFfnLayer probes it for
+packed-Q2 weights only; a safetensors NVFP4 checkpoint never installs
+packed-Q2 weights, so the arm is unreachable here."""
+atlas_q2_0_mmq128_wc = "Same family — unreachable without packed-Q2 weights."
