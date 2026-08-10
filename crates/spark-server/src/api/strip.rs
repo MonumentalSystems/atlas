@@ -181,7 +181,10 @@ mod orphan_tool_tests {
         let leaked = "<tool_call>The project codename is ZANTHOR, and the site log \
 records exactly 7 entries.";
         let out = strip_orphan_tool_markup(leaked);
-        assert!(out.starts_with("The project codename is ZANTHOR"), "got {out:?}");
+        assert!(
+            out.starts_with("The project codename is ZANTHOR"),
+            "got {out:?}"
+        );
         assert!(!out.contains("<tool_call>"), "marker survived: {out:?}");
     }
 

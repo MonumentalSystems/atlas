@@ -108,6 +108,16 @@ pub struct SequenceState {
     /// prefill. The model uses this to tag saved snapshots and verify ownership
     /// before restoring. 0 = no session tracking (legacy behavior).
     pub session_hash: u64,
+    /// Ownership stamp for the SINGLE-SLOT whole-prompt hidden capture
+    /// (`mtp_prefill_hidden`). Written by `try_mtp_prefill_capture` when THIS
+    /// sequence's chunk 0 (re)starts the capture, with the model's monotonic
+    /// capture generation. `ensure_drafter_context` prefills the drafter only
+    /// while the stamp still matches the model's current generation — at
+    /// C>=2 interleaved prefills restart the shared capture, and without this
+    /// check a sequence's first propose could pair ITS tokens with ANOTHER
+    /// sequence's captured hiddens (poisoned drafter KV; blind is strictly
+    /// better than poisoned). 0 = never owned a capture.
+    pub mtp_capture_gen: u64,
     /// Per-adapter prefix-cache namespace (adapter-correct KV). Folded into the
     /// prefix hash so two adapters that share a token prefix never reuse each
     /// other's blocks. `0` = base / no adapter (a strict no-op in the fold, so
@@ -143,12 +153,12 @@ pub struct SequenceState {
     /// matched KV block and PUSHES it onto `block_table`. It also runs BEFORE
     /// `ensure_blocks_through_prefill`, so a chunk-0 prefill that fails to
     /// allocate its suffix (KV exhausted) leaves all of that applied. The
-    /// scheduler's preempt-and-retry re-enters `prefill_chunk` for the SAME
-    /// chunk, which would run the lookup a second time — appending the matched
-    /// blocks to `block_table` again (so `block_table[i]` no longer maps to
-    /// logical block `i`) and acquiring a second radix ref that the single
+    /// preempt-and-retry in `run_standard_chunk_loop` re-enters `prefill_chunk`
+    /// for the SAME chunk, which would run the lookup a second time — appending
+    /// the matched blocks to `block_table` again (so `block_table[i]` no longer
+    /// maps to logical block `i`) and taking a second radix ref that the single
     /// `release` in `free_sequence` can never balance. This flag makes the
-    /// re-entry a no-op that returns chunk 0's original decision.
+    /// re-entry a no-op that replays chunk 0's original decision.
     pub prefix_lookup_applied: bool,
     /// The `skip` half of the chunk-0 lookup's return value, replayed verbatim
     /// when `prefix_lookup_applied` short-circuits a retry.
@@ -301,4 +311,4 @@ impl SequenceState {
 mod logprobs;
 mod model;
 pub use logprobs::*;
-pub use model::{BeamReq, Model};
+pub use model::{BeamReq, Model, padded_batch_n};

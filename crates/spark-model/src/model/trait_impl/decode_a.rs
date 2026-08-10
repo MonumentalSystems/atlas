@@ -36,6 +36,9 @@ impl TransformerModel {
     ) -> Result<DevicePtr> {
         // Use backend's own stream (non-default, required for CUDA graph capture).
         let stream = self.gpu.default_stream();
+        // ATLAS_SSM_H_FP16: narrow this sequence's SSM h-state to FP16 exactly
+        // once, HERE — outside the CUDA-graph region. No-op without the flag.
+        self.ssm_h_to_f16_dispatch(seq)?;
         let hidden = self.buffers.hidden_states();
         let residual = self.buffers.residual();
 
@@ -97,6 +100,7 @@ impl TransformerModel {
             self.prefix_cache.as_ref(),
             self.gpu.as_ref(),
             stream,
+            self.levers.kv_poison,
         )?;
 
         let meta_base = self.buffers.scratch().offset(32768);
@@ -118,6 +122,7 @@ impl TransformerModel {
             .copy_h2d_async(&actual_seq_len.to_le_bytes(), meta_base.offset(16), stream)?;
 
         let bt_i32: Vec<i32> = seq.block_table.iter().map(|&b| b as i32).collect();
+        // SAFETY: length derived from `bt_i32` itself — `len() * size_of::<i32>()` over the `collect`ed Vec above.
         let bt_bytes: &[u8] =
             unsafe { std::slice::from_raw_parts(bt_i32.as_ptr() as *const u8, bt_i32.len() * 4) };
         self.gpu
@@ -205,7 +210,7 @@ impl TransformerModel {
         // Default (unset) keeps graphs ON — the LoRA delta launches are
         // capture-safe (pool weights / arena scratch / f32 scale are all
         // load-time-fixed). Folded in as one more suppressor.
-        let lora_eager = self.lora.is_some() && crate::lora::lora_eager_env();
+        let lora_eager = self.lora.is_some() && self.levers.lora_eager;
         // `ATLAS_NO_DECODE_GRAPHS=1` — run decode eagerly. Capture faults are
         // STICKY: a fault inside `cuStreamBeginCapture`/`EndCapture` leaves the
         // context poisoned, so every later request 500s until the process is
@@ -231,6 +236,10 @@ impl TransformerModel {
             buffers: &self.buffers,
             gpu: self.gpu.as_ref(),
             config: &self.config,
+            dispatch: &self.dispatch,
+            derived: &self.derived,
+            levers: &self.levers,
+            stats: &self.stats,
             attn_metadata: Some(attn_metadata),
             profile: self.profile,
             comm: self.comm_ref(),

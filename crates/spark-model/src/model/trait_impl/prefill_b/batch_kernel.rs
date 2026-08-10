@@ -160,7 +160,9 @@ impl TransformerModel {
                     n = streams.len(),
                     needed,
                     free,
-                    "Q12 kernel-batched declined: cohort needs more KV than is                      reclaimable — falling back to per-stream so one exhaustion                      cannot fail the whole batch"
+                    "Q12 kernel-batched declined: cohort needs more KV than is \
+                     reclaimable — falling back to per-stream so one exhaustion \
+                     cannot fail the whole batch"
                 );
                 return Ok(KernelBatchResult::NotAdmitted);
             }
@@ -307,6 +309,7 @@ impl TransformerModel {
                 self.prefix_cache.as_ref(),
                 self.gpu.as_ref(),
                 stream,
+                self.levers.kv_poison,
             )?;
 
             // Effective processing range. DEFECT 1 fix: pass this stream's
@@ -361,6 +364,10 @@ impl TransformerModel {
 
             // Per-stream meta upload to distinct scratch slice.
             let meta_base = self.buffers.scratch().offset(scratch_cursor);
+            // This stream's slice runs from `scratch_cursor` to the end of the
+            // arena; the per-stream stride advance below keeps successive
+            // blocks from overlapping.
+            let meta_region_bytes = self.buffers.scratch_bytes().saturating_sub(scratch_cursor);
             let layout = self.prefill_b_upload_meta_at(
                 tokens,
                 seq,
@@ -371,6 +378,7 @@ impl TransformerModel {
                 effective_seq_len_start,
                 &kv_cache,
                 meta_base,
+                meta_region_bytes,
                 stream,
             )?;
             if layout.needs_paged || force_paged_first_chunk {
@@ -515,6 +523,10 @@ impl TransformerModel {
             buffers: &self.buffers,
             gpu: self.gpu.as_ref(),
             config: &self.config,
+            dispatch: &self.dispatch,
+            derived: &self.derived,
+            levers: &self.levers,
+            stats: &self.stats,
             attn_metadata: None,
             profile: self.profile,
             comm: self.comm_ref(),

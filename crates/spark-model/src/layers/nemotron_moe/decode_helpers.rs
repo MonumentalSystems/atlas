@@ -143,7 +143,12 @@ impl NemotronMoeLayer {
         // kept them (ModelOpt MIXED_PRECISION) instead of the FP8→BF16→NVFP4
         // requant — the requant is what degrades proper-noun retrieval on Puzzle.
         let shared_up_out = ctx.buffers.ssm_qkvz();
-        match self.weights.shared_up_fp8.as_ref().filter(|_| self.w8a16_gemv_k.0 != 0) {
+        match self
+            .weights
+            .shared_up_fp8
+            .as_ref()
+            .filter(|_| self.w8a16_gemv_k.0 != 0)
+        {
             Some(fp8w) => ops::w8a16_gemv(
                 ctx.gpu,
                 self.w8a16_gemv_k,

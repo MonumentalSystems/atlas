@@ -42,6 +42,19 @@ impl MoeLayer {
         if self.bf16_gate_weight_ptrs.is_some() && !use_bf16_batch2 {
             return self.forward_batched(input, 2, ctx, stream);
         }
+        // E8M0 (native MXFP4, per-32 E8M0 scale) routed experts MUST NOT reach the
+        // unified-T batch2 kernel `moe_expert_gate_up_shared_batch2_t`: it is an
+        // NVFP4 kernel that hardcodes GROUP_SIZE=16 and would read `inter·h/16`
+        // scale bytes from the correctly-sized `inter·h/32` E8M0 scale buffer — a
+        // 2× over-read → CUDA_ERROR_ILLEGAL_ADDRESS (it also E4M3-decodes E8M0
+        // scale bytes → garbage even in-bounds). No E8M0 batch2 kernel exists, so
+        // route both verify tokens through the per-token unified-T path
+        // (`forward_batched`), whose `use_t_layout_for_prefill` branch selects the
+        // GS32 `_e8m0` kernel via `e8m0_or` — the same correct path ordinary decode
+        // already uses. Mirrors the BF16 fallback above.
+        if k2_e8m0_needs_per_token(self.experts_scale_kind) {
+            return self.forward_batched(input, 2, ctx, stream);
+        }
         // Mixed NVFP4-routed / BF16-shared (Laguna): the fused batch2 kernels
         // cannot compute a BF16 shared expert alongside NVFP4 routed weights.
         // Under the transposed unified layout we still batch the routed half
@@ -168,13 +181,7 @@ impl MoeLayer {
                 stream,
             )?;
         }
-        super::union_stats::maybe_sample_expert_union(
-            ctx.gpu,
-            indices_dev,
-            2,
-            top_k as usize,
-            stream,
-        );
+        super::union_stats::maybe_sample_expert_union(ctx, indices_dev, 2, top_k as usize, stream);
 
         if k2_diag {
             ctx.gpu
@@ -432,20 +439,7 @@ impl MoeLayer {
         } else {
             // NVFP4 batch2 path (originals layout)
             let null_shared = QuantizedWeight::null();
-            // NOTE: `hidden_size >= 3072` is a proxy for "this model ships the
-            // 256-thread moe_shared_expert_fused_batch2 source" (e.g.
-            // kernels/gb10/qwen3.5-122b-a10b/nvfp4/, BLOCK_SIZE 256 +
-            // THREADS_PER_OUT 64). Laguna satisfies the proxy but ships NO
-            // override, so it resolves to kernels/gb10/common/ which is
-            // BLOCK_SIZE 128 => THREADS_PER_OUT 32, and warps 4-7 redundantly
-            // recompute the next block's columns. Output is value-identical and
-            // the re-read hits L2, so an A/B of 128-vs-256 here measured only
-            // +4% at C=4 and 0% at C=2 -- real but minor. See HANDOFF.md.
-            let batch2_block = if ctx.config.hidden_size >= 3072 {
-                256u32
-            } else {
-                128u32
-            };
+            let batch2_block = batch2_block_width(ctx.config.hidden_size);
             ops::moe_expert_gate_up_shared_batch2(
                 ctx.gpu,
                 self.moe_expert_gate_up_shared_batch2,
@@ -586,3 +580,28 @@ impl MoeLayer {
         Ok(())
     }
 }
+
+/// Block width for the NVFP4 batch2 MoE GEMVs — 128 (one warp per output pair)
+/// or 256 (two warps joined through smem, which pays off once K is large). This
+/// was inlined at the call site, where it read as a proxy for "is this model's
+/// kernel one of the three 256-wide shadows" and over-fired for every other MoE
+/// model at hidden_size ≥ 3072, launching them twice as wide as their `#define
+/// BLOCK_SIZE 128`. The kernel reads `blockDim.x` now, so this is pure tuning.
+pub(crate) fn batch2_block_width(hidden_size: usize) -> u32 {
+    if hidden_size >= 3072 { 256 } else { 128 }
+}
+
+/// K=2-verify MoE dispatch guard. E8M0 (native MXFP4, per-32 E8M0 scale) routed
+/// experts MUST take the per-token unified-T path (GS32 `_e8m0` kernel via
+/// `e8m0_or`), NOT the GS16 NVFP4 `moe_expert_gate_up_shared_batch2_t` batch2
+/// kernel: that kernel reads `inter·h/16` scale bytes from the correctly-sized
+/// `inter·h/32` E8M0 scale buffer — a 2× over-read → CUDA_ERROR_ILLEGAL_ADDRESS.
+/// Pure decision, unit-tested and wired at the top of `forward_k2`.
+pub(crate) fn k2_e8m0_needs_per_token(scale_kind: crate::weight_map::WeightQuantFormat) -> bool {
+    matches!(scale_kind, crate::weight_map::WeightQuantFormat::Mxfp4E8m0)
+}
+
+// Focused dispatch tests live in a sibling file to keep this file ≤500 LoC.
+#[cfg(test)]
+#[path = "forward_k2_dispatch_tests.rs"]
+mod k2_dispatch_tests;

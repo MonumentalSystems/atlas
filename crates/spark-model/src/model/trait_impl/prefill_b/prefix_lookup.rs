@@ -26,9 +26,10 @@ impl TransformerModel {
     ) -> Result<(usize, bool)> {
         let bs = kv_cache.block_size();
         // Retry re-entry (scheduler preempt-and-retry on KV exhaustion): chunk 0
-        // already acquired this sequence's prefix. Re-running would push the
-        // matched blocks onto `block_table` a second time and take a second radix
-        // ref that nothing releases — replay the original decision instead.
+        // already acquired this sequence's prefix — it `inc_ref`d each matched
+        // block and pushed it onto `block_table` BEFORE the allocation that
+        // failed. Re-running would push those blocks a second time and take a
+        // second radix ref that nothing releases. Replay the original decision.
         // Any reservation this attempt acquired must be handed back here, since
         // the early return is the one path that never consumes it.
         if chunk_start == 0 && seq.prefix_lookup_applied {
@@ -172,19 +173,16 @@ impl TransformerModel {
                 let exact_without_hidden = snap_tok == matched
                     && matched == total
                     && !self.ssm_snapshots.has_hidden(snap_id);
-                // `ATLAS_NO_MARCONI_EXACT=1` must be decided HERE, not after the
-                // restore below. It used to be checked ~80 lines further down,
-                // where it set `skip = false` to force a full recompute — but by
-                // then `restore()` had ALREADY overwritten the SSM pool with the
-                // snapshot state. The "full recompute" then ran the prefill on top
-                // of a restored (non-zero) starting state instead of a clean one,
-                // so the flag did the opposite of what it documents.
+                // The bypass must be decided HERE, not after the restore below.
+                // It used to be checked ~80 lines further down, where it set
+                // `skip = false` to force a full recompute — but by then
+                // `restore()` had ALREADY overwritten the SSM pool with the
+                // snapshot state, so the "full recompute" ran on top of a
+                // restored (non-zero) starting state and the flag did the
+                // opposite of what it documents (measured: 2/10 -> 5/10
+                // distinct warm completions with the old position).
                 //
-                // MEASURED: with the check in its old position, warm requests went
-                // from 2/10 distinct completions to 5/10 — the bypass made
-                // determinism WORSE, which is what exposed the ordering bug.
-                // Skipping the restore too is what the flag always meant.
-                // DEFAULT ON. The exact-full-prompt shortcut is UNSOUND BY
+                // BYPASS IS THE DEFAULT. The exact-full-prompt shortcut is UNSOUND BY
                 // CONSTRUCTION, not merely buggy: computing the last token needs
                 // SSM state@(N-1), the snapshot holds state@N, and the recurrence
                 // is not invertible, so state@(N-1) cannot be recovered. The path
@@ -197,13 +195,23 @@ impl TransformerModel {
                 let bypass_exact = snap_tok == matched
                     && matched == total
                     && std::env::var("ATLAS_MARCONI_EXACT").as_deref() != Ok("1");
-                if snap_tok > 0
+                // Session gate applies ONLY to TAIL snapshots (their state
+                // bleeds past the exact prefix). Exact / is_tail_sibling
+                // snapshots are content-addressed by the verified token prefix
+                // and safe cross-session — matching the KV radix. Gating them on
+                // the (unstable) session_hash is what rejected every valid warm-
+                // turn anchor and forced recompute-all. See lookup_tiered.
+                // Below `marconi_min_tokens()` the snapshot restore costs more in lost
+                // drafter acceptance than the skipped prefill saves — see the helper.
+                if snap_tok >= crate::model::mtp_carry::marconi_min_tokens()
+                    && snap_tok > 0
                     && matched <= total
                     && !exact_without_hidden
                     && !bypass_exact
-                    && self
-                        .ssm_snapshots
-                        .session_matches(snap_id, seq.session_hash)
+                    && (!prefix_match.ssm_snapshot_is_tail
+                        || self
+                            .ssm_snapshots
+                            .session_matches(snap_id, seq.session_hash))
                 {
                     // Cross-stream ordering: the snapshot we are about to read
                     // was SAVED on the default stream (decode_marconi_checkpoint
@@ -296,7 +304,7 @@ impl TransformerModel {
                 skip = false;
                 seq.marconi_exact_snap = None;
                 tracing::info!(
-                    "ATLAS_NO_MARCONI_EXACT: bypassing exact-leaf snapshot shortcut \
+                    "exact-leaf snapshot shortcut bypassed (default; ATLAS_MARCONI_EXACT=1 re-enables) \
                      for {matched}-token full hit — recomputing all KV+SSM"
                 );
             }

@@ -84,8 +84,7 @@ fn q2_group_usize() -> usize {
 /// (its 256 routed experts are the whole ~219GB BF16 mass that would otherwise
 /// OOM a 128GB GB10); also opt-in for any MoE GGUF via `ATLAS_GGUF_KEEP_PACKED_MOE=1`.
 fn keep_packed_experts_enabled(arch: &str) -> bool {
-    arch == "laguna"
-        || std::env::var("ATLAS_GGUF_KEEP_PACKED_MOE").ok().as_deref() == Some("1")
+    arch == "laguna" || std::env::var("ATLAS_GGUF_KEEP_PACKED_MOE").ok().as_deref() == Some("1")
 }
 
 /// Map a group size to the container's `Q2Group` (for on-disk byte sizing).
@@ -197,6 +196,7 @@ impl GgufLoader {
     /// into the single packed device allocation. `shape[0]` is the expert count;
     /// each expert is `shape[1..]` with a block footprint of `per_elems/256 *
     /// {144 (Q4_K id 12) | 210 (Q6_K id 14)}` bytes. No BF16 expansion.
+    #[allow(clippy::too_many_arguments)]
     fn emit_experts_packed(
         &self,
         weights: &mut HashMap<String, WeightTensor>,
@@ -217,7 +217,7 @@ impl GgufLoader {
             other => bail!("emit_experts_packed: unexpected ggml id {other} (want 12 or 14)"),
         };
         anyhow::ensure!(
-            per_elems % 256 == 0,
+            per_elems.is_multiple_of(256),
             "keep-packed expert per_elems {per_elems} not a multiple of 256 (K-quant super-block)"
         );
         let per_bytes = (per_elems / 256) * block_bytes;

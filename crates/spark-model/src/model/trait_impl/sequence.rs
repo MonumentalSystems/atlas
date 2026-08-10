@@ -226,10 +226,17 @@ impl TransformerModel {
                 seq.slot_idx
             );
         }
-        // batch_decode_graphs is keyed by padded_n, not slot — but the captured
-        // graphs DO contain per-slot SSM pointers from the active set at capture
-        // time. Drop them all (they'll be re-captured on next batched decode).
-        for (_, graph) in self.batch_decode_graphs.lock().drain() {
+        // batch_decode_graphs is now keyed by the per-row SSM slot VECTOR
+        // (decode_graph_key.rs), so a freed slot's entries are already
+        // unreachable unless the exact same vector recurs — at which point the
+        // slot has been re-claimed and its pool addresses are the same ones the
+        // graph baked (SSM pool addresses are per-SLOT and fixed for the life
+        // of the process). The blanket drain is therefore no longer required
+        // for correctness; it is KEPT deliberately — dropping it would extend a
+        // graph's lifetime across arbitrary request turnover, which is a
+        // separate (unmeasured) risk surface, and re-capture costs one eager
+        // step per completion.
+        for (_, (graph, _)) in self.batch_decode_graphs.lock().0.drain() {
             if let Err(e) = self.gpu.destroy_graph(graph) {
                 tracing::error!("free_sequence: destroy_graph(batch_decode_graphs entry): {e:#}");
             }
@@ -281,7 +288,7 @@ impl TransformerModel {
         // empties the proposer state, so the `free_state` below then releases
         // nothing — the blocks are owned by the carry slot XOR by a live
         // sequence, never both.
-        if crate::model::mtp_carry::mtp_carry_drafter_enabled()
+        if crate::model::mtp_carry::mtp_carry_drafter_enabled(&self.levers)
             && let Some(ref proposer) = self.proposer
             && let Some(ref mut pstate) = seq.proposer_state
             && let Some((blocks, rows, last_pair_key)) = proposer.take_drafter_kv(pstate.as_mut())
@@ -438,6 +445,10 @@ impl TransformerModel {
 
     pub(super) fn num_free_blocks_dispatch(&self) -> usize {
         self.kv_cache.lock().num_free_blocks()
+    }
+
+    pub(super) fn num_total_blocks_dispatch(&self) -> usize {
+        self.kv_cache.lock().num_blocks()
     }
 
     pub(super) fn reclaim_prefix_blocks_dispatch(&self, num_blocks: usize) -> usize {

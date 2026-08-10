@@ -41,6 +41,7 @@ fn cache_match(tokens: usize) -> PrefixMatch {
         ssm_snapshot_tokens: 0,
         ssm_snapshot_tier_key: None,
         ssm_snapshot_tier_tokens: 0,
+        ssm_snapshot_is_tail: false,
     }
 }
 

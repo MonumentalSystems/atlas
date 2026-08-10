@@ -126,7 +126,11 @@ fn run(gpu: &dyn GpuBackend, stream: u64, n: u32, k: u32, vary: bool) -> Result<
         }
     }
 
-    let label = if vary { "VARYING block scale" } else { "constant scale" };
+    let label = if vary {
+        "VARYING block scale"
+    } else {
+        "constant scale"
+    };
     println!("  {label}: N={n} K={k} blocks=[{nb},{kb}]");
     println!(
         "    row0: got={:.6} want={:.6}",
@@ -179,9 +183,13 @@ fn run_gemm(gpu: &dyn GpuBackend, stream: u64, which: &str, m: u32, n: u32, k: u
     let kern = gpu.kernel(which, which)?;
     let launch = KernelLaunch::new(gpu, kern);
     let launch = if which == "w8a16_gemm_pipelined" {
-        launch.grid([n.div_ceil(32), m.div_ceil(128), 1]).block([256, 1, 1])
+        launch
+            .grid([n.div_ceil(32), m.div_ceil(128), 1])
+            .block([256, 1, 1])
     } else {
-        launch.grid([n.div_ceil(64), m.div_ceil(64), 1]).block([128, 1, 1])
+        launch
+            .grid([n.div_ceil(64), m.div_ceil(64), 1])
+            .block([128, 1, 1])
     };
     launch
         .arg_ptr(a)
@@ -230,7 +238,10 @@ fn run_gemm(gpu: &dyn GpuBackend, stream: u64, which: &str, m: u32, n: u32, k: u
         want_at(0, FP8_BLOCK),
     );
     if let Some((mi, ni, got, want)) = first_bad {
-        println!("    FAIL first bad [{mi},{ni}] got={got:.4} want={want:.4}  bad={bad}/{}", (m as usize) * (n as usize));
+        println!(
+            "    FAIL first bad [{mi},{ni}] got={got:.4} want={want:.4}  bad={bad}/{}",
+            (m as usize) * (n as usize)
+        );
     } else {
         println!("    PASS (worst rel {worst:.5})");
     }

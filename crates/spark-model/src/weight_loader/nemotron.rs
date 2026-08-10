@@ -259,9 +259,8 @@ impl ModelWeightLoader for NemotronHWeightLoader {
                         // 16-bit -> 4-bit saved ~0.9 GB and degraded exactly what
                         // they exist for. `ATLAS_NEMOTRON_BF16_ATTN=0` restores
                         // the old quantize-everything behaviour for an A/B.
-                        let keep_bf16_attn = std::env::var("ATLAS_NEMOTRON_BF16_ATTN")
-                            .as_deref()
-                            != Ok("0");
+                        let keep_bf16_attn =
+                            std::env::var("ATLAS_NEMOTRON_BF16_ATTN").as_deref() != Ok("0");
                         if keep_bf16_attn {
                             tracing::info!(
                                 "L{i} attention: keeping checkpoint BF16 Q/K/V/O (no NVFP4 requant)"
@@ -269,44 +268,44 @@ impl ModelWeightLoader for NemotronHWeightLoader {
                             bf16_o_dense = Some(o_dense);
                             (None, None, None)
                         } else {
-                        let q = quantize_to_nvfp4(
-                            &attn.q_proj,
-                            num_heads * hd,
-                            h,
-                            gpu,
-                            absmax_k,
-                            quantize_k,
-                            stream,
-                        )?;
-                        let k = quantize_to_nvfp4(
-                            &attn.k_proj,
-                            kv_heads * hd,
-                            h,
-                            gpu,
-                            absmax_k,
-                            quantize_k,
-                            stream,
-                        )?;
-                        let v = quantize_to_nvfp4(
-                            &attn.v_proj,
-                            kv_heads * hd,
-                            h,
-                            gpu,
-                            absmax_k,
-                            quantize_k,
-                            stream,
-                        )?;
-                        let o = quantize_to_nvfp4(
-                            &o_dense,
-                            h,
-                            num_heads * hd,
-                            gpu,
-                            absmax_k,
-                            quantize_k,
-                            stream,
-                        )?;
-                        attn.o_proj = o;
-                        (Some(q), Some(k), Some(v))
+                            let q = quantize_to_nvfp4(
+                                &attn.q_proj,
+                                num_heads * hd,
+                                h,
+                                gpu,
+                                absmax_k,
+                                quantize_k,
+                                stream,
+                            )?;
+                            let k = quantize_to_nvfp4(
+                                &attn.k_proj,
+                                kv_heads * hd,
+                                h,
+                                gpu,
+                                absmax_k,
+                                quantize_k,
+                                stream,
+                            )?;
+                            let v = quantize_to_nvfp4(
+                                &attn.v_proj,
+                                kv_heads * hd,
+                                h,
+                                gpu,
+                                absmax_k,
+                                quantize_k,
+                                stream,
+                            )?;
+                            let o = quantize_to_nvfp4(
+                                &o_dense,
+                                h,
+                                num_heads * hd,
+                                gpu,
+                                absmax_k,
+                                quantize_k,
+                                stream,
+                            )?;
+                            attn.o_proj = o;
+                            (Some(q), Some(k), Some(v))
                         }
                     };
                     // Transposed Q/K/V/O so prefill uses `w4a16_gemm_t` (FP8 MMA,

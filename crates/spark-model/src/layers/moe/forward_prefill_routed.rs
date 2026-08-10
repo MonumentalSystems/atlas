@@ -178,7 +178,7 @@ impl MoeLayer {
         let smallm_nvfp4 = self.experts_scale_kind == crate::weight_map::WeightQuantFormat::Nvfp4;
         let smallm_gate_up = smallm_m > 0
             && total_expanded <= smallm_m
-            && total_expanded as u32 >= fp4_decode_smallm_min()
+            && total_expanded >= fp4_decode_smallm_min()
             && smallm_nvfp4
             && self.moe_fused_gate_up_fp4_smallm.0 != 0
             && self.gate_ptrs_t.is_some()
@@ -471,7 +471,7 @@ impl MoeLayer {
             // null sorted_token_ids (identity row gather), unpermute unchanged.
             let smallm_down = smallm_m > 0
                 && total_expanded <= smallm_m
-                && total_expanded as u32 >= fp4_decode_smallm_min()
+                && total_expanded >= fp4_decode_smallm_min()
                 && smallm_nvfp4
                 && self.moe_down_fp4_smallm.0 != 0
                 && self.down_ptrs_t.is_some();

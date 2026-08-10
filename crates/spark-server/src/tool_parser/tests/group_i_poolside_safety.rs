@@ -117,14 +117,17 @@ async fn call: <function=x> // 日本語 émojis 🔥🎉
     // No spurious start under a bogus (non-"write") name.
     for o in &outputs {
         if let DetectorOutput::ToolCallStart { name, .. } = o {
-            assert_eq!(name, "write", "spurious tool-call start under bogus name {name:?}");
+            assert_eq!(
+                name, "write",
+                "spurious tool-call start under bogus name {name:?}"
+            );
         }
     }
 
     // The emitted args must be valid JSON carrying the real path + contents.
     let args = args_from_outputs(&outputs);
-    let v: serde_json::Value =
-        serde_json::from_str(&args).unwrap_or_else(|e| panic!("args not valid JSON: {e}; args={args:?}"));
+    let v: serde_json::Value = serde_json::from_str(&args)
+        .unwrap_or_else(|e| panic!("args not valid JSON: {e}; args={args:?}"));
     assert_eq!(v.get("path").and_then(|x| x.as_str()), Some("main.rs"));
     assert_eq!(v.get("contents").and_then(|x| x.as_str()), Some(content));
 }

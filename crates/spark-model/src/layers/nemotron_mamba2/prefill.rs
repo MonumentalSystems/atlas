@@ -113,7 +113,10 @@ impl NemotronMamba2Layer {
                 h as u32,
                 stream,
             )?;
-        } else if let Some(ref fp8w) = self.in_proj_fp8.as_ref().filter(|_| self.native_fp8_prefill)
+        } else if let Some(fp8w) = self
+            .in_proj_fp8
+            .as_ref()
+            .filter(|_| self.native_fp8_prefill)
         {
             if self.w8a16_gemm_pipelined_k.0 != 0 {
                 ops::w8a16_gemm_pipelined(
@@ -465,7 +468,7 @@ impl NemotronMamba2Layer {
                 self.d_inner as u32,
                 stream,
             )?;
-        } else if let Some(ref fp8w) = self
+        } else if let Some(fp8w) = self
             .out_proj_fp8
             .as_ref()
             .filter(|_| self.native_fp8_prefill)

@@ -85,8 +85,8 @@ impl NemotronHWeightLoader {
         //   "decode"       — native decode; legacy NVFP4 requant + prefill
         //                    copies still built, prefill keeps using them
         //   unset/"1"/"both" — native FP8 for decode and prefill (no NVFP4 copies)
-        let mode = std::env::var("ATLAS_NEMOTRON_NATIVE_FP8_SSM")
-            .unwrap_or_else(|_| "1".to_string());
+        let mode =
+            std::env::var("ATLAS_NEMOTRON_NATIVE_FP8_SSM").unwrap_or_else(|_| "1".to_string());
         let native_fp8_enabled = matches!(mode.as_str(), "1" | "both" | "decode");
         // Decode-only mode keeps the legacy NVFP4 weights resident for prefill.
         let native_prefill_wanted = matches!(mode.as_str(), "1" | "both");
@@ -148,7 +148,8 @@ impl NemotronHWeightLoader {
             config.mamba2_d_inner(),
         );
         let native = if native_fp8 {
-            let mut in_fp8 = load_fp8_block_scaled_as_fp8weight(store, &format!("{p}.in_proj"), gpu)?;
+            let mut in_fp8 =
+                load_fp8_block_scaled_as_fp8weight(store, &format!("{p}.in_proj"), gpu)?;
             let mut out_fp8 =
                 load_fp8_block_scaled_as_fp8weight(store, &format!("{p}.out_proj"), gpu)?;
             // OWN the FP8 weight bytes. `load_fp8_block_scaled_as_fp8weight`
@@ -286,9 +287,8 @@ impl NemotronHWeightLoader {
         // leave `ssm.in_proj`/`ssm.out_proj` as NULL `QuantizedWeight`s, and both
         // derived copies read them (`transpose_for_gemm` copy_d2h's from NULL,
         // `predequant_to_fp8` launches on a NULL B).
-        let fp8_prefill = !native_prefill
-            && !native_bf16
-            && std::env::var("ATLAS_NO_SSM_FP8_PREFILL").is_err();
+        let fp8_prefill =
+            !native_prefill && !native_bf16 && std::env::var("ATLAS_NO_SSM_FP8_PREFILL").is_err();
         let prefill_t = !native_prefill
             && !native_bf16
             && !fp8_prefill

@@ -362,19 +362,18 @@ fn resolve_jinja_includes(template: &str, model_dir: &Path) -> String {
             .trim_start_matches('-')
             .trim_end_matches('-')
             .trim();
-        if body.starts_with("include") {
-            if let Some(fname) = first_quoted(body) {
-                // Only allow a bare filename in the model dir (no path escapes).
-                if !fname.contains('/') && !fname.contains("..") {
-                    if let Ok(contents) = std::fs::read_to_string(model_dir.join(&fname)) {
-                        result.push_str(&template[cursor..open]);
-                        result.push_str(&contents);
-                        tracing::info!("Inlined Jinja include '{fname}' ({} chars)", contents.len());
-                        cursor = close;
-                        continue;
-                    }
-                }
-            }
+        if body.starts_with("include")
+            && let Some(fname) = first_quoted(body)
+            // Only allow a bare filename in the model dir (no path escapes).
+            && !fname.contains('/')
+            && !fname.contains("..")
+            && let Ok(contents) = std::fs::read_to_string(model_dir.join(&fname))
+        {
+            result.push_str(&template[cursor..open]);
+            result.push_str(&contents);
+            tracing::info!("Inlined Jinja include '{fname}' ({} chars)", contents.len());
+            cursor = close;
+            continue;
         }
         // Not a resolvable include — emit the tag verbatim and continue.
         result.push_str(&template[cursor..close]);

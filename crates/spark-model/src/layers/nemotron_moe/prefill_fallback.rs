@@ -99,11 +99,10 @@ impl NemotronMoeLayer {
                 let shared_down_out = ctx.buffers.ssm_deinterleaved();
                 let max_n = (p.h as u32).max(p.latent);
                 let smem = (p.shared_inter.max(p.inter) as usize) * 4;
-                let native_down = self
-                    .weights
-                    .shared_down_fp8
-                    .as_ref()
-                    .filter(|_| self.w8a16_gemv_k.0 != 0 && self.moe_relu2_elementwise_k.0 != 0);
+                let native_down =
+                    self.weights.shared_down_fp8.as_ref().filter(|_| {
+                        self.w8a16_gemv_k.0 != 0 && self.moe_relu2_elementwise_k.0 != 0
+                    });
                 if let Some(fp8w) = native_down {
                     // Same substitution as decode: relu^2 in place, then the
                     // checkpoint's own FP8 bytes through `w8a16_gemv`, and let the
@@ -220,11 +219,10 @@ impl NemotronMoeLayer {
                 let expert_down_out = ctx.buffers.expert_down_out();
                 let shared_down_out = ctx.buffers.ssm_deinterleaved();
                 let smem = (p.shared_inter.max(p.inter) as usize) * 4;
-                let native_down = self
-                    .weights
-                    .shared_down_fp8
-                    .as_ref()
-                    .filter(|_| self.w8a16_gemv_k.0 != 0 && self.moe_relu2_elementwise_k.0 != 0);
+                let native_down =
+                    self.weights.shared_down_fp8.as_ref().filter(|_| {
+                        self.w8a16_gemv_k.0 != 0 && self.moe_relu2_elementwise_k.0 != 0
+                    });
                 if let Some(fp8w) = native_down {
                     // Same substitution as decode: relu^2 in place, then the
                     // checkpoint's own FP8 bytes through `w8a16_gemv`, and let the
