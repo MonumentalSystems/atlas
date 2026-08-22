@@ -34,6 +34,8 @@ mod kv;
 mod lang;
 mod lora;
 mod model_impl;
+mod token_adapter;
+mod token_overlay;
 mod util;
 
 pub use lang::NllbLang;
@@ -108,6 +110,22 @@ impl SlotAlloc {
     fn release(&mut self, slot: usize) {
         self.free.push(slot);
     }
+    /// Remove `slot` from the free-list so it is owned exclusively by the caller
+    /// (the two-phase retire compaction migrates a survivor onto a slot freed by
+    /// a retiring sequence — that target is on the free-list and MUST be claimed
+    /// or a later `claim` would hand the same slot to a new sequence). Also keep
+    /// the monotonic `next` ahead of any claimed index so it is never re-minted.
+    /// Returns whether the slot was actually on the free-list.
+    fn claim_specific(&mut self, slot: usize) -> bool {
+        let found = self.free.iter().position(|&s| s == slot);
+        if let Some(pos) = found {
+            self.free.swap_remove(pos);
+        }
+        if slot >= self.next {
+            self.next = slot + 1;
+        }
+        found.is_some()
+    }
 }
 
 impl NllbGpuModel {
@@ -164,7 +182,14 @@ impl NllbGpuModel {
         gpu.copy_h2d(util::bf16_bytes(&pos_host), pos_table)?;
 
         let lora = match lora_dir {
-            Some(dir) => Some(NllbLora::load(dir, gpu.as_ref(), cache_rows)?),
+            Some(dir) => Some(NllbLora::load(
+                dir,
+                gpu.as_ref(),
+                cache_rows,
+                embed_table,
+                vocab,
+                d,
+            )?),
             None => None,
         };
 
@@ -221,5 +246,51 @@ impl NllbGpuModel {
     #[inline]
     pub(super) fn lora_is_active(&self) -> bool {
         self.lora_active.load(Ordering::Relaxed)
+    }
+}
+
+#[cfg(test)]
+mod slot_tests {
+    use super::SlotAlloc;
+
+    /// `claim_specific` must remove a free slot so it is never handed out again —
+    /// the exact invariant the retire-compaction relies on (a survivor migrated
+    /// onto a freed slot must own it exclusively).
+    #[test]
+    fn claim_specific_removes_from_free_list() {
+        let mut a = SlotAlloc::default();
+        let (s0, s1, s2) = (a.claim(), a.claim(), a.claim()); // 0,1,2
+        assert_eq!((s0, s1, s2), (0, 1, 2));
+        a.release(1); // free-list: [1]
+        assert!(a.claim_specific(1)); // migrate a survivor onto slot 1
+        assert!(!a.claim_specific(1)); // already owned — no longer free
+        // The next fresh claim must NOT reuse slot 1 (it is live now).
+        assert_eq!(a.claim(), 3);
+    }
+
+    /// The compaction bookkeeping: release(old) + claim_specific(new) keeps the
+    /// free-list consistent so no two live sequences ever share a slot.
+    #[test]
+    fn compaction_bookkeeping_keeps_slots_disjoint() {
+        let mut a = SlotAlloc::default();
+        for _ in 0..4 {
+            a.claim();
+        } // 0,1,2,3 live
+        a.release(1); // seq at slot 1 retired → free-list [1]
+        // Survivor at slot 3 compacts into the hole at slot 1.
+        a.claim_specific(1); // claim target
+        a.release(3); // release vacated source
+        // Now live = {0,1,2}; a new sequence must get slot 3 (the only free one),
+        // never slot 1 (owned by the migrated survivor).
+        assert_eq!(a.claim(), 3);
+    }
+
+    /// `claim_specific` for a slot beyond `next` reserves the range so a later
+    /// monotonic `claim` cannot re-mint it.
+    #[test]
+    fn claim_specific_beyond_next_advances_monotonic() {
+        let mut a = SlotAlloc::default();
+        assert!(!a.claim_specific(5)); // not on free-list, but reserve up to 5
+        assert_eq!(a.claim(), 6);
     }
 }
