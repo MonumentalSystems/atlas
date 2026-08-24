@@ -596,3 +596,70 @@ extern "C" __global__ void nllb_beam_topk(
         }
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// Vocab-extending PEFT trainable_tokens / token_adapter support.
+//
+// A PEFT adapter that adds vocabulary ships a `token_adapter` per tied
+// embedding: `base_layer.weight` [R,d] (the adapter's own, resized base
+// embedding) and `trainable_tokens_delta` [T,d] (the FULL replacement rows for
+// the T trainable token ids — PEFT `index_copy`, NOT base+delta; verified in
+// peft/tuners/trainable_tokens/layer.py). The served model overrides only the
+// handful of rows that differ from its own embed table: a compact
+// `override_rows[n,d]` plus a `slot_map[vocab]` (token id -> row, else -1).
+// ─────────────────────────────────────────────────────────────────────────
+
+// Per-row max|a[r]-b[r]| > thresh -> flags[r]=1 (used at load to find exactly
+// the rows where the adapter's base_layer differs from the served embed table).
+// One thread per row; d is small (~1024).
+extern "C" __global__ void nllb_embed_rowdiff_bf16(
+    const __nv_bfloat16* __restrict__ a, const __nv_bfloat16* __restrict__ b,
+    unsigned char* __restrict__ flags, unsigned int rows, unsigned int d, float thresh) {
+    unsigned int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= rows) return;
+    const __nv_bfloat16* ar = a + (unsigned long long)r * d;
+    const __nv_bfloat16* br = b + (unsigned long long)r * d;
+    float m = 0.0f;
+    for (unsigned int i = 0; i < d; ++i) {
+        float dv = fabsf(__bfloat162float(ar[i]) - __bfloat162float(br[i]));
+        if (dv > m) m = dv;
+    }
+    flags[r] = (m > thresh) ? 1 : 0;
+}
+
+// Input-embedding override: for each of `rows` embedded tokens, replace the raw
+// embed row with `override_rows[slot_map[ids[r]]]` when that slot is >= 0. Runs
+// AFTER the embed gather and BEFORE the sqrt(d) scale (PEFT replaces the raw
+// row; the scale then multiplies it like any row). grid=[rows], block=[256].
+extern "C" __global__ void nllb_embed_overlay_bf16(
+    const unsigned int* __restrict__ ids, const int* __restrict__ slot_map,
+    const __nv_bfloat16* __restrict__ override_rows, __nv_bfloat16* __restrict__ out,
+    unsigned int d) {
+    unsigned int r = blockIdx.x;
+    int s = slot_map[ids[r]];
+    if (s < 0) return;
+    const __nv_bfloat16* src = override_rows + (unsigned long long)s * d;
+    __nv_bfloat16* dst = out + (unsigned long long)r * d;
+    for (unsigned int i = threadIdx.x; i < d; i += blockDim.x) dst[i] = src[i];
+}
+
+// lm_head override: the tied gemv/gemm used the OLD embed row for the overridden
+// vocab columns; recompute exactly those columns as a warp-reduced dot. One warp
+// per (logit row, override j): logits[row*vocab + ids[j]] = dot(hidden[row],
+// override_rows[j]). grid=[m*n], block=[32].
+extern "C" __global__ void nllb_lmhead_overlay_bf16(
+    const __nv_bfloat16* __restrict__ hidden, const __nv_bfloat16* __restrict__ override_rows,
+    const unsigned int* __restrict__ ids, __nv_bfloat16* __restrict__ logits,
+    unsigned int n, unsigned int d, unsigned int vocab) {
+    unsigned int pair = blockIdx.x;
+    unsigned int row = pair / n;
+    unsigned int j = pair % n;
+    unsigned int lane = threadIdx.x & 31u;
+    const __nv_bfloat16* h = hidden + (unsigned long long)row * d;
+    const __nv_bfloat16* w = override_rows + (unsigned long long)j * d;
+    float acc = 0.0f;
+    for (unsigned int k = lane; k < d; k += 32u)
+        acc += __bfloat162float(h[k]) * __bfloat162float(w[k]);
+    for (int o = 16; o > 0; o >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, o);
+    if (lane == 0) logits[(unsigned long long)row * vocab + ids[j]] = __float2bfloat16(acc);
+}

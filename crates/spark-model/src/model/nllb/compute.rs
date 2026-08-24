@@ -320,6 +320,7 @@ impl NllbGpuModel {
             .arg_ptr(enc_out)
             .arg_u32(d as u32)
             .launch(self.stream())?;
+        self.apply_embed_overlay(ids_dev, enc_out, seq)?;
         self.scale(enc_out, seq * d)?;
         let pos = encoder_pos_bf16(src_ids, d, self.lang.pad_id);
         let pos_dev = gpu.alloc(seq * d * 2)?;
@@ -396,6 +397,7 @@ impl NllbGpuModel {
             .arg_ptr(s.dh)
             .arg_u32(d as u32)
             .launch(self.stream())?;
+        self.apply_embed_overlay(s.id_dev, s.dh, 1)?;
         self.scale(s.dh, d)?;
         self.add(s.dh, self.pos_table.offset(pos * d * 2), d)?;
 
@@ -455,6 +457,7 @@ impl NllbGpuModel {
             self.vocab,
             d,
         )?;
+        self.apply_lmhead_overlay(s.dh, logits_out, 1)?;
         kv.dec_pos += 1;
         Ok(())
     }

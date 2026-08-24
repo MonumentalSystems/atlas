@@ -123,6 +123,7 @@ impl NllbGpuModel {
         let sh = ((self.head_dim + buf.cache_rows) * 4) as u32;
         self.gpu.copy_h2d(u32_bytes(cur), buf.id)?;
         self.embed_rows(buf.id, buf.dh, b)?;
+        self.apply_embed_overlay(buf.id, buf.dh, b)?;
         self.scale(buf.dh, b * d)?;
         // add the position row (broadcast across the B batch)
         KernelLaunch::new(self.gpu.as_ref(), self.kernels.add_row)
@@ -234,6 +235,7 @@ impl NllbGpuModel {
             .unwrap_or(false)
             .then(std::time::Instant::now);
         self.gemm(buf.dh, self.embed_table, buf.logits, b, self.vocab, d)?; // tied lm_head
+        self.apply_lmhead_overlay(buf.dh, buf.logits, b)?;
         if let Some(t) = t_lm {
             self.gpu.synchronize(self.stream())?;
             LMHEAD_NS.with(|c| c.set(c.get() + t.elapsed().as_nanos() as u64));
